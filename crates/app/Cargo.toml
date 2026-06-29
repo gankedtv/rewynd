@@ -22,6 +22,7 @@ rewynd-encode.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 rewynd-capture.workspace = true
 rewynd-gpu.workspace = true
+rewynd-mux.workspace = true
 ashpd = { workspace = true, features = ["global_shortcuts"] }
 tokio.workspace = true
 pollster.workspace = true

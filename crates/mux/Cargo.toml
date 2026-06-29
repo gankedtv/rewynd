@@ -11,3 +11,4 @@ publish = false
 [dependencies]
 thiserror.workspace = true
 rewynd-buffer.workspace = true
+mp4.workspace = true

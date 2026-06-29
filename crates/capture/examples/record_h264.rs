@@ -194,6 +194,7 @@ mod linux {
         frame_index: u32,
         writer: &mut impl Write,
     ) -> Result<ChunkInfo, Box<dyn std::error::Error>> {
+        let pts = captured.pts;
         let format = captured.texture_format().ok_or_else(|| {
             format!(
                 "unsupported DRM fourcc {:#010x} (expected packed 32-bit RGB)",
@@ -221,7 +222,7 @@ mod linux {
 
         // Force a keyframe on the very first frame so the file is decodable from the
         // start (the encoder's own GOP handles the rest via EncodeParams.idr_period).
-        let chunk = enc.encode(&nv12, frame_index == 0)?;
+        let chunk = enc.encode(&nv12, frame_index == 0, pts)?;
         writer.write_all(&chunk.bytes)?;
 
         Ok(ChunkInfo {

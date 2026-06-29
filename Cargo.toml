@@ -35,6 +35,8 @@ gpu-video = { git = "https://github.com/software-mansion/smelter", rev = "4fff15
 
 # Shared third-party
 drm-fourcc = "2"
+# MP4 muxing (docs/adr/0002): pure-Rust ISO-BMFF writer; we feed AVCC samples + PTS.
+mp4 = "0.14"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
