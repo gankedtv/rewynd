@@ -1,0 +1,20 @@
+[package]
+name = "rewynd-encode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+wgpu.workspace = true
+thiserror.workspace = true
+rewynd-buffer.workspace = true
+rewynd-gpu.workspace = true
+
+# gpu-video only builds where Vulkan exists (Windows + non-Apple unixes), matching the
+# crate's own target gating. macOS is out of scope (PLAN §3.6).
+[target.'cfg(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "emscripten"))))'.dependencies]
+gpu-video.workspace = true
