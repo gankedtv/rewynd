@@ -1,0 +1,17 @@
+[package]
+name = "rewynd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Lightweight instant-replay clip recorder: keeps the last 60s on the GPU, writes a clip on a hotkey."
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rewynd-buffer.workspace = true
+rewynd-encode.workspace = true
