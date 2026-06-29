@@ -1,11 +1,10 @@
 //! Thin wrapper over `gpu-video`: an NV12 [`wgpu::Texture`] in, an H.264
 //! [`EncodedChunk`] out (PLAN §4.3). The crate also provides the RGBA→NV12
-//! conversion (#8) that produces that NV12 input — a step upstream of [`Encoder`],
+//! conversion that produces that NV12 input — a step upstream of [`Encoder`],
 //! not something [`Encoder::encode`] does itself.
 //!
 //! [`GpuVideoEncoder::new`] constructs the encoder against the shared wgpu device
-//! ([`rewynd_gpu::GpuContext`], #3); the per-frame encode path and RGBA→NV12 land in
-//! #9 / #8.
+//! ([`rewynd_gpu::GpuContext`]); [`Nv12Converter`] performs the RGBA→NV12 step.
 
 use rewynd_buffer::EncodedChunk;
 use thiserror::Error;
@@ -38,7 +37,7 @@ pub struct EncodeParams {
     pub framerate: u32,
     /// Average target bitrate in bits per second.
     pub bitrate_bps: u32,
-    /// Frames between IDRs (GOP length); governs where the ring buffer can cut (#10).
+    /// Frames between IDRs (GOP length); governs where the ring buffer can cut.
     pub idr_period: u32,
 }
 
@@ -57,7 +56,7 @@ impl Default for EncodeParams {
 /// Encodes NV12 [`wgpu::Texture`]s into H.264 [`EncodedChunk`]s.
 ///
 /// `frame` must already be NV12 (`wgpu::TextureFormat::NV12`); run the crate's
-/// RGBA→NV12 conversion (#8) first when the source isn't NV12.
+/// [`Nv12Converter`] first when the source isn't NV12.
 pub trait Encoder {
     /// Encode one NV12 frame. `force_keyframe` forces an IDR at this frame so a clip
     /// can begin here (PLAN §3.3).
@@ -68,8 +67,9 @@ pub trait Encoder {
     ) -> Result<EncodedChunk, EncodeError>;
 }
 
-// The concrete gpu-video-backed encoder only exists where gpu-video builds.
+// The concrete gpu-video-backed encoder and converter only exist where gpu-video
+// builds.
 #[cfg(vulkan)]
 mod gpu_video_backend;
 #[cfg(vulkan)]
-pub use gpu_video_backend::GpuVideoEncoder;
+pub use gpu_video_backend::{GpuVideoEncoder, Nv12Converter};
