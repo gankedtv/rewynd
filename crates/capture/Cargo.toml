@@ -18,7 +18,7 @@ tracing.workspace = true
 ashpd.workspace = true
 pipewire.workspace = true
 # Used to query the GPU's supported DRM format modifiers for the PipeWire DMA-BUF
-# negotiation (#4) via VK_EXT_image_drm_format_modifier. Matches the 0.38.x already
+# negotiation via VK_EXT_image_drm_format_modifier. Matches the 0.38.x already
 # pulled into Cargo.lock by wgpu-hal/gpu-video.
 ash = "0.38"
 # Type-safe DRM fourcc codes and the DRM_FORMAT_MOD_INVALID sentinel.
@@ -27,20 +27,28 @@ drm-fourcc.workspace = true
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tokio.workspace = true
 tracing-subscriber.workspace = true
-# #5 PNG probe: import a captured DMA-BUF into a wgpu::Texture and save a screenshot.
+# PNG probe: import a captured DMA-BUF into a wgpu::Texture and save a screenshot.
 # The probe reuses the existing tokio runtime to drive the async GpuContext::new,
 # so no extra block-on shim is needed.
 rewynd-gpu.workspace = true
 png = "0.18"
+# Live-pipeline recording spike: NV12 conversion + H.264 encode of captured frames.
+rewynd-encode.workspace = true
 
-# Diagnostic probe (#4): logs PipeWire node id, negotiated format, and per-frame
+# Diagnostic probe: logs PipeWire node id, negotiated format, and per-frame
 # DMA-BUF descriptors. Linux-only at runtime; the binary compiles everywhere via a
 # `#[cfg(not(target_os = "linux"))]` stub `main`.
 [[example]]
 name = "linux_capture_probe"
 
-# #5 deliverable: import the first captured DMA-BUF as a wgpu::Texture and save it
-# as `screenshot.png`, proving the import + readback path. Linux-only at runtime;
+# Import the first captured DMA-BUF as a wgpu::Texture and save it as
+# `screenshot.png`, proving the import + readback path. Linux-only at runtime;
 # compiles everywhere via a `#[cfg(not(target_os = "linux"))]` stub `main`.
 [[example]]
 name = "import_to_png"
+
+# Live-pipeline spike: capture → import → RGBA/BGRx→NV12 → H.264 encode → write an
+# Annex-B `.h264` file, then print a CPU/GPU overhead report. Linux-only at runtime;
+# compiles everywhere via a `#[cfg(not(target_os = "linux"))]` stub `main`.
+[[example]]
+name = "record_h264"

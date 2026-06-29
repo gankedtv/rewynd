@@ -13,7 +13,9 @@ pub mod pipewire_capture;
 pub mod portal;
 pub mod vulkan_modifiers;
 
-pub use pipewire_capture::{CapturedDmabuf, DmabufFrame, capture_one_dmabuf, run_capture_probe};
+pub use pipewire_capture::{
+    CapturedDmabuf, DmabufFrame, capture_one_dmabuf, capture_stream, run_capture_probe,
+};
 pub use portal::{PortalSession, open_portal};
 pub use vulkan_modifiers::query_drm_format_modifiers;
 

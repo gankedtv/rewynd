@@ -48,7 +48,12 @@ impl GpuContext {
     pub async fn new() -> Result<Self, GpuError> {
         use gpu_video::{VideoAdapterExt, parameters::VideoDeviceDescriptor};
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        // Vulkan only: the encoder requires it and we enumerate Vulkan adapters below, so
+        // there's no reason to initialise the other backends' drivers at instance creation.
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
 
         let adapter = instance
             .enumerate_adapters(wgpu::Backends::VULKAN)

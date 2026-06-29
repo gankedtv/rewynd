@@ -12,35 +12,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod linux {
     use std::sync::mpsc;
 
-    use drm_fourcc::DrmFourcc;
     use rewynd_capture::linux::{CapturedDmabuf, capture_one_dmabuf, open_portal};
     use rewynd_gpu::{DmabufImport, GpuContext};
-
-    /// Whether the chosen wgpu format orders the channels B,G,R,A in memory (so the
-    /// readback bytes need a BGRA→RGBA swizzle before PNG, which expects RGBA).
-    struct Mapped {
-        format: wgpu::TextureFormat,
-        is_bgra: bool,
-    }
-
-    /// Map a captured DRM `fourcc` to the wgpu texture format used for the import.
-    ///
-    /// XRGB/ARGB (B,G,R,A in memory) → `Bgra8Unorm`; XBGR/ABGR (R,G,B,A in memory)
-    /// → `Rgba8Unorm`. The alpha-less X variants share a format with their A
-    /// counterparts (we just ignore/overwrite alpha on output).
-    fn map_fourcc(fourcc: u32) -> Option<Mapped> {
-        match DrmFourcc::try_from(fourcc).ok()? {
-            DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888 => Some(Mapped {
-                format: wgpu::TextureFormat::Bgra8Unorm,
-                is_bgra: true,
-            }),
-            DrmFourcc::Xbgr8888 | DrmFourcc::Abgr8888 => Some(Mapped {
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                is_bgra: false,
-            }),
-            _ => None,
-        }
-    }
 
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         tracing_subscriber::fmt()
@@ -96,12 +69,15 @@ mod linux {
         captured: CapturedDmabuf,
         out_path: &std::path::Path,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        let Mapped { format, is_bgra } = map_fourcc(captured.fourcc).ok_or_else(|| {
+        let format = captured.texture_format().ok_or_else(|| {
             format!(
                 "unsupported DRM fourcc {:#010x} (expected packed 32-bit RGB)",
                 captured.fourcc
             )
         })?;
+        // Bgra8Unorm orders channels B,G,R,A in memory, so the readback bytes need a
+        // BGRA→RGBA swizzle before PNG (which expects RGBA).
+        let is_bgra = format == wgpu::TextureFormat::Bgra8Unorm;
 
         let width = captured.width;
         let height = captured.height;
