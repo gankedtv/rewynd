@@ -1,33 +1,27 @@
 //! Thin wrapper over `gpu-video`: an NV12 [`wgpu::Texture`] in, an H.264
-//! [`EncodedChunk`] out (PLAN §4.3). This crate owns the RGBA→NV12 conversion.
+//! [`EncodedChunk`] out (PLAN §4.3). The crate also provides the RGBA→NV12
+//! conversion (#8) that produces that NV12 input — a step upstream of [`Encoder`],
+//! not something [`Encoder::encode`] does itself.
 //!
-//! The encoder is constructed against the shared wgpu device (#3) and wired in #9;
-//! RGBA→NV12 (reusing `gpu-video`'s `WgpuRgbaToNv12Converter`) is #8.
+//! [`GpuVideoEncoder::new`] constructs the encoder against the shared wgpu device
+//! ([`rewynd_gpu::GpuContext`], #3); the per-frame encode path and RGBA→NV12 land in
+//! #9 / #8.
 
 use rewynd_buffer::EncodedChunk;
-use rewynd_gpu::GpuContext;
 use thiserror::Error;
 
 /// The pinned `gpu-video` H.264 parameter type this wrapper builds on, re-exported so
-/// the workspace compiles against the ADR 0001 pin from the scaffold onward. Available
-/// only where `gpu-video` builds (see Cargo.toml target gating).
-#[cfg(any(
-    windows,
-    all(
-        unix,
-        not(target_os = "macos"),
-        not(target_os = "ios"),
-        not(target_os = "emscripten")
-    )
-))]
+/// the workspace compiles against the ADR 0001 pin. Available only where `gpu-video`
+/// builds (see Cargo.toml target gating).
+#[cfg(vulkan)]
 pub type GpuVideoEncoderParameters = gpu_video::parameters::EncoderParametersH264;
 
 /// Errors from the encoder.
 #[derive(Debug, Error)]
 pub enum EncodeError {
     /// The encoder failed to initialise on the shared device.
-    #[error("encoder initialisation failed")]
-    Init,
+    #[error("failed to initialise the gpu-video encoder: {0}")]
+    Init(String),
 }
 
 /// Encoder configuration.
@@ -61,9 +55,12 @@ impl Default for EncodeParams {
 }
 
 /// Encodes NV12 [`wgpu::Texture`]s into H.264 [`EncodedChunk`]s.
+///
+/// `frame` must already be NV12 (`wgpu::TextureFormat::NV12`); run the crate's
+/// RGBA→NV12 conversion (#8) first when the source isn't NV12.
 pub trait Encoder {
-    /// Encode one frame. `force_keyframe` forces an IDR at this frame so a clip can
-    /// begin here (PLAN §3.3).
+    /// Encode one NV12 frame. `force_keyframe` forces an IDR at this frame so a clip
+    /// can begin here (PLAN §3.3).
     fn encode(
         &mut self,
         frame: &wgpu::Texture,
@@ -71,33 +68,8 @@ pub trait Encoder {
     ) -> Result<EncodedChunk, EncodeError>;
 }
 
-/// `gpu-video`-backed encoder, constructed against the shared [`GpuContext`].
-pub struct GpuVideoEncoder {
-    params: EncodeParams,
-}
-
-impl GpuVideoEncoder {
-    /// Build the encoder on the shared device. The real `create_wgpu_textures_encoder_h264`
-    /// wiring lands in #9.
-    pub fn new(gpu: &GpuContext, params: EncodeParams) -> Result<Self, EncodeError> {
-        let _ = gpu;
-        Ok(Self { params })
-    }
-
-    /// The parameters this encoder was configured with.
-    #[must_use]
-    pub fn params(&self) -> EncodeParams {
-        self.params
-    }
-}
-
-impl Encoder for GpuVideoEncoder {
-    fn encode(
-        &mut self,
-        frame: &wgpu::Texture,
-        force_keyframe: bool,
-    ) -> Result<EncodedChunk, EncodeError> {
-        let _ = (frame, force_keyframe);
-        todo!("gpu-video encode (NV12 wgpu::Texture → H.264 chunk) — issue #9")
-    }
-}
+// The concrete gpu-video-backed encoder only exists where gpu-video builds.
+#[cfg(vulkan)]
+mod gpu_video_backend;
+#[cfg(vulkan)]
+pub use gpu_video_backend::GpuVideoEncoder;
