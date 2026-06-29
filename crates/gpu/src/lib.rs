@@ -4,10 +4,15 @@
 //! `request_device_with_video_support`, so the device is shared with the encoder
 //! (same wgpu source end-to-end — see docs/adr/0001-wgpu-rev.md). It enables the
 //! external-memory features the capture-import path needs (DMA-BUF on Linux, the
-//! D3D11 shared handle on Windows). The DMABUF / D3D11 import helpers themselves land
-//! in #5 / #7.
+//! D3D11 shared handle on Windows). DMA-BUF import lives in the `import` submodule.
 
 use thiserror::Error;
+
+#[cfg(target_os = "linux")]
+mod import;
+
+#[cfg(target_os = "linux")]
+pub use import::DmabufImport;
 
 /// Errors from GPU setup.
 #[derive(Debug, Error)]
@@ -18,6 +23,10 @@ pub enum GpuError {
     /// The wgpu device could not be created with video support.
     #[error("failed to create the shared wgpu device: {0}")]
     DeviceCreation(String),
+    /// A captured GPU resource (DMA-BUF / shared handle) could not be imported as
+    /// a [`wgpu::Texture`].
+    #[error("failed to import external GPU memory: {0}")]
+    Import(String),
 }
 
 /// The wgpu device/queue shared across the pipeline and handed to `gpu-video`.
@@ -35,7 +44,7 @@ pub struct GpuContext {
 impl GpuContext {
     /// Create the shared device on the Vulkan backend, enabling whichever
     /// external-memory features the adapter advertises (so the capture-import path
-    /// in #5 / #7 can import DMA-BUF / D3D11 memory zero-copy).
+    /// can import DMA-BUF / D3D11 memory zero-copy).
     pub async fn new() -> Result<Self, GpuError> {
         use gpu_video::{VideoAdapterExt, parameters::VideoDeviceDescriptor};
 

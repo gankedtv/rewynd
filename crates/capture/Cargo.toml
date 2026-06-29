@@ -25,9 +25,20 @@ ash = "0.38"
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tokio.workspace = true
 tracing-subscriber.workspace = true
+# #5 PNG probe: import a captured DMA-BUF into a wgpu::Texture and save a screenshot.
+# The probe reuses the existing tokio runtime to drive the async GpuContext::new,
+# so no extra block-on shim is needed.
+rewynd-gpu.workspace = true
+png = "0.18"
 
 # Diagnostic probe (#4): logs PipeWire node id, negotiated format, and per-frame
 # DMA-BUF descriptors. Linux-only at runtime; the binary compiles everywhere via a
 # `#[cfg(not(target_os = "linux"))]` stub `main`.
 [[example]]
 name = "linux_capture_probe"
+
+# #5 deliverable: import the first captured DMA-BUF as a wgpu::Texture and save it
+# as `screenshot.png`, proving the import + readback path. Linux-only at runtime;
+# compiles everywhere via a `#[cfg(not(target_os = "linux"))]` stub `main`.
+[[example]]
+name = "import_to_png"
