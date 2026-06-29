@@ -17,6 +17,14 @@ jobs:
         with:
           persist-credentials: false
 
+      # Linux capture deps: pipewire-sys/libspa-sys need libpipewire-0.3 (pkg-config)
+      # and libclang (bindgen). vk-mem needs a C++ compiler (preinstalled).
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libpipewire-0.3-dev clang libclang-dev
+
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
