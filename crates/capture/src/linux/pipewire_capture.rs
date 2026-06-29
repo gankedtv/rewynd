@@ -119,6 +119,20 @@ pub struct CapturedDmabuf {
     pub offset: i32,
 }
 
+impl CapturedDmabuf {
+    /// The `wgpu` texture format to import this frame as, or `None` if the captured
+    /// DRM `fourcc` isn't a supported single-plane packed 32-bit RGB layout. XRGB/ARGB
+    /// (B,G,R,A in memory) → `Bgra8Unorm`; XBGR/ABGR (R,G,B,A) → `Rgba8Unorm`.
+    #[must_use]
+    pub fn texture_format(&self) -> Option<wgpu::TextureFormat> {
+        match DrmFourcc::try_from(self.fourcc).ok()? {
+            DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888 => Some(wgpu::TextureFormat::Bgra8Unorm),
+            DrmFourcc::Xbgr8888 | DrmFourcc::Abgr8888 => Some(wgpu::TextureFormat::Rgba8Unorm),
+            _ => None,
+        }
+    }
+}
+
 /// Map a SPA [`VideoFormat`] to its DRM `fourcc`, accounting for the SPA→DRM
 /// byte-order swap (SPA names list bytes in memory order; DRM `fourcc` little-endian
 /// codes spell the channels in the *opposite* order).
@@ -680,6 +694,30 @@ pub fn run_capture_probe(node_id: u32, fd: OwnedFd) -> Result<(), CaptureError> 
     )
 }
 
+/// `dup()` a usable frame's borrowed plane fd into an owned [`CapturedDmabuf`].
+///
+/// PipeWire recycles the plane fd on the next dequeue, so callers cannot keep the
+/// borrow; [`BorrowedFd::try_clone_to_owned`] dups it (`F_DUPFD_CLOEXEC`) into an
+/// [`OwnedFd`] that outlives the buffer. Returns `None` (after logging) when the dup
+/// fails — e.g. fd exhaustion, which won't recover, so the caller should stop.
+fn dup_captured_frame(frame: &DmabufFrame, plane_fd: BorrowedFd) -> Option<CapturedDmabuf> {
+    match plane_fd.try_clone_to_owned() {
+        Ok(fd) => Some(CapturedDmabuf {
+            fd,
+            fourcc: frame.fourcc,
+            drm_modifier: frame.modifier,
+            width: frame.width,
+            height: frame.height,
+            stride: frame.stride,
+            offset: frame.offset,
+        }),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to dup DMA-BUF fd; aborting");
+            None
+        }
+    }
+}
+
 /// Capture exactly one usable single-plane DMA-BUF frame from `node_id` (the
 /// PipeWire remote behind `fd`) and return its owned, dup'd descriptor.
 ///
@@ -704,17 +742,8 @@ pub fn capture_one_dmabuf(node_id: u32, fd: OwnedFd) -> Result<CapturedDmabuf, C
         {
             let captured = captured.clone();
             move |frame, plane_fd| {
-                // dup() the borrowed fd into an OwnedFd: PipeWire recycles its fd on
-                // the next dequeue, so we cannot keep the borrow. `try_clone_to_owned`
-                // uses F_DUPFD_CLOEXEC under the hood.
-                let owned = match plane_fd.try_clone_to_owned() {
-                    Ok(fd) => fd,
-                    Err(e) => {
-                        // dup failure (e.g. fd exhaustion) won't recover; stop instead
-                        // of spinning on every usable frame.
-                        tracing::error!(error = %e, "failed to dup DMA-BUF fd; aborting");
-                        return ControlFlow::Break(());
-                    }
+                let Some(captured_frame) = dup_captured_frame(frame, plane_fd) else {
+                    return ControlFlow::Break(());
                 };
                 tracing::info!(
                     fourcc = format_args!("{:#010x}", frame.fourcc),
@@ -725,15 +754,7 @@ pub fn capture_one_dmabuf(node_id: u32, fd: OwnedFd) -> Result<CapturedDmabuf, C
                     offset = frame.offset,
                     "captured single DMA-BUF frame for import"
                 );
-                *captured.borrow_mut() = Some(CapturedDmabuf {
-                    fd: owned,
-                    fourcc: frame.fourcc,
-                    drm_modifier: frame.modifier,
-                    width: frame.width,
-                    height: frame.height,
-                    stride: frame.stride,
-                    offset: frame.offset,
-                });
+                *captured.borrow_mut() = Some(captured_frame);
                 ControlFlow::Break(())
             }
         },
@@ -746,4 +767,53 @@ pub fn capture_one_dmabuf(node_id: u32, fd: OwnedFd) -> Result<CapturedDmabuf, C
     captured.borrow_mut().take().ok_or_else(|| {
         CaptureError::PipeWire("capture loop succeeded but produced no frame".to_owned())
     })
+}
+
+/// Capture a continuous stream of usable single-plane DMA-BUF frames from `node_id`
+/// (the PipeWire remote behind `fd`), handing each one to `on_frame` as an owned,
+/// dup'd [`CapturedDmabuf`].
+///
+/// Like [`capture_one_dmabuf`], each frame's plane fd is `dup()`'d
+/// (`F_DUPFD_CLOEXEC`, via [`BorrowedFd::try_clone_to_owned`]) into an [`OwnedFd`]
+/// that outlives the buffer, so `on_frame` may keep it (e.g. hand it to
+/// `rewynd_gpu::GpuContext::import_dmabuf`). `on_frame` returns
+/// [`ControlFlow::Continue`] to keep receiving frames or [`ControlFlow::Break`] to
+/// stop the loop (a successful, deliberate end).
+///
+/// Blocks (runs the PipeWire main loop) until `on_frame` breaks or the stream
+/// errors. Must be called on a thread that owns the `fd`; keep the portal
+/// `Session` (and any tokio runtime) alive for the whole call.
+pub fn capture_stream(
+    node_id: u32,
+    fd: OwnedFd,
+    mut on_frame: impl FnMut(CapturedDmabuf) -> ControlFlow<()> + 'static,
+) -> Result<(), CaptureError> {
+    // A failed dup inside the callback can only break the loop, which `run_stream`
+    // reports as a clean stop; record it so we can surface it as an error instead of
+    // a silent zero-frame success.
+    let dup_failed = Rc::new(Cell::new(false));
+    run_stream(
+        node_id,
+        fd,
+        "rewynd-capture-stream",
+        {
+            let dup_failed = dup_failed.clone();
+            move |frame, plane_fd| match dup_captured_frame(frame, plane_fd) {
+                Some(captured_frame) => on_frame(captured_frame),
+                None => {
+                    dup_failed.set(true);
+                    ControlFlow::Break(())
+                }
+            }
+        },
+        "stream ended without capturing any usable DMA-BUF frames \
+         (modifier fixation or buffer negotiation failed — see logs)",
+    )?;
+
+    if dup_failed.get() {
+        return Err(CaptureError::PipeWire(
+            "failed to dup a DMA-BUF plane fd (fd exhaustion?)".to_owned(),
+        ));
+    }
+    Ok(())
 }

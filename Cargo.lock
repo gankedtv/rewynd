@@ -1276,6 +1276,7 @@ dependencies = [
  "drm-fourcc",
  "pipewire",
  "png",
+ "rewynd-encode",
  "rewynd-gpu",
  "thiserror 2.0.18",
  "tokio",

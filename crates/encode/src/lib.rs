@@ -21,6 +21,9 @@ pub enum EncodeError {
     /// The encoder failed to initialise on the shared device.
     #[error("failed to initialise the gpu-video encoder: {0}")]
     Init(String),
+    /// The encoder failed while encoding a frame.
+    #[error("failed to encode a frame: {0}")]
+    Encode(String),
 }
 
 /// Encoder configuration.
@@ -95,5 +98,11 @@ mod tests {
             err.to_string(),
             "failed to initialise the gpu-video encoder: boom"
         );
+    }
+
+    #[test]
+    fn encode_error_displays_the_cause() {
+        let err = EncodeError::Encode("kaput".to_owned());
+        assert_eq!(err.to_string(), "failed to encode a frame: kaput");
     }
 }
