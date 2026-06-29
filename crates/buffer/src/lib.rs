@@ -24,18 +24,13 @@ pub struct EncodedChunk {
 /// Errors returned by [`RingBuffer`].
 #[derive(Debug, Error)]
 pub enum BufferError {
-    /// No keyframe exists within the requested window, so no self-decodable cut is possible.
+    /// The buffer holds no keyframe, so no self-decodable clip can be cut.
     #[error("no keyframe within the requested {0:?} window")]
     NoKeyframe(Duration),
-    /// The keyframe-aware cut is not yet implemented.
-    #[error("ring-buffer flush is not yet implemented")]
-    NotImplemented,
 }
 
-/// A time-bounded ring of encoded chunks.
-///
-/// The keyframe-aware cut ([`flush_last`](RingBuffer::flush_last)) is implemented
-/// later; the scaffold provides storage and time-based eviction.
+/// A time-bounded ring of encoded chunks with a keyframe-aware cut
+/// ([`flush_last`](RingBuffer::flush_last)).
 #[derive(Debug)]
 pub struct RingBuffer {
     window: Duration,
@@ -66,14 +61,35 @@ impl RingBuffer {
         }
     }
 
-    /// Return the chunks for a clip covering up to `duration`, starting at the most
-    /// recent IDR within that window so the clip is self-decodable.
+    /// Cut a self-decodable clip of the most recent ~`duration` of footage, returning
+    /// its chunks oldest-first.
     ///
-    /// The real keyframe-aware walk lands later.
+    /// The clip starts on an IDR so it decodes standalone (encoded with inline
+    /// SPS/PPS). To avoid losing the moment, the start is the most recent IDR at or
+    /// before `newest_pts - duration`, so the clip spans *at least* `duration` when
+    /// the buffer reaches that far back; otherwise it starts at the earliest retained
+    /// IDR (the whole buffer from its first keyframe). Returns [`BufferError::NoKeyframe`]
+    /// only when the buffer holds no IDR at all.
     pub fn flush_last(&self, duration: Duration) -> Result<Vec<EncodedChunk>, BufferError> {
-        // The keyframe-aware cut from the most recent IDR lands later.
-        let _ = duration;
-        Err(BufferError::NotImplemented)
+        let newest = self
+            .chunks
+            .back()
+            .ok_or(BufferError::NoKeyframe(duration))?
+            .pts;
+        let cutoff = newest.saturating_sub(duration);
+
+        // Prefer the most recent IDR at or before the cutoff (covers >= duration); fall
+        // back to the earliest retained IDR when none is that old.
+        let start = self
+            .chunks
+            .iter()
+            .enumerate()
+            .rfind(|(_, c)| c.is_keyframe && c.pts <= cutoff)
+            .map(|(i, _)| i)
+            .or_else(|| self.chunks.iter().position(|c| c.is_keyframe))
+            .ok_or(BufferError::NoKeyframe(duration))?;
+
+        Ok(self.chunks.iter().skip(start).cloned().collect())
     }
 
     /// Number of buffered chunks.
@@ -132,19 +148,74 @@ mod tests {
         assert!(!buf.is_empty());
     }
 
-    #[test]
-    fn flush_last_is_not_yet_implemented() {
-        let buf = RingBuffer::new(Duration::from_secs(60));
-        let err = buf.flush_last(Duration::from_secs(10)).unwrap_err();
-        assert!(matches!(err, BufferError::NotImplemented));
+    /// Collect the `pts` (in whole seconds) of each chunk in a flushed clip.
+    fn pts_secs(clip: &[EncodedChunk]) -> Vec<u64> {
+        clip.iter().map(|c| c.pts.as_secs()).collect()
     }
 
     #[test]
-    fn error_variants_display() {
-        assert_eq!(
-            BufferError::NotImplemented.to_string(),
-            "ring-buffer flush is not yet implemented"
-        );
+    fn flush_starts_at_the_idr_before_the_cutoff() {
+        // IDR every 2s, P-frames on the odd seconds; newest = 10s.
+        let mut buf = RingBuffer::new(Duration::from_secs(60));
+        for s in 0..=10 {
+            buf.push(chunk(s, s % 2 == 0));
+        }
+        // duration 5s → cutoff 5s. The most recent IDR at/before 5s is the one at 4s,
+        // so the clip is 4..=10 (spans 6s ≥ the requested 5s) and starts on a keyframe.
+        let clip = buf.flush_last(Duration::from_secs(5)).unwrap();
+        assert!(clip.first().unwrap().is_keyframe);
+        assert_eq!(pts_secs(&clip), vec![4, 5, 6, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn flush_with_window_larger_than_buffer_returns_from_earliest_idr() {
+        // Buffer starts with a couple of orphan P-frames (their IDR was evicted),
+        // then an IDR at 2s. A long request can't reach back `duration`, so the clip
+        // starts at the earliest retained IDR and excludes the undecodable P-frames.
+        let mut buf = RingBuffer::new(Duration::from_secs(60));
+        buf.push(chunk(0, false));
+        buf.push(chunk(1, false));
+        for s in 2..=5 {
+            buf.push(chunk(s, s == 2));
+        }
+        let clip = buf.flush_last(Duration::from_secs(60)).unwrap();
+        assert_eq!(pts_secs(&clip), vec![2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn flush_after_eviction_uses_the_surviving_idr() {
+        // Mirrors the eviction test: IDRs at 0/60/120, window 60s. After pushing up to
+        // 129s the only surviving IDR is at 120s, so a 60s flush yields 120..=129.
+        let mut buf = RingBuffer::new(Duration::from_secs(60));
+        for s in 0..130 {
+            buf.push(chunk(s, s % 60 == 0));
+        }
+        let clip = buf.flush_last(Duration::from_secs(60)).unwrap();
+        assert_eq!(clip.first().unwrap().pts, Duration::from_secs(120));
+        assert_eq!(clip.len(), 10);
+    }
+
+    #[test]
+    fn flush_without_any_keyframe_errors() {
+        let mut buf = RingBuffer::new(Duration::from_secs(60));
+        for s in 0..5 {
+            buf.push(chunk(s, false));
+        }
+        let err = buf.flush_last(Duration::from_secs(10)).unwrap_err();
+        assert!(matches!(err, BufferError::NoKeyframe(_)));
+    }
+
+    #[test]
+    fn flush_empty_buffer_errors() {
+        let buf = RingBuffer::new(Duration::from_secs(60));
+        assert!(matches!(
+            buf.flush_last(Duration::from_secs(10)).unwrap_err(),
+            BufferError::NoKeyframe(_)
+        ));
+    }
+
+    #[test]
+    fn error_variant_displays() {
         assert_eq!(
             BufferError::NoKeyframe(Duration::from_secs(5)).to_string(),
             "no keyframe within the requested 5s window"
