@@ -152,9 +152,11 @@ fn nal_units(data: &[u8]) -> Vec<&[u8]> {
     for (k, &code) in codes.iter().enumerate() {
         let start = code + 3;
         let mut end = codes.get(k + 1).copied().unwrap_or(data.len());
-        // A four-byte start code is `00 00 01` preceded by an extra `00`; trim it off the
-        // previous NAL. Valid NALs never end in `00` (rbsp trailing bits), so this is safe.
-        if end > start && data[end - 1] == 0 {
+        // Between NAL units the byte stream carries only zero padding — the
+        // trailing/leading zero bytes around the next start code (so a four-byte
+        // `00 00 00 01` is just `00 00 01` with extra leading zeros). A NAL's last RBSP
+        // byte is non-zero (the rbsp stop bit), so every trailing zero here is padding.
+        while end > start && data[end - 1] == 0 {
             end -= 1;
         }
         if start < end {
@@ -168,7 +170,7 @@ fn nal_units(data: &[u8]) -> Vec<&[u8]> {
 fn find_nal(data: &[u8], nal_type: u8) -> Option<&[u8]> {
     nal_units(data)
         .into_iter()
-        .find(|nal| nal[0] & 0x1f == nal_type)
+        .find(|nal| nal.first().is_some_and(|&header| header & 0x1f == nal_type))
 }
 
 /// Convert Annex-B (start-code-delimited) NAL units into AVCC form: each NAL prefixed
@@ -214,6 +216,19 @@ mod tests {
     }
 
     #[test]
+    fn trims_extra_leading_zeros_and_trailing_padding() {
+        // NAL [67 88], then a start code with two extra leading zeros, then NAL [68].
+        let mut data = vec![0, 0, 0, 1, 0x67, 0x88];
+        data.extend_from_slice(&[0, 0, 0, 0, 1, 0x68]);
+        assert_eq!(nal_units(&data), vec![&[0x67, 0x88][..], &[0x68][..]]);
+
+        // Trailing zero padding at end of stream is not part of the NAL.
+        let mut padded = annexb(&[&[0x67, 0x88]]);
+        padded.extend_from_slice(&[0, 0]);
+        assert_eq!(nal_units(&padded), vec![&[0x67, 0x88][..]]);
+    }
+
+    #[test]
     fn annexb_to_avcc_length_prefixes_each_nal() {
         let data = annexb(&[&[0x65, 0x11], &[0x41]]);
         assert_eq!(
@@ -224,7 +239,8 @@ mod tests {
 
     #[test]
     fn find_nal_locates_sps_and_pps() {
-        let sps = [0x67, 0x42, 0x00];
+        // NALs end on a non-zero rbsp stop bit, so no trailing-zero trimming applies here.
+        let sps = [0x67, 0x42, 0x1f];
         let pps = [0x68, 0xCE];
         let idr = [0x65, 0x88];
         let data = annexb(&[&sps, &pps, &idr]);

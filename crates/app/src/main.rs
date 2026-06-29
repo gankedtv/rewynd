@@ -188,11 +188,8 @@ mod linux {
                     frame_index == 0,
                 ) {
                     Ok(chunk) => {
-                        // The chunk's PTS is constant-framerate (frame index / target fps).
-                        // When the source delivers faster than the target (high-refresh
-                        // displays), that PTS outruns wall time, so the window retains less
-                        // real footage than configured — fixed by capture-timestamp PTS in
-                        // the muxing work.
+                        // The chunk carries the frame's real capture timestamp, so the
+                        // window evicts by wall-clock time regardless of the capture rate.
                         buffer.lock().expect("ring buffer mutex").push(chunk);
                         frame_index += 1;
                         ControlFlow::Continue(())
