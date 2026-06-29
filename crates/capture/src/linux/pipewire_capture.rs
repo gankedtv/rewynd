@@ -26,6 +26,7 @@ use std::io::Cursor;
 use std::ops::ControlFlow;
 use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use drm_fourcc::{DrmFourcc, DrmModifier};
 use pipewire as pw;
@@ -93,6 +94,10 @@ pub struct DmabufFrame {
     pub offset: i32,
     /// Number of planes in the buffer (we only accept single-plane formats).
     pub num_planes: usize,
+    /// Monotonic capture time of this frame, relative to the start of the stream.
+    /// Inter-frame deltas reflect the real (variable) capture cadence, so downstream
+    /// PTS stays wall-clock-accurate even when the source isn't a fixed framerate.
+    pub pts: Duration,
 }
 
 /// A single captured DMA-BUF frame with an *owned* (dup'd) file descriptor.
@@ -117,6 +122,9 @@ pub struct CapturedDmabuf {
     pub stride: i32,
     /// Byte offset of the plane within the DMA-BUF.
     pub offset: i32,
+    /// Monotonic capture time relative to the start of the stream (see
+    /// [`DmabufFrame::pts`]).
+    pub pts: Duration,
 }
 
 impl CapturedDmabuf {
@@ -179,6 +187,8 @@ struct UserData<F> {
     success: Rc<Cell<bool>>,
     /// Clone of the main loop so a callback can `quit()`.
     main_loop: pw::main_loop::MainLoopRc,
+    /// When the stream started, so each frame gets a monotonic capture-relative PTS.
+    stream_start: Instant,
 }
 
 /// Serialize a pod [`Object`] to bytes (suitable for `Pod::from_bytes`).
@@ -444,6 +454,7 @@ where
         on_usable,
         success: success.clone(),
         main_loop: main_loop.clone(),
+        stream_start: Instant::now(),
     };
 
     let _listener = stream
@@ -585,6 +596,7 @@ where
                     stride: chunk.stride(),
                     offset: chunk.offset() as i32,
                     num_planes: 1,
+                    pts: ud.stream_start.elapsed(),
                 };
 
                 // SAFETY: `raw_fd` is the plane's DMA-BUF fd, owned by PipeWire and
@@ -710,6 +722,7 @@ fn dup_captured_frame(frame: &DmabufFrame, plane_fd: BorrowedFd) -> Option<Captu
             height: frame.height,
             stride: frame.stride,
             offset: frame.offset,
+            pts: frame.pts,
         }),
         Err(e) => {
             tracing::error!(error = %e, "failed to dup DMA-BUF fd; aborting");

@@ -28,6 +28,7 @@ mod linux {
     use rewynd_capture::linux::{CapturedDmabuf, capture_stream, open_portal};
     use rewynd_encode::{EncodeParams, Encoder, GpuVideoEncoder, Nv12Converter};
     use rewynd_gpu::{DmabufImport, GpuContext};
+    use rewynd_mux::{Mp4Muxer, Muxer};
 
     /// Buffer retention window for the MVP (PLAN §2). Configurable later.
     const BUFFER_WINDOW: Duration = Duration::from_secs(60);
@@ -131,7 +132,7 @@ mod linux {
                     let buffer = buffer.clone();
                     std::thread::spawn(move || {
                         std::thread::sleep(Duration::from_secs(secs));
-                        save_clip(&buffer);
+                        save_clip(&buffer, params);
                     });
                 }
                 Err(e) => tracing::warn!(value, error = %e, "ignoring invalid REWYND_FLUSH_AFTER"),
@@ -140,7 +141,7 @@ mod linux {
 
         // Block on the hotkey loop until the shortcut session ends (or the process is
         // killed). The capture thread keeps filling the buffer in the background.
-        let result = runtime.block_on(run_hotkey_loop(&buffer));
+        let result = runtime.block_on(run_hotkey_loop(&buffer, params));
 
         // Shut the capture loop down, then join it so the GPU pipeline tears down on its
         // own thread rather than during process exit. The loop only observes `stop` when a
@@ -187,11 +188,8 @@ mod linux {
                     frame_index == 0,
                 ) {
                     Ok(chunk) => {
-                        // The chunk's PTS is constant-framerate (frame index / target fps).
-                        // When the source delivers faster than the target (high-refresh
-                        // displays), that PTS outruns wall time, so the window retains less
-                        // real footage than configured — fixed by capture-timestamp PTS in
-                        // the muxing work.
+                        // The chunk carries the frame's real capture timestamp, so the
+                        // window evicts by wall-clock time regardless of the capture rate.
                         buffer.lock().expect("ring buffer mutex").push(chunk);
                         frame_index += 1;
                         ControlFlow::Continue(())
@@ -218,6 +216,7 @@ mod linux {
         captured: CapturedDmabuf,
         force_keyframe: bool,
     ) -> Result<EncodedChunk> {
+        let pts = captured.pts;
         let format = captured.texture_format().ok_or_else(|| {
             anyhow!(
                 "unsupported DRM fourcc {:#010x} (expected packed 32-bit RGB)",
@@ -242,7 +241,7 @@ mod linux {
         // valid single-plane DMA-BUF whose format/modifier/stride/offset match `import`.
         let texture = unsafe { gpu.import_dmabuf(import)? };
         let nv12 = conv.convert(gpu, &texture);
-        Ok(enc.encode(&nv12, force_keyframe)?)
+        Ok(enc.encode(&nv12, force_keyframe, pts)?)
     }
 
     /// Render a path as a single quoted `Exec` value, applying both unescaping layers
@@ -301,7 +300,7 @@ mod linux {
     }
 
     /// Register the global shortcut and flush a clip whenever it fires.
-    async fn run_hotkey_loop(buffer: &SharedBuffer) -> Result<()> {
+    async fn run_hotkey_loop(buffer: &SharedBuffer, params: EncodeParams) -> Result<()> {
         let shortcuts = GlobalShortcuts::new().await?;
         let session = shortcuts.create_session(Default::default()).await?;
         // Subscribe before binding so no early activation is missed.
@@ -351,7 +350,7 @@ mod linux {
         while let Some(activation) = activated.next().await {
             tracing::info!(shortcut_id = activation.shortcut_id(), "shortcut activated");
             if activation.shortcut_id() == SHORTCUT_ID {
-                save_clip(buffer);
+                save_clip(buffer, params);
             }
         }
 
@@ -359,30 +358,54 @@ mod linux {
         Ok(())
     }
 
-    /// Cut the most recent clip from the buffer and report it. Muxing the chunks to an
-    /// MP4 on disk lands in the next issue; for now this proves the hotkey→flush path.
-    fn save_clip(buffer: &SharedBuffer) {
+    /// Cut the most recent clip from the buffer and write it to an MP4 on disk.
+    fn save_clip(buffer: &SharedBuffer, params: EncodeParams) {
+        // Hold the lock only for the cut (which clones the clip's chunks), then release it
+        // so the capture thread keeps filling the buffer while we write the file.
         let clip = buffer
             .lock()
             .expect("ring buffer mutex")
             .flush_last(BUFFER_WINDOW);
-        match clip {
-            Ok(chunks) => {
-                let bytes: usize = chunks.iter().map(|c| c.bytes.len()).sum();
+        let chunks = match clip {
+            Ok(chunks) => chunks,
+            Err(e) => {
+                tracing::warn!(error = %e, "nothing to save yet");
+                return;
+            }
+        };
+
+        let path = clip_output_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match Mp4Muxer::new(params.width, params.height, params.framerate).write_mp4(&chunks, &path)
+        {
+            Ok(()) => {
                 let span = match (chunks.first(), chunks.last()) {
                     (Some(first), Some(last)) => last.pts.saturating_sub(first.pts),
                     _ => Duration::ZERO,
                 };
                 tracing::info!(
+                    path = %path.display(),
                     frames = chunks.len(),
-                    bytes,
                     span_s = span.as_secs_f64(),
-                    starts_on_keyframe = chunks.first().is_some_and(|c| c.is_keyframe),
-                    "clip flushed (MP4 muxing lands in the next issue)"
+                    "saved clip"
                 );
             }
-            Err(e) => tracing::warn!(error = %e, "nothing to save yet"),
+            Err(e) => tracing::error!(error = %e, path = %path.display(), "failed to write clip"),
         }
+    }
+
+    /// Where to write a saved clip: `$REWYND_OUTPUT_DIR` (default: the temp dir) with a
+    /// millisecond-stamped name so successive saves don't collide.
+    fn clip_output_path() -> std::path::PathBuf {
+        let dir = std::env::var_os("REWYND_OUTPUT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        dir.join(format!("rewynd-{stamp}.mp4"))
     }
 
     #[cfg(test)]

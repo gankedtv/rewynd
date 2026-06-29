@@ -26,8 +26,6 @@ pub struct GpuVideoEncoder {
     params: EncodeParams,
     // Owns the live gpu-video encoder so it lives as long as this wrapper.
     inner: gpu_video::WgpuTexturesEncoderH264,
-    /// Count of frames encoded so far, used to stamp each chunk's presentation time.
-    frames_encoded: u64,
 }
 
 impl GpuVideoEncoder {
@@ -74,11 +72,7 @@ impl GpuVideoEncoder {
             )
             .map_err(|e| EncodeError::Init(e.to_string()))?;
 
-        Ok(Self {
-            params,
-            inner,
-            frames_encoded: 0,
-        })
+        Ok(Self { params, inner })
     }
 
     /// The parameters this encoder was configured with.
@@ -93,6 +87,7 @@ impl Encoder for GpuVideoEncoder {
         &mut self,
         frame: &wgpu::Texture,
         force_keyframe: bool,
+        pts: std::time::Duration,
     ) -> Result<EncodedChunk, EncodeError> {
         // gpu-video takes the NV12 texture by value; the converter hands us a fresh
         // texture each frame, but the trait borrows it, so clone the wgpu handle (a
@@ -103,24 +98,18 @@ impl Encoder for GpuVideoEncoder {
                 gpu_video::InputFrame {
                     data: frame.clone(),
                     // gpu-video drives its own GOP/rate control from target_framerate;
-                    // we stamp the chunk's PTS ourselves below.
+                    // we carry the real capture PTS on the chunk ourselves.
                     pts: None,
                 },
                 force_keyframe,
             )
             .map_err(|e| EncodeError::Encode(e.to_string()))?;
 
-        // Presentation timestamp derived from the configured (constant) framerate:
-        // chunk N presents at N / framerate. The ring buffer's window eviction
-        // measures elapsed time as the difference between chunk PTSs, so this must be
-        // monotonic. (Drop-accurate timing would need capture timestamps threaded in.)
-        let fps = u64::from(self.params.framerate).max(1);
-        let pts = std::time::Duration::from_nanos(self.frames_encoded * 1_000_000_000 / fps);
-        self.frames_encoded += 1;
-
         Ok(EncodedChunk {
             bytes: chunk.data,
             is_keyframe: chunk.is_keyframe,
+            // The capture-relative timestamp, carried through verbatim for the ring
+            // buffer's window eviction and the muxer's per-sample timing.
             pts,
         })
     }

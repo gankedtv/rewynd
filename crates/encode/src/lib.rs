@@ -6,6 +6,8 @@
 //! [`GpuVideoEncoder::new`] constructs the encoder against the shared wgpu device
 //! ([`rewynd_gpu::GpuContext`]); [`Nv12Converter`] performs the RGBA→NV12 step.
 
+use std::time::Duration;
+
 use rewynd_buffer::EncodedChunk;
 use thiserror::Error;
 
@@ -61,12 +63,15 @@ impl Default for EncodeParams {
 /// `frame` must already be NV12 (`wgpu::TextureFormat::NV12`); run the crate's
 /// [`Nv12Converter`] first when the source isn't NV12.
 pub trait Encoder {
-    /// Encode one NV12 frame. `force_keyframe` forces an IDR at this frame so a clip
-    /// can begin here (PLAN §3.3).
+    /// Encode one NV12 frame captured at `pts` (capture-relative). `force_keyframe`
+    /// forces an IDR at this frame so a clip can begin here (PLAN §3.3). The encoder
+    /// stamps `pts` onto the returned chunk verbatim — it doesn't invent timing — so
+    /// the ring buffer and muxer see real, wall-clock-accurate timestamps.
     fn encode(
         &mut self,
         frame: &wgpu::Texture,
         force_keyframe: bool,
+        pts: Duration,
     ) -> Result<EncodedChunk, EncodeError>;
 }
 
