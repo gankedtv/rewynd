@@ -86,6 +86,9 @@ fn load_token() -> Option<String> {
 
 /// Persist a restore token for the next run (best-effort; logs on failure).
 fn save_token(token: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
     let path = token_path();
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -93,10 +96,24 @@ fn save_token(token: &str) {
             return;
         }
     }
-    if let Err(e) = std::fs::write(&path, token) {
-        tracing::warn!(error = %e, path = %path.display(), "could not persist restore token");
-    } else {
-        tracing::info!(path = %path.display(), "persisted screencast restore token");
+    // The restore token enables prompt-less screen capture, so treat it as a secret:
+    // create it owner-only (0600).
+    let result = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .and_then(|mut f| f.write_all(token.as_bytes()));
+    match result {
+        Ok(()) => {
+            // Tighten perms even if the file pre-existed with a looser mode.
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            tracing::info!(path = %path.display(), "persisted screencast restore token");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "could not persist restore token");
+        }
     }
 }
 

@@ -15,7 +15,9 @@
 //! - re-emit a single-modifier `EnumFormat` to fixate, then a `SPA_PARAM_Buffers`
 //!   pinning `dataType = 1 << SPA_DATA_DmaBuf`.
 
+use std::cell::Cell;
 use std::io::Cursor;
+use std::rc::Rc;
 
 use pipewire as pw;
 use pw::spa;
@@ -116,8 +118,12 @@ struct UserData {
     fixation_attempts: u32,
     /// Count of DMA-BUF frames logged so far.
     frames_logged: u32,
-    /// Count of non-DMA-BUF (SHM/empty) buffers seen, to bound log spam and bail.
+    /// Count of unusable (multi-plane / SHM / empty) buffers seen, to bound log
+    /// spam and bail.
     non_dmabuf_seen: u32,
+    /// Set once the DMA-BUF frame quota is reached; read after the loop to decide
+    /// whether the probe actually succeeded (vs. quitting on a failure path).
+    success: Rc<Cell<bool>>,
     /// Clone of the main loop so a callback can `quit()` after N frames.
     main_loop: pw::main_loop::MainLoopRc,
 }
@@ -350,19 +356,24 @@ pub fn run_capture_probe(node_id: u32, fd: std::os::fd::OwnedFd) -> Result<(), C
     // *explicit* modifier the GPU supports; offering INVALID alone yields empty
     // buffers. We query the GPU's supported modifiers for B8G8R8A8 via Vulkan
     // (VK_EXT_image_drm_format_modifier); the server picks one in fixation.
-    let mut modifiers = super::query_drm_format_modifiers().unwrap_or_default();
+    // Propagate genuine Vulkan failures (loader/instance) rather than silently
+    // degrading to an INVALID-only offer — that's the very path we're diagnosing.
+    // (A device without VK_EXT_image_drm_format_modifier returns Ok(empty), not Err.)
+    let mut modifiers = super::query_drm_format_modifiers()?;
     modifiers.push(DRM_FORMAT_MOD_INVALID);
     tracing::info!(
         count = modifiers.len(),
         "advertising DRM modifiers to PipeWire (explicit + INVALID fallback)"
     );
 
+    let success = Rc::new(Cell::new(false));
     let user_data = UserData {
         format: VideoInfoRaw::default(),
         fixated: false,
         fixation_attempts: 0,
         frames_logged: 0,
         non_dmabuf_seen: 0,
+        success: success.clone(),
         main_loop: main_loop.clone(),
     };
 
@@ -478,30 +489,21 @@ pub fn run_capture_probe(node_id: u32, fd: std::os::fd::OwnedFd) -> Result<(), C
                 return;
             };
             let datas = buffer.datas_mut();
-            if datas.len() != 1 {
-                tracing::warn!(
-                    planes = datas.len(),
-                    "rejecting multi-plane buffer (#4 is single-plane only)"
-                );
-                return;
-            }
 
-            let data = &mut datas[0];
-            let data_type = data.type_();
-            let size = ud.format.size();
-            let fourcc = spa_format_to_drm_fourcc(ud.format.format());
+            // A usable frame is a single-plane DMA-BUF carrying real data. Everything
+            // else (multi-plane, SHM fallback, or an empty placeholder buffer) counts
+            // toward the abort budget, so no path can loop forever.
+            let usable = datas.len() == 1
+                && datas[0].type_() == pw::spa::buffer::DataType::DmaBuf
+                && datas[0].chunk().size() != 0;
 
-            if data_type == pw::spa::buffer::DataType::DmaBuf {
+            if usable {
+                let data = &datas[0];
                 let chunk = data.chunk();
-                // Skip empty/placeholder DMA-BUF buffers (size 0) — common at stream
-                // start/suspend; counting them could meet the quota with no pixels.
-                if chunk.size() == 0 {
-                    tracing::debug!("skipping empty DMA-BUF buffer (chunk size 0)");
-                    return;
-                }
+                let size = ud.format.size();
                 let frame = DmabufFrame {
                     fd: i64::from(data.fd()),
-                    fourcc: fourcc.unwrap_or(0),
+                    fourcc: spa_format_to_drm_fourcc(ud.format.format()).unwrap_or(0),
                     modifier: ud.format.modifier(),
                     width: size.width,
                     height: size.height,
@@ -522,26 +524,27 @@ pub fn run_capture_probe(node_id: u32, fd: std::os::fd::OwnedFd) -> Result<(), C
 
                 ud.frames_logged += 1;
                 if ud.frames_logged >= FRAMES_TO_LOG {
-                    tracing::info!(
-                        frames = ud.frames_logged,
-                        "logged enough DMA-BUF frames; quitting"
-                    );
+                    tracing::info!(frames = ud.frames_logged, "captured enough DMA-BUF frames");
+                    ud.success.set(true);
                     ud.main_loop.quit();
                 }
             } else {
-                // Not DMA-BUF: the negotiation fell back to SHM (or empty buffers).
-                // Log the first few so the buffer type is clear, then bail rather
-                // than spam thousands of lines / capture the screen indefinitely.
+                // Multi-plane, SHM fallback, or empty buffer — the dmabuf negotiation
+                // didn't take. Log the first few, then bail rather than loop forever.
                 ud.non_dmabuf_seen += 1;
                 if ud.non_dmabuf_seen <= NON_DMABUF_LOG_LIMIT {
                     tracing::warn!(
-                        ?data_type,
-                        size = data.chunk().size(),
-                        "received NON-dmabuf buffer; the dmabuf negotiation did not take"
+                        planes = datas.len(),
+                        data_type = ?datas.first().map(|d| d.type_()),
+                        size = datas.first().map(|d| d.chunk().size()),
+                        "unusable buffer (not a single-plane DMA-BUF with data)"
                     );
                 }
                 if ud.non_dmabuf_seen >= NON_DMABUF_ABORT_AFTER {
-                    tracing::error!(seen = ud.non_dmabuf_seen, "no DMA-BUF buffers; giving up");
+                    tracing::error!(
+                        seen = ud.non_dmabuf_seen,
+                        "no usable DMA-BUF buffers; giving up"
+                    );
                     ud.main_loop.quit();
                 }
             }
@@ -575,5 +578,13 @@ pub fn run_capture_probe(node_id: u32, fd: std::os::fd::OwnedFd) -> Result<(), C
     main_loop.run();
     tracing::info!("main loop exited");
 
-    Ok(())
+    if success.get() {
+        Ok(())
+    } else {
+        Err(CaptureError::PipeWire(
+            "stream ended without capturing any DMA-BUF frames \
+             (modifier fixation or buffer negotiation failed — see logs)"
+                .to_owned(),
+        ))
+    }
 }
