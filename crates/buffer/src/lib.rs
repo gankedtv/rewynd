@@ -27,6 +27,9 @@ pub enum BufferError {
     /// No keyframe exists within the requested window, so no self-decodable cut is possible.
     #[error("no keyframe within the requested {0:?} window")]
     NoKeyframe(Duration),
+    /// The keyframe-aware cut is not yet implemented (issue #10).
+    #[error("ring-buffer flush is not yet implemented (issue #10)")]
+    NotImplemented,
 }
 
 /// A time-bounded ring of encoded chunks.
@@ -68,7 +71,9 @@ impl RingBuffer {
     ///
     /// The real keyframe-aware walk lands in #10.
     pub fn flush_last(&self, duration: Duration) -> Result<Vec<EncodedChunk>, BufferError> {
-        todo!("keyframe-aware cut from the most recent IDR — issue #10 ({duration:?})")
+        // The keyframe-aware cut from the most recent IDR lands in #10.
+        let _ = duration;
+        Err(BufferError::NotImplemented)
     }
 
     /// Number of buffered chunks.

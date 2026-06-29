@@ -10,6 +10,7 @@ pub struct WgcCapture;
 
 impl FrameSource for WgcCapture {
     async fn next_frame(&mut self) -> Result<GpuFrame, CaptureError> {
-        todo!("WGC/DXGI capture and D3D11 shared-handle import — issues #6/#7")
+        // WGC/DXGI capture and D3D11 shared-handle import land in #6/#7.
+        Err(CaptureError::NotImplemented)
     }
 }

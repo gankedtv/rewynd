@@ -21,6 +21,9 @@ pub enum CaptureError {
     /// The platform capture backend could not be started (no portal, no permission, …).
     #[error("capture backend unavailable")]
     Unavailable,
+    /// The platform capture backend is not yet implemented.
+    #[error("capture backend not yet implemented")]
+    NotImplemented,
 }
 
 /// Pixel layout of a captured frame, as imported into the texture.

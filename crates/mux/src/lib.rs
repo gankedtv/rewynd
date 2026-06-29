@@ -18,12 +18,18 @@ pub enum MuxError {
     /// Underlying I/O error while writing the container.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// MP4 muxing is not yet implemented (issue #12).
+    #[error("MP4 muxing is not yet implemented (issue #12)")]
+    NotImplemented,
 }
 
 /// Writes encoded chunks into a container file with correct timestamps.
 pub trait Muxer {
-    /// Mux `chunks` — which must begin on an IDR — into an MP4 at `path`, stamping PTS
-    /// from each chunk's timestamp.
+    /// Mux `chunks` — which must begin on an IDR — into an MP4 at `path`.
+    ///
+    /// [`EncodedChunk::pts`] is capture-relative and a flushed clip is a mid-stream
+    /// slice, so the muxer rebases timestamps against the first chunk's PTS: the
+    /// written clip starts at PTS zero.
     fn write_mp4(&mut self, chunks: &[EncodedChunk], path: &Path) -> Result<(), MuxError>;
 }
 
@@ -33,7 +39,8 @@ pub struct Mp4Muxer;
 
 impl Muxer for Mp4Muxer {
     fn write_mp4(&mut self, chunks: &[EncodedChunk], path: &Path) -> Result<(), MuxError> {
+        // Annex-B → AVCC muxing with rebased PTS lands in #12.
         let _ = (chunks, path);
-        todo!("Annex-B → AVCC MP4 muxing with capture PTS — issue #12")
+        Err(MuxError::NotImplemented)
     }
 }

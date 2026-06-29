@@ -10,6 +10,7 @@ pub struct PipewireCapture;
 
 impl FrameSource for PipewireCapture {
     async fn next_frame(&mut self) -> Result<GpuFrame, CaptureError> {
-        todo!("portal + PipeWire DMA-BUF capture and import — issues #4/#5")
+        // Portal + PipeWire DMA-BUF capture and import land in #4/#5.
+        Err(CaptureError::NotImplemented)
     }
 }
