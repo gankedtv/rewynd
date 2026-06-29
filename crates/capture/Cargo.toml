@@ -21,6 +21,8 @@ pipewire.workspace = true
 # negotiation (#4) via VK_EXT_image_drm_format_modifier. Matches the 0.38.x already
 # pulled into Cargo.lock by wgpu-hal/gpu-video.
 ash = "0.38"
+# Type-safe DRM fourcc codes and the DRM_FORMAT_MOD_INVALID sentinel.
+drm-fourcc.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tokio.workspace = true

@@ -27,6 +27,7 @@ use std::ops::ControlFlow;
 use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::rc::Rc;
 
+use drm_fourcc::{DrmFourcc, DrmModifier};
 use pipewire as pw;
 use pw::spa;
 use pw::spa::param::ParamType;
@@ -40,9 +41,12 @@ use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction, Id, Rectangle, S
 
 use crate::CaptureError;
 
-/// `DRM_FORMAT_MOD_INVALID` — "let the driver pick" / implicit modifier.
-/// `fourcc_mod_code(NONE, DRM_FORMAT_RESERVED)` = `0x00ffffffffffffff`.
-const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+/// `DRM_FORMAT_MOD_INVALID` — "let the driver pick" / implicit modifier
+/// (`0x00ffffffffffffff`). `From` is not const, so this is a tiny helper rather
+/// than a `const`.
+fn mod_invalid() -> u64 {
+    u64::from(DrmModifier::Invalid)
+}
 
 /// `enum spa_data_type` values (from `spa/buffer/buffer.h`). Used to build the
 /// `SPA_PARAM_BUFFERS_dataType` flags choice.
@@ -77,7 +81,7 @@ pub struct DmabufFrame {
     /// DRM `fourcc` pixel format (e.g. `DRM_FORMAT_XRGB8888`).
     pub fourcc: u32,
     /// DRM format modifier (tiling/compression layout, or
-    /// [`DRM_FORMAT_MOD_INVALID`] for an implicit/linear layout).
+    /// `DRM_FORMAT_MOD_INVALID` for an implicit/linear layout).
     pub modifier: u64,
     /// Frame width in pixels.
     pub width: u32,
@@ -103,7 +107,7 @@ pub struct CapturedDmabuf {
     /// DRM `fourcc` pixel format (e.g. `DRM_FORMAT_XRGB8888`).
     pub fourcc: u32,
     /// DRM format modifier (tiling/compression layout, or
-    /// [`DRM_FORMAT_MOD_INVALID`] for an implicit/linear layout).
+    /// `DRM_FORMAT_MOD_INVALID` for an implicit/linear layout).
     pub drm_modifier: u64,
     /// Frame width in pixels.
     pub width: u32,
@@ -121,22 +125,18 @@ pub struct CapturedDmabuf {
 ///
 /// Returns `None` for formats we do not offer (multi-plane / non-packed-RGB).
 fn spa_format_to_drm_fourcc(format: VideoFormat) -> Option<u32> {
-    // DRM fourcc helper: 4 ASCII bytes, little-endian.
-    const fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
-        (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
-    }
-    // SPA BGRx (B,G,R,x in memory) == DRM_FORMAT_XRGB8888 ('X','R','2','4' => 0x34325258)
-    // SPA BGRA (B,G,R,A in memory) == DRM_FORMAT_ARGB8888 ('A','R','2','4' => 0x34325241)
-    // SPA RGBx (R,G,B,x in memory) == DRM_FORMAT_XBGR8888 ('X','B','2','4' => 0x34324258)
-    // SPA RGBA (R,G,B,A in memory) == DRM_FORMAT_ABGR8888 ('A','B','2','4' => 0x34324241)
+    // SPA BGRx (B,G,R,x in memory) == DRM_FORMAT_XRGB8888
+    // SPA BGRA (B,G,R,A in memory) == DRM_FORMAT_ARGB8888
+    // SPA RGBx (R,G,B,x in memory) == DRM_FORMAT_XBGR8888
+    // SPA RGBA (R,G,B,A in memory) == DRM_FORMAT_ABGR8888
     let code = match format {
-        VideoFormat::BGRx => fourcc(b'X', b'R', b'2', b'4'),
-        VideoFormat::BGRA => fourcc(b'A', b'R', b'2', b'4'),
-        VideoFormat::RGBx => fourcc(b'X', b'B', b'2', b'4'),
-        VideoFormat::RGBA => fourcc(b'A', b'B', b'2', b'4'),
+        VideoFormat::BGRx => DrmFourcc::Xrgb8888,
+        VideoFormat::BGRA => DrmFourcc::Argb8888,
+        VideoFormat::RGBx => DrmFourcc::Xbgr8888,
+        VideoFormat::RGBA => DrmFourcc::Abgr8888,
         _ => return None,
     };
-    Some(code)
+    Some(code as u32)
 }
 
 /// Outcome of a per-frame callback: keep running the loop, or stop it.
@@ -195,7 +195,7 @@ fn video_modifier_property(modifiers: &[u64], fixate_to: Option<u64>) -> Propert
         let default = alternatives
             .first()
             .copied()
-            .unwrap_or(DRM_FORMAT_MOD_INVALID as i64);
+            .unwrap_or(mod_invalid() as i64);
         Property {
             key: FormatProperties::VideoModifier.as_raw(),
             flags: PropertyFlags::MANDATORY | PropertyFlags::DONT_FIXATE,
@@ -415,7 +415,7 @@ where
     // a multi-GPU host would need the import device's own set). Genuine loader/instance
     // failures propagate as Err; a device lacking the extension returns Ok(empty).
     let mut modifiers = super::query_drm_format_modifiers()?;
-    modifiers.push(DRM_FORMAT_MOD_INVALID);
+    modifiers.push(mod_invalid());
     tracing::info!(
         count = modifiers.len(),
         "advertising DRM modifiers to PipeWire (explicit + INVALID fallback)"
@@ -497,9 +497,9 @@ where
                     let chosen = offered
                         .iter()
                         .copied()
-                        .find(|&m| m != DRM_FORMAT_MOD_INVALID)
+                        .find(|&m| m != mod_invalid())
                         .or_else(|| offered.first().copied())
-                        .unwrap_or(DRM_FORMAT_MOD_INVALID);
+                        .unwrap_or(mod_invalid());
                     tracing::info!(
                         ?offered_hex,
                         chosen = format_args!("{chosen:#018x}"),

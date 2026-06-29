@@ -12,15 +12,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod linux {
     use std::sync::mpsc;
 
+    use drm_fourcc::DrmFourcc;
     use rewynd_capture::linux::{CapturedDmabuf, capture_one_dmabuf, open_portal};
     use rewynd_gpu::{DmabufImport, GpuContext};
-
-    /// DRM fourcc codes (little-endian 4-byte ASCII). See `pipewire_capture`'s
-    /// `spa_format_to_drm_fourcc` for the SPA→DRM mapping.
-    const DRM_FORMAT_XRGB8888: u32 = u32::from_le_bytes([b'X', b'R', b'2', b'4']);
-    const DRM_FORMAT_ARGB8888: u32 = u32::from_le_bytes([b'A', b'R', b'2', b'4']);
-    const DRM_FORMAT_XBGR8888: u32 = u32::from_le_bytes([b'X', b'B', b'2', b'4']);
-    const DRM_FORMAT_ABGR8888: u32 = u32::from_le_bytes([b'A', b'B', b'2', b'4']);
 
     /// Whether the chosen wgpu format orders the channels B,G,R,A in memory (so the
     /// readback bytes need a BGRA→RGBA swizzle before PNG, which expects RGBA).
@@ -35,12 +29,12 @@ mod linux {
     /// → `Rgba8Unorm`. The alpha-less X variants share a format with their A
     /// counterparts (we just ignore/overwrite alpha on output).
     fn map_fourcc(fourcc: u32) -> Option<Mapped> {
-        match fourcc {
-            DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888 => Some(Mapped {
+        match DrmFourcc::try_from(fourcc).ok()? {
+            DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888 => Some(Mapped {
                 format: wgpu::TextureFormat::Bgra8Unorm,
                 is_bgra: true,
             }),
-            DRM_FORMAT_XBGR8888 | DRM_FORMAT_ABGR8888 => Some(Mapped {
+            DrmFourcc::Xbgr8888 | DrmFourcc::Abgr8888 => Some(Mapped {
                 format: wgpu::TextureFormat::Rgba8Unorm,
                 is_bgra: false,
             }),

@@ -15,13 +15,17 @@
 use std::ffi::CStr;
 
 use ash::vk;
+use drm_fourcc::DrmModifier;
 
 use crate::CaptureError;
 
 /// `DRM_FORMAT_MOD_INVALID` — the "let the driver pick" sentinel. The caller
 /// always advertises this itself as a fallback, so we exclude it from the
-/// explicit-modifier list we return.
-const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+/// explicit-modifier list we return. `From` is not const, so this is a tiny
+/// helper rather than a `const`.
+fn mod_invalid() -> u64 {
+    u64::from(DrmModifier::Invalid)
+}
 
 /// Query the DRM format modifiers the GPU supports for `VK_FORMAT_B8G8R8A8_UNORM`.
 ///
@@ -140,7 +144,7 @@ fn query_with_instance(instance: &ash::Instance) -> Result<Vec<u64>, CaptureErro
     let mut out: Vec<u64> = modifiers
         .into_iter()
         .map(|p| p.drm_format_modifier)
-        .filter(|&m| m != DRM_FORMAT_MOD_INVALID)
+        .filter(|&m| m != mod_invalid())
         .collect();
     out.sort_unstable();
     out.dedup();

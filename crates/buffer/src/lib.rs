@@ -1,7 +1,7 @@
 //! Keyframe-aware ring buffer — the pure-Rust core of rewynd (PLAN §4.3, §6.3).
 //!
 //! Holds roughly `window` of encoded H.264 chunks, drops the oldest as new ones
-//! arrive, and (in #10) cuts a clip starting at the most recent IDR boundary so the
+//! arrive, and cuts a clip starting at the most recent IDR boundary so the
 //! result is self-decodable. This crate has **no GPU or driver dependency**, so the
 //! interesting logic is fully unit-testable.
 
@@ -27,15 +27,15 @@ pub enum BufferError {
     /// No keyframe exists within the requested window, so no self-decodable cut is possible.
     #[error("no keyframe within the requested {0:?} window")]
     NoKeyframe(Duration),
-    /// The keyframe-aware cut is not yet implemented (issue #10).
-    #[error("ring-buffer flush is not yet implemented (issue #10)")]
+    /// The keyframe-aware cut is not yet implemented.
+    #[error("ring-buffer flush is not yet implemented")]
     NotImplemented,
 }
 
 /// A time-bounded ring of encoded chunks.
 ///
-/// The keyframe-aware cut ([`flush_last`](RingBuffer::flush_last)) is implemented in
-/// #10; the scaffold provides storage and time-based eviction.
+/// The keyframe-aware cut ([`flush_last`](RingBuffer::flush_last)) is implemented
+/// later; the scaffold provides storage and time-based eviction.
 #[derive(Debug)]
 pub struct RingBuffer {
     window: Duration,
@@ -69,9 +69,9 @@ impl RingBuffer {
     /// Return the chunks for a clip covering up to `duration`, starting at the most
     /// recent IDR within that window so the clip is self-decodable.
     ///
-    /// The real keyframe-aware walk lands in #10.
+    /// The real keyframe-aware walk lands later.
     pub fn flush_last(&self, duration: Duration) -> Result<Vec<EncodedChunk>, BufferError> {
-        // The keyframe-aware cut from the most recent IDR lands in #10.
+        // The keyframe-aware cut from the most recent IDR lands later.
         let _ = duration;
         Err(BufferError::NotImplemented)
     }

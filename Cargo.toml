@@ -34,6 +34,7 @@ wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "1503796" }
 gpu-video = { git = "https://github.com/software-mansion/smelter", rev = "4fff151fe4040d0df40a6688ca019c545f0e6402" }
 
 # Shared third-party
+drm-fourcc = "2"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"

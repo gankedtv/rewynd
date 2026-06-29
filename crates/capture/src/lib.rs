@@ -63,7 +63,7 @@ pub struct GpuFrame {
 /// A source of GPU-resident frames. Per-platform implementations live in the
 /// [`linux`] / [`windows`] submodules.
 // The pipeline drives a single capture task; `Send` bounds are handled at the call
-// site (#9), so the desugared-RPIT warning does not apply here.
+// site, so the desugared-RPIT warning does not apply here.
 #[allow(async_fn_in_trait)]
 pub trait FrameSource {
     /// Yield the next captured frame, awaiting one if necessary.
