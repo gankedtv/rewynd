@@ -378,7 +378,8 @@ mod linux {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        match Mp4Muxer::new(params.width, params.height).write_mp4(&chunks, &path) {
+        match Mp4Muxer::new(params.width, params.height, params.framerate).write_mp4(&chunks, &path)
+        {
             Ok(()) => {
                 let span = match (chunks.first(), chunks.last()) {
                     (Some(first), Some(last)) => last.pts.saturating_sub(first.pts),

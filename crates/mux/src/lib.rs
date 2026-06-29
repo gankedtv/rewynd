@@ -54,16 +54,20 @@ pub trait Muxer {
 pub struct Mp4Muxer {
     width: u16,
     height: u16,
+    framerate: u32,
 }
 
 impl Mp4Muxer {
-    /// Create a muxer for an H.264 stream of the given pixel dimensions (used for the
-    /// track's visual sample entry; the decoder reads the real size from the SPS).
+    /// Create a muxer for an H.264 stream of the given pixel dimensions and framerate.
+    /// The dimensions feed the track's visual sample entry (the decoder reads the real
+    /// size from the SPS); the framerate sets the duration of the final frame, which has
+    /// no successor to measure against.
     #[must_use]
-    pub fn new(width: u32, height: u32) -> Self {
+    pub fn new(width: u32, height: u32, framerate: u32) -> Self {
         Self {
             width: width.min(u32::from(u16::MAX)) as u16,
             height: height.min(u32::from(u16::MAX)) as u16,
+            framerate: framerate.max(1),
         }
     }
 }
@@ -110,12 +114,13 @@ impl Muxer for Mp4Muxer {
         let base = first.pts;
         for (i, chunk) in chunks.iter().enumerate() {
             let start = chunk.pts.saturating_sub(base);
-            // Duration is the gap to the next frame; the last frame reuses the previous
-            // gap (or a 1µs floor for a single-frame clip) so the track has a real length.
+            // Duration is the gap to the next frame; the last frame has no successor, so
+            // reuse the previous gap, or fall back to one frame period for a single-frame
+            // clip (so it stays visible rather than collapsing to ~0s).
             let duration = match chunks.get(i + 1) {
                 Some(next) => next.pts.saturating_sub(chunk.pts),
                 None if i > 0 => chunk.pts.saturating_sub(chunks[i - 1].pts),
-                None => Duration::from_micros(1),
+                None => Duration::from_nanos(1_000_000_000 / u64::from(self.framerate)),
             };
             writer.write_sample(
                 1,
@@ -206,6 +211,24 @@ mod tests {
         }
     }
 
+    /// A unique temp-file path that removes itself on drop, so parallel runs don't
+    /// collide and a failed assertion doesn't leave a stale file behind.
+    struct TempMp4(std::path::PathBuf);
+
+    impl TempMp4 {
+        fn new() -> Self {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!("rewynd-mux-{}-{n}.mp4", std::process::id())))
+        }
+    }
+
+    impl Drop for TempMp4 {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     #[test]
     fn splits_three_and_four_byte_start_codes() {
         // 4-byte start code, a NAL, then a 3-byte start code and another NAL.
@@ -251,7 +274,7 @@ mod tests {
 
     #[test]
     fn rejects_non_keyframe_start_and_empty() {
-        let mut muxer = Mp4Muxer::new(1920, 1080);
+        let mut muxer = Mp4Muxer::new(1920, 1080, 60);
         let chunks = [chunk(annexb(&[&[0x41]]), false, 0)];
         assert!(matches!(
             muxer
@@ -267,7 +290,7 @@ mod tests {
 
     #[test]
     fn keyframe_without_parameter_sets_errors() {
-        let mut muxer = Mp4Muxer::new(1920, 1080);
+        let mut muxer = Mp4Muxer::new(1920, 1080, 60);
         let chunks = [chunk(annexb(&[&[0x65, 0x88]]), true, 0)];
         assert!(matches!(
             muxer
@@ -289,12 +312,12 @@ mod tests {
             chunk(inter, false, 34_334),
         ];
 
-        let path = std::env::temp_dir().join("rewynd-mux-roundtrip.mp4");
-        Mp4Muxer::new(1920, 1080)
-            .write_mp4(&chunks, &path)
+        let out = TempMp4::new();
+        Mp4Muxer::new(1920, 1080, 60)
+            .write_mp4(&chunks, &out.0)
             .expect("write_mp4");
 
-        let file = std::fs::File::open(&path).unwrap();
+        let file = std::fs::File::open(&out.0).unwrap();
         let size = file.metadata().unwrap().len();
         let reader = mp4::Mp4Reader::read_header(std::io::BufReader::new(file), size).unwrap();
 
@@ -306,8 +329,24 @@ mod tests {
         assert_eq!(track.sequence_parameter_set().unwrap(), &sps[..]);
         assert_eq!(track.picture_parameter_set().unwrap(), &pps[..]);
         assert_eq!(track.sample_count(), 3);
+    }
 
-        let _ = std::fs::remove_file(&path);
+    #[test]
+    fn single_frame_clip_uses_one_frame_duration() {
+        let sps = [0x67, 0x42, 0x00, 0x1f];
+        let pps = [0x68, 0xCE, 0x3c, 0x80];
+        let key = annexb(&[&sps, &pps, &[0x65, 0x88, 0x84]]);
+        let out = TempMp4::new();
+        Mp4Muxer::new(1920, 1080, 60)
+            .write_mp4(&[chunk(key, true, 0)], &out.0)
+            .expect("write_mp4");
+
+        let file = std::fs::File::open(&out.0).unwrap();
+        let size = file.metadata().unwrap().len();
+        let mut reader = mp4::Mp4Reader::read_header(std::io::BufReader::new(file), size).unwrap();
+        let sample = reader.read_sample(1, 1).unwrap().expect("one sample");
+        // One frame at 60fps on a microsecond timescale ≈ 16_666 ticks, not ~0.
+        assert_eq!(sample.duration, 1_000_000 / 60);
     }
 
     #[test]
