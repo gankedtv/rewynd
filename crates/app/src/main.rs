@@ -144,10 +144,10 @@ mod linux {
 
         // Shut the capture loop down, then join it so the GPU pipeline tears down on its
         // own thread rather than during process exit. The loop only observes `stop` when a
-        // frame arrives, so drop the portal first: closing the ScreenCast session ends the
-        // PipeWire stream, which unblocks the loop even if no further frame comes.
+        // frame arrives, so explicitly close the portal session first: that removes the
+        // PipeWire node, the stream errors out, and the loop quits even on an idle screen.
         stop.store(true, Ordering::Relaxed);
-        drop(portal);
+        let _ = runtime.block_on(portal.close());
         let _ = capture.join();
         result
     }
@@ -245,6 +245,24 @@ mod linux {
         Ok(enc.encode(&nv12, force_keyframe)?)
     }
 
+    /// Render a path as a single quoted `Exec` value, applying both unescaping layers
+    /// the Desktop Entry spec runs on read: wrap in double quotes and backslash-escape
+    /// the reserved characters (`"` `` ` `` `$` `\`), then escape every backslash again
+    /// for the string-value layer. So a literal `\` ends up as four backslashes, and a
+    /// path with spaces is simply quoted.
+    fn desktop_exec_value(path: &str) -> String {
+        let mut quoted = String::with_capacity(path.len() + 2);
+        quoted.push('"');
+        for ch in path.chars() {
+            if matches!(ch, '"' | '`' | '$' | '\\') {
+                quoted.push('\\');
+            }
+            quoted.push(ch);
+        }
+        quoted.push('"');
+        quoted.replace('\\', "\\\\")
+    }
+
     /// Write a minimal desktop entry for [`APP_ID`] under `$XDG_DATA_HOME/applications`
     /// if one isn't already present. The GlobalShortcuts portal rejects an app id with
     /// no installed desktop entry ("app info not found"); a packaged install ships this
@@ -266,20 +284,13 @@ mod linux {
         }
 
         let exec = std::env::current_exe()?;
-        // Quote + escape the path per the Desktop Entry spec so a path with spaces or
-        // reserved characters (" ` $ \) doesn't corrupt the Exec line.
-        let exec_escaped = exec
-            .to_string_lossy()
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('`', "\\`")
-            .replace('$', "\\$");
+        let exec_value = desktop_exec_value(&exec.to_string_lossy());
         let entry = format!(
             "[Desktop Entry]\n\
              Type=Application\n\
              Name=rewynd\n\
              Comment=Instant-replay clip recorder\n\
-             Exec=\"{exec_escaped}\"\n\
+             Exec={exec_value}\n\
              Terminal=false\n\
              Categories=AudioVideo;Recorder;\n",
         );
@@ -371,6 +382,31 @@ mod linux {
                 );
             }
             Err(e) => tracing::warn!(error = %e, "nothing to save yet"),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::desktop_exec_value;
+
+        #[test]
+        fn exec_value_quotes_plain_and_spaced_paths() {
+            assert_eq!(
+                desktop_exec_value("/usr/bin/rewynd"),
+                r#""/usr/bin/rewynd""#
+            );
+            assert_eq!(
+                desktop_exec_value("/home/a b/rewynd"),
+                r#""/home/a b/rewynd""#
+            );
+        }
+
+        #[test]
+        fn exec_value_double_escapes_reserved_characters() {
+            // `$` -> `\$` (quote layer) -> `\\$` (string layer).
+            assert_eq!(desktop_exec_value("/x/$y/rewynd"), r#""/x/\\$y/rewynd""#);
+            // A literal backslash becomes four.
+            assert_eq!(desktop_exec_value("/x\\y"), r#""/x\\\\y""#);
         }
     }
 }
