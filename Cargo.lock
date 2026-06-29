@@ -1254,8 +1254,14 @@ name = "rewynd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ashpd",
+ "futures-util",
+ "pollster",
  "rewynd-buffer",
+ "rewynd-capture",
  "rewynd-encode",
+ "rewynd-gpu",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
