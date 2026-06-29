@@ -184,7 +184,7 @@ Each phase is a GitHub **milestone**. Issues below are written to be created rou
 
 ### Phase 4 — Ring buffer + hotkey (THE feature)
 - **#10 Keyframe-aware ring buffer** (`area:buffer`) — pure Rust, unit-tested. Stores ~60s of chunks, drops oldest, tracks IDRs, `flush_last(60s)` returns the byte range from the most recent IDR. Set a sane `idr_period` so keyframes are frequent enough to cut on.
-- **#11 Global hotkey** (`area:app`) — `global-hotkey` crate. Deliverable: pressing the hotkey triggers a flush.
+- **#11 Global hotkey** (`area:app`) — **on Linux/Wayland, the XDG `GlobalShortcuts` portal via `ashpd`** (the `global-hotkey` crate is X11-only — its `XGrabKey` grab does not fire for an unfocused app under Wayland/KWin; the portal is the Wayland-correct path and is consistent with our ScreenCast portal use). `global-hotkey` (or the Win32 API) is the Windows backend when #6/#7 land. Deliverable: pressing the hotkey triggers a flush.
 - **#12 Minimal MP4 muxing with real PTS** (`area:mux`) — Annex-B → AVCC, write MP4 with PTS from capture timestamps (don't let players guess fps). Evaluate a Rust mp4 muxer crate vs. invoking the `ffmpeg` binary for muxing only (both license-clean). Deliverable: **hotkey → playable, correctly-timed 60s MP4 on disk that starts on a keyframe.** ← MVP COMPLETE.
 
 ### Phase 5 — Audio + A/V sync
@@ -263,7 +263,7 @@ Use `gh issue create` / `gh api` (the GitHub CLI). If `gh` isn't authenticated, 
 - **Linux capture:** `ashpd` (XDG portals, screencast) + `pipewire` (pipewire-rs). Consider `lamco-pipewire` (higher-level DMABUF capture, young) as an option to evaluate.
 - **wgpu interop:** `wgpu-hal` Vulkan — `texture_from_dmabuf_fd`, D3D11 shared-handle import (`VK_KHR_external_memory_win32`), `Queue::add_wait_semaphore`, `Adapter::open_with_callback`.
 - **Windows capture:** `windows-capture` crate or raw `windows` (windows-rs) for WGC/DXGI.
-- **Hotkey:** `global-hotkey`. **Audio:** `cpal`. **UI (later):** egui / iced / Tauri (MIT/Apache; avoid Slint).
+- **Hotkey:** Linux/Wayland = XDG `GlobalShortcuts` portal via `ashpd`; Windows = `global-hotkey` (or Win32 `RegisterHotKey`). **Audio:** `cpal`. **UI (later):** egui / iced / Tauri (MIT/Apache; avoid Slint).
 - **Architecture references:** `libscreencapture-wayland` (C++), RustDesk Wayland capture (Rust), GPU Screen Recorder / ReplaySorcery (C, lightweight instant-replay prior art).
 - **Encode-half blueprint + human contact:** Dennis de Vulder — `github.com/dennisdevulder/gpu-vulkan`, branch `feat/vulkan-video-recorder` (reference only; Java/LWJGL, RuneLite-coupled).
 

@@ -15,3 +15,14 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 rewynd-buffer.workspace = true
 rewynd-encode.workspace = true
+
+# Linux MVP wiring: capture + GPU import + the ScreenCast (capture) and
+# GlobalShortcuts (hotkey) portals. Linux-only; the binary compiles elsewhere via a
+# `#[cfg(not(target_os = "linux"))]` stub `main`.
+[target.'cfg(target_os = "linux")'.dependencies]
+rewynd-capture.workspace = true
+rewynd-gpu.workspace = true
+ashpd = { workspace = true, features = ["global_shortcuts"] }
+tokio.workspace = true
+pollster.workspace = true
+futures-util = "0.3"
