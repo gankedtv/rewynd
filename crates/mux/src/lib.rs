@@ -2,7 +2,7 @@
 //!
 //! We stamp PTS from capture timestamps and write them into the container so players
 //! don't guess the framerate. The muxer-crate-vs-`ffmpeg`-binary choice (ADR-worthy)
-//! and the implementation land in #12.
+//! and the implementation land later.
 
 use std::path::Path;
 
@@ -18,8 +18,8 @@ pub enum MuxError {
     /// Underlying I/O error while writing the container.
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    /// MP4 muxing is not yet implemented (issue #12).
-    #[error("MP4 muxing is not yet implemented (issue #12)")]
+    /// MP4 muxing is not yet implemented.
+    #[error("MP4 muxing is not yet implemented")]
     NotImplemented,
 }
 
@@ -33,13 +33,13 @@ pub trait Muxer {
     fn write_mp4(&mut self, chunks: &[EncodedChunk], path: &Path) -> Result<(), MuxError>;
 }
 
-/// MP4 muxer (Annex-B → AVCC). Implemented in #12.
+/// MP4 muxer (Annex-B → AVCC).
 #[derive(Debug, Default)]
 pub struct Mp4Muxer;
 
 impl Muxer for Mp4Muxer {
     fn write_mp4(&mut self, chunks: &[EncodedChunk], path: &Path) -> Result<(), MuxError> {
-        // Annex-B → AVCC muxing with rebased PTS lands in #12.
+        // Annex-B → AVCC muxing with rebased PTS lands later.
         let _ = (chunks, path);
         Err(MuxError::NotImplemented)
     }

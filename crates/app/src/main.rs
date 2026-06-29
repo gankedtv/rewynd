@@ -3,8 +3,7 @@
 //! This binary wires the pipeline together: capture → RGBA→NV12 → encode → keyframe
 //! -aware ring buffer → hotkey → MP4 mux → disk (→ optional ganked.tv upload). The
 //! scaffold only sets up logging and reports the default target; each stage is
-//! assembled in its own issue (capture #4–#7, encode #8/#9, buffer #10, hotkey #11,
-//! mux #12).
+//! assembled in its own issue (capture, encode, buffer, hotkey, mux).
 
 use std::time::Duration;
 
@@ -12,7 +11,7 @@ use anyhow::Result;
 use rewynd_buffer::RingBuffer;
 use rewynd_encode::EncodeParams;
 
-/// Buffer retention window for the MVP (PLAN §2). Configurable in #16.
+/// Buffer retention window for the MVP (PLAN §2). Configurable later.
 const BUFFER_WINDOW: Duration = Duration::from_secs(60);
 
 fn main() -> Result<()> {

@@ -1,4 +1,4 @@
-//! Issue #3 deliverable: a `gpu-video` H.264 encoder constructs on the **same** wgpu
+//! Deliverable: a `gpu-video` H.264 encoder constructs on the **same** wgpu
 //! device as the rest of the pipeline.
 //!
 //! This needs a Vulkan GPU with H.264 encode support, so it is `#[ignore]`d (the CI

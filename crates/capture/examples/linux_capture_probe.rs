@@ -1,4 +1,4 @@
-//! Diagnostic probe for #4: open the XDG ScreenCast portal, connect to its
+//! Diagnostic probe for Linux capture: open the XDG ScreenCast portal, connect to its
 //! PipeWire remote, negotiate a DMA-BUF video format, and log the PipeWire node
 //! id, the negotiated format, and the first few frames' DMA-BUF descriptors
 //! (fd / DRM fourcc / DRM modifier / size / stride / offset).
