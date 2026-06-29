@@ -26,9 +26,9 @@ use crate::CaptureError;
 /// tears down the portal session and the PipeWire node disappears. Hold on to
 /// this `PortalSession` value until capture is finished.
 pub struct PortalSession {
-    /// The portal session handle. Kept alive (not otherwise read) so the
-    /// negotiated PipeWire node remains valid for the capture's lifetime.
-    _session: Session<Screencast>,
+    /// The portal session handle. Kept alive so the negotiated PipeWire node remains
+    /// valid for the capture's lifetime; [`close`](PortalSession::close) ends it.
+    session: Session<Screencast>,
     /// The PipeWire global node id of the selected stream.
     pub node_id: u32,
     /// An open fd to the PipeWire remote (pass to `Context::connect_fd`). Taken
@@ -55,6 +55,19 @@ impl PortalSession {
     /// Panics if called twice.
     pub fn take_fd(&mut self) -> OwnedFd {
         self.fd.take().expect("PipeWire fd already taken")
+    }
+
+    /// Close the portal session, tearing down the PipeWire node so any consumer
+    /// stream errors out and stops. Call this at shutdown to end the capture.
+    ///
+    /// The session has no `Drop`-based teardown (the portal's `Close` is an explicit
+    /// call), so dropping a [`PortalSession`] leaves the screencast running until the
+    /// shared D-Bus connection itself goes away.
+    pub async fn close(self) -> Result<(), CaptureError> {
+        self.session
+            .close()
+            .await
+            .map_err(|e| CaptureError::Portal(format!("close screencast session: {e}")))
     }
 }
 
@@ -181,7 +194,7 @@ pub async fn open_portal() -> Result<PortalSession, CaptureError> {
         .map_err(|e| CaptureError::Portal(format!("open_pipe_wire_remote: {e}")))?;
 
     Ok(PortalSession {
-        _session: session,
+        session,
         node_id,
         fd: Some(fd),
         size,
