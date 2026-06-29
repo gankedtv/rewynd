@@ -24,6 +24,18 @@ pub enum CaptureError {
     /// The platform capture backend is not yet implemented.
     #[error("capture backend not yet implemented")]
     NotImplemented,
+    /// The user cancelled the screencast share-picker dialog.
+    #[error("screencast selection cancelled by the user")]
+    Cancelled,
+    /// The XDG desktop portal handshake failed (user cancelled, no portal, …).
+    #[error("screencast portal error: {0}")]
+    Portal(String),
+    /// A PipeWire stream / negotiation error.
+    #[error("pipewire error: {0}")]
+    PipeWire(String),
+    /// A Vulkan error while probing GPU capabilities (e.g. DRM format modifiers).
+    #[error("vulkan error: {0}")]
+    Vulkan(String),
 }
 
 /// Pixel layout of a captured frame, as imported into the texture.

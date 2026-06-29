@@ -5,3 +5,6 @@
 *.rs.bk
 *.swp
 .DS_Store
+
+# Local Claude Code working notes / progress tracking (not shared)
+.claude/
