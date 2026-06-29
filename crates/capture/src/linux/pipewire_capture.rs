@@ -1,10 +1,10 @@
 //! PipeWire stream setup + DMA-BUF format negotiation (PLAN §3.5).
 //!
-//! This is the crux of #4: we connect to the portal's PipeWire remote, offer an
+//! We connect to the portal's PipeWire remote, offer an
 //! `EnumFormat` that advertises DRM-modifier support (so the server hands us
 //! DMA-BUF buffers instead of SHM copies), drive the two-pass modifier fixation
 //! handshake, request DMA-BUF buffers via a `SPA_PARAM_Buffers` param, and then
-//! log each arriving frame's DMA-BUF descriptor.
+//! deliver each arriving frame's DMA-BUF descriptor to a per-frame callback.
 //!
 //! Unlike the upstream `ashpd`/`pipewire-rs` examples (which use
 //! `StreamFlags::MAP_BUFFERS` and end up with SHM), we deliberately:
@@ -14,9 +14,17 @@
 //!   hardcodes empty flags),
 //! - re-emit a single-modifier `EnumFormat` to fixate, then a `SPA_PARAM_Buffers`
 //!   pinning `dataType = 1 << SPA_DATA_DmaBuf`.
+//!
+//! Two entry points share all of the above negotiation machinery via
+//! [`run_stream`]:
+//! - [`run_capture_probe`]: a diagnostic that logs the first N DMA-BUF frames.
+//! - [`capture_one_dmabuf`]: `dup()`s the first usable DMA-BUF fd into an [`OwnedFd`]
+//!   and returns its descriptor for the wgpu import.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io::Cursor;
+use std::ops::ControlFlow;
+use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::rc::Rc;
 
 use pipewire as pw;
@@ -59,8 +67,8 @@ const MAX_FIXATION_ATTEMPTS: u32 = 4;
 
 /// A self-contained description of one captured DMA-BUF plane + its format.
 ///
-/// This is the deliverable of #4: the import into a `wgpu::Texture` (turning this
-/// into a [`crate::GpuFrame`]) is #5.
+/// The import into a `wgpu::Texture` (turning this into a [`crate::GpuFrame`]) goes
+/// via [`capture_one_dmabuf`] + `rewynd_gpu::GpuContext::import_dmabuf`.
 #[derive(Debug, Clone)]
 pub struct DmabufFrame {
     /// The DMA-BUF file descriptor for the plane (borrowed from PipeWire; valid
@@ -81,6 +89,30 @@ pub struct DmabufFrame {
     pub offset: i32,
     /// Number of planes in the buffer (we only accept single-plane formats).
     pub num_planes: usize,
+}
+
+/// A single captured DMA-BUF frame with an *owned* (dup'd) file descriptor.
+///
+/// PipeWire recycles the buffer's borrowed fd on the next dequeue, so
+/// [`capture_one_dmabuf`] `dup()`s it (`F_DUPFD_CLOEXEC`) into this owned handle
+/// that outlives the stream and can be handed to the wgpu DMA-BUF import.
+#[derive(Debug)]
+pub struct CapturedDmabuf {
+    /// Owned (dup'd) DMA-BUF file descriptor for the single plane.
+    pub fd: OwnedFd,
+    /// DRM `fourcc` pixel format (e.g. `DRM_FORMAT_XRGB8888`).
+    pub fourcc: u32,
+    /// DRM format modifier (tiling/compression layout, or
+    /// [`DRM_FORMAT_MOD_INVALID`] for an implicit/linear layout).
+    pub drm_modifier: u64,
+    /// Frame width in pixels.
+    pub width: u32,
+    /// Frame height in pixels.
+    pub height: u32,
+    /// Row stride in bytes.
+    pub stride: i32,
+    /// Byte offset of the plane within the DMA-BUF.
+    pub offset: i32,
 }
 
 /// Map a SPA [`VideoFormat`] to its DRM `fourcc`, accounting for the SPA→DRM
@@ -107,8 +139,14 @@ fn spa_format_to_drm_fourcc(format: VideoFormat) -> Option<u32> {
     Some(code)
 }
 
+/// Outcome of a per-frame callback: keep running the loop, or stop it.
+type FrameAction = ControlFlow<()>;
+
 /// Per-stream state threaded through the PipeWire callbacks.
-struct UserData {
+///
+/// The negotiation fields are identical for both entry points; only the
+/// per-usable-frame behaviour (`on_usable`) and the abort/log bookkeeping differ.
+struct UserData<F> {
     /// The most recently negotiated raw video format.
     format: VideoInfoRaw,
     /// Whether we have already fixated the modifier (so we only do the second
@@ -116,15 +154,16 @@ struct UserData {
     fixated: bool,
     /// Number of modifier-fixation round-trips attempted (bounded to avoid livelock).
     fixation_attempts: u32,
-    /// Count of DMA-BUF frames logged so far.
-    frames_logged: u32,
     /// Count of unusable (multi-plane / SHM / empty) buffers seen, to bound log
     /// spam and bail.
     non_dmabuf_seen: u32,
-    /// Set once the DMA-BUF frame quota is reached; read after the loop to decide
-    /// whether the probe actually succeeded (vs. quitting on a failure path).
+    /// Per-usable-frame callback. Receives the frame descriptor plus the borrowed
+    /// (PipeWire-owned) plane fd, and decides whether the loop should stop.
+    on_usable: F,
+    /// Set once the caller's success condition is reached; read after the loop to
+    /// decide whether the run actually succeeded (vs. quitting on a failure path).
     success: Rc<Cell<bool>>,
-    /// Clone of the main loop so a callback can `quit()` after N frames.
+    /// Clone of the main loop so a callback can `quit()`.
     main_loop: pw::main_loop::MainLoopRc,
 }
 
@@ -190,8 +229,8 @@ fn build_enum_format(modifiers: Option<&[u64]>, fixate_to: Option<u64>) -> Objec
             Choice,
             Enum,
             Id,
-            // default + alternatives: single-plane packed RGB only (the #5 Vulkan
-            // import is single-plane; do NOT offer NV12 / multi-plane here).
+            // Single-plane packed RGB only — the Vulkan import is single-plane;
+            // do NOT offer NV12 / multi-plane.
             VideoFormat::BGRx,
             VideoFormat::BGRx,
             VideoFormat::BGRA,
@@ -322,14 +361,30 @@ fn modifier_choices_inner(param: &Pod) -> Vec<u64> {
     }
 }
 
-/// Run the diagnostic capture probe: connect to the PipeWire remote behind `fd`,
-/// negotiate a DMA-BUF format on `node_id`, and log the first [`FRAMES_TO_LOG`]
-/// DMA-BUF frames before returning.
+/// Drive the shared portal→stream→negotiation machinery and deliver each usable
+/// (single-plane DMA-BUF carrying data) frame to `on_usable`.
 ///
-/// Blocks (runs the PipeWire main loop) until enough frames are seen or the
-/// stream errors. Must be called on a thread that owns the `fd`; keep the portal
-/// `Session` (and any tokio runtime) alive for the whole call.
-pub fn run_capture_probe(node_id: u32, fd: std::os::fd::OwnedFd) -> Result<(), CaptureError> {
+/// `on_usable(frame, plane_fd)` receives the frame's [`DmabufFrame`] descriptor
+/// plus the *borrowed* plane fd (valid only for that call), and returns
+/// [`ControlFlow::Break`] to stop the loop (success) or [`ControlFlow::Continue`]
+/// to keep receiving frames. The callback is responsible for `dup()`ing the fd if
+/// it needs to outlive the call (PipeWire recycles it on the next dequeue).
+///
+/// Returns `Ok(())` once the loop quits with the success flag set, otherwise a
+/// [`CaptureError::PipeWire`] describing why negotiation/capture failed.
+///
+/// Blocks (runs the PipeWire main loop) on the calling thread, which must own the
+/// `fd`; keep the portal `Session` (and any tokio runtime) alive for the whole call.
+fn run_stream<F>(
+    node_id: u32,
+    fd: OwnedFd,
+    stream_name: &str,
+    on_usable: F,
+    no_frame_error: &str,
+) -> Result<(), CaptureError>
+where
+    F: FnMut(&DmabufFrame, BorrowedFd<'_>) -> FrameAction + 'static,
+{
     pw::init();
 
     let main_loop = pw::main_loop::MainLoopRc::new(None)
@@ -342,7 +397,7 @@ pub fn run_capture_probe(node_id: u32, fd: std::os::fd::OwnedFd) -> Result<(), C
 
     let stream = pw::stream::StreamRc::new(
         core,
-        "rewynd-capture-probe",
+        stream_name,
         pw::properties::properties! {
             *pw::keys::MEDIA_TYPE => "Video",
             *pw::keys::MEDIA_CATEGORY => "Capture",
@@ -371,8 +426,8 @@ pub fn run_capture_probe(node_id: u32, fd: std::os::fd::OwnedFd) -> Result<(), C
         format: VideoInfoRaw::default(),
         fixated: false,
         fixation_attempts: 0,
-        frames_logged: 0,
         non_dmabuf_seen: 0,
+        on_usable,
         success: success.clone(),
         main_loop: main_loop.clone(),
     };
@@ -432,8 +487,7 @@ pub fn run_capture_probe(node_id: u32, fd: std::os::fd::OwnedFd) -> Result<(), C
                     let offered_hex: Vec<String> =
                         offered.iter().map(|m| format!("{m:#018x}")).collect();
                     // Prefer an explicit modifier the server proposed; fall back to its
-                    // first choice, then to INVALID. (#5 will intersect this with the set
-                    // the Vulkan device can actually import.)
+                    // first choice, then to INVALID.
                     let chosen = offered
                         .iter()
                         .copied()
@@ -501,6 +555,7 @@ pub fn run_capture_probe(node_id: u32, fd: std::os::fd::OwnedFd) -> Result<(), C
                 let data = &datas[0];
                 let chunk = data.chunk();
                 let size = ud.format.size();
+                let raw_fd: RawFd = data.fd();
                 let frame = DmabufFrame {
                     fd: i64::from(data.fd()),
                     fourcc: spa_format_to_drm_fourcc(ud.format.format()).unwrap_or(0),
@@ -511,22 +566,18 @@ pub fn run_capture_probe(node_id: u32, fd: std::os::fd::OwnedFd) -> Result<(), C
                     offset: chunk.offset() as i32,
                     num_planes: 1,
                 };
-                tracing::info!(
-                    fd = frame.fd,
-                    fourcc = format_args!("{:#010x}", frame.fourcc),
-                    modifier = format_args!("{:#018x}", frame.modifier),
-                    width = frame.width,
-                    height = frame.height,
-                    stride = frame.stride,
-                    offset = frame.offset,
-                    "DMA-BUF frame"
-                );
 
-                ud.frames_logged += 1;
-                if ud.frames_logged >= FRAMES_TO_LOG {
-                    tracing::info!(frames = ud.frames_logged, "captured enough DMA-BUF frames");
-                    ud.success.set(true);
-                    ud.main_loop.quit();
+                // SAFETY: `raw_fd` is the plane's DMA-BUF fd, owned by PipeWire and
+                // valid for the duration of this callback (it is recycled on the next
+                // dequeue). The `BorrowedFd` does not outlive this scope, and the
+                // callback only `dup()`s it (never closes it).
+                let borrowed = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+                match (ud.on_usable)(&frame, borrowed) {
+                    ControlFlow::Break(()) => {
+                        ud.success.set(true);
+                        ud.main_loop.quit();
+                    }
+                    ControlFlow::Continue(()) => {}
                 }
             } else {
                 // Multi-plane, SHM fallback, or empty buffer — the dmabuf negotiation
@@ -581,10 +632,112 @@ pub fn run_capture_probe(node_id: u32, fd: std::os::fd::OwnedFd) -> Result<(), C
     if success.get() {
         Ok(())
     } else {
-        Err(CaptureError::PipeWire(
-            "stream ended without capturing any DMA-BUF frames \
-             (modifier fixation or buffer negotiation failed — see logs)"
-                .to_owned(),
-        ))
+        Err(CaptureError::PipeWire(no_frame_error.to_owned()))
     }
+}
+
+/// Run the diagnostic capture probe: connect to the PipeWire remote behind `fd`,
+/// negotiate a DMA-BUF format on `node_id`, and log the first [`FRAMES_TO_LOG`]
+/// DMA-BUF frames before returning.
+///
+/// Blocks (runs the PipeWire main loop) until enough frames are seen or the
+/// stream errors. Must be called on a thread that owns the `fd`; keep the portal
+/// `Session` (and any tokio runtime) alive for the whole call.
+pub fn run_capture_probe(node_id: u32, fd: OwnedFd) -> Result<(), CaptureError> {
+    let mut frames_logged: u32 = 0;
+    run_stream(
+        node_id,
+        fd,
+        "rewynd-capture-probe",
+        move |frame, _plane_fd| {
+            tracing::info!(
+                fd = frame.fd,
+                fourcc = format_args!("{:#010x}", frame.fourcc),
+                modifier = format_args!("{:#018x}", frame.modifier),
+                width = frame.width,
+                height = frame.height,
+                stride = frame.stride,
+                offset = frame.offset,
+                "DMA-BUF frame"
+            );
+
+            frames_logged += 1;
+            if frames_logged >= FRAMES_TO_LOG {
+                tracing::info!(frames = frames_logged, "captured enough DMA-BUF frames");
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        },
+        "stream ended without capturing any DMA-BUF frames \
+         (modifier fixation or buffer negotiation failed — see logs)",
+    )
+}
+
+/// Capture exactly one usable single-plane DMA-BUF frame from `node_id` (the
+/// PipeWire remote behind `fd`) and return its owned, dup'd descriptor.
+///
+/// On the first usable frame it `dup()`s the plane fd (`F_DUPFD_CLOEXEC`, via
+/// [`BorrowedFd::try_clone_to_owned`]) into a [`CapturedDmabuf`] that outlives the
+/// stream, then quits the main loop and returns. The returned fd is ready to hand
+/// to `rewynd_gpu::GpuContext::import_dmabuf`.
+///
+/// Blocks (runs the PipeWire main loop) until one frame is captured or the stream
+/// errors. Must be called on a thread that owns the `fd`; keep the portal
+/// `Session` (and any tokio runtime) alive for the whole call.
+pub fn capture_one_dmabuf(node_id: u32, fd: OwnedFd) -> Result<CapturedDmabuf, CaptureError> {
+    // The callback fills this in on the first usable frame; we read it back out
+    // after the loop quits. `Rc<RefCell<..>>` so the 'static callback can own a
+    // clone while we keep one to read the result.
+    let captured: Rc<RefCell<Option<CapturedDmabuf>>> = Rc::new(RefCell::new(None));
+
+    run_stream(
+        node_id,
+        fd,
+        "rewynd-capture-import",
+        {
+            let captured = captured.clone();
+            move |frame, plane_fd| {
+                // dup() the borrowed fd into an OwnedFd: PipeWire recycles its fd on
+                // the next dequeue, so we cannot keep the borrow. `try_clone_to_owned`
+                // uses F_DUPFD_CLOEXEC under the hood.
+                let owned = match plane_fd.try_clone_to_owned() {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        // dup failure (e.g. fd exhaustion) won't recover; stop instead
+                        // of spinning on every usable frame.
+                        tracing::error!(error = %e, "failed to dup DMA-BUF fd; aborting");
+                        return ControlFlow::Break(());
+                    }
+                };
+                tracing::info!(
+                    fourcc = format_args!("{:#010x}", frame.fourcc),
+                    modifier = format_args!("{:#018x}", frame.modifier),
+                    width = frame.width,
+                    height = frame.height,
+                    stride = frame.stride,
+                    offset = frame.offset,
+                    "captured single DMA-BUF frame for import"
+                );
+                *captured.borrow_mut() = Some(CapturedDmabuf {
+                    fd: owned,
+                    fourcc: frame.fourcc,
+                    drm_modifier: frame.modifier,
+                    width: frame.width,
+                    height: frame.height,
+                    stride: frame.stride,
+                    offset: frame.offset,
+                });
+                ControlFlow::Break(())
+            }
+        },
+        "stream ended without capturing a usable DMA-BUF frame \
+         (modifier fixation or buffer negotiation failed — see logs)",
+    )?;
+
+    // The loop only reports success after the callback stored a frame, so this is
+    // populated whenever `run_stream` returned Ok.
+    captured.borrow_mut().take().ok_or_else(|| {
+        CaptureError::PipeWire("capture loop succeeded but produced no frame".to_owned())
+    })
 }
