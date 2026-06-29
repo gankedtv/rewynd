@@ -411,9 +411,9 @@ where
     // *explicit* modifier the GPU supports; offering INVALID alone yields empty
     // buffers. We query the GPU's supported modifiers for B8G8R8A8 via Vulkan
     // (VK_EXT_image_drm_format_modifier); the server picks one in fixation.
-    // Propagate genuine Vulkan failures (loader/instance) rather than silently
-    // degrading to an INVALID-only offer — that's the very path we're diagnosing.
-    // (A device without VK_EXT_image_drm_format_modifier returns Ok(empty), not Err.)
+    // Explicit DRM modifiers from a standalone Vulkan query (assumes a single GPU;
+    // a multi-GPU host would need the import device's own set). Genuine loader/instance
+    // failures propagate as Err; a device lacking the extension returns Ok(empty).
     let mut modifiers = super::query_drm_format_modifiers()?;
     modifiers.push(DRM_FORMAT_MOD_INVALID);
     tracing::info!(
@@ -434,8 +434,14 @@ where
 
     let _listener = stream
         .add_local_listener_with_user_data(user_data)
-        .state_changed(|_stream, _ud, old, new| {
+        .state_changed(|_stream, ud, old, new| {
             tracing::info!(?old, ?new, "stream state changed");
+            // run() doesn't exit on its own when the stream errors — quit so the
+            // caller gets an error instead of hanging.
+            if let pw::stream::StreamState::Error(err) = &new {
+                tracing::error!(error = %err, "pipewire stream error; stopping");
+                ud.main_loop.quit();
+            }
         })
         .param_changed({
             let modifiers = modifiers.clone();
