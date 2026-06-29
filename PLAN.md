@@ -72,9 +72,10 @@ There is no single cross-platform capture API. Capture is the one genuinely per-
 Apple has hardware ray tracing (M3+), but RT is a *rendering* feature, independent of video encode. The relevant fact: **Vulkan Video is still not available on Apple** (MoltenVK does not expose the video-encode extensions; the request has been open since 2021), and `gpu-video` itself targets only Linux + Windows. So an Apple port would mean a **separate VideoToolbox backend**, not our `gpu-video`/Vulkan path. Out of scope for v1.
 
 ### 3.7 Licensing — cleared, with one ongoing obligation
+- **rewynd's own license: `GPL-3.0-or-later`** (decided — the repo ships under GPLv3; set in the root `LICENSE` and every crate's `license` field). This is sound because **every dependency is GPLv3-compatible**: `gpu-video` (MIT), `wgpu`/`ash`/`naga`/etc. (MIT/Apache-2.0) all incorporate cleanly into a GPLv3 work. The flip side is a constraint *going forward*: anything we link must be GPLv3-compatible (MIT and Apache-2.0 are — note Apache-2.0 is compatible with GPLv3 but **not** GPLv2).
 - **`gpu-video` is MIT** (confirmed: `license = "MIT"` + a LICENSE file in `gpu-video/`). The *smelter product* as a whole has a restrictive source-available license (real-time use / SaaS / embedding-for-distribution requires a commercial license starting $1k/mo), **but that governs the compositor product, not the separately-MIT-licensed library crate we depend on.**
-- **Therefore permitted:** building a UI around it, shipping a full app, distributing, selling, and feeding ganked.tv — all fine. **Only obligation:** include the MIT copyright/license notice in distributed builds (an "about"/`LICENSES` file is enough).
-- **UI framework is not chosen yet** (decided at Phase 7, not before). When choosing, watch the license: pick MIT/Apache; **avoid GPL/commercial-encumbered toolkits like Slint** for a distributed app.
+- **Therefore permitted:** building a UI around it, shipping a full app, distributing, selling, and feeding ganked.tv — all fine. **Obligation:** include the MIT copyright/license notice for `gpu-video` (and any other attribution-requiring deps) in distributed builds (a `LICENSES/` dir / "about" screen is enough).
+- **UI framework is not chosen yet** (decided at Phase 7, not before). Since rewynd is GPLv3, the toolkit must be **GPLv3-compatible**: egui / iced (MIT/Apache-2.0) are fine; Slint's GPLv3 option is now usable too (a commercial Slint license is no longer required, given we're GPL). Avoid only toolkits that are GPLv3-*incompatible* or commercial-only.
 - **Name-collision warning:** there is an unrelated `gpu-video` by AdrianEddy (a Gyroflow ffmpeg refactor, also MIT/Apache, not ready). We use the **Software Mansion** one from the cloned `smelter` repo. Keep the dependency pointed at that, not crates.io by accident.
 - Other deps (wgpu, ash, ashpd, pipewire, global-hotkey) are MIT/Apache — fine.
 
@@ -234,7 +235,7 @@ Each phase is a GitHub **milestone**. Issues below are written to be created rou
 - **Keep `gpu-video` / `wgpu` versions pinned and identical across the workspace** (§5). Any bump is an ADR-worthy event.
 - **Resolution / framerate / bitrate are parameters, never hard-coded** (target 1080p60, but other qualities must be addable). The ring buffer holds encoded H.264 only — never buffer uncompressed frames.
 - **ADRs** under `docs/adr/` for: the wgpu rev (0001), the muxer choice (Rust crate vs ffmpeg binary), and any encoder-param decisions.
-- **Licensing in builds:** ship the MIT notice for `gpu-video` (and any other deps requiring attribution) in a `LICENSES/` dir or about screen.
+- **Licensing in builds:** rewynd ships under **GPL-3.0-or-later** (root `LICENSE`); keep every crate's `license` field set to match. Ship third-party attribution notices — the `gpu-video` MIT notice and any other deps requiring attribution — in a `LICENSES/` dir or about screen.
 
 **Use, don't depend on, Dennis's repo.** If Vulkan Video encode misbehaves in a way `gpu-video` doesn't insulate, his `feat/vulkan-video-recorder` branch is the worked example to consult — and he's a person to ask.
 
