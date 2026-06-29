@@ -24,3 +24,8 @@ cfg_aliases = "0.2.1"
 
 [dev-dependencies]
 pollster.workspace = true
+
+# The RGBA→NV12 verification test needs the shared GpuContext, which only exists where
+# gpu-video builds; gate its dep on the same targets.
+[target.'cfg(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "emscripten"))))'.dev-dependencies]
+rewynd-gpu.workspace = true

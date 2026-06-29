@@ -4,8 +4,11 @@
 use std::num::NonZeroU32;
 
 use gpu_video::{
-    VideoDeviceExt,
-    parameters::{EncoderParametersH264, RateControl, VideoParameters},
+    VideoDeviceExt, WgpuRgbaToNv12Converter,
+    parameters::{
+        ColorRange, ColorSpace, EncoderParametersH264, RateControl, VideoParameters,
+        WgpuConverterParameters,
+    },
 };
 use rewynd_buffer::EncodedChunk;
 use rewynd_gpu::GpuContext;
@@ -13,23 +16,22 @@ use rewynd_gpu::GpuContext;
 use crate::{EncodeError, EncodeParams, Encoder};
 
 /// Burst headroom the VBV rate control may use over the average bitrate.
-/// Provisional default — encoder-param tuning is revisited (and ADR'd) in #9.
+/// Provisional default — encoder-param tuning is revisited (and ADR'd) later.
 const MAX_BITRATE_RATIO: u64 = 2;
-/// Rate-control averaging window (virtual buffer size). Provisional default — see #9.
+/// Rate-control averaging window (virtual buffer size). Provisional default.
 const VBV_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// `gpu-video`-backed H.264 encoder, constructed against the shared [`GpuContext`].
 pub struct GpuVideoEncoder {
     params: EncodeParams,
     // Owns the live gpu-video encoder so it lives as long as this wrapper. The
-    // per-frame encode path that drives it is wired in #9.
+    // per-frame encode path that drives it is wired up later.
     inner: gpu_video::WgpuTexturesEncoderH264,
 }
 
 impl GpuVideoEncoder {
-    /// Build the encoder on the shared device (PLAN §4.3, §3.3). This is the #3
-    /// deliverable: a `gpu-video` encoder constructed on the *same* wgpu device as
-    /// the rest of the pipeline. The frame-level encode (NV12 texture → chunk) is #9.
+    /// Build the encoder on the shared device (PLAN §4.3, §3.3): a `gpu-video`
+    /// encoder constructed on the *same* wgpu device as the rest of the pipeline.
     pub fn new(gpu: &GpuContext, params: EncodeParams) -> Result<Self, EncodeError> {
         let video = gpu
             .device
@@ -88,6 +90,73 @@ impl Encoder for GpuVideoEncoder {
         force_keyframe: bool,
     ) -> Result<EncodedChunk, EncodeError> {
         let _ = (&self.inner, frame, force_keyframe);
-        todo!("gpu-video encode (NV12 wgpu::Texture → H.264 chunk) — issue #9")
+        todo!("gpu-video encode (NV12 wgpu::Texture → H.264 chunk)")
+    }
+}
+
+/// RGBA→NV12 colour-space converter, backed by `gpu-video`'s
+/// [`WgpuRgbaToNv12Converter`]. Produces the NV12 input [`Encoder::encode`] expects.
+pub struct Nv12Converter {
+    inner: WgpuRgbaToNv12Converter,
+}
+
+impl Nv12Converter {
+    /// Build a BT.709 limited-range RGBA→NV12 converter on the shared device.
+    /// `gpu-video` only supports BT.709 limited; other combinations are rejected.
+    pub fn new(gpu: &GpuContext) -> Result<Self, EncodeError> {
+        let inner = WgpuRgbaToNv12Converter::new(
+            &gpu.device,
+            WgpuConverterParameters {
+                color_space: ColorSpace::BT709,
+                color_range: ColorRange::Limited,
+            },
+        )
+        .map_err(|e| EncodeError::Init(e.to_string()))?;
+        Ok(Self { inner })
+    }
+
+    /// Convert an RGBA/BGRA texture (usage must include `TEXTURE_BINDING`) into a
+    /// fresh NV12 [`wgpu::Texture`] of the same size.
+    ///
+    /// Allocates the NV12 texture per call; the live encode path reuses one.
+    #[must_use]
+    pub fn convert(&self, gpu: &GpuContext, rgba: &wgpu::Texture) -> wgpu::Texture {
+        let nv12 = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rewynd nv12 frame"),
+            size: wgpu::Extent3d {
+                width: rgba.width(),
+                height: rgba.height(),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::NV12,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+
+        let y_view = nv12.create_view(&wgpu::TextureViewDescriptor {
+            aspect: wgpu::TextureAspect::Plane0,
+            ..Default::default()
+        });
+        let uv_view = nv12.create_view(&wgpu::TextureViewDescriptor {
+            aspect: wgpu::TextureAspect::Plane1,
+            ..Default::default()
+        });
+        let rgba_bind_group = self.inner.create_input_bind_group(rgba);
+
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("rewynd rgba->nv12"),
+            });
+        self.inner
+            .convert(&mut encoder, &rgba_bind_group, &y_view, &uv_view);
+        gpu.queue.submit([encoder.finish()]);
+
+        nv12
     }
 }
