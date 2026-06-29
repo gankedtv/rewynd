@@ -43,7 +43,7 @@ The switch to the git rev happened **after** 0.4.0 was published: smelter PR #20
 | `texture_from_raw(vk_image, desc, drop_callback, memory)` | `wgpu-hal/src/vulkan/device.rs` | also in 29.0.3; used internally by `gpu-video` |
 | `create_texture_from_hal::<Vulkan>(hal_texture, desc, initial_state)` | wgpu-core | **breaking** (PR #9496): now requires explicit `initial_state: wgt::TextureUses`; pass the real imported state, not `UNINITIALIZED`, or zero-copy content is discarded |
 
-`gpu-video`'s own encoder uses the same surface (`as_hal::<Vulkan>()` + `texture_from_raw` + `create_texture_from_hal`), so the interop contract is shared at this rev. `git compare 1503796...trunk` is `behind_by: 0` (a clean ancestor of trunk).
+`gpu-video`'s own encoder uses the same surface (`as_hal::<Vulkan>()` + `texture_from_raw` + `create_texture_from_hal`), so the interop contract is shared at this rev. A GitHub compare of `1503796...trunk` reports `ahead_by: 137, behind_by: 0` — trunk carries 137 commits beyond `1503796` and none are missing from it, i.e. `1503796` is a point on trunk's own history, not a diverged fork.
 
 ### `gpu-video` API surface we will call (confirmed on 0.4.0 docs + master source)
 
@@ -62,7 +62,8 @@ The switch to the git rev happened **after** 0.4.0 was published: smelter PR #20
 
 [workspace.dependencies]
 # gpu-video from git — the published 0.4.0 uses crates.io wgpu 29.0.x and lacks the interop fns.
-gpu-video = { git = "https://github.com/software-mansion/smelter", rev = "<pin a commit >= PR #2025; see open questions>" }
+# rev: UNRESOLVED — see "Open question (blocker)" below. Must be a smelter commit >= PR #2025 (so it pins wgpu 1503796).
+gpu-video = { git = "https://github.com/software-mansion/smelter", rev = "TBD-SEE-BLOCKER" }
 wgpu      = { git = "https://github.com/gfx-rs/wgpu", rev = "1503796" }
 
 # Force every wgpu/naga crate in the tree to the same source as gpu-video, so wgpu::Texture types unify.
@@ -74,18 +75,34 @@ wgpu-types = { git = "https://github.com/gfx-rs/wgpu", rev = "1503796" }
 naga       = { git = "https://github.com/gfx-rs/wgpu", rev = "1503796" }
 ```
 
+### Open question (blocker)
+
+The exact `gpu-video` commit is **not yet resolved** (`rev = "TBD-SEE-BLOCKER"` above). It must be chosen and verified on the Linux box before this ADR moves to Accepted and before #2 wires the real `Cargo.toml`. The chosen commit must:
+
+- be a smelter `master` commit at or after PR #2025 (so its `gpu-video/Cargo.toml` pins `wgpu` rev `1503796`);
+- come with a decision on whether to include PR #2039's device/adapter API change (it affects the `create_wgpu_textures_encoder_h264` call site);
+- be confirmed to build + link in the spike (see [Verification gate](#verification-gate)).
+
+**Until that SHA is filled in here, #2/#3 implementation stays blocked.**
+
 **Rejected: crates.io `wgpu` 29.0.x (and the published `gpu-video` 0.4.0).** 29.0.3 exposes only `texture_from_raw`; the DMA-BUF / D3D11 / semaphore imports are trunk-only. That path both lacks the functions and mismatches the git-rev type identity. This is strategy (1) *"pinned rev already has interop"* from PLAN §5 — but specifically via git `gpu-video`, not the crate.
 
 This is an **ADR-worthy pin**: any future bump of `wgpu` or `gpu-video` must be done in lockstep and recorded here.
 
 ## Verification gate
 
-The web proves the functions exist *in source* at the rev. It cannot prove the workspace **builds and links** on the target hardware. This Claude environment is macOS (out of scope, no Vulkan Video), so the following **must be run by the author on the Linux box (CachyOS / RTX 3080 Ti)** — they belong with issue #2 (scaffold) and #3 (shared device):
+The web proves the functions exist *in source* at the rev. It cannot prove the workspace **builds and links** on the target hardware. macOS is out of scope for Vulkan Video, so these checks must be run on the **Linux target (CachyOS / RTX 3080 Ti)**; they land alongside issue #2 (scaffold) and #3 (shared device).
 
-- [ ] `cargo build` / `cargo check` the scaffolded workspace against `wgpu` rev `1503796` + git `gpu-video`.
+**Required to move this ADR to Accepted** — the first three boxes must all pass:
+
+- [ ] `cargo build` / `cargo check` the scaffolded workspace (or the spike crate) against `wgpu` rev `1503796` + git `gpu-video`.
 - [ ] `cargo tree -i wgpu` (and `wgpu-hal`, `wgpu-core`, `wgpu-types`, `naga`) shows **exactly one** source for each — no crates.io `wgpu` sneaking in transitively.
-- [ ] Pin the exact `gpu-video` commit (≥ PR #2025 so it uses wgpu `1503796`); decide whether to include PR #2039's device/adapter API change, and confirm the `create_wgpu_textures_encoder_h264` signature on that commit.
-- [ ] Confirm the wgpu device is created with `VULKAN_EXTERNAL_MEMORY_DMA_BUF` / `_FD` (Linux) — and that the NVIDIA adapter actually advertises them — before relying on import at runtime (relevant to #3, #5). Confirm whether `Adapter::open_with_callback` (PLAN §6.1) is still the path to enable extensions on the post-#2039 API.
+- [ ] A `gpu-video` encoder (`create_wgpu_textures_encoder_h264`) constructs on the **same** wgpu device (no `VideoDeviceWithoutWgpu`). This resolves the [blocker SHA](#open-question-blocker) and pins the `create_wgpu_textures_encoder_h264` signature (incl. whether PR #2039 is in the chosen commit).
+
+**Deferred — confirmations that may complete under follow-up issues, not required for Accepted:**
+
+- [ ] (→ #3/#5) Confirm the NVIDIA adapter advertises `VULKAN_EXTERNAL_MEMORY_DMA_BUF` / `_FD` and that the device enables them before relying on import at runtime; confirm whether `Adapter::open_with_callback` (PLAN §6.1) is still the extension-enable path on the post-#2039 API.
+- [ ] (→ #6/#7) Windows D3D11 shared-handle import (`VULKAN_EXTERNAL_MEMORY_WIN32`) — unverifiable on the Linux box; source-confirmed only.
 
 ## Consequences
 
