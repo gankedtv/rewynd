@@ -1,5 +1,7 @@
 //! Thin wrapper over `gpu-video`: an NV12 [`wgpu::Texture`] in, an H.264
-//! [`EncodedChunk`] out (PLAN §4.3). This crate owns the RGBA→NV12 conversion.
+//! [`EncodedChunk`] out (PLAN §4.3). The crate also provides the RGBA→NV12
+//! conversion (#8) that produces that NV12 input — a step upstream of [`Encoder`],
+//! not something [`Encoder::encode`] does itself.
 //!
 //! [`GpuVideoEncoder::new`] constructs the encoder against the shared wgpu device
 //! ([`rewynd_gpu::GpuContext`], #3); the per-frame encode path and RGBA→NV12 land in
@@ -53,9 +55,12 @@ impl Default for EncodeParams {
 }
 
 /// Encodes NV12 [`wgpu::Texture`]s into H.264 [`EncodedChunk`]s.
+///
+/// `frame` must already be NV12 (`wgpu::TextureFormat::NV12`); run the crate's
+/// RGBA→NV12 conversion (#8) first when the source isn't NV12.
 pub trait Encoder {
-    /// Encode one frame. `force_keyframe` forces an IDR at this frame so a clip can
-    /// begin here (PLAN §3.3).
+    /// Encode one NV12 frame. `force_keyframe` forces an IDR at this frame so a clip
+    /// can begin here (PLAN §3.3).
     fn encode(
         &mut self,
         frame: &wgpu::Texture,
