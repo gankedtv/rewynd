@@ -651,6 +651,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
+name = "pollster"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f3a9f18d041e6d0e102a0a46750538147e5e8992d3b4873aaafee2520b00ce3"
+
+[[package]]
 name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -764,7 +770,9 @@ dependencies = [
 name = "rewynd-encode"
 version = "0.1.0"
 dependencies = [
+ "cfg_aliases",
  "gpu-video",
+ "pollster",
  "rewynd-buffer",
  "rewynd-gpu",
  "thiserror 2.0.18",
@@ -775,6 +783,8 @@ dependencies = [
 name = "rewynd-gpu"
 version = "0.1.0"
 dependencies = [
+ "cfg_aliases",
+ "gpu-video",
  "thiserror 2.0.18",
  "wgpu",
 ]

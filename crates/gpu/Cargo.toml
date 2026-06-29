@@ -11,3 +11,11 @@ publish = false
 [dependencies]
 wgpu.workspace = true
 thiserror.workspace = true
+
+# gpu-video provides the video-capable device creation (VideoAdapterExt). Only builds
+# where Vulkan exists (Windows + non-Apple unixes), matching gpu-video's own gating.
+[target.'cfg(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "emscripten"))))'.dependencies]
+gpu-video.workspace = true
+
+[build-dependencies]
+cfg_aliases = "0.2.1"
