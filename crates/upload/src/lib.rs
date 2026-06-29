@@ -27,3 +27,23 @@ impl GankedClient {
         Err(UploadError::NotImplemented)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upload_is_not_yet_implemented() {
+        let client = GankedClient;
+        let err = pollster::block_on(client.upload(Path::new("/x"))).unwrap_err();
+        assert!(matches!(err, UploadError::NotImplemented));
+    }
+
+    #[test]
+    fn error_displays() {
+        assert_eq!(
+            UploadError::NotImplemented.to_string(),
+            "ganked.tv upload not yet implemented"
+        );
+    }
+}

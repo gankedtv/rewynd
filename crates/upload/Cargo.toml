@@ -10,3 +10,6 @@ publish = false
 
 [dependencies]
 thiserror.workspace = true
+
+[dev-dependencies]
+pollster.workspace = true

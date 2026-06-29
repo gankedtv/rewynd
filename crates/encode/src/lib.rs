@@ -73,3 +73,27 @@ pub trait Encoder {
 mod gpu_video_backend;
 #[cfg(vulkan)]
 pub use gpu_video_backend::{GpuVideoEncoder, Nv12Converter};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_params_target_1080p60() {
+        let p = EncodeParams::default();
+        assert_eq!(p.width, 1920);
+        assert_eq!(p.height, 1080);
+        assert_eq!(p.framerate, 60);
+        assert_eq!(p.bitrate_bps, 12_000_000);
+        assert_eq!(p.idr_period, 60);
+    }
+
+    #[test]
+    fn init_error_displays_the_cause() {
+        let err = EncodeError::Init("boom".to_owned());
+        assert_eq!(
+            err.to_string(),
+            "failed to initialise the gpu-video encoder: boom"
+        );
+    }
+}

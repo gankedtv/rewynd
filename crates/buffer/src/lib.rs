@@ -118,4 +118,36 @@ mod tests {
         // leaving pts 69..=129 inclusive.
         assert_eq!(buf.len(), 61);
     }
+
+    #[test]
+    fn getters_reflect_state() {
+        let window = Duration::from_secs(30);
+        let mut buf = RingBuffer::new(window);
+        assert_eq!(buf.window(), window);
+        assert_eq!(buf.len(), 0);
+        assert!(buf.is_empty());
+
+        buf.push(chunk(0, true));
+        assert_eq!(buf.len(), 1);
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn flush_last_is_not_yet_implemented() {
+        let buf = RingBuffer::new(Duration::from_secs(60));
+        let err = buf.flush_last(Duration::from_secs(10)).unwrap_err();
+        assert!(matches!(err, BufferError::NotImplemented));
+    }
+
+    #[test]
+    fn error_variants_display() {
+        assert_eq!(
+            BufferError::NotImplemented.to_string(),
+            "ring-buffer flush is not yet implemented"
+        );
+        assert_eq!(
+            BufferError::NoKeyframe(Duration::from_secs(5)).to_string(),
+            "no keyframe within the requested 5s window"
+        );
+    }
 }

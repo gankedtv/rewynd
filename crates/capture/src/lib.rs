@@ -69,3 +69,44 @@ pub trait FrameSource {
     /// Yield the next captured frame, awaiting one if necessary.
     async fn next_frame(&mut self) -> Result<GpuFrame, CaptureError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_error_variants_display() {
+        assert_eq!(
+            CaptureError::Unavailable.to_string(),
+            "capture backend unavailable"
+        );
+        assert_eq!(
+            CaptureError::NotImplemented.to_string(),
+            "capture backend not yet implemented"
+        );
+        assert_eq!(
+            CaptureError::Cancelled.to_string(),
+            "screencast selection cancelled by the user"
+        );
+        assert_eq!(
+            CaptureError::Portal("no portal".to_owned()).to_string(),
+            "screencast portal error: no portal"
+        );
+        assert_eq!(
+            CaptureError::PipeWire("stream gone".to_owned()).to_string(),
+            "pipewire error: stream gone"
+        );
+        assert_eq!(
+            CaptureError::Vulkan("no modifier".to_owned()).to_string(),
+            "vulkan error: no modifier"
+        );
+    }
+
+    #[test]
+    fn frame_format_debug_and_equality() {
+        assert_eq!(FrameFormat::Bgra8, FrameFormat::Bgra8);
+        assert_ne!(FrameFormat::Bgra8, FrameFormat::Rgba8);
+        assert_ne!(FrameFormat::Rgba8, FrameFormat::Nv12);
+        assert_eq!(format!("{:?}", FrameFormat::Nv12), "Nv12");
+    }
+}

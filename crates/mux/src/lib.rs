@@ -44,3 +44,30 @@ impl Muxer for Mp4Muxer {
         Err(MuxError::NotImplemented)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_mp4_is_not_yet_implemented() {
+        let mut muxer = Mp4Muxer;
+        let err = muxer.write_mp4(&[], Path::new("/x")).unwrap_err();
+        assert!(matches!(err, MuxError::NotImplemented));
+    }
+
+    #[test]
+    fn error_variants_display() {
+        assert_eq!(
+            MuxError::NotImplemented.to_string(),
+            "MP4 muxing is not yet implemented"
+        );
+        assert_eq!(
+            MuxError::NotKeyframeStart.to_string(),
+            "clip does not start on a keyframe"
+        );
+        let io = MuxError::from(std::io::Error::other("x"));
+        assert!(matches!(io, MuxError::Io(_)));
+        assert_eq!(io.to_string(), "x");
+    }
+}
