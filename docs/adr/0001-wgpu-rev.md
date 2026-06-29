@@ -1,6 +1,6 @@
 # ADR 0001 — wgpu version coordination
 
-- **Status:** Proposed (pending local build verification on the Linux dev box — see [Verification gate](#verification-gate))
+- **Status:** Accepted (verified on the Linux dev box — CachyOS / RTX 3080 Ti, 2026-06-29 — see [Verification results](#verification-results))
 - **Date:** 2026-06-29
 - **Issue:** [#1 Resolve wgpu version coordination](https://github.com/gankedtv/rewynd/issues/1)
 - **Deciders:** Turbootzz
@@ -62,8 +62,8 @@ The switch to the git rev happened **after** 0.4.0 was published: smelter PR #20
 
 [workspace.dependencies]
 # gpu-video from git — the published 0.4.0 uses crates.io wgpu 29.0.x and lacks the interop fns.
-# rev: UNRESOLVED — see "Open question (blocker)" below. Must be a smelter commit >= PR #2025 (so it pins wgpu 1503796).
-gpu-video = { git = "https://github.com/software-mansion/smelter", rev = "TBD-SEE-BLOCKER" }
+# Pinned to smelter master tip 4fff151f (PR #2090); confirms wgpu rev 1503796 and builds on the target (see Verification results).
+gpu-video = { git = "https://github.com/software-mansion/smelter", rev = "4fff151fe4040d0df40a6688ca019c545f0e6402" }
 wgpu      = { git = "https://github.com/gfx-rs/wgpu", rev = "1503796" }
 
 # Force every wgpu/naga crate in the tree to the same source as gpu-video, so wgpu::Texture types unify.
@@ -75,15 +75,15 @@ wgpu-types = { git = "https://github.com/gfx-rs/wgpu", rev = "1503796" }
 naga       = { git = "https://github.com/gfx-rs/wgpu", rev = "1503796" }
 ```
 
-### Open question (blocker)
+### Resolved: the pinned `gpu-video` commit
 
-The exact `gpu-video` commit is **not yet resolved** (`rev = "TBD-SEE-BLOCKER"` above). It must be chosen and verified on the Linux box before this ADR moves to Accepted and before #2 wires the real `Cargo.toml`. The chosen commit must:
+**Pinned to smelter `master` tip `4fff151fe4040d0df40a6688ca019c545f0e6402` (PR #2090, "Make `VideoInstance`/`VideoAdapter` backend agnostic", 2026-06-25).** Confirmed against the criteria that were open:
 
-- be a smelter `master` commit at or after PR #2025 (so its `gpu-video/Cargo.toml` pins `wgpu` rev `1503796`);
-- come with a decision on whether to include PR #2039's device/adapter API change (it affects the `create_wgpu_textures_encoder_h264` call site);
-- be confirmed to build + link in the spike (see [Verification gate](#verification-gate)).
+- It is well past PR #2025, and its `gpu-video/Cargo.toml` pins `wgpu = { git = ".../gfx-rs/wgpu", rev = "1503796" }` (verified in the file at that commit).
+- **PR #2039 / #2090 device-adapter refactors:** included (they are ≤ the pinned tip). They are **internal** backend reorganizations — `examples/encode_wgpu.rs` is byte-identical from `4c7508f` through `4fff151f`, so the public encoder surface we call is unchanged. The call path is the trait-based one: `instance.enumerate_adapters(Backends::VULKAN)` → `Adapter::video_adapter_info()` (`VideoAdapterExt`) → `Adapter::request_device_with_video_support(&VideoDeviceDescriptor { .. })` → `Device::video()` (`VideoDeviceExt`) → `create_wgpu_textures_encoder_h264(&queue, EncoderParametersH264 { .. })`. Note: `Adapter::open_with_callback` (PLAN §6.1) is **not** how `gpu-video` enables its device — the extension/feature set is selected via `request_device_with_video_support`, and external-memory features go in `VideoDeviceDescriptor.wgpu_features`.
+- Built + linked + ran in the spike (see [Verification results](#verification-results)).
 
-**Until that SHA is filled in here, #2/#3 implementation stays blocked.**
+This unblocks #2 (scaffold) and #3 (shared device).
 
 **Rejected: crates.io `wgpu` 29.0.x (and the published `gpu-video` 0.4.0).** 29.0.3 exposes only `texture_from_raw`; the DMA-BUF / D3D11 / semaphore imports are trunk-only. That path both lacks the functions and mismatches the git-rev type identity. This is strategy (1) *"pinned rev already has interop"* from PLAN §5 — but specifically via git `gpu-video`, not the crate.
 
@@ -95,14 +95,32 @@ The web proves the functions exist *in source* at the rev. It cannot prove the w
 
 **Required to move this ADR to Accepted** — the first three boxes must all pass:
 
-- [ ] `cargo build` / `cargo check` the scaffolded workspace (or the spike crate) against `wgpu` rev `1503796` + git `gpu-video`.
-- [ ] `cargo tree -i wgpu` (and `wgpu-hal`, `wgpu-core`, `wgpu-types`, `naga`) shows **exactly one** source for each — no crates.io `wgpu` sneaking in transitively.
-- [ ] A `gpu-video` encoder (`create_wgpu_textures_encoder_h264`) constructs on the **same** wgpu device (no `VideoDeviceWithoutWgpu`). This resolves the [blocker SHA](#open-question-blocker) and pins the `create_wgpu_textures_encoder_h264` signature (incl. whether PR #2039 is in the chosen commit).
+- [x] `cargo build` / `cargo check` the scaffolded workspace (or the spike crate) against `wgpu` rev `1503796` + git `gpu-video`.
+- [x] `cargo tree -i wgpu` (and `wgpu-hal`, `wgpu-core`, `wgpu-types`, `naga`) shows **exactly one** source for each — no crates.io `wgpu` sneaking in transitively.
+- [x] A `gpu-video` encoder (`create_wgpu_textures_encoder_h264`) constructs on the **same** wgpu device (no `VideoDeviceWithoutWgpu`). This resolved the [pinned commit](#resolved-the-pinned-gpu-video-commit) and pins the `create_wgpu_textures_encoder_h264` signature.
 
 **Deferred — confirmations that may complete under follow-up issues, not required for Accepted:**
 
-- [ ] (→ #3/#5) Confirm the NVIDIA adapter advertises `VULKAN_EXTERNAL_MEMORY_DMA_BUF` / `_FD` and that the device enables them before relying on import at runtime; confirm whether `Adapter::open_with_callback` (PLAN §6.1) is still the extension-enable path on the post-#2039 API.
+- [x] (→ #3/#5) The NVIDIA adapter advertises **both** `VULKAN_EXTERNAL_MEMORY_DMA_BUF` and `_FD`, and the device was created **with both enabled** (confirmed in the spike — earlier than planned). The extension-enable path is `VideoDeviceDescriptor.wgpu_features` via `request_device_with_video_support`, **not** `Adapter::open_with_callback` (that PLAN §6.1 note is superseded for the `gpu-video` device). Per-plane semaphore wait-sync (`add_wait_semaphore`) is still to be exercised at actual import time in #5.
 - [ ] (→ #6/#7) Windows D3D11 shared-handle import (`VULKAN_EXTERNAL_MEMORY_WIN32`) — unverifiable on the Linux box; source-confirmed only.
+
+## Verification results
+
+Ran a throwaway spike (`wgpu-pin-spike`, outside the repo) on the Linux dev box — **CachyOS / RTX 3080 Ti, NVIDIA driver 610.43.02, rustc 1.95.0, clang 22.1** — pinning `gpu-video = 4fff151f` + `wgpu = 1503796` with the `[patch.crates-io]` block above. All required gate boxes passed:
+
+- **Builds + links:** the full tree (`wgpu`, `wgpu-hal`, `wgpu-core`, `wgpu-types`, `naga` @ `1503796`; `vk-mem` 0.4.0; `gpu-video` @ `4fff151f`) compiled clean. `vk-mem` built via the `cc` crate — **no cmake needed** (despite the crate's reputation).
+- **Single source:** `Cargo.lock` resolves `wgpu` / `wgpu-hal` / `wgpu-core` / `wgpu-types` / `naga` each to exactly one source — `git+https://github.com/gfx-rs/wgpu?rev=1503796#1503796a…`, version `29.0.0`. No crates.io `wgpu` anywhere in the tree.
+- **Encoder on the same device:** runtime output —
+  ```
+  Adapter: NVIDIA GeForce RTX 3080 Ti | backend: Vulkan | driver: NVIDIA 610.43.02
+  advertises VULKAN_EXTERNAL_MEMORY_DMA_BUF: true
+  advertises VULKAN_EXTERNAL_MEMORY_FD:      true
+  wgpu Device + Queue created: YES (features: VULKAN_EXTERNAL_MEMORY_FD | VULKAN_EXTERNAL_MEMORY_DMA_BUF | IMMEDIATES)
+  RESULT: gpu-video H.264 encoder constructed on the SAME wgpu device — OK (no VideoDeviceWithoutWgpu)
+  ```
+  1080p60 NV12 H.264 params, `idr_period = 60`, `inline_stream_params = true`.
+
+The exact verified API call path is recorded under [Resolved: the pinned `gpu-video` commit](#resolved-the-pinned-gpu-video-commit).
 
 ## Consequences
 
@@ -113,7 +131,7 @@ The web proves the functions exist *in source* at the rev. It cannot prove the w
 
 **Negative / risks**
 - **Unreleased APIs.** The interop fns are trunk-only; we cannot move to a crates.io `wgpu` release until they land in one. Exit path = a future wgpu release that ships these imports.
-- **Moving target.** `gpu-video` master is ahead of 0.4.0 and already changed its device/adapter API (#2039). Pin a specific commit; bump deliberately.
+- **Moving target.** `gpu-video` master is ahead of 0.4.0 and has already reworked its device/adapter API twice (#2039, #2090) — both internal so far. We pin the exact commit `4fff151f`; any bump is deliberate and re-recorded here.
 - **Single-plane DMA-buf limit.** `texture_from_dmabuf_fd` is single-plane only; PipeWire NV12/multi-plane frames need per-plane handling or a conversion step (integration constraint for #5/#8).
 - **`create_texture_from_hal` breaking change.** Import code must pass the correct `initial_state` or zero-copy content is discarded.
 - **Windows path source-confirmed only.** The D3D11 import can't be validated on the Linux dev box (#7 will shake it out).
