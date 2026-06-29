@@ -45,3 +45,39 @@ jobs:
 
       - name: test
         run: cargo test --workspace --locked
+
+  coverage:
+    name: coverage gate (CI-testable surface)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libpipewire-0.3-dev clang libclang-dev
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # Gates 85% line coverage on CI-testable code only. GPU/portal code needs a
+      # GPU/live Wayland session CI does not have, so it is excluded here and covered
+      # by #[ignore]d tests on the dev box (see CLAUDE.md → Coverage).
+      - name: coverage gate
+        run: |
+          cargo llvm-cov --workspace --locked \
+            --ignore-filename-regex '(capture/src/linux/|gpu/src/|encode/src/gpu_video_backend\.rs|app/src/main\.rs)' \
+            --fail-under-lines 85 --summary-only

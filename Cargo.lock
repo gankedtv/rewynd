@@ -1319,6 +1319,7 @@ dependencies = [
 name = "rewynd-upload"
 version = "0.1.0"
 dependencies = [
+ "pollster",
  "thiserror 2.0.18",
 ]
 

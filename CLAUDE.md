@@ -8,6 +8,10 @@
 - The Linux capture probes need the live Wayland/KDE session + PipeWire; the XDG ScreenCast restore token is saved under `$XDG_STATE_HOME/rewynd`, so reruns don't re-prompt. PNG/diagnostic probe output goes to the temp dir, never the repo.
 - Dev box: CachyOS / RTX 3080 Ti / KWin Wayland.
 
+### Coverage
+- CI gates **85% line coverage** on CI-testable code, excluding GPU/portal code via `--ignore-filename-regex '(capture/src/linux/|gpu/src/|encode/src/gpu_video_backend\.rs|app/src/main\.rs)'` (no GPU/live Wayland in CI).
+- That GPU/portal code is validated by `#[ignore]`d tests on a GPU box. Full local coverage including them: `cargo llvm-cov --workspace --include-ignored`.
+
 ## Hard rules
 - **GPU pin:** `wgpu` git rev `1503796` + `gpu-video` git `4fff151f`, unified via `[patch.crates-io]`. Do not bump `wgpu`/`gpu-video` without an ADR (`docs/adr/`). See ADR 0001.
 - **Resolution / framerate / bitrate are parameters, never hard-coded** (target 1080p60).
