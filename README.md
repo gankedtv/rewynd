@@ -26,7 +26,10 @@ See [`PLAN.md`](PLAN.md) for the full design and rationale, and
 
 ## Building
 
-Requires a recent stable Rust (edition 2024) and a C++ compiler (for `vk-mem`).
+Requires a recent stable Rust (edition 2024) and a C++ compiler (for `vk-mem`). On
+Linux the capture crate additionally needs PipeWire dev headers and libclang (for
+`pipewire-sys`/`libspa-sys` bindgen): on Debian/Ubuntu, `pkg-config
+libpipewire-0.3-dev clang libclang-dev`.
 
 ```sh
 cargo build
