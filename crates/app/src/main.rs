@@ -42,11 +42,43 @@ mod linux {
     /// Shared, mutable ring buffer: the capture thread pushes, the hotkey handler cuts.
     type SharedBuffer = Arc<Mutex<RingBuffer>>;
 
+    /// Encode parameters: the 1080p60 default, with each field overridable from the
+    /// environment (`REWYND_WIDTH` / `_HEIGHT` / `_FPS` / `_BITRATE_BPS` / `_IDR_PERIOD`).
+    fn encode_params_from_env() -> EncodeParams {
+        let env_u32 = |key: &str| std::env::var(key).ok().and_then(|v| v.parse::<u32>().ok());
+        let mut params = EncodeParams::default();
+        if let Some(v) = env_u32("REWYND_WIDTH") {
+            params.width = v;
+        }
+        if let Some(v) = env_u32("REWYND_HEIGHT") {
+            params.height = v;
+        }
+        if let Some(v) = env_u32("REWYND_FPS") {
+            params.framerate = v;
+        }
+        if let Some(v) = env_u32("REWYND_BITRATE_BPS") {
+            params.bitrate_bps = v;
+        }
+        if let Some(v) = env_u32("REWYND_IDR_PERIOD") {
+            params.idr_period = v;
+        }
+        params
+    }
+
     pub fn run() -> Result<()> {
         tracing_subscriber::fmt::init();
 
-        // 1080p60 target (PLAN §2); every field is a parameter, never a hard limit (PLAN §9).
-        let params = EncodeParams::default();
+        // Resolution / framerate / bitrate are parameters: the 1080p60 target is the
+        // default, overridable via the environment until there's a config file/CLI.
+        let params = encode_params_from_env();
+        tracing::info!(
+            width = params.width,
+            height = params.height,
+            fps = params.framerate,
+            bitrate_bps = params.bitrate_bps,
+            idr_period = params.idr_period,
+            "encode parameters"
+        );
         let buffer: SharedBuffer = Arc::new(Mutex::new(RingBuffer::new(BUFFER_WINDOW)));
 
         // ashpd's portals are async; reuse one runtime for ScreenCast setup and the
@@ -110,11 +142,13 @@ mod linux {
         // killed). The capture thread keeps filling the buffer in the background.
         let result = runtime.block_on(run_hotkey_loop(&buffer));
 
-        // Stop the capture loop and join it before dropping the portal, so the GPU
-        // pipeline tears down on its own thread rather than during process exit.
+        // Shut the capture loop down, then join it so the GPU pipeline tears down on its
+        // own thread rather than during process exit. The loop only observes `stop` when a
+        // frame arrives, so drop the portal first: closing the ScreenCast session ends the
+        // PipeWire stream, which unblocks the loop even if no further frame comes.
         stop.store(true, Ordering::Relaxed);
-        let _ = capture.join();
         drop(portal);
+        let _ = capture.join();
         result
     }
 
@@ -232,15 +266,22 @@ mod linux {
         }
 
         let exec = std::env::current_exe()?;
+        // Quote + escape the path per the Desktop Entry spec so a path with spaces or
+        // reserved characters (" ` $ \) doesn't corrupt the Exec line.
+        let exec_escaped = exec
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('`', "\\`")
+            .replace('$', "\\$");
         let entry = format!(
             "[Desktop Entry]\n\
              Type=Application\n\
              Name=rewynd\n\
              Comment=Instant-replay clip recorder\n\
-             Exec={}\n\
+             Exec=\"{exec_escaped}\"\n\
              Terminal=false\n\
              Categories=AudioVideo;Recorder;\n",
-            exec.display()
         );
         std::fs::create_dir_all(path.parent().expect("path has a parent"))?;
         std::fs::write(&path, entry)?;
