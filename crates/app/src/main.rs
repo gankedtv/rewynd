@@ -46,21 +46,33 @@ mod linux {
     /// Encode parameters: the 1080p60 default, with each field overridable from the
     /// environment (`REWYND_WIDTH` / `_HEIGHT` / `_FPS` / `_BITRATE_BPS` / `_IDR_PERIOD`).
     fn encode_params_from_env() -> EncodeParams {
-        let env_u32 = |key: &str| std::env::var(key).ok().and_then(|v| v.parse::<u32>().ok());
+        params_from(|key| std::env::var(key).ok())
+    }
+
+    /// Build [`EncodeParams`] from a key→value lookup: the 1080p60 default with any
+    /// positive `u32` overrides applied. Split out from the environment so it's testable.
+    fn params_from(get: impl Fn(&str) -> Option<String>) -> EncodeParams {
+        // Ignore unparseable or non-positive overrides: every field must be > 0 (the
+        // encoder rejects zero), so fall back to the default rather than fail at startup.
+        let u32_of = |key: &str| {
+            get(key)
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|&v| v > 0)
+        };
         let mut params = EncodeParams::default();
-        if let Some(v) = env_u32("REWYND_WIDTH") {
+        if let Some(v) = u32_of("REWYND_WIDTH") {
             params.width = v;
         }
-        if let Some(v) = env_u32("REWYND_HEIGHT") {
+        if let Some(v) = u32_of("REWYND_HEIGHT") {
             params.height = v;
         }
-        if let Some(v) = env_u32("REWYND_FPS") {
+        if let Some(v) = u32_of("REWYND_FPS") {
             params.framerate = v;
         }
-        if let Some(v) = env_u32("REWYND_BITRATE_BPS") {
+        if let Some(v) = u32_of("REWYND_BITRATE_BPS") {
             params.bitrate_bps = v;
         }
-        if let Some(v) = env_u32("REWYND_IDR_PERIOD") {
+        if let Some(v) = u32_of("REWYND_IDR_PERIOD") {
             params.idr_period = v;
         }
         params
@@ -410,7 +422,23 @@ mod linux {
 
     #[cfg(test)]
     mod tests {
-        use super::desktop_exec_value;
+        use super::{desktop_exec_value, params_from};
+
+        #[test]
+        fn params_from_applies_overrides_and_falls_back() {
+            let env = std::collections::HashMap::from([
+                ("REWYND_WIDTH", "1280"),
+                ("REWYND_FPS", "30"),
+                ("REWYND_HEIGHT", "0"),
+                ("REWYND_BITRATE_BPS", "not-a-number"),
+            ]);
+            let p = params_from(|k| env.get(k).map(|s| (*s).to_owned()));
+            assert_eq!(p.width, 1280); // overridden
+            assert_eq!(p.framerate, 30); // overridden
+            assert_eq!(p.height, 1080); // zero rejected → default
+            assert_eq!(p.bitrate_bps, 12_000_000); // unparseable → default
+            assert_eq!(p.idr_period, 60); // absent → default
+        }
 
         #[test]
         fn exec_value_quotes_plain_and_spaced_paths() {

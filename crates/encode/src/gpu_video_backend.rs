@@ -89,9 +89,10 @@ impl Encoder for GpuVideoEncoder {
         force_keyframe: bool,
         pts: std::time::Duration,
     ) -> Result<EncodedChunk, EncodeError> {
-        // gpu-video takes the NV12 texture by value; the converter hands us a fresh
-        // texture each frame, but the trait borrows it, so clone the wgpu handle (a
-        // cheap ref-count bump, not a pixel copy).
+        // gpu-video takes the NV12 texture by value (it copies it into its own input
+        // image), but the trait borrows it, so clone the wgpu handle — a cheap ref-count
+        // bump, not a pixel copy. The converter reuses one texture across frames; the
+        // copy-in here is what makes that reuse safe.
         let chunk = self
             .inner
             .encode(
@@ -119,6 +120,20 @@ impl Encoder for GpuVideoEncoder {
 /// [`WgpuRgbaToNv12Converter`]. Produces the NV12 input [`Encoder::encode`] expects.
 pub struct Nv12Converter {
     inner: WgpuRgbaToNv12Converter,
+    /// Reused NV12 output texture + its plane views, (re)created only when the frame
+    /// size changes. The capture format is fixed for a stream, so this is allocated
+    /// once and rewritten in place each frame instead of per-call. `RefCell` because
+    /// the converter is driven single-threaded on the capture thread.
+    output: std::cell::RefCell<Option<Nv12Output>>,
+}
+
+/// The cached NV12 render target the converter writes each frame.
+struct Nv12Output {
+    texture: wgpu::Texture,
+    y_view: wgpu::TextureView,
+    uv_view: wgpu::TextureView,
+    width: u32,
+    height: u32,
 }
 
 impl Nv12Converter {
@@ -133,40 +148,64 @@ impl Nv12Converter {
             },
         )
         .map_err(|e| EncodeError::Init(e.to_string()))?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            output: std::cell::RefCell::new(None),
+        })
     }
 
-    /// Convert an RGBA/BGRA texture (usage must include `TEXTURE_BINDING`) into a
-    /// fresh NV12 [`wgpu::Texture`] of the same size.
+    /// Convert an RGBA/BGRA texture (usage must include `TEXTURE_BINDING`) into an NV12
+    /// [`wgpu::Texture`] of the same size and return its handle.
     ///
-    /// Allocates the NV12 texture per call; the live encode path reuses one.
+    /// The NV12 output texture is reused across calls (re-created only when the frame
+    /// size changes), so this allocates no per-frame GPU texture on the hot path. The
+    /// caller must consume the returned frame (encode it) before the next `convert`,
+    /// which overwrites the same texture; the GPU queue orders that write after the
+    /// encoder's read, so per-frame `convert → encode` is safe.
     #[must_use]
     pub fn convert(&self, gpu: &GpuContext, rgba: &wgpu::Texture) -> wgpu::Texture {
-        let nv12 = gpu.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("rewynd nv12 frame"),
-            size: wgpu::Extent3d {
-                width: rgba.width(),
-                height: rgba.height(),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::NV12,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
+        let (width, height) = (rgba.width(), rgba.height());
+        let mut slot = self.output.borrow_mut();
+        if slot
+            .as_ref()
+            .is_none_or(|o| o.width != width || o.height != height)
+        {
+            let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("rewynd nv12 frame"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::NV12,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let y_view = texture.create_view(&wgpu::TextureViewDescriptor {
+                aspect: wgpu::TextureAspect::Plane0,
+                ..Default::default()
+            });
+            let uv_view = texture.create_view(&wgpu::TextureViewDescriptor {
+                aspect: wgpu::TextureAspect::Plane1,
+                ..Default::default()
+            });
+            *slot = Some(Nv12Output {
+                texture,
+                y_view,
+                uv_view,
+                width,
+                height,
+            });
+        }
+        let output = slot.as_ref().expect("output set above");
 
-        let y_view = nv12.create_view(&wgpu::TextureViewDescriptor {
-            aspect: wgpu::TextureAspect::Plane0,
-            ..Default::default()
-        });
-        let uv_view = nv12.create_view(&wgpu::TextureViewDescriptor {
-            aspect: wgpu::TextureAspect::Plane1,
-            ..Default::default()
-        });
+        // The input texture is a fresh DMA-BUF import each frame, so its bind group can't
+        // be cached; only the output target is reused.
         let rgba_bind_group = self.inner.create_input_bind_group(rgba);
 
         let mut encoder = gpu
@@ -174,10 +213,14 @@ impl Nv12Converter {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("rewynd rgba->nv12"),
             });
-        self.inner
-            .convert(&mut encoder, &rgba_bind_group, &y_view, &uv_view);
+        self.inner.convert(
+            &mut encoder,
+            &rgba_bind_group,
+            &output.y_view,
+            &output.uv_view,
+        );
         gpu.queue.submit([encoder.finish()]);
 
-        nv12
+        output.texture.clone()
     }
 }
