@@ -52,3 +52,9 @@ name = "import_to_png"
 # compiles everywhere via a `#[cfg(not(target_os = "linux"))]` stub `main`.
 [[example]]
 name = "record_h264"
+
+# System-audio capture probe: capture the default sink monitor as PCM and log each
+# buffer's peak/RMS level + PTS, proving non-silent capture. Linux-only at runtime;
+# compiles everywhere via a `#[cfg(not(target_os = "linux"))]` stub `main`.
+[[example]]
+name = "audio_probe"

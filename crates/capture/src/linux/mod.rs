@@ -3,16 +3,19 @@
 //!
 //! - [`portal`]: the ScreenCast handshake → a PipeWire node id + remote fd.
 //! - [`pipewire_capture`]: the stream setup that negotiates DMA-BUF and reads frames.
+//! - [`audio`]: system-audio (default sink monitor) capture as interleaved PCM.
 //!
 //! `FrameSource` → [`GpuFrame`] is not yet wired; [`PipewireCapture`] returns
 //! [`CaptureError::NotImplemented`].
 
 use super::{CaptureError, FrameSource, GpuFrame};
 
+pub mod audio;
 pub mod pipewire_capture;
 pub mod portal;
 pub mod vulkan_modifiers;
 
+pub use audio::{AudioParams, capture_system_audio};
 pub use pipewire_capture::{
     CapturedDmabuf, DmabufFrame, capture_one_dmabuf, capture_stream, run_capture_probe,
 };
