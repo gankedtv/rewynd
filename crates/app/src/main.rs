@@ -8,6 +8,9 @@
 //! Linux-only at runtime; the binary compiles elsewhere via a stub `main`.
 
 #[cfg(target_os = "linux")]
+mod tray;
+
+#[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
     linux::run()
 }
@@ -35,6 +38,8 @@ mod linux {
     };
 
     use rewynd_config::{self as config, AudioSettings, VideoSettings};
+
+    use crate::tray;
     use rewynd_gpu::{DmabufImport, GpuContext};
     use rewynd_mux::{AudioTrack, Mp4Muxer, Muxer};
 
@@ -241,6 +246,41 @@ mod linux {
             }
         }
 
+        // Tray icon + menu, on a background task of the same runtime (no GTK, no extra event
+        // loop). Menu clicks arrive as `TrayCmd`s; the hotkey loop below is left untouched.
+        {
+            let tray_buffer = buffer.clone();
+            let tray_audio = audio_buffer.clone();
+            let tray_output = output_dir.clone();
+            runtime.spawn(async move {
+                let (handle, mut rx) = match tray::spawn().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "tray unavailable; continuing without it");
+                        return;
+                    }
+                };
+                let _handle = handle; // dropping it would remove the icon
+                while let Some(cmd) = rx.recv().await {
+                    match cmd {
+                        tray::TrayCmd::SaveClip => save_clip(
+                            &tray_buffer,
+                            &tray_audio,
+                            params,
+                            audio_params,
+                            buffer_window,
+                            tray_output.as_deref(),
+                        ),
+                        tray::TrayCmd::OpenSettings => open_settings(),
+                        tray::TrayCmd::Quit => {
+                            tracing::info!("quit requested from the tray");
+                            std::process::exit(0);
+                        }
+                    }
+                }
+            });
+        }
+
         // Block on the hotkey loop until the shortcut session ends (or the process is
         // killed). The capture threads keep filling the buffers in the background.
         let result = runtime.block_on(run_hotkey_loop(
@@ -286,6 +326,19 @@ mod linux {
 
     fn remove_pid_file() {
         let _ = std::fs::remove_file(config::recorder_pid_path());
+    }
+
+    /// Launch the sibling settings binary (best-effort), for the tray's "Open settings".
+    fn open_settings() {
+        match std::env::current_exe() {
+            Ok(exe) => {
+                let settings = exe.with_file_name("rewynd-settings");
+                if let Err(e) = std::process::Command::new(&settings).spawn() {
+                    tracing::warn!(error = %e, path = %settings.display(), "could not open settings");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "could not locate the settings binary"),
+        }
     }
 
     /// Spawn a thread that captures `source`, applies `gain`, and sums each buffer into the
@@ -714,6 +767,7 @@ mod linux {
                     span_s = span.as_secs_f64(),
                     "saved clip"
                 );
+                tray::clip_saved_toast(&path);
             }
             Err(e) => tracing::error!(error = %e, path = %path.display(), "failed to write clip"),
         }
