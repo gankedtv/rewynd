@@ -515,6 +515,28 @@ mod tests {
         assert_eq!(audio_track.track_type().unwrap(), TrackType::Audio);
         assert_eq!(audio_track.media_type().unwrap(), mp4::MediaType::OPUS);
         assert_eq!(audio_track.sample_count(), 3);
+
+        // Byte-exact dOps guard, run in CI (the vendored crate's own tests aren't part of
+        // `cargo test --workspace`). 48 kHz / stereo / pre_skip=312, per RFC 7845 §5.1.
+        let bytes = std::fs::read(&out.0).unwrap();
+        let pos = bytes
+            .windows(4)
+            .position(|w| w == b"dOps")
+            .expect("dOps box present in the written file");
+        let dops = &bytes[pos - 4..pos - 4 + 19];
+        assert_eq!(
+            dops,
+            &[
+                0x00, 0x00, 0x00, 0x13, // box size = 19
+                b'd', b'O', b'p', b's', // 'dOps'
+                0x00, // version
+                0x02, // output channel count
+                0x01, 0x38, // pre_skip = 312
+                0x00, 0x00, 0xbb, 0x80, // input sample rate = 48000
+                0x00, 0x00, // output gain
+                0x00, // channel mapping family
+            ]
+        );
     }
 
     #[test]

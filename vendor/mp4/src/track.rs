@@ -901,11 +901,21 @@ impl Mp4TrackWriter {
         }
 
         if !self.edit_list.is_empty() {
+            let entries = std::mem::take(&mut self.edit_list);
+            // elst version 0 stores segment_duration/media_time as u32. Use version 1 (u64)
+            // when a segment_duration exceeds u32 (a clip longer than ~71 min at a µs movie
+            // timescale); media_time is only ever a small pre-skip or the -1 empty-edit
+            // sentinel, both of which round-trip correctly in either version.
+            let version = u8::from(
+                entries
+                    .iter()
+                    .any(|e| e.segment_duration > u64::from(u32::MAX)),
+            );
             self.trak.edts = Some(EdtsBox {
                 elst: Some(ElstBox {
-                    version: 0,
+                    version,
                     flags: 0,
-                    entries: std::mem::take(&mut self.edit_list),
+                    entries,
                 }),
             });
         }

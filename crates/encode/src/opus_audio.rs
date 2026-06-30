@@ -3,9 +3,9 @@
 //!
 //! libopus encodes fixed-size frames, but the capture delivers variable-size buffers, so
 //! [`OpusAudioEncoder`] accumulates samples and emits one [`EncodedAudioChunk`] per whole
-//! Opus frame. The PTS is anchored to the first buffered sample and advanced by exactly one
-//! frame each packet, which stays wall-clock-accurate for the continuous monitor capture
-//! and re-anchors whenever the buffer fully drains (so a gap doesn't accumulate drift).
+//! Opus frame. Each `push` re-anchors the PTS to the incoming buffer's real capture timestamp
+//! (offset by the buffered remainder) and advances by one frame per packet, so the timeline
+//! tracks the capture clock rather than drifting on nominal frame durations.
 
 use std::time::Duration;
 
@@ -63,6 +63,10 @@ impl Default for AudioEncodeParams {
 /// libopus-backed encoder that turns interleaved `f32` PCM into [`EncodedAudioChunk`]s.
 pub struct OpusAudioEncoder {
     encoder: opus::Encoder,
+    /// Channel count (interleaving stride), used to convert buffered sample counts to time.
+    channels: usize,
+    /// Sample rate in Hz, used to time the buffered remainder when re-anchoring the PTS.
+    sample_rate: u32,
     /// Samples per channel in one Opus frame (e.g. 960 for 20 ms at 48 kHz).
     samples_per_channel: u32,
     /// Interleaved samples in one frame (`samples_per_channel * channels`).
@@ -93,14 +97,17 @@ impl OpusAudioEncoder {
             }
         };
 
-        // samples per channel per frame; must be a whole, valid Opus frame size.
-        if params.frame_ms == 0 || (params.sample_rate * params.frame_ms) % 1000 != 0 {
+        // samples per channel per frame; must be a whole, valid Opus frame size. Compute in
+        // u64 so an out-of-range sample_rate/frame_ms can't overflow before the check.
+        let total = u64::from(params.sample_rate) * u64::from(params.frame_ms);
+        if params.frame_ms == 0 || total % 1000 != 0 {
             return Err(AudioEncodeError::Params(format!(
                 "frame_ms {} does not yield a whole frame at {} Hz",
                 params.frame_ms, params.sample_rate
             )));
         }
-        let samples_per_channel = params.sample_rate * params.frame_ms / 1000;
+        let samples_per_channel = u32::try_from(total / 1000)
+            .map_err(|_| AudioEncodeError::Params("frame size too large".to_owned()))?;
 
         let mut encoder = opus::Encoder::new(params.sample_rate, channels, Application::Audio)
             .map_err(|e| AudioEncodeError::Init(e.to_string()))?;
@@ -130,6 +137,8 @@ impl OpusAudioEncoder {
 
         Ok(Self {
             encoder,
+            channels,
+            sample_rate: params.sample_rate,
             samples_per_channel,
             frame_len,
             frame_duration,
@@ -155,11 +164,14 @@ impl OpusAudioEncoder {
         pts: Duration,
         mut on_packet: impl FnMut(EncodedAudioChunk),
     ) -> Result<(), AudioEncodeError> {
-        // Re-anchor the PTS clock whenever we start from an empty buffer (first call, or
-        // after a full drain), so a capture gap doesn't accumulate drift.
-        if self.pending.is_empty() {
-            self.pending_pts = pts;
-        }
+        // Anchor the PTS to the real capture clock every push: the samples already buffered
+        // precede this buffer, so `pending[0]` started `rem` before `pts`. Re-anchoring each
+        // call tracks wall-clock time (and absorbs any capture gap) rather than free-running
+        // on nominal frame durations, which would drift if the sink clock differs from 48 kHz.
+        let rem_per_channel = (self.pending.len() / self.channels) as u64;
+        let rem =
+            Duration::from_nanos(rem_per_channel * 1_000_000_000 / u64::from(self.sample_rate));
+        self.pending_pts = pts.saturating_sub(rem);
         self.pending.extend_from_slice(pcm);
 
         while self.pending.len() >= self.frame_len {

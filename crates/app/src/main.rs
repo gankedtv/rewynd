@@ -52,9 +52,14 @@ mod linux {
     /// Audio encode parameters: 48 kHz stereo Opus (matching capture + Opus's native rate),
     /// with the bitrate overridable from the environment (`REWYND_AUDIO_BITRATE_BPS`).
     fn audio_params_from_env() -> AudioEncodeParams {
+        audio_params_from(|key| std::env::var(key).ok())
+    }
+
+    /// Build [`AudioEncodeParams`] from a key→value lookup: the default with a positive
+    /// `REWYND_AUDIO_BITRATE_BPS` override applied. Split from the environment so it's testable.
+    fn audio_params_from(get: impl Fn(&str) -> Option<String>) -> AudioEncodeParams {
         let mut params = AudioEncodeParams::default();
-        if let Some(v) = std::env::var("REWYND_AUDIO_BITRATE_BPS")
-            .ok()
+        if let Some(v) = get("REWYND_AUDIO_BITRATE_BPS")
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|&v| v > 0)
         {
@@ -264,7 +269,12 @@ mod linux {
                     Ok(chunk) => {
                         // The chunk carries the frame's real capture timestamp, so the
                         // window evicts by wall-clock time regardless of the capture rate.
-                        buffer.lock().expect("ring buffer mutex").push(chunk);
+                        // Recover from a poisoned lock rather than panicking across the
+                        // PipeWire C callback boundary (which would be undefined behaviour).
+                        buffer
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(chunk);
                         frame_index += 1;
                         ControlFlow::Continue(())
                     }
@@ -298,22 +308,30 @@ mod linux {
         };
         tracing::info!("audio pipeline ready; filling the audio ring");
 
-        let stop = stop.clone();
-        // No idle timeout: capture runs until shutdown. The callback checks `stop` on every
-        // buffer (the monitor delivers continuously), so shutdown is prompt.
-        capture_system_audio(capture_params, None, epoch, move |pcm, pts| {
-            if stop.load(Ordering::Relaxed) {
-                return ControlFlow::Break(());
-            }
-            let result = encoder.push(pcm, pts, |chunk| {
-                buffer.lock().expect("audio ring mutex").push(chunk);
-            });
-            if let Err(e) = result {
-                tracing::error!(error = %e, "audio encode failed; stopping audio capture");
-                return ControlFlow::Break(());
-            }
-            ControlFlow::Continue(())
-        })?;
+        // No idle timeout (capture runs until shutdown), but hand the stop flag to the
+        // watchdog so the loop quits promptly even if the sink suspends and stops delivering
+        // buffers — the per-buffer check alone wouldn't fire then.
+        capture_system_audio(
+            capture_params,
+            None,
+            Some(stop.clone()),
+            epoch,
+            move |pcm, pts| {
+                let result = encoder.push(pcm, pts, |chunk| {
+                    // Recover from a poisoned lock instead of panicking: a panic here would
+                    // unwind across the PipeWire C callback boundary (undefined behaviour).
+                    buffer
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(chunk);
+                });
+                if let Err(e) = result {
+                    tracing::error!(error = %e, "audio encode failed; stopping audio capture");
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            },
+        )?;
         Ok(())
     }
 
@@ -483,7 +501,7 @@ mod linux {
         // so the capture thread keeps filling the buffer while we write the file.
         let clip = buffer
             .lock()
-            .expect("ring buffer mutex")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .flush_last(BUFFER_WINDOW);
         let chunks = match clip {
             Ok(chunks) => chunks,
@@ -498,7 +516,7 @@ mod linux {
         let clip_base = chunks.first().map_or(Duration::ZERO, |c| c.pts);
         let audio_chunks = audio_buffer
             .lock()
-            .expect("audio ring mutex")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .flush_from(clip_base);
 
         let path = clip_output_path();
@@ -540,20 +558,40 @@ mod linux {
     }
 
     /// Where to write a saved clip: `$REWYND_OUTPUT_DIR` (default: the temp dir) with a
-    /// millisecond-stamped name so successive saves don't collide.
+    /// millisecond-stamped, per-process-sequenced name. The sequence number disambiguates
+    /// two saves landing in the same millisecond (e.g. the dev-hook flush racing a hotkey
+    /// press), which a bare timestamp would collide on.
     fn clip_output_path() -> std::path::PathBuf {
+        use std::sync::atomic::AtomicU32;
+        static SEQ: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::var_os("REWYND_OUTPUT_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis());
-        dir.join(format!("rewynd-{stamp}.mp4"))
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        dir.join(format!("rewynd-{stamp}-{seq}.mp4"))
     }
 
     #[cfg(test)]
     mod tests {
-        use super::{desktop_exec_value, params_from};
+        use super::{audio_params_from, desktop_exec_value, params_from};
+
+        #[test]
+        fn audio_params_from_applies_bitrate_and_falls_back() {
+            let p =
+                audio_params_from(|k| (k == "REWYND_AUDIO_BITRATE_BPS").then(|| "96000".into()));
+            assert_eq!(p.bitrate_bps, 96_000); // overridden
+            assert_eq!(p.sample_rate, 48_000); // default
+            assert_eq!(p.channels, 2); // default
+
+            // Zero and garbage are rejected → default 128 kbps.
+            let zero = audio_params_from(|_| Some("0".into()));
+            assert_eq!(zero.bitrate_bps, 128_000);
+            let garbage = audio_params_from(|_| Some("nope".into()));
+            assert_eq!(garbage.bitrate_bps, 128_000);
+        }
 
         #[test]
         fn params_from_applies_overrides_and_falls_back() {

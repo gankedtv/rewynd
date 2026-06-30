@@ -61,59 +61,65 @@ mod linux {
         let overall_peak = Rc::new(Cell::new(0.0_f32));
         let nonfinite = Rc::new(Cell::new(0_u64));
 
-        capture_system_audio(params, Some(IDLE_TIMEOUT), std::time::Instant::now(), {
-            let buffers_seen = buffers_seen.clone();
-            let total_frames = total_frames.clone();
-            let overall_peak = overall_peak.clone();
-            let nonfinite = nonfinite.clone();
-            move |pcm, pts| {
-                let n = buffers_seen.get() + 1;
-                buffers_seen.set(n);
-                let frames = pcm.len() as u64 / u64::from(params.channels.max(1));
-                total_frames.set(total_frames.get() + frames);
+        capture_system_audio(
+            params,
+            Some(IDLE_TIMEOUT),
+            None,
+            std::time::Instant::now(),
+            {
+                let buffers_seen = buffers_seen.clone();
+                let total_frames = total_frames.clone();
+                let overall_peak = overall_peak.clone();
+                let nonfinite = nonfinite.clone();
+                move |pcm, pts| {
+                    let n = buffers_seen.get() + 1;
+                    buffers_seen.set(n);
+                    let frames = pcm.len() as u64 / u64::from(params.channels.max(1));
+                    total_frames.set(total_frames.get() + frames);
 
-                // One pass: peak amplitude + sum of squares (f64 accumulator avoids
-                // overflow/precision loss), tracking any non-finite samples separately so a
-                // NaN run can't masquerade as silence in the `.max()` fold.
-                let mut peak = 0.0_f32;
-                let mut sum_sq = 0.0_f64;
-                let mut nan = 0_u64;
-                for &s in pcm {
-                    if s.is_finite() {
-                        peak = peak.max(s.abs());
-                        sum_sq += f64::from(s) * f64::from(s);
+                    // One pass: peak amplitude + sum of squares (f64 accumulator avoids
+                    // overflow/precision loss), tracking any non-finite samples separately so a
+                    // NaN run can't masquerade as silence in the `.max()` fold.
+                    let mut peak = 0.0_f32;
+                    let mut sum_sq = 0.0_f64;
+                    let mut nan = 0_u64;
+                    for &s in pcm {
+                        if s.is_finite() {
+                            peak = peak.max(s.abs());
+                            sum_sq += f64::from(s) * f64::from(s);
+                        } else {
+                            nan += 1;
+                        }
+                    }
+                    overall_peak.set(overall_peak.get().max(peak));
+                    nonfinite.set(nonfinite.get() + nan);
+                    // Divide by the finite-sample count (sum_sq skipped the non-finite ones), so
+                    // a NaN/inf-laden buffer isn't reported as artificially quieter than it is.
+                    let finite = pcm.len() as u64 - nan;
+                    let rms = if finite == 0 {
+                        0.0
                     } else {
-                        nan += 1;
+                        (sum_sq / finite as f64).sqrt()
+                    };
+
+                    tracing::info!(
+                        buffer = n,
+                        samples = pcm.len(),
+                        frames,
+                        pts_ms = pts.as_millis() as u64,
+                        peak = format_args!("{peak:.5}"),
+                        rms = format_args!("{rms:.5}"),
+                        "audio buffer"
+                    );
+
+                    if n >= max_buffers {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
                     }
                 }
-                overall_peak.set(overall_peak.get().max(peak));
-                nonfinite.set(nonfinite.get() + nan);
-                // Divide by the finite-sample count (sum_sq skipped the non-finite ones), so
-                // a NaN/inf-laden buffer isn't reported as artificially quieter than it is.
-                let finite = pcm.len() as u64 - nan;
-                let rms = if finite == 0 {
-                    0.0
-                } else {
-                    (sum_sq / finite as f64).sqrt()
-                };
-
-                tracing::info!(
-                    buffer = n,
-                    samples = pcm.len(),
-                    frames,
-                    pts_ms = pts.as_millis() as u64,
-                    peak = format_args!("{peak:.5}"),
-                    rms = format_args!("{rms:.5}"),
-                    "audio buffer"
-                );
-
-                if n >= max_buffers {
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
-                }
-            }
-        })?;
+            },
+        )?;
 
         let overall_peak = overall_peak.get();
         let nonfinite = nonfinite.get();
