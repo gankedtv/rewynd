@@ -8,6 +8,7 @@ members = [
     "crates/mux",
     "crates/upload",
     "crates/config",
+    "crates/settings",
     "crates/app",
 ]
 # Vendored third-party muxer fork (ADR 0004). It's a path dependency inside the workspace

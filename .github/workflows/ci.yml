@@ -19,12 +19,13 @@ jobs:
 
       # Linux capture deps: pipewire-sys/libspa-sys need libpipewire-0.3 (pkg-config)
       # and libclang (bindgen). vk-mem needs a C++ compiler (preinstalled). The Opus audio
-      # encoder (audiopus_sys) links system libopus → libopus-dev.
+      # encoder (audiopus_sys) links system libopus → libopus-dev. The iced settings GUI's
+      # winit/softbuffer backend needs libxkbcommon (keymap) to build (ADR 0006).
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libpipewire-0.3-dev clang libclang-dev libopus-dev
+            pkg-config libpipewire-0.3-dev clang libclang-dev libopus-dev libxkbcommon-dev
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -59,7 +60,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libpipewire-0.3-dev clang libclang-dev libopus-dev
+            pkg-config libpipewire-0.3-dev clang libclang-dev libopus-dev libxkbcommon-dev
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -80,5 +81,5 @@ jobs:
       - name: coverage gate
         run: |
           cargo llvm-cov --workspace --locked \
-            --ignore-filename-regex '(capture/src/linux/|gpu/src/|encode/src/gpu_video_backend\.rs|app/src/main\.rs|vendor/mp4/)' \
+            --ignore-filename-regex '(capture/src/linux/|gpu/src/|encode/src/gpu_video_backend\.rs|app/src/main\.rs|settings/src/|vendor/mp4/)' \
             --fail-under-lines 85 --summary-only
