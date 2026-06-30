@@ -45,10 +45,10 @@ mod palette {
 /// Slider bounds (kept generous but sane).
 const GAIN_MAX: f32 = 4.0;
 const BUFFER_MIN_S: u32 = 5;
-/// Slider ceiling for the replay length (4 minutes), so the common ~60 s default sits a quarter
-/// of the way along rather than pinned to the left. The config/daemon allow more via hand-edit;
-/// a larger stored value is shown clamped to this ceiling here.
-const BUFFER_MAX_S: u32 = 240;
+/// Slider ceiling for the replay length: the same cap the daemon enforces, so the slider and the
+/// recorder agree (no value the slider shows differently from what's used). At this ceiling the
+/// common ~60 s default sits about a quarter of the way along rather than pinned to the left.
+const BUFFER_MAX_S: u32 = config::MAX_BUFFER_SECONDS as u32;
 const BITRATE_MIN_MBPS: u32 = 1;
 const BITRATE_MAX_MBPS: u32 = 50;
 /// Frame-rate options offered in the dropdown.
@@ -282,12 +282,13 @@ impl App {
         let a = self.config.audio();
         let mbps = v.bitrate_bps / BITS_PER_MBIT;
         let secs = self.config.buffer_seconds().min(u64::from(BUFFER_MAX_S)) as u32;
-        // Rough clip size from the target bitrate (video + audio) over the replay window.
-        let est_mb = u64::from(v.bitrate_bps)
+        // Rough clip size from the target bitrate (video + audio) over the replay window,
+        // rounded to the nearest MB.
+        let est_bytes = u64::from(v.bitrate_bps)
             .saturating_add(u64::from(a.bitrate_bps))
             .saturating_mul(u64::from(secs))
-            / 8
-            / 1_000_000;
+            / 8;
+        let est_mb = est_bytes.saturating_add(500_000) / 1_000_000;
 
         let audio = card(
             "AUDIO",
