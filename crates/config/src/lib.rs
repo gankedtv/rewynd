@@ -375,13 +375,21 @@ pub fn default_output_dir() -> Option<PathBuf> {
 }
 
 /// Per-user runtime directory for rewynd's pid/lock files: `$XDG_RUNTIME_DIR/rewynd`, falling
-/// back to `<temp>/rewynd` when the runtime dir is unset or relative.
+/// back to a uid-scoped dir under the temp dir when the runtime dir is unset or relative (so the
+/// guard stays per-user rather than machine-wide on a shared, world-writable `/tmp`).
 fn instance_dir_from(runtime_dir: Option<OsString>, temp: PathBuf) -> PathBuf {
-    let base = runtime_dir
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .unwrap_or(temp);
-    base.join("rewynd")
+    if let Some(base) = runtime_dir.map(PathBuf::from).filter(|p| p.is_absolute()) {
+        return base.join("rewynd");
+    }
+    #[cfg(unix)]
+    let name = {
+        // SAFETY: `geteuid` is infallible and takes no arguments.
+        let uid = unsafe { libc::geteuid() };
+        format!("rewynd-{uid}")
+    };
+    #[cfg(not(unix))]
+    let name = "rewynd".to_owned();
+    temp.join(name)
 }
 
 /// [`instance_dir_from`] resolved against the process environment.
@@ -451,12 +459,12 @@ fn acquire_pid_lock_at(path: &Path) -> std::io::Result<Option<InstanceLock>> {
     let Some(mut file) = lock_file(path)? else {
         return Ok(None);
     };
-    // Write the pid, then truncate to its length: this never leaves an empty window (a concurrent
-    // reader mid-rewrite would otherwise see no pid and skip a live recorder) and still drops any
-    // tail left by a longer previous pid.
-    let pid = std::process::id().to_string();
-    file.write_all(pid.as_bytes())?;
-    file.set_len(pid.len() as u64)?;
+    // Newline-framed and written before truncating: a concurrent unlocked reader never sees an
+    // empty file, and by taking the first line it gets a clean pid even if a longer previous pid
+    // briefly leaves a tail; the truncate then drops that tail.
+    let line = format!("{}\n", std::process::id());
+    file.write_all(line.as_bytes())?;
+    file.set_len(line.len() as u64)?;
     Ok(Some(InstanceLock { _file: file }))
 }
 
@@ -741,14 +749,19 @@ mod tests {
     fn instance_dir_prefers_runtime_dir() {
         let rt = instance_dir_from(Some(OsString::from("/run/u")), PathBuf::from("/tmp"));
         assert_eq!(rt, PathBuf::from("/run/u/rewynd"));
-        // Unset or relative runtime dir falls back to the temp dir.
-        assert_eq!(
-            instance_dir_from(None, PathBuf::from("/tmp")),
-            PathBuf::from("/tmp/rewynd")
-        );
+        // Unset or relative runtime dir falls back under the temp dir, scoped per user on unix.
+        #[cfg(unix)]
+        let expected = {
+            // SAFETY: `geteuid` is infallible and takes no arguments.
+            let uid = unsafe { libc::geteuid() };
+            PathBuf::from(format!("/tmp/rewynd-{uid}"))
+        };
+        #[cfg(not(unix))]
+        let expected = PathBuf::from("/tmp/rewynd");
+        assert_eq!(instance_dir_from(None, PathBuf::from("/tmp")), expected);
         assert_eq!(
             instance_dir_from(Some(OsString::from("rel")), PathBuf::from("/tmp")),
-            PathBuf::from("/tmp/rewynd")
+            expected
         );
     }
 
@@ -778,7 +791,7 @@ mod tests {
             .expect("acquires");
         assert_eq!(
             std::fs::read_to_string(&path).expect("read pid"),
-            std::process::id().to_string()
+            format!("{}\n", std::process::id())
         );
         assert!(
             acquire_pid_lock_at(&path).expect("io ok").is_none(),
@@ -799,7 +812,7 @@ mod tests {
             .expect("acquires");
         assert_eq!(
             std::fs::read_to_string(&path).expect("read pid"),
-            std::process::id().to_string()
+            format!("{}\n", std::process::id())
         );
         drop(lock);
         let _ = std::fs::remove_file(&path);

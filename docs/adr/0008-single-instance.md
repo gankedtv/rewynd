@@ -35,9 +35,10 @@ process's lifetime (an `InstanceLock` guard). The pid file is **not** removed on
 ## Rationale
 
 - **Self-cleaning:** the lock lives on the open file description, so process death frees it. The
-  restart path (settings SIGTERMs the recorder, waits for `/proc/<pid>` to clear — escalating to
-  SIGKILL if it outlives the wait — then relaunches) re-acquires it cleanly. The recorder retries
-  the `flock` on `EINTR` so a stray signal can't be mistaken for a free lock.
+  restart path (settings SIGTERMs the recorder, waits for `/proc/<pid>` to clear — tracking the
+  process's start time so a reused pid isn't mistaken for it, and escalating to SIGKILL only if the
+  same process outlives the wait — then relaunches) re-acquires it cleanly. The recorder retries the
+  `flock` on `EINTR` so a stray signal can't be mistaken for a free lock.
 - **No unlink race:** the pid file is left in place on exit. Unlinking it could let an incoming
   instance create and lock a fresh inode at the same path while the outgoing fd still holds a lock
   on the old one. A leftover pid is harmless — the settings app verifies it against `/proc`.
