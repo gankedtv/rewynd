@@ -48,6 +48,21 @@ const BITS_PER_MBIT: u32 = 1_000_000;
 
 fn main() -> iced::Result {
     tracing_subscriber::fmt::init();
+
+    // Single-instance guard: a second window edits the same file, where its save clobbers the
+    // first's. Held until `run` returns; the kernel releases it when the process exits.
+    let _instance: Option<config::InstanceLock> = match config::acquire_settings_lock() {
+        Ok(Some(lock)) => Some(lock),
+        Ok(None) => {
+            tracing::info!("rewynd settings is already open; not opening a second window");
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not acquire the settings lock; opening anyway");
+            None
+        }
+    };
+
     iced::application(App::load, App::update, App::view)
         .title("rewynd settings")
         .theme(App::theme)
@@ -564,7 +579,7 @@ fn restart_recorder() -> Result<(), String> {
 /// it has dropped the global hotkey and ScreenCast portal before the replacement starts.
 #[cfg(unix)]
 fn stop_running_recorder() {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     let Ok(pid) = std::fs::read_to_string(config::recorder_pid_path()) else {
         return;
     };
@@ -580,11 +595,32 @@ fn stop_running_recorder() {
         return;
     }
     let _ = std::process::Command::new("kill").arg(pid).status();
-    // The recorder releases the portal/hotkey as it dies; wait (bounded) for that before relaunch.
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while proc_dir.exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(30));
+    // The recorder releases the portal/hotkey (and the single-instance lock) as it dies; wait
+    // (bounded) for that before relaunch.
+    if wait_for_exit(&proc_dir, Duration::from_secs(3)) {
+        return;
     }
+    // It outlived SIGTERM; escalate to SIGKILL so the replacement isn't refused by the lock the
+    // old process still holds.
+    let _ = std::process::Command::new("kill")
+        .arg("-KILL")
+        .arg(pid)
+        .status();
+    wait_for_exit(&proc_dir, Duration::from_secs(2));
+}
+
+/// Poll until `proc_dir` disappears or the timeout elapses; `true` if it's gone.
+#[cfg(unix)]
+fn wait_for_exit(proc_dir: &std::path::Path, timeout: std::time::Duration) -> bool {
+    use std::time::Instant;
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !proc_dir.exists() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    !proc_dir.exists()
 }
 
 #[cfg(not(unix))]

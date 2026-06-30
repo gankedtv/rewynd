@@ -18,3 +18,7 @@ tracing.workspace = true
 # Resolves the platform's standard Videos directory (XDG user-dirs on Linux, Known Folders on
 # Windows) for the default clip output location. MIT/Apache, no GPU.
 dirs = "6"
+
+# Advisory `flock` for the single-instance guard (docs/adr/0008); unix-only.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
