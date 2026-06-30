@@ -1,5 +1,5 @@
-//! Runtime configuration (see docs/adr/0005): a TOML file layered under the built-in
-//! defaults and overridden by `REWYND_*` environment variables.
+//! Runtime configuration (see docs/adr/0005): a TOML file layered under the built-in defaults
+//! and overridden by `REWYND_*` environment variables.
 //!
 //! Precedence, low → high: **built-in defaults < `config.toml` < environment overrides**.
 //! Resolution / framerate / bitrate (and the audio rate / channels / bitrate) stay parameters
@@ -8,14 +8,28 @@
 //! The file lives at `$XDG_CONFIG_HOME/rewynd/config.toml` (falling back to
 //! `$HOME/.config/rewynd/config.toml`); [`ensure_default_file`] writes a commented
 //! [`DEFAULT_TEMPLATE`] there on first run so the settings are discoverable.
+//!
+//! This crate is intentionally GPU-free: it exposes plain [`VideoSettings`] / [`AudioSettings`]
+//! rather than `rewynd-encode`'s param types, so the settings app can depend on it without
+//! pulling the wgpu/gpu-video stack. The consumer maps these onto the encoder's params (and a
+//! test there guards that the defaults stay in lockstep).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rewynd_encode::{AudioEncodeParams, EncodeParams};
 use serde::Deserialize;
 
+/// Built-in video defaults (must match `rewynd_encode::EncodeParams::default`; the app guards it).
+const DEFAULT_WIDTH: u32 = 1920;
+const DEFAULT_HEIGHT: u32 = 1080;
+const DEFAULT_FRAMERATE: u32 = 60;
+const DEFAULT_VIDEO_BITRATE_BPS: u32 = 12_000_000;
+const DEFAULT_IDR_PERIOD: u32 = 60;
+/// Built-in audio defaults (must match `rewynd_encode::AudioEncodeParams::default`).
+const DEFAULT_SAMPLE_RATE: u32 = 48_000;
+const DEFAULT_CHANNELS: u32 = 2;
+const DEFAULT_AUDIO_BITRATE_BPS: u32 = 128_000;
 /// Default retention window in seconds (PLAN §2's 60 s, now configurable).
 const DEFAULT_BUFFER_SECONDS: u64 = 60;
 /// Upper bound on the retention window. The ring buffer holds encoded frames in memory, so an
@@ -25,7 +39,25 @@ const MAX_BUFFER_SECONDS: u64 = 3600;
 /// Default preferred global-shortcut trigger; the compositor may rebind it.
 const DEFAULT_HOTKEY_TRIGGER: &str = "CTRL+ALT+R";
 
-/// Video encode settings; mirrors [`EncodeParams`] for TOML, defaulting to its built-ins.
+/// Plain video encode settings (the consumer maps these onto its encoder param type).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoSettings {
+    pub width: u32,
+    pub height: u32,
+    pub framerate: u32,
+    pub bitrate_bps: u32,
+    pub idr_period: u32,
+}
+
+/// Plain audio encode settings (the consumer maps these onto its encoder param type).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioSettings {
+    pub sample_rate: u32,
+    pub channels: u32,
+    pub bitrate_bps: u32,
+}
+
+/// Video encode settings as parsed from TOML, defaulting to the built-ins.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct VideoConfig {
@@ -38,13 +70,12 @@ struct VideoConfig {
 
 impl Default for VideoConfig {
     fn default() -> Self {
-        let d = EncodeParams::default();
         Self {
-            width: d.width,
-            height: d.height,
-            framerate: d.framerate,
-            bitrate_bps: d.bitrate_bps,
-            idr_period: d.idr_period,
+            width: DEFAULT_WIDTH,
+            height: DEFAULT_HEIGHT,
+            framerate: DEFAULT_FRAMERATE,
+            bitrate_bps: DEFAULT_VIDEO_BITRATE_BPS,
+            idr_period: DEFAULT_IDR_PERIOD,
         }
     }
 }
@@ -64,11 +95,10 @@ struct AudioConfig {
 
 impl Default for AudioConfig {
     fn default() -> Self {
-        let d = AudioEncodeParams::default();
         Self {
-            sample_rate: d.sample_rate,
-            channels: d.channels,
-            bitrate_bps: d.bitrate_bps,
+            sample_rate: DEFAULT_SAMPLE_RATE,
+            channels: DEFAULT_CHANNELS,
+            bitrate_bps: DEFAULT_AUDIO_BITRATE_BPS,
             mic_gain: 1.0,
             system_gain: 1.0,
         }
@@ -170,10 +200,10 @@ impl Config {
         }
     }
 
-    /// The H.264 encode parameters.
+    /// The video encode settings.
     #[must_use]
-    pub fn encode_params(&self) -> EncodeParams {
-        EncodeParams {
+    pub fn video(&self) -> VideoSettings {
+        VideoSettings {
             width: self.video.width,
             height: self.video.height,
             framerate: self.video.framerate,
@@ -182,14 +212,13 @@ impl Config {
         }
     }
 
-    /// The Opus encode parameters (frame size stays at the encoder's default).
+    /// The audio encode settings (sample rate / channels / bitrate).
     #[must_use]
-    pub fn audio_params(&self) -> AudioEncodeParams {
-        AudioEncodeParams {
+    pub fn audio(&self) -> AudioSettings {
+        AudioSettings {
             sample_rate: self.audio.sample_rate,
             channels: self.audio.channels,
             bitrate_bps: self.audio.bitrate_bps,
-            ..Default::default()
         }
     }
 
@@ -372,9 +401,10 @@ mod tests {
     fn empty_toml_is_all_defaults() {
         let c = Config::from_toml_str("").expect("empty parses");
         assert_eq!(c, Config::default());
-        let e = c.encode_params();
-        assert_eq!((e.width, e.height, e.framerate), (1920, 1080, 60));
-        let a = c.audio_params();
+        let v = c.video();
+        assert_eq!((v.width, v.height, v.framerate), (1920, 1080, 60));
+        assert_eq!((v.bitrate_bps, v.idr_period), (12_000_000, 60));
+        let a = c.audio();
         assert_eq!(
             (a.sample_rate, a.channels, a.bitrate_bps),
             (48_000, 2, 128_000)
@@ -399,11 +429,11 @@ mod tests {
     #[test]
     fn partial_file_fills_missing_with_defaults() {
         let c = Config::from_toml_str("[video]\nwidth = 1280\nframerate = 30\n").expect("parses");
-        let e = c.encode_params();
-        assert_eq!(e.width, 1280); // set
-        assert_eq!(e.framerate, 30); // set
-        assert_eq!(e.height, 1080); // default
-        assert_eq!(e.bitrate_bps, 12_000_000); // default
+        let v = c.video();
+        assert_eq!(v.width, 1280); // set
+        assert_eq!(v.framerate, 30); // set
+        assert_eq!(v.height, 1080); // default
+        assert_eq!(v.bitrate_bps, 12_000_000); // default
     }
 
     #[test]
@@ -472,17 +502,17 @@ mod tests {
             ("REWYND_OUTPUT_DIR", "/tmp/over"),
         ]);
         c.apply_env_overrides(|k| env.get(k).map(|s| (*s).to_owned()));
-        let e = c.encode_params();
-        assert_eq!(e.width, 3840, "WIDTH overrides the file value");
-        assert_eq!(e.height, 2160, "HEIGHT overrides the default");
-        assert_eq!(e.framerate, 120, "FPS overrides the default");
+        let v = c.video();
+        assert_eq!(v.width, 3840, "WIDTH overrides the file value");
+        assert_eq!(v.height, 2160, "HEIGHT overrides the default");
+        assert_eq!(v.framerate, 120, "FPS overrides the default");
         assert_eq!(
-            e.bitrate_bps, 25_000_000,
+            v.bitrate_bps, 25_000_000,
             "BITRATE_BPS overrides the default"
         );
-        assert_eq!(e.idr_period, 240, "IDR_PERIOD overrides the default");
+        assert_eq!(v.idr_period, 240, "IDR_PERIOD overrides the default");
         assert_eq!(
-            c.audio_params().bitrate_bps,
+            c.audio().bitrate_bps,
             64_000,
             "zero AUDIO_BITRATE_BPS ignored → file value"
         );
@@ -493,7 +523,7 @@ mod tests {
         let bad = std::collections::HashMap::from([("REWYND_WIDTH", "not-a-number")]);
         c2.apply_env_overrides(|k| bad.get(k).map(|s| (*s).to_owned()));
         assert_eq!(
-            c2.encode_params().width,
+            c2.video().width,
             1600,
             "unparseable override ignored → file value"
         );
@@ -522,8 +552,8 @@ mod tests {
     fn load_from_none_is_defaults_plus_env() {
         let env = std::collections::HashMap::from([("REWYND_WIDTH", "800")]);
         let c = load_from(None, |k| env.get(k).map(|s| (*s).to_owned()));
-        assert_eq!(c.encode_params().width, 800);
-        assert_eq!(c.encode_params().height, 1080); // default survives
+        assert_eq!(c.video().width, 800);
+        assert_eq!(c.video().height, 1080); // default survives
     }
 
     #[test]
@@ -532,8 +562,8 @@ mod tests {
         std::fs::write(&path, "[video]\nwidth = 1280\nheight = 720\n").expect("write");
         let env = std::collections::HashMap::from([("REWYND_WIDTH", "2560")]);
         let c = load_from(Some(&path), |k| env.get(k).map(|s| (*s).to_owned()));
-        assert_eq!(c.encode_params().width, 2560, "env beats the file");
-        assert_eq!(c.encode_params().height, 720, "file beats the default");
+        assert_eq!(c.video().width, 2560, "env beats the file");
+        assert_eq!(c.video().height, 720, "file beats the default");
         let _ = std::fs::remove_file(&path);
     }
 

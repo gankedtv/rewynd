@@ -1343,12 +1343,11 @@ dependencies = [
  "pollster",
  "rewynd-buffer",
  "rewynd-capture",
+ "rewynd-config",
  "rewynd-encode",
  "rewynd-gpu",
  "rewynd-mux",
- "serde",
  "tokio",
- "toml",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1376,6 +1375,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wgpu",
+]
+
+[[package]]
+name = "rewynd-config"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "toml",
+ "tracing",
 ]
 
 [[package]]

@@ -7,8 +7,6 @@
 //!
 //! Linux-only at runtime; the binary compiles elsewhere via a stub `main`.
 
-mod config;
-
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
     linux::run()
@@ -36,7 +34,7 @@ mod linux {
         OpusAudioEncoder, apply_gain, center_mono_into,
     };
 
-    use crate::config;
+    use rewynd_config::{self as config, AudioSettings, VideoSettings};
     use rewynd_gpu::{DmabufImport, GpuContext};
     use rewynd_mux::{AudioTrack, Mp4Muxer, Muxer};
 
@@ -60,16 +58,38 @@ mod linux {
     /// How often the mixer thread drains settled audio into the encoder.
     const AUDIO_DRAIN_INTERVAL: Duration = Duration::from_millis(20);
 
+    /// Map the GPU-free [`VideoSettings`] from the config onto the encoder's [`EncodeParams`].
+    /// A test guards that the config defaults stay in lockstep with [`EncodeParams::default`].
+    fn encode_params(v: VideoSettings) -> EncodeParams {
+        EncodeParams {
+            width: v.width,
+            height: v.height,
+            framerate: v.framerate,
+            bitrate_bps: v.bitrate_bps,
+            idr_period: v.idr_period,
+        }
+    }
+
+    /// Map [`AudioSettings`] onto [`AudioEncodeParams`] (frame size stays at the encoder default).
+    fn audio_encode_params(a: AudioSettings) -> AudioEncodeParams {
+        AudioEncodeParams {
+            sample_rate: a.sample_rate,
+            channels: a.channels,
+            bitrate_bps: a.bitrate_bps,
+            ..Default::default()
+        }
+    }
+
     pub fn run() -> Result<()> {
         tracing_subscriber::fmt::init();
 
         // Settings come from the config file (written on first run) layered under the built-in
-        // defaults and over by `REWYND_*` env overrides (see `crate::config`).
+        // defaults and over by `REWYND_*` env overrides (see `rewynd_config`).
         config::ensure_default_file();
         let config = config::load();
 
         // Resolution / framerate / bitrate stay parameters (PLAN §9), sourced from the config.
-        let params = config.encode_params();
+        let params = encode_params(config.video());
         tracing::info!(
             width = params.width,
             height = params.height,
@@ -78,7 +98,7 @@ mod linux {
             idr_period = params.idr_period,
             "encode parameters"
         );
-        let audio_params = config.audio_params();
+        let audio_params = audio_encode_params(config.audio());
         let buffer_window = config.buffer_window();
         let output_dir = config.output_dir();
         tracing::info!(
@@ -696,7 +716,29 @@ mod linux {
 
     #[cfg(test)]
     mod tests {
-        use super::desktop_exec_value;
+        use super::{audio_encode_params, desktop_exec_value, encode_params};
+        use rewynd_config::Config;
+        use rewynd_encode::{AudioEncodeParams, EncodeParams};
+
+        #[test]
+        fn config_defaults_map_to_encoder_defaults() {
+            // rewynd-config is GPU-free and mirrors the encoder defaults as its own constants;
+            // this guards that the two never drift (a new EncodeParams default must be reflected
+            // in the config crate, or this fails).
+            let c = Config::default();
+            let v = encode_params(c.video());
+            let d = EncodeParams::default();
+            assert_eq!(
+                (v.width, v.height, v.framerate, v.bitrate_bps, v.idr_period),
+                (d.width, d.height, d.framerate, d.bitrate_bps, d.idr_period)
+            );
+            let a = audio_encode_params(c.audio());
+            let ad = AudioEncodeParams::default();
+            assert_eq!(
+                (a.sample_rate, a.channels, a.bitrate_bps),
+                (ad.sample_rate, ad.channels, ad.bitrate_bps)
+            );
+        }
 
         #[test]
         fn exec_value_quotes_plain_and_spaced_paths() {
