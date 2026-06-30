@@ -30,8 +30,8 @@ const DEFAULT_IDR_PERIOD: u32 = 60;
 const DEFAULT_SAMPLE_RATE: u32 = 48_000;
 const DEFAULT_CHANNELS: u32 = 2;
 const DEFAULT_AUDIO_BITRATE_BPS: u32 = 128_000;
-/// Default retention window in seconds (PLAN §2's 60 s, now configurable).
-const DEFAULT_BUFFER_SECONDS: u64 = 60;
+/// Default retention window in seconds. 30 s suits most clips; configurable up to the cap below.
+const DEFAULT_BUFFER_SECONDS: u64 = 30;
 /// Upper bound on the retention window (four minutes). The ring buffer holds encoded frames in
 /// memory, so the window is capped: an instant-replay buffer this long is already generous, and a
 /// bound keeps a fat-fingered `seconds` from growing it without limit. The settings UI offers the
@@ -444,7 +444,7 @@ system_gain = 1.0
 
 [buffer]
 # How many seconds of footage to keep for a clip.
-seconds = 60
+seconds = 30
 
 [output]
 # Directory for saved clips. Unset = the system temp dir.
@@ -501,7 +501,7 @@ mod tests {
             (a.sample_rate, a.channels, a.bitrate_bps),
             (48_000, 2, 128_000)
         );
-        assert_eq!(c.buffer_window(), Duration::from_secs(60));
+        assert_eq!(c.buffer_window(), Duration::from_secs(30));
         assert_eq!(c.hotkey_trigger(), "CTRL+ALT+R");
         assert!(c.output_dir().is_none());
         assert!(!c.always_prompt());

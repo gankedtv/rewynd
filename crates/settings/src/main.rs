@@ -60,7 +60,7 @@ fn main() -> iced::Result {
     iced::application(App::load, App::update, App::view)
         .title("rewynd settings")
         .theme(App::theme)
-        .window_size((540.0, 700.0))
+        .window_size((900.0, 740.0))
         .centered()
         .run()
 }
@@ -394,11 +394,21 @@ impl App {
         ]
         .spacing(10);
 
-        let body = column![header, audio, recording, output, save]
+        // Two columns so everything fits in a landscape window without scrolling: the tall
+        // Recording card on the left, the shorter Audio and Output cards stacked on the right.
+        let columns = row![
+            recording,
+            column![audio, output].spacing(20).width(Length::Fill),
+        ]
+        .spacing(20);
+
+        let body = column![header, columns, save]
             .spacing(20)
             .padding(28)
-            .max_width(600);
+            .max_width(880);
 
+        // The scrollable is a safety net for very small windows; at the default size the content
+        // fits, so it never actually scrolls (which keeps the software renderer smooth).
         container(scrollable(body))
             .width(Length::Fill)
             .height(Length::Fill)
