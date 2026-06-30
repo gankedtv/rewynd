@@ -212,9 +212,13 @@ fn write_audio_track<W: std::io::Write + std::io::Seek>(
         }),
     })?;
 
-    // Track 2 is the second `add_track`. Packets are written back-to-back (their cumulative
-    // durations form the timeline); `start_time` is informational (the writer uses only
-    // `duration`).
+    // Track 2 is the second `add_track`. Packets are written back-to-back: each sample's
+    // duration is its real Opus frame length (so the audio sample clock stays exact), and the
+    // cumulative durations form the timeline; `start_time` is informational (the writer uses
+    // only `duration`). This assumes contiguous capture — a mid-clip gap (a sink that
+    // suspends mid-session) would collapse, presenting later audio early. Continuous monitor
+    // capture doesn't produce such gaps; reconstructing one (silence fill / multi-edit elst)
+    // is a future refinement.
     let mut cumulative: u64 = 0;
     for chunk in audio.chunks {
         writer.write_sample(

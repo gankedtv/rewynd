@@ -33,7 +33,9 @@ mod linux {
     const SILENCE_PEAK: f32 = 1.0e-4;
     /// Give up (with a clear error) if no audio buffers arrive within this window — an idle
     /// default sink can suspend and deliver nothing, which would otherwise hang the probe.
-    const IDLE_TIMEOUT: Duration = Duration::from_secs(3);
+    /// Generous vs typical negotiation latency (tens of ms) so a slow cold sink isn't failed
+    /// spuriously; long enough still to give up on a genuinely dead sink.
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         tracing_subscriber::fmt()

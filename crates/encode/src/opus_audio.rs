@@ -4,8 +4,10 @@
 //! libopus encodes fixed-size frames, but the capture delivers variable-size buffers, so
 //! [`OpusAudioEncoder`] accumulates samples and emits one [`EncodedAudioChunk`] per whole
 //! Opus frame. Each `push` re-anchors the PTS to the incoming buffer's real capture timestamp
-//! (offset by the buffered remainder) and advances by one frame per packet, so the timeline
-//! tracks the capture clock rather than drifting on nominal frame durations.
+//! (offset by the buffered remainder) and advances by one frame per packet, so each packet's
+//! PTS tracks the capture clock rather than drifting on nominal frame durations. (The muxer
+//! packs packets contiguously and only reads the first PTS for the clip's start offset, so a
+//! mid-clip *gap* in capture isn't reconstructed downstream — see `rewynd_mux`.)
 
 use std::time::Duration;
 

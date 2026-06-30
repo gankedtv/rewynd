@@ -76,6 +76,16 @@ support, and upstream (alfg/mp4-rust) is archived — there is nothing to upstre
   sane per-track `start_time`/duration, and a clip with a known clap/beep lines up audio to
   the video frame in VLC/mpv (and a browser `<video>`), with no leading priming click.
 
+## Known limitations
+
+- **Mid-clip capture gaps aren't reconstructed.** Audio samples are written contiguously
+  (each sample's duration is its real Opus frame length, keeping the audio sample clock
+  exact), and only the first packet's PTS sets the clip's start offset. If capture stalls
+  mid-clip (a sink that suspends mid-session — which continuous monitor capture does not
+  normally do), the post-gap audio is presented early. Reconstructing a gap (silence fill or
+  a multi-edit list) is a future refinement; the encoder already stamps gap-aware PTS, so the
+  muxer is the only piece that would change.
+
 ## Consequences
 
 - `vendor/mp4` is third-party code we now own; the Opus additions are small, isolated, and
