@@ -19,27 +19,28 @@ use iced::{Background, Border, Element, Length, Task, Theme};
 
 use rewynd_config::{self as config, Config};
 
-/// Theme colours — a modern charcoal/indigo palette. Tweak here to restyle the whole window.
+/// Theme colours — a modern slate/cyan palette. Every colour the window uses lives here, so
+/// swapping the whole look (or moving to the ganked.tv house style later) is a one-place edit.
 mod palette {
     use iced::Color;
-    /// Deep charcoal window background (not hard black).
-    pub const BACKGROUND: Color = Color::from_rgb8(0x15, 0x17, 0x1e);
+    /// Near-black slate window background.
+    pub const BACKGROUND: Color = Color::from_rgb8(0x0d, 0x11, 0x17);
     /// Soft off-white text.
-    pub const TEXT: Color = Color::from_rgb8(0xe7, 0xe9, 0xf0);
-    /// Vibrant indigo/violet accent for buttons, slider rails, active controls.
-    pub const ACCENT: Color = Color::from_rgb8(0x7c, 0x5c, 0xff);
+    pub const TEXT: Color = Color::from_rgb8(0xe6, 0xed, 0xf3);
+    /// Vivid cyan accent for buttons, slider rails, active controls.
+    pub const ACCENT: Color = Color::from_rgb8(0x22, 0xd3, 0xee);
     /// Raised card surface, a step lighter than the window background.
-    pub const PANEL: Color = Color::from_rgb8(0x1d, 0x20, 0x2b);
+    pub const PANEL: Color = Color::from_rgb8(0x16, 0x1b, 0x22);
     /// Hairline border around cards.
-    pub const BORDER: Color = Color::from_rgb8(0x2c, 0x30, 0x3e);
+    pub const BORDER: Color = Color::from_rgb8(0x2d, 0x33, 0x3b);
     /// Green for the "saved" confirmation.
-    pub const SUCCESS: Color = Color::from_rgb8(0x40, 0xd0, 0x8b);
+    pub const SUCCESS: Color = Color::from_rgb8(0x3f, 0xb9, 0x50);
     /// Amber for the restart hint.
-    pub const WARNING: Color = Color::from_rgb8(0xf5, 0xc2, 0x4b);
+    pub const WARNING: Color = Color::from_rgb8(0xf0, 0xb4, 0x29);
     /// Red for errors.
-    pub const DANGER: Color = Color::from_rgb8(0xff, 0x5c, 0x5c);
+    pub const DANGER: Color = Color::from_rgb8(0xf8, 0x51, 0x49);
     /// Muted text for hints/sublabels.
-    pub const MUTED: Color = Color::from_rgb8(0x9a, 0x9f, 0xb3);
+    pub const MUTED: Color = Color::from_rgb8(0x8b, 0x94, 0x9e);
 }
 
 /// Slider bounds (kept generous but sane).
@@ -386,13 +387,17 @@ impl App {
         ]
         .spacing(6);
 
-        let save = column![
-            button(text("Save settings").size(15))
-                .on_press(Message::Save)
-                .padding([12, 28]),
-            status_line(&self.status),
-        ]
-        .spacing(10);
+        let save = container(
+            column![
+                button(text("Save settings").size(15))
+                    .on_press(Message::Save)
+                    .padding([12, 28]),
+                status_line(&self.status),
+            ]
+            .spacing(10)
+            .align_x(iced::Alignment::Center),
+        )
+        .center_x(Length::Fill);
 
         // Two columns so everything fits in a landscape window without scrolling: the tall
         // Recording card on the left, the shorter Audio and Output cards stacked on the right.
