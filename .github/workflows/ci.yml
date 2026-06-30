@@ -24,7 +24,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libpipewire-0.3-dev clang libclang-dev libopus-dev
+            pkg-config libpipewire-0.3-dev clang libclang-dev libopus-dev libxkbcommon-dev
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -59,7 +59,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libpipewire-0.3-dev clang libclang-dev libopus-dev
+            pkg-config libpipewire-0.3-dev clang libclang-dev libopus-dev libxkbcommon-dev
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -80,5 +80,5 @@ jobs:
       - name: coverage gate
         run: |
           cargo llvm-cov --workspace --locked \
-            --ignore-filename-regex '(capture/src/linux/|gpu/src/|encode/src/gpu_video_backend\.rs|app/src/main\.rs|vendor/mp4/)' \
+            --ignore-filename-regex '(capture/src/linux/|gpu/src/|encode/src/gpu_video_backend\.rs|app/src/main\.rs|settings/src/|vendor/mp4/)' \
             --fail-under-lines 85 --summary-only
