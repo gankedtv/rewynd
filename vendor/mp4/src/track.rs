@@ -599,9 +599,9 @@ pub(crate) struct Mp4TrackWriter {
     samples_per_chunk: u32,
     duration_per_chunk: u32,
 
-    // Optional single-entry edit list (e.g. the Opus encoder pre-skip trim), attached to
-    // the track in `write_end`.
-    edit_list: Option<ElstEntry>,
+    // Optional edit list (e.g. an empty edit for an A/V start offset plus the Opus
+    // pre-skip trim), attached to the track in `write_end`. Empty = no edit list.
+    edit_list: Vec<ElstEntry>,
 }
 
 impl Mp4TrackWriter {
@@ -667,16 +667,20 @@ impl Mp4TrackWriter {
         })
     }
 
-    /// Attach a one-entry edit list, emitted on the track in `write_end`. `media_time` is in
-    /// this track's media timescale; `segment_duration` in the movie timescale. Used for the
-    /// Opus pre-skip trim. `media_rate` is fixed at 1.0 (normal playback).
-    pub(crate) fn set_edit_list(&mut self, media_time: u64, segment_duration: u64) {
-        self.edit_list = Some(ElstEntry {
-            segment_duration,
-            media_time,
-            media_rate: 1,
-            media_rate_fraction: 0,
-        });
+    /// Attach an edit list, emitted on the track in `write_end`. Each `(segment_duration,
+    /// media_time)`: `segment_duration` is in the movie timescale; `media_time` is in this
+    /// track's media timescale, or `-1` for an empty (blank) edit. `media_rate` is fixed at
+    /// 1.0 (normal playback). Used for the A/V start offset + Opus pre-skip trim.
+    pub(crate) fn set_edit_list(&mut self, edits: &[(u64, i64)]) {
+        self.edit_list = edits
+            .iter()
+            .map(|&(segment_duration, media_time)| ElstEntry {
+                segment_duration,
+                media_time: media_time as u64,
+                media_rate: 1,
+                media_rate_fraction: 0,
+            })
+            .collect();
     }
 
     fn update_sample_sizes(&mut self, size: u32) {
@@ -896,12 +900,12 @@ impl Mp4TrackWriter {
             self.trak.mdia.minf.stbl.co64 = None;
         }
 
-        if let Some(entry) = self.edit_list.take() {
+        if !self.edit_list.is_empty() {
             self.trak.edts = Some(EdtsBox {
                 elst: Some(ElstBox {
                     version: 0,
                     flags: 0,
-                    entries: vec![entry],
+                    entries: std::mem::take(&mut self.edit_list),
                 }),
             });
         }

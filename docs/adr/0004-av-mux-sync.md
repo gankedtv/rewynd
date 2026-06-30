@@ -39,13 +39,21 @@ support, and upstream (alfg/mp4-rust) is archived — there is nothing to upstre
    (not zeroed), keeping lip-sync. Video samples carry µs durations (timescale 1_000_000);
    audio samples carry their Opus frame length in 48 kHz ticks (track timescale 48000).
 
-4. **Opus pre-skip trim via an edit list (`elst`), now — not deferred.** `dOps.PreSkip` is
-   set to the encoder lookahead (queried, not hard-coded). For correct playback on *all*
-   players (including browsers/MSE, which ignore `PreSkip` and rely on `elst`), the audio
-   track also carries a one-entry edit list: `media_time = PreSkip` (track timescale),
-   `segment_duration = (total_samples − PreSkip)` converted to the movie timescale. ganked.tv
-   re-encodes uploads to AV1, but raw clips are played/shared directly, so standalone
-   correctness is the better default (user's call).
+4. **A/V sync + Opus pre-skip handled via an edit list (`elst`).** The audio track carries
+   an `elst` (when it does something): an empty edit (`media_time = -1`) for the audio's real
+   start offset from the clip base, followed by a trim edit at `media_time = PreSkip`
+   (`segment_duration` in the movie timescale). The edit-list machinery is correct on all
+   players including browsers/MSE (which rely on `elst` rather than `dOps.PreSkip`). We chose
+   to build it now rather than defer (user's call): ganked.tv re-encodes uploads to AV1, but
+   raw clips are played/shared directly, so standalone correctness is the better default.
+
+   **Mid-stream pre-skip = 0.** A clip is a *mid-stream* cut of a continuous Opus encode (the
+   ring holds encoded packets, like video), so the encoder startup priming is not present at
+   the clip's first packet — setting `PreSkip` to the encoder lookahead would make players
+   trim ~6.5 ms of *real* audio and shift sync. So the clip's `dOps.PreSkip` is **0** and the
+   trim edit is identity; the inherent constant ~6.5 ms encoder delay is well below the A/V
+   sync perceptibility threshold. The muxer still accepts a non-zero pre-skip (correct for a
+   hypothetical from-start stream); the app passes 0 for the mid-stream clip.
 
 ## Box layout (RFC 7845 §5, "Encapsulation of Opus in ISO-BMFF")
 

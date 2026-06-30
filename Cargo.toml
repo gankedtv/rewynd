@@ -45,6 +45,9 @@ drm-fourcc = "2"
 mp4 = { path = "vendor/mp4" }
 thiserror = "2"
 anyhow = "1"
+# Opus audio encoding (docs/adr/0004): safe bindings over libopus (BSD-3, GPL-3-compatible).
+# Links the system libopus via pkg-config (CI installs libopus-dev).
+opus = "0.3"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 pollster = "0.4"

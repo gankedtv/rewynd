@@ -82,6 +82,10 @@ mod gpu_video_backend;
 #[cfg(vulkan)]
 pub use gpu_video_backend::{GpuVideoEncoder, Nv12Converter};
 
+// Opus audio encoding is CPU-side and platform-agnostic (libopus), so it's unconditional.
+mod opus_audio;
+pub use opus_audio::{AudioEncodeError, AudioEncodeParams, OpusAudioEncoder};
+
 #[cfg(test)]
 mod tests {
     use super::*;

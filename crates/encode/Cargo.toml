@@ -13,6 +13,8 @@ wgpu.workspace = true
 thiserror.workspace = true
 rewynd-buffer.workspace = true
 rewynd-gpu.workspace = true
+# Opus audio encoding (docs/adr/0004). Codec work lives here; the muxer stays codec-agnostic.
+opus.workspace = true
 
 # gpu-video only builds where Vulkan exists (Windows + non-Apple unixes), matching the
 # crate's own target gating. macOS is out of scope (PLAN §3.6).

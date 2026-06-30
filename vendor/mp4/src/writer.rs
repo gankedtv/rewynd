@@ -92,15 +92,11 @@ impl<W: Write + Seek> Mp4Writer<W> {
         Ok(())
     }
 
-    /// Attach a one-entry edit list to a track (used for the Opus encoder pre-skip trim).
-    /// `media_time` is in the track's media timescale; `segment_duration` in the movie
-    /// timescale. Call after the track's samples are written and before [`Self::write_end`].
-    pub fn set_track_edit_list(
-        &mut self,
-        track_id: u32,
-        media_time: u64,
-        segment_duration: u64,
-    ) -> Result<()> {
+    /// Attach an edit list to a track (used for the A/V start offset + Opus pre-skip trim).
+    /// Each `(segment_duration, media_time)`: `segment_duration` is in the movie timescale;
+    /// `media_time` is in the track's media timescale, or `-1` for an empty (blank) edit.
+    /// Call after the track's samples are written and before [`Self::write_end`].
+    pub fn set_track_edit_list(&mut self, track_id: u32, edits: &[(u64, i64)]) -> Result<()> {
         if track_id == 0 {
             return Err(Error::TrakNotFound(track_id));
         }
@@ -108,7 +104,7 @@ impl<W: Write + Seek> Mp4Writer<W> {
             .tracks
             .get_mut(track_id as usize - 1)
             .ok_or(Error::TrakNotFound(track_id))?;
-        track.set_edit_list(media_time, segment_duration);
+        track.set_edit_list(edits);
         Ok(())
     }
 
