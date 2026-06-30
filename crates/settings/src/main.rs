@@ -106,6 +106,7 @@ impl fmt::Display for Resolution {
 enum Status {
     Editing,
     Saved,
+    Restarting,
     Restarted,
     Error(String),
 }
@@ -135,6 +136,7 @@ enum Message {
     AlwaysPrompt(bool),
     Save,
     Restart,
+    Restarted(Result<(), String>),
 }
 
 impl App {
@@ -230,7 +232,19 @@ impl App {
             }
             Message::Save => self.save(),
             Message::Restart => {
-                self.status = match restart_recorder() {
+                self.status = Status::Restarting;
+                // Off the UI thread: stop the old recorder, wait for it to exit, then relaunch.
+                return Task::perform(
+                    async {
+                        tokio::task::spawn_blocking(restart_recorder)
+                            .await
+                            .unwrap_or_else(|e| Err(e.to_string()))
+                    },
+                    Message::Restarted,
+                );
+            }
+            Message::Restarted(result) => {
+                self.status = match result {
                     Ok(()) => Status::Restarted,
                     Err(e) => Status::Error(e),
                 };
@@ -388,8 +402,9 @@ impl App {
                 .into(),
             status_line(&self.status),
         ];
-        // Offer a one-click restart once the file is saved, since changes only apply on restart.
-        if matches!(self.status, Status::Saved) {
+        // Offer a one-click restart once the file is saved (and let it retry after a failed one),
+        // since changes only apply on restart. Hidden while a restart is in flight.
+        if matches!(self.status, Status::Saved | Status::Error(_)) {
             save_items.push(
                 button(text("Restart rewynd now").size(14))
                     .on_press(Message::Restart)
@@ -510,6 +525,7 @@ fn status_line(status: &Status) -> Element<'_, Message> {
             "Saved. Restart rewynd to apply the changes.".to_owned(),
             palette::SUCCESS,
         ),
+        Status::Restarting => ("Restarting rewynd...".to_owned(), palette::MUTED),
         Status::Restarted => (
             "Restarted rewynd with the new settings.".to_owned(),
             palette::SUCCESS,
@@ -529,7 +545,8 @@ const RECORDER_BIN: &str = if cfg!(windows) {
     "rewynd"
 };
 
-/// Stop the running recorder (if any) and launch a fresh one so it re-reads the saved config.
+/// Stop the running recorder (if any), wait for it to exit, then launch a fresh one so it picks
+/// up the saved config. Blocking — runs on a `spawn_blocking` thread, not the UI thread.
 fn restart_recorder() -> Result<(), String> {
     stop_running_recorder();
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -543,8 +560,11 @@ fn restart_recorder() -> Result<(), String> {
         .map_err(|e| format!("could not start {}: {e}", recorder.display()))
 }
 
+/// SIGTERM the running recorder (if its pid is still a rewynd process) and wait for it to exit, so
+/// it has dropped the global hotkey and ScreenCast portal before the replacement starts.
 #[cfg(unix)]
 fn stop_running_recorder() {
+    use std::time::{Duration, Instant};
     let Ok(pid) = std::fs::read_to_string(config::recorder_pid_path()) else {
         return;
     };
@@ -553,11 +573,17 @@ fn stop_running_recorder() {
         return;
     }
     // Guard against a stale/reused pid: only signal it if it's still a rewynd process.
-    let is_recorder = std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .is_ok_and(|comm| comm.trim() == "rewynd");
-    if is_recorder {
-        // kill's default SIGTERM lets the recorder release the portal/hotkey before we relaunch.
-        let _ = std::process::Command::new("kill").arg(pid).status();
+    let proc_dir = std::path::PathBuf::from(format!("/proc/{pid}"));
+    let is_recorder =
+        std::fs::read_to_string(proc_dir.join("comm")).is_ok_and(|comm| comm.trim() == "rewynd");
+    if !is_recorder {
+        return;
+    }
+    let _ = std::process::Command::new("kill").arg(pid).status();
+    // The recorder releases the portal/hotkey as it dies; wait (bounded) for that before relaunch.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while proc_dir.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(30));
     }
 }
 

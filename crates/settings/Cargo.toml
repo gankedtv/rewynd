@@ -13,6 +13,8 @@ description = "rewynd settings: a small iced GUI to view and edit the config fil
 rewynd-config.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Runs the stop-and-relaunch off the UI thread (spawn_blocking) so the window never freezes.
+tokio.workspace = true
 
 # iced with the tiny-skia SOFTWARE renderer only (no wgpu): the workspace's wgpu-v29
 # [patch.crates-io] rewrite can't bite a tree with no wgpu, and a settings window doesn't need
