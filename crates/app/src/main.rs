@@ -174,28 +174,14 @@ mod linux {
         let fd = portal.take_fd();
         tracing::info!(node_id, "screencast portal established");
 
-        // Fill the ring buffer on its own thread: the PipeWire loop blocks, and the GPU
-        // pipeline lives there start to finish (so it also tears down there, in order).
-        // `stop` lets us end that loop and join the thread before returning, so the GPU
-        // tears down cleanly instead of racing process exit on the error path.
         let stop = Arc::new(AtomicBool::new(false));
-        let capture_buffer = buffer.clone();
-        let capture_stop = stop.clone();
-        let capture = std::thread::Builder::new()
-            .name("rewynd-capture".to_owned())
-            .spawn(move || {
-                if let Err(e) =
-                    run_capture(node_id, fd, params, epoch, capture_buffer, &capture_stop)
-                {
-                    tracing::error!(error = %e, "capture loop stopped");
-                }
-            })
-            .context("spawning the capture thread")?;
 
         // Audio runs on three threads: the system (sink-monitor) and microphone captures each
         // sum their PCM into the shared mixer; the mixer thread drains the aligned mix, Opus-
         // encodes it, and fills the audio ring. No portal — PipeWire connects directly. The
         // Opus encoder is built inside the mixer thread so it never crosses a thread boundary.
+        // These (and the mixer) are spawned BEFORE the GPU video thread so that a spawn
+        // failure here can't leave the video thread running and racing process exit.
         let system_audio = spawn_audio_capture(
             "rewynd-audio-system",
             AudioSource::SinkMonitor,
@@ -231,6 +217,23 @@ mod linux {
                 }
             })
             .context("spawning the audio mixer thread")?;
+
+        // Fill the video ring on its own thread: the PipeWire loop blocks, and the GPU
+        // pipeline lives there start to finish (so it also tears down there, in order).
+        // Spawned LAST — it's the only thread whose teardown must not race process exit, so
+        // nothing fallible runs after it; `stop` ends its loop and we join it before return.
+        let capture_buffer = buffer.clone();
+        let capture_stop = stop.clone();
+        let capture = std::thread::Builder::new()
+            .name("rewynd-capture".to_owned())
+            .spawn(move || {
+                if let Err(e) =
+                    run_capture(node_id, fd, params, epoch, capture_buffer, &capture_stop)
+                {
+                    tracing::error!(error = %e, "capture loop stopped");
+                }
+            })
+            .context("spawning the capture thread")?;
 
         // Dev aid: flush once after N seconds without a keypress, so the pipeline can be
         // exercised headlessly. The hotkey is the real trigger.
@@ -428,11 +431,9 @@ mod linux {
             };
             if let Some((pts, pcm)) = drained {
                 if let Err(e) = encoder.push(&pcm, pts, |chunk| push_packet(&buffer, chunk)) {
-                    tracing::error!(error = %e, "audio encode failed; stopping mixer");
-                    // Mid-stream this stops the mixer; while finalizing, still flush below.
-                    if !finalize {
-                        break;
-                    }
+                    // Drop this chunk but keep mixing: a transient encode error shouldn't kill
+                    // audio for the rest of the session (and would skip the shutdown flush).
+                    tracing::error!(error = %e, "audio encode failed; dropping this chunk");
                 }
             }
 
