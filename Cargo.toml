@@ -7,6 +7,7 @@ members = [
     "crates/buffer",
     "crates/mux",
     "crates/upload",
+    "crates/config",
     "crates/app",
 ]
 # Vendored third-party muxer fork (ADR 0004). It's a path dependency inside the workspace
@@ -30,6 +31,7 @@ rewynd-encode = { path = "crates/encode" }
 rewynd-buffer = { path = "crates/buffer" }
 rewynd-mux = { path = "crates/mux" }
 rewynd-upload = { path = "crates/upload" }
+rewynd-config = { path = "crates/config" }
 
 # GPU stack — pinned in lockstep per docs/adr/0001-wgpu-rev.md.
 # Both crates resolve to the SAME wgpu source so wgpu::Texture types unify across

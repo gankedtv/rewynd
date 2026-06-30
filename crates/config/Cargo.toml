@@ -1,0 +1,17 @@
+[package]
+name = "rewynd-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "rewynd runtime configuration: a TOML config file with environment overrides."
+
+# Deliberately light: no GPU/encode deps, so the settings app can depend on it without pulling
+# the wgpu/gpu-video stack. The app maps these plain settings onto rewynd-encode's param types.
+[dependencies]
+serde.workspace = true
+toml.workspace = true
+tracing.workspace = true
