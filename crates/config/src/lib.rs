@@ -32,10 +32,11 @@ const DEFAULT_CHANNELS: u32 = 2;
 const DEFAULT_AUDIO_BITRATE_BPS: u32 = 128_000;
 /// Default retention window in seconds (PLAN §2's 60 s, now configurable).
 const DEFAULT_BUFFER_SECONDS: u64 = 60;
-/// Upper bound on the retention window. The ring buffer holds encoded frames in memory, so an
-/// absurd value (a fat-fingered `seconds`) would grow it without limit; cap it to a generous
-/// hour rather than let a typo OOM the machine.
-const MAX_BUFFER_SECONDS: u64 = 3600;
+/// Upper bound on the retention window (four minutes). The ring buffer holds encoded frames in
+/// memory, so the window is capped: an instant-replay buffer this long is already generous, and a
+/// bound keeps a fat-fingered `seconds` from growing it without limit. The settings UI offers the
+/// same ceiling, so the slider and the daemon agree.
+pub const MAX_BUFFER_SECONDS: u64 = 240;
 /// Default preferred global-shortcut trigger; the compositor may rebind it.
 pub const DEFAULT_HOTKEY_TRIGGER: &str = "CTRL+ALT+R";
 
@@ -364,6 +365,14 @@ pub fn config_path() -> Option<PathBuf> {
     config_path_from(|k| std::env::var_os(k))
 }
 
+/// The default directory for saved clips when none is configured: the user's **Videos** folder
+/// (XDG user-dirs on Linux, the Known Folder on Windows). `None` if it can't be resolved, in
+/// which case the caller falls back (e.g. the temp dir).
+#[must_use]
+pub fn default_output_dir() -> Option<PathBuf> {
+    dirs::video_dir()
+}
+
 /// Read the config file at `path` (if any) and layer `REWYND_*` overrides via `get_env`. A
 /// missing or malformed file falls back to the built-in defaults (logging why). The testable
 /// core of [`load`].
@@ -610,6 +619,13 @@ mod tests {
             1600,
             "unparseable override ignored → file value"
         );
+    }
+
+    #[test]
+    fn default_output_dir_does_not_panic() {
+        // Thin wrapper over a platform call; just exercise it (the result is environment-specific
+        // and may be None on a headless box, which is a valid outcome).
+        let _ = default_output_dir();
     }
 
     #[test]
