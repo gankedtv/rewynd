@@ -89,9 +89,10 @@ impl Encoder for GpuVideoEncoder {
         force_keyframe: bool,
         pts: std::time::Duration,
     ) -> Result<EncodedChunk, EncodeError> {
-        // gpu-video takes the NV12 texture by value; the converter hands us a fresh
-        // texture each frame, but the trait borrows it, so clone the wgpu handle (a
-        // cheap ref-count bump, not a pixel copy).
+        // gpu-video takes the NV12 texture by value (it copies it into its own input
+        // image), but the trait borrows it, so clone the wgpu handle — a cheap ref-count
+        // bump, not a pixel copy. The converter reuses one texture across frames; the
+        // copy-in here is what makes that reuse safe.
         let chunk = self
             .inner
             .encode(
