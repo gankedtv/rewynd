@@ -26,10 +26,11 @@ mod linux {
     use futures_util::StreamExt;
     use rewynd_buffer::{AudioRingBuffer, EncodedChunk, RingBuffer};
     use rewynd_capture::linux::{
-        AudioParams, CapturedDmabuf, capture_stream, capture_system_audio, open_portal,
+        AudioParams, AudioSource, CapturedDmabuf, capture_audio, capture_stream, open_portal,
     };
     use rewynd_encode::{
-        AudioEncodeParams, EncodeParams, Encoder, GpuVideoEncoder, Nv12Converter, OpusAudioEncoder,
+        AudioEncodeParams, AudioMixer, EncodeParams, Encoder, GpuVideoEncoder, Nv12Converter,
+        OpusAudioEncoder,
     };
     use rewynd_gpu::{DmabufImport, GpuContext};
     use rewynd_mux::{AudioTrack, Mp4Muxer, Muxer};
@@ -46,8 +47,17 @@ mod linux {
 
     /// Shared, mutable ring buffer: the capture thread pushes, the hotkey handler cuts.
     type SharedBuffer = Arc<Mutex<RingBuffer>>;
-    /// Shared audio ring: the audio thread pushes Opus packets, the hotkey handler cuts.
+    /// Shared audio ring: the mixer thread pushes Opus packets, the hotkey handler cuts.
     type SharedAudioBuffer = Arc<Mutex<AudioRingBuffer>>;
+    /// Shared mixer: the system + mic capture threads sum into it, the mixer thread drains it.
+    type SharedMixer = Arc<Mutex<AudioMixer>>;
+
+    /// How far behind real time the mixer holds audio before encoding it, so the system and
+    /// mic streams have both contributed. Latency is irrelevant for a replay buffer; this
+    /// just absorbs the two streams' jitter.
+    const AUDIO_SETTLE: Duration = Duration::from_millis(120);
+    /// How often the mixer thread drains settled audio into the encoder.
+    const AUDIO_DRAIN_INTERVAL: Duration = Duration::from_millis(20);
 
     /// Audio encode parameters: 48 kHz stereo Opus (matching capture + Opus's native rate),
     /// with the bitrate overridable from the environment (`REWYND_AUDIO_BITRATE_BPS`).
@@ -127,9 +137,15 @@ mod linux {
         let buffer: SharedBuffer = Arc::new(Mutex::new(RingBuffer::new(BUFFER_WINDOW)));
         let audio_buffer: SharedAudioBuffer =
             Arc::new(Mutex::new(AudioRingBuffer::new(BUFFER_WINDOW)));
+        // The system + mic capture threads sum into this; the mixer thread drains + encodes it.
+        let mixer: SharedMixer = Arc::new(Mutex::new(AudioMixer::new(
+            audio_params.sample_rate,
+            audio_params.channels,
+            AUDIO_SETTLE,
+        )));
 
-        // One monotonic epoch shared by both capture threads, so the video and audio PTS
-        // are on the same clock and the muxer can align the tracks.
+        // One monotonic epoch shared by all capture threads, so the video, system-audio and
+        // mic PTS are on the same clock and the mixer/muxer can align them.
         let epoch = Instant::now();
 
         // ashpd's portals are async; reuse one runtime for ScreenCast setup and the
@@ -176,21 +192,42 @@ mod linux {
             })
             .context("spawning the capture thread")?;
 
-        // System audio on its own thread: capture the sink monitor, Opus-encode, push
-        // packets into the audio ring. No portal — PipeWire connects directly. The Opus
-        // encoder is built inside the thread so it never crosses a thread boundary.
-        let audio_capture_buffer = audio_buffer.clone();
-        let audio_stop = stop.clone();
-        let audio_capture = std::thread::Builder::new()
-            .name("rewynd-audio".to_owned())
+        // Audio runs on three threads: the system (sink-monitor) and microphone captures each
+        // sum their PCM into the shared mixer; the mixer thread drains the aligned mix, Opus-
+        // encodes it, and fills the audio ring. No portal — PipeWire connects directly. The
+        // Opus encoder is built inside the mixer thread so it never crosses a thread boundary.
+        let system_audio = spawn_audio_capture(
+            "rewynd-audio-system",
+            AudioSource::SinkMonitor,
+            audio_params,
+            mixer.clone(),
+            &stop,
+            epoch,
+        )?;
+        // The mic is optional: if there's no input device the capture errors and we carry on
+        // with system-only audio (the mixer simply never receives mic samples).
+        let mic_audio = spawn_audio_capture(
+            "rewynd-audio-mic",
+            AudioSource::Microphone,
+            audio_params,
+            mixer.clone(),
+            &stop,
+            epoch,
+        )?;
+
+        let mixer_buffer = audio_buffer.clone();
+        let mixer_mixer = mixer.clone();
+        let mixer_stop = stop.clone();
+        let audio_mixer = std::thread::Builder::new()
+            .name("rewynd-audio-mixer".to_owned())
             .spawn(move || {
                 if let Err(e) =
-                    run_audio_capture(epoch, audio_params, audio_capture_buffer, &audio_stop)
+                    run_audio_mixer(epoch, audio_params, mixer_mixer, mixer_buffer, &mixer_stop)
                 {
-                    tracing::error!(error = %e, "audio capture loop stopped");
+                    tracing::error!(error = %e, "audio mixer loop stopped");
                 }
             })
-            .context("spawning the audio capture thread")?;
+            .context("spawning the audio mixer thread")?;
 
         // Dev aid: flush once after N seconds without a keypress, so the pipeline can be
         // exercised headlessly. The hotkey is the real trigger.
@@ -224,11 +261,55 @@ mod linux {
         stop.store(true, Ordering::Relaxed);
         let _ = runtime.block_on(portal.close());
         let _ = capture.join();
-        // The audio loop observes `stop` on its next buffer (the sink monitor delivers
-        // continuously, including silence), so it quits promptly; join to drop libopus and
-        // the PipeWire stream cleanly rather than racing process exit.
-        let _ = audio_capture.join();
+        // The audio capture loops poll `stop` via their watchdog timers (so they quit even if
+        // a sink is suspended), and the mixer thread checks `stop` each tick; join all three
+        // to drop libopus and the PipeWire streams cleanly rather than racing process exit.
+        let _ = system_audio.join();
+        let _ = mic_audio.join();
+        let _ = audio_mixer.join();
         result
+    }
+
+    /// Spawn a thread that captures `source` and sums each buffer into the shared `mixer`,
+    /// aligned by its capture-relative PTS. A capture error (e.g. no microphone) is logged
+    /// and the thread exits — the mixer simply never sees that source.
+    fn spawn_audio_capture(
+        name: &str,
+        source: AudioSource,
+        audio_params: AudioEncodeParams,
+        mixer: SharedMixer,
+        stop: &Arc<AtomicBool>,
+        epoch: Instant,
+    ) -> Result<std::thread::JoinHandle<()>> {
+        let stop = stop.clone();
+        let capture_params = AudioParams {
+            sample_rate: audio_params.sample_rate,
+            channels: audio_params.channels,
+        };
+        std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || {
+                // No idle timeout (capture runs until shutdown); the stop flag drives the
+                // watchdog so the loop quits promptly even if the endpoint suspends.
+                let result = capture_audio(
+                    capture_params,
+                    source,
+                    None,
+                    Some(stop.clone()),
+                    epoch,
+                    move |pcm, pts| {
+                        mixer
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .add(pcm, pts);
+                        ControlFlow::Continue(())
+                    },
+                );
+                if let Err(e) = result {
+                    tracing::warn!(error = %e, ?source, "audio capture stopped (continuing without this source)");
+                }
+            })
+            .with_context(|| format!("spawning the {name} thread"))
     }
 
     /// Build the GPU pipeline and pump captured frames into `buffer` until the stream
@@ -292,46 +373,57 @@ mod linux {
         Ok(())
     }
 
-    /// Capture the system-audio sink monitor, Opus-encode it, and push packets into the
-    /// audio ring until `stop` is set (observed on the next buffer). The encoder is built
-    /// here so it stays on this thread; `epoch` matches the video capture's clock.
-    fn run_audio_capture(
+    /// Drain settled mixed audio from `mixer`, Opus-encode it, and push packets into the
+    /// audio ring until `stop` is set. The encoder is built here so it stays on this thread;
+    /// `epoch` matches the capture clock the mixer aligns against.
+    fn run_audio_mixer(
         epoch: Instant,
         audio_params: AudioEncodeParams,
+        mixer: SharedMixer,
         buffer: SharedAudioBuffer,
         stop: &Arc<AtomicBool>,
     ) -> Result<()> {
         let mut encoder = OpusAudioEncoder::new(audio_params)?;
-        let capture_params = AudioParams {
-            sample_rate: audio_params.sample_rate,
-            channels: audio_params.channels,
-        };
-        tracing::info!("audio pipeline ready; filling the audio ring");
+        tracing::info!("audio pipeline ready; mixing system + mic into the audio ring");
 
-        // No idle timeout (capture runs until shutdown), but hand the stop flag to the
-        // watchdog so the loop quits promptly even if the sink suspends and stops delivering
-        // buffers — the per-buffer check alone wouldn't fire then.
-        capture_system_audio(
-            capture_params,
-            None,
-            Some(stop.clone()),
-            epoch,
-            move |pcm, pts| {
-                let result = encoder.push(pcm, pts, |chunk| {
-                    // Recover from a poisoned lock instead of panicking: a panic here would
-                    // unwind across the PipeWire C callback boundary (undefined behaviour).
-                    buffer
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(chunk);
-                });
-                if let Err(e) = result {
-                    tracing::error!(error = %e, "audio encode failed; stopping audio capture");
-                    return ControlFlow::Break(());
+        let push_packet = |buffer: &SharedAudioBuffer, chunk| {
+            buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(chunk);
+        };
+
+        loop {
+            std::thread::sleep(AUDIO_DRAIN_INTERVAL);
+            let stopping = stop.load(Ordering::Relaxed);
+
+            // Drain under the mixer lock, encode outside it. On shutdown take the whole tail
+            // (ignoring the settle delay) so the last fraction of a second isn't lost.
+            let drained = {
+                let mut guard = mixer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if stopping {
+                    guard.drain_all()
+                } else {
+                    guard.drain_settled(epoch.elapsed())
                 }
-                ControlFlow::Continue(())
-            },
-        )?;
+            };
+            if let Some((pts, pcm)) = drained {
+                if let Err(e) = encoder.push(&pcm, pts, |chunk| push_packet(&buffer, chunk)) {
+                    tracing::error!(error = %e, "audio encode failed; stopping mixer");
+                    break;
+                }
+            }
+
+            if stopping {
+                // Flush the encoder's final sub-frame so the tail isn't dropped.
+                if let Err(e) = encoder.flush(|chunk| push_packet(&buffer, chunk)) {
+                    tracing::error!(error = %e, "audio flush failed");
+                }
+                break;
+            }
+        }
         Ok(())
     }
 

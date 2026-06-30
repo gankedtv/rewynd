@@ -86,6 +86,10 @@ pub use gpu_video_backend::{GpuVideoEncoder, Nv12Converter};
 mod opus_audio;
 pub use opus_audio::{AudioEncodeError, AudioEncodeParams, OpusAudioEncoder};
 
+// System + mic mixing — pure CPU logic, platform-agnostic.
+mod audio_mix;
+pub use audio_mix::AudioMixer;
+
 #[cfg(test)]
 mod tests {
     use super::*;

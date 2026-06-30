@@ -24,7 +24,7 @@ mod linux {
     use std::rc::Rc;
     use std::time::Duration;
 
-    use rewynd_capture::linux::{AudioParams, capture_system_audio};
+    use rewynd_capture::linux::{AudioParams, AudioSource, capture_audio};
 
     /// Default number of buffers to capture when `AUDIO_PROBE_BUFFERS` is unset.
     const DEFAULT_BUFFERS: u32 = 200;
@@ -63,8 +63,9 @@ mod linux {
         let overall_peak = Rc::new(Cell::new(0.0_f32));
         let nonfinite = Rc::new(Cell::new(0_u64));
 
-        capture_system_audio(
+        capture_audio(
             params,
+            AudioSource::SinkMonitor,
             Some(IDLE_TIMEOUT),
             None,
             std::time::Instant::now(),
