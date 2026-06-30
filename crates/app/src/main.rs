@@ -8,6 +8,9 @@
 //! Linux-only at runtime; the binary compiles elsewhere via a stub `main`.
 
 #[cfg(target_os = "linux")]
+mod tray;
+
+#[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
     linux::run()
 }
@@ -35,6 +38,8 @@ mod linux {
     };
 
     use rewynd_config::{self as config, AudioSettings, VideoSettings};
+
+    use crate::tray;
     use rewynd_gpu::{DmabufImport, GpuContext};
     use rewynd_mux::{AudioTrack, Mp4Muxer, Muxer};
 
@@ -241,6 +246,47 @@ mod linux {
             }
         }
 
+        // Tray icon + menu, on a background task of the same runtime (no GTK, no extra event
+        // loop). Menu clicks arrive as `TrayCmd`s; the hotkey loop below is left untouched.
+        {
+            let tray_buffer = buffer.clone();
+            let tray_audio = audio_buffer.clone();
+            let tray_output = output_dir.clone();
+            runtime.spawn(async move {
+                let (handle, mut rx) = match tray::spawn().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "tray unavailable; continuing without it");
+                        return;
+                    }
+                };
+                let _handle = handle; // dropping it would remove the icon
+                while let Some(cmd) = rx.recv().await {
+                    match cmd {
+                        tray::TrayCmd::SaveClip => {
+                            // The cut + mux is blocking; run it off the runtime worker, then toast.
+                            let (b, a, o) =
+                                (tray_buffer.clone(), tray_audio.clone(), tray_output.clone());
+                            let saved = tokio::task::spawn_blocking(move || {
+                                save_clip(&b, &a, params, audio_params, buffer_window, o.as_deref())
+                            })
+                            .await
+                            .ok()
+                            .flatten();
+                            if let Some(path) = saved {
+                                tray::clip_saved_toast(&path).await;
+                            }
+                        }
+                        tray::TrayCmd::OpenSettings => open_settings(),
+                        tray::TrayCmd::Quit => {
+                            tracing::info!("quit requested from the tray");
+                            std::process::exit(0);
+                        }
+                    }
+                }
+            });
+        }
+
         // Block on the hotkey loop until the shortcut session ends (or the process is
         // killed). The capture threads keep filling the buffers in the background.
         let result = runtime.block_on(run_hotkey_loop(
@@ -286,6 +332,19 @@ mod linux {
 
     fn remove_pid_file() {
         let _ = std::fs::remove_file(config::recorder_pid_path());
+    }
+
+    /// Launch the sibling settings binary (best-effort), for the tray's "Open settings".
+    fn open_settings() {
+        match std::env::current_exe() {
+            Ok(exe) => {
+                let settings = exe.with_file_name("rewynd-settings");
+                if let Err(e) = std::process::Command::new(&settings).spawn() {
+                    tracing::warn!(error = %e, path = %settings.display(), "could not open settings");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "could not locate the settings binary"),
+        }
     }
 
     /// Spawn a thread that captures `source`, applies `gain`, and sums each buffer into the
@@ -634,14 +693,16 @@ mod linux {
         while let Some(activation) = activated.next().await {
             tracing::info!(shortcut_id = activation.shortcut_id(), "shortcut activated");
             if activation.shortcut_id() == SHORTCUT_ID {
-                save_clip(
+                if let Some(path) = save_clip(
                     buffer,
                     audio_buffer,
                     params,
                     audio_params,
                     buffer_window,
                     output_dir,
-                );
+                ) {
+                    tray::clip_saved_toast(&path).await;
+                }
             }
         }
 
@@ -650,7 +711,8 @@ mod linux {
     }
 
     /// Cut the most recent `buffer_window` from both rings and write it to an MP4 under
-    /// `output_dir` (or the temp dir when `None`).
+    /// `output_dir` (or the temp dir when `None`). Returns the written path on success so the
+    /// caller can show a notification (the toast is async, so it can't fire from here).
     fn save_clip(
         buffer: &SharedBuffer,
         audio_buffer: &SharedAudioBuffer,
@@ -658,7 +720,7 @@ mod linux {
         audio_params: AudioEncodeParams,
         buffer_window: Duration,
         output_dir: Option<&Path>,
-    ) {
+    ) -> Option<PathBuf> {
         // Hold the lock only for the cut (which clones the clip's chunks), then release it
         // so the capture thread keeps filling the buffer while we write the file.
         let clip = buffer
@@ -669,7 +731,7 @@ mod linux {
             Ok(chunks) => chunks,
             Err(e) => {
                 tracing::warn!(error = %e, "nothing to save yet");
-                return;
+                return None;
             }
         };
 
@@ -714,8 +776,12 @@ mod linux {
                     span_s = span.as_secs_f64(),
                     "saved clip"
                 );
+                Some(path)
             }
-            Err(e) => tracing::error!(error = %e, path = %path.display(), "failed to write clip"),
+            Err(e) => {
+                tracing::error!(error = %e, path = %path.display(), "failed to write clip");
+                None
+            }
         }
     }
 

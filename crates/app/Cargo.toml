@@ -28,3 +28,8 @@ ashpd = { workspace = true, features = ["global_shortcuts"] }
 tokio.workspace = true
 pollster.workspace = true
 futures-util = "0.3"
+# Tray (StatusNotifierItem over D-Bus, no GTK — reuses our zbus stack) + desktop toast +
+# PNG decode for the tray icon. See docs/adr/0007.
+ksni = "0.3"
+notify-rust = "4"
+image = { version = "0.25", default-features = false, features = ["png"] }
