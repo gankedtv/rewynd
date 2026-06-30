@@ -30,7 +30,7 @@ mod linux {
     };
     use rewynd_encode::{
         AudioEncodeParams, AudioMixer, EncodeParams, Encoder, GpuVideoEncoder, Nv12Converter,
-        OpusAudioEncoder,
+        OpusAudioEncoder, center_mono_into,
     };
     use rewynd_gpu::{DmabufImport, GpuContext};
     use rewynd_mux::{AudioTrack, Mp4Muxer, Muxer};
@@ -295,9 +295,14 @@ mod linux {
             sample_rate: audio_params.sample_rate,
             channels: audio_params.channels,
         };
+        let channels = capture_params.channels as usize;
         std::thread::Builder::new()
             .name(name.to_owned())
             .spawn(move || {
+                // Centre the mic to mono before mixing (see `center_mono_into`) so a
+                // single-sided mic isn't stuck in one ear; system audio keeps its stereo image.
+                // The scratch buffer is reused across buffers so the hot path doesn't realloc.
+                let mut centered = Vec::new();
                 // No idle timeout (capture runs until shutdown); the stop flag drives the
                 // watchdog so the loop quits promptly even if the endpoint suspends.
                 let result = capture_audio(
@@ -307,10 +312,17 @@ mod linux {
                     Some(stop.clone()),
                     epoch,
                     move |pcm, pts| {
+                        let prepared = match source {
+                            AudioSource::Microphone => {
+                                center_mono_into(pcm, channels, &mut centered);
+                                centered.as_slice()
+                            }
+                            AudioSource::SinkMonitor => pcm,
+                        };
                         mixer
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .add(pcm, pts);
+                            .add(prepared, pts);
                         ControlFlow::Continue(())
                     },
                 );
