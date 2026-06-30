@@ -78,7 +78,8 @@ struct UserData<F> {
     fatal: Rc<RefCell<Option<String>>>,
     /// Clone of the main loop so a callback can `quit()`.
     main_loop: pw::main_loop::MainLoopRc,
-    /// When the stream started, so each buffer gets a monotonic capture-relative PTS.
+    /// The shared monotonic epoch each buffer's PTS is measured from — the same epoch the
+    /// video capture uses, so the muxer can align the two tracks.
     stream_start: Instant,
 }
 
@@ -139,12 +140,16 @@ fn decode_f32le(raw: &[u8], offset: usize, size: usize, out: &mut Vec<f32>) {
 /// pass a value comfortably larger than stream-startup latency. Continuous consumers that
 /// drive their own shutdown pass `None`.
 ///
+/// Each buffer's PTS is measured from `epoch`; pass the same epoch to the video capture so
+/// the two tracks share one clock and the muxer can align them.
+///
 /// Blocks (runs the PipeWire main loop) on the calling thread until the callback breaks,
 /// the stream errors, or the idle timeout fires. Returns `Ok(())` on a deliberate stop,
 /// otherwise a [`CaptureError::PipeWire`].
 pub fn capture_system_audio(
     params: AudioParams,
     idle_timeout: Option<Duration>,
+    epoch: Instant,
     on_samples: impl FnMut(&[f32], Duration) -> ControlFlow<()> + 'static,
 ) -> Result<(), CaptureError> {
     if params.sample_rate == 0 || params.channels == 0 {
@@ -187,7 +192,7 @@ pub fn capture_system_audio(
         success: success.clone(),
         fatal: fatal.clone(),
         main_loop: main_loop.clone(),
-        stream_start: Instant::now(),
+        stream_start: epoch,
     };
 
     let _listener = stream
@@ -432,6 +437,7 @@ mod tests {
                 channels: 2,
             },
             None,
+            Instant::now(),
             |_, _| ControlFlow::Break(()),
         )
         .expect_err("zero sample_rate must be rejected");
@@ -443,6 +449,7 @@ mod tests {
                 channels: 0,
             },
             None,
+            Instant::now(),
             |_, _| ControlFlow::Break(()),
         )
         .expect_err("zero channels must be rejected");

@@ -185,7 +185,8 @@ struct UserData<F> {
     success: Rc<Cell<bool>>,
     /// Clone of the main loop so a callback can `quit()`.
     main_loop: pw::main_loop::MainLoopRc,
-    /// When the stream started, so each frame gets a monotonic capture-relative PTS.
+    /// The shared monotonic epoch each frame's PTS is measured from. Passing one epoch to
+    /// both the video and audio capture lets the muxer align the two tracks.
     stream_start: Instant,
 }
 
@@ -393,6 +394,7 @@ fn run_stream<F>(
     node_id: u32,
     fd: OwnedFd,
     stream_name: &str,
+    epoch: Instant,
     on_usable: F,
     no_frame_error: &str,
 ) -> Result<(), CaptureError>
@@ -444,7 +446,7 @@ where
         on_usable,
         success: success.clone(),
         main_loop: main_loop.clone(),
-        stream_start: Instant::now(),
+        stream_start: epoch,
     };
 
     let _listener = stream
@@ -672,6 +674,8 @@ pub fn run_capture_probe(node_id: u32, fd: OwnedFd) -> Result<(), CaptureError> 
         node_id,
         fd,
         "rewynd-capture-probe",
+        // The probe logs frames; its PTS isn't muxed, so any epoch works.
+        Instant::now(),
         move |frame, _plane_fd| {
             tracing::info!(
                 fd = frame.fd,
@@ -743,6 +747,8 @@ pub fn capture_one_dmabuf(node_id: u32, fd: OwnedFd) -> Result<CapturedDmabuf, C
         node_id,
         fd,
         "rewynd-capture-import",
+        // A single-frame readback; its PTS isn't muxed, so any epoch works.
+        Instant::now(),
         {
             let captured = captured.clone();
             move |frame, plane_fd| {
@@ -784,12 +790,16 @@ pub fn capture_one_dmabuf(node_id: u32, fd: OwnedFd) -> Result<CapturedDmabuf, C
 /// [`ControlFlow::Continue`] to keep receiving frames or [`ControlFlow::Break`] to
 /// stop the loop (a successful, deliberate end).
 ///
+/// Each frame's PTS is measured from `epoch`; pass the same epoch to the audio capture so
+/// the two tracks share one clock and the muxer can align them.
+///
 /// Blocks (runs the PipeWire main loop) until `on_frame` breaks or the stream
 /// errors. Must be called on a thread that owns the `fd`; keep the portal
 /// `Session` (and any tokio runtime) alive for the whole call.
 pub fn capture_stream(
     node_id: u32,
     fd: OwnedFd,
+    epoch: Instant,
     mut on_frame: impl FnMut(CapturedDmabuf) -> ControlFlow<()> + 'static,
 ) -> Result<(), CaptureError> {
     // A failed dup inside the callback can only break the loop, which `run_stream`
@@ -800,6 +810,7 @@ pub fn capture_stream(
         node_id,
         fd,
         "rewynd-capture-stream",
+        epoch,
         {
             let dup_failed = dup_failed.clone();
             move |frame, plane_fd| match dup_captured_frame(frame, plane_fd) {

@@ -61,7 +61,7 @@ mod linux {
         let overall_peak = Rc::new(Cell::new(0.0_f32));
         let nonfinite = Rc::new(Cell::new(0_u64));
 
-        capture_system_audio(params, Some(IDLE_TIMEOUT), {
+        capture_system_audio(params, Some(IDLE_TIMEOUT), std::time::Instant::now(), {
             let buffers_seen = buffers_seen.clone();
             let total_frames = total_frames.clone();
             let overall_peak = overall_peak.clone();
