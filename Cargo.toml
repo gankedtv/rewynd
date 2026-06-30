@@ -9,6 +9,10 @@ members = [
     "crates/upload",
     "crates/app",
 ]
+# Vendored third-party muxer fork (ADR 0004). It's a path dependency inside the workspace
+# root, which would otherwise auto-include it as a member; exclude it so the clippy/fmt/
+# coverage gates skip the vendored source. It still builds as a path dep of rewynd-mux.
+exclude = ["vendor/mp4"]
 
 [workspace.package]
 version = "0.1.0"
@@ -35,8 +39,10 @@ gpu-video = { git = "https://github.com/software-mansion/smelter", rev = "4fff15
 
 # Shared third-party
 drm-fourcc = "2"
-# MP4 muxing (docs/adr/0002): pure-Rust ISO-BMFF writer; we feed AVCC samples + PTS.
-mp4 = "0.14"
+# MP4 muxing (docs/adr/0002, 0004): vendored fork of alfg/mp4-rust 0.14 extended with an
+# Opus audio track (vendor/mp4). Deliberately NOT a workspace member, so clippy/fmt/coverage
+# gates skip the vendored third-party source; we still build it as a path dep.
+mp4 = { path = "vendor/mp4" }
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
