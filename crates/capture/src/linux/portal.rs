@@ -130,12 +130,22 @@ fn save_token(token: &str) {
     }
 }
 
+/// Run the full portal handshake and return a live [`PortalSession`], reusing the saved
+/// restore token so the share dialog is skipped after the first run. See
+/// [`open_portal_with`] to force the picker.
+pub async fn open_portal() -> Result<PortalSession, CaptureError> {
+    open_portal_with(false).await
+}
+
 /// Run the full portal handshake and return a live [`PortalSession`].
 ///
 /// This awaits an interactive share-picker dialog on the first run (and whenever
 /// the saved restore token is rejected). Must be called inside a tokio runtime
 /// (ashpd uses the tokio reactor by default).
-pub async fn open_portal() -> Result<PortalSession, CaptureError> {
+///
+/// `force_picker` ignores any saved restore token so the monitor picker is shown again,
+/// letting the user select a different monitor; the new selection is persisted for next time.
+pub async fn open_portal_with(force_picker: bool) -> Result<PortalSession, CaptureError> {
     let proxy = Screencast::new()
         .await
         .map_err(|e| CaptureError::Portal(format!("connect to ScreenCast portal: {e}")))?;
@@ -145,8 +155,10 @@ pub async fn open_portal() -> Result<PortalSession, CaptureError> {
         .await
         .map_err(|e| CaptureError::Portal(format!("create_session: {e}")))?;
 
-    let saved_token = load_token();
-    if saved_token.is_some() {
+    let saved_token = if force_picker { None } else { load_token() };
+    if force_picker {
+        tracing::info!("forcing the share dialog (monitor re-selection requested)");
+    } else if saved_token.is_some() {
         tracing::info!("found saved restore token; the share dialog may be skipped");
     }
 

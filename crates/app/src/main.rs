@@ -7,6 +7,8 @@
 //!
 //! Linux-only at runtime; the binary compiles elsewhere via a stub `main`.
 
+mod config;
+
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
     linux::run()
@@ -16,6 +18,7 @@ fn main() -> anyhow::Result<()> {
 mod linux {
     use std::cell::RefCell;
     use std::ops::ControlFlow;
+    use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -26,24 +29,22 @@ mod linux {
     use futures_util::StreamExt;
     use rewynd_buffer::{AudioRingBuffer, EncodedChunk, RingBuffer};
     use rewynd_capture::linux::{
-        AudioParams, AudioSource, CapturedDmabuf, capture_audio, capture_stream, open_portal,
+        AudioParams, AudioSource, CapturedDmabuf, capture_audio, capture_stream, open_portal_with,
     };
     use rewynd_encode::{
         AudioEncodeParams, AudioMixer, EncodeParams, Encoder, GpuVideoEncoder, Nv12Converter,
-        OpusAudioEncoder, center_mono_into,
+        OpusAudioEncoder, apply_gain, center_mono_into,
     };
+
+    use crate::config;
     use rewynd_gpu::{DmabufImport, GpuContext};
     use rewynd_mux::{AudioTrack, Mp4Muxer, Muxer};
 
-    /// Buffer retention window for the MVP (PLAN §2). Configurable later.
-    const BUFFER_WINDOW: Duration = Duration::from_secs(60);
     /// Application id, registered with the portal so the GlobalShortcuts backend (e.g.
     /// KWin) can attribute and persist our shortcut. Unsandboxed apps must register one.
     const APP_ID: &str = "tv.ganked.rewynd";
     /// Stable id for our one shortcut; the compositor binds a trigger to it.
     const SHORTCUT_ID: &str = "save-clip";
-    /// Trigger we *prefer*; the user can rebind it in the desktop's shortcut settings.
-    const PREFERRED_TRIGGER: &str = "CTRL+ALT+R";
 
     /// Shared, mutable ring buffer: the capture thread pushes, the hotkey handler cuts.
     type SharedBuffer = Arc<Mutex<RingBuffer>>;
@@ -59,66 +60,16 @@ mod linux {
     /// How often the mixer thread drains settled audio into the encoder.
     const AUDIO_DRAIN_INTERVAL: Duration = Duration::from_millis(20);
 
-    /// Audio encode parameters: 48 kHz stereo Opus (matching capture + Opus's native rate),
-    /// with the bitrate overridable from the environment (`REWYND_AUDIO_BITRATE_BPS`).
-    fn audio_params_from_env() -> AudioEncodeParams {
-        audio_params_from(|key| std::env::var(key).ok())
-    }
-
-    /// Build [`AudioEncodeParams`] from a key→value lookup: the default with a positive
-    /// `REWYND_AUDIO_BITRATE_BPS` override applied. Split from the environment so it's testable.
-    fn audio_params_from(get: impl Fn(&str) -> Option<String>) -> AudioEncodeParams {
-        let mut params = AudioEncodeParams::default();
-        if let Some(v) = get("REWYND_AUDIO_BITRATE_BPS")
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|&v| v > 0)
-        {
-            params.bitrate_bps = v;
-        }
-        params
-    }
-
-    /// Encode parameters: the 1080p60 default, with each field overridable from the
-    /// environment (`REWYND_WIDTH` / `_HEIGHT` / `_FPS` / `_BITRATE_BPS` / `_IDR_PERIOD`).
-    fn encode_params_from_env() -> EncodeParams {
-        params_from(|key| std::env::var(key).ok())
-    }
-
-    /// Build [`EncodeParams`] from a key→value lookup: the 1080p60 default with any
-    /// positive `u32` overrides applied. Split out from the environment so it's testable.
-    fn params_from(get: impl Fn(&str) -> Option<String>) -> EncodeParams {
-        // Ignore unparseable or non-positive overrides: every field must be > 0 (the
-        // encoder rejects zero), so fall back to the default rather than fail at startup.
-        let u32_of = |key: &str| {
-            get(key)
-                .and_then(|v| v.parse::<u32>().ok())
-                .filter(|&v| v > 0)
-        };
-        let mut params = EncodeParams::default();
-        if let Some(v) = u32_of("REWYND_WIDTH") {
-            params.width = v;
-        }
-        if let Some(v) = u32_of("REWYND_HEIGHT") {
-            params.height = v;
-        }
-        if let Some(v) = u32_of("REWYND_FPS") {
-            params.framerate = v;
-        }
-        if let Some(v) = u32_of("REWYND_BITRATE_BPS") {
-            params.bitrate_bps = v;
-        }
-        if let Some(v) = u32_of("REWYND_IDR_PERIOD") {
-            params.idr_period = v;
-        }
-        params
-    }
-
     pub fn run() -> Result<()> {
         tracing_subscriber::fmt::init();
 
-        // Resolution / framerate / bitrate are parameters: the 1080p60 target is the
-        // default, overridable via the environment until there's a config file/CLI.
-        let params = encode_params_from_env();
+        // Settings come from the config file (written on first run) layered under the built-in
+        // defaults and over by `REWYND_*` env overrides (see `crate::config`).
+        config::ensure_default_file();
+        let config = config::load();
+
+        // Resolution / framerate / bitrate stay parameters (PLAN §9), sourced from the config.
+        let params = config.encode_params();
         tracing::info!(
             width = params.width,
             height = params.height,
@@ -127,16 +78,21 @@ mod linux {
             idr_period = params.idr_period,
             "encode parameters"
         );
-        let audio_params = audio_params_from_env();
+        let audio_params = config.audio_params();
+        let buffer_window = config.buffer_window();
+        let output_dir = config.output_dir();
         tracing::info!(
             sample_rate = audio_params.sample_rate,
             channels = audio_params.channels,
             bitrate_bps = audio_params.bitrate_bps,
-            "audio encode parameters"
+            mic_gain = config.mic_gain(),
+            system_gain = config.system_gain(),
+            buffer_s = buffer_window.as_secs(),
+            "audio + buffer parameters"
         );
-        let buffer: SharedBuffer = Arc::new(Mutex::new(RingBuffer::new(BUFFER_WINDOW)));
+        let buffer: SharedBuffer = Arc::new(Mutex::new(RingBuffer::new(buffer_window)));
         let audio_buffer: SharedAudioBuffer =
-            Arc::new(Mutex::new(AudioRingBuffer::new(BUFFER_WINDOW)));
+            Arc::new(Mutex::new(AudioRingBuffer::new(buffer_window)));
         // The system + mic capture threads sum into this; the mixer thread drains + encodes it.
         let mixer: SharedMixer = Arc::new(Mutex::new(AudioMixer::new(
             audio_params.sample_rate,
@@ -168,8 +124,9 @@ mod linux {
         runtime.block_on(ashpd::register_host_app(app_id))?;
 
         // ScreenCast portal: one share-picker dialog the first time, then a saved restore
-        // token. The fd moves to the capture thread; the session stays alive here.
-        let mut portal = runtime.block_on(open_portal())?;
+        // token. `always_prompt` re-shows the picker so a different monitor can be chosen.
+        // The fd moves to the capture thread; the session stays alive here.
+        let mut portal = runtime.block_on(open_portal_with(config.always_prompt()))?;
         let node_id = portal.node_id;
         let fd = portal.take_fd();
         tracing::info!(node_id, "screencast portal established");
@@ -186,6 +143,7 @@ mod linux {
             "rewynd-audio-system",
             AudioSource::SinkMonitor,
             audio_params,
+            config.system_gain(),
             mixer.clone(),
             &stop,
             epoch,
@@ -196,6 +154,7 @@ mod linux {
             "rewynd-audio-mic",
             AudioSource::Microphone,
             audio_params,
+            config.mic_gain(),
             mixer.clone(),
             &stop,
             epoch,
@@ -242,9 +201,17 @@ mod linux {
                 Ok(secs) => {
                     let buffer = buffer.clone();
                     let audio_buffer = audio_buffer.clone();
+                    let output_dir = output_dir.clone();
                     std::thread::spawn(move || {
                         std::thread::sleep(Duration::from_secs(secs));
-                        save_clip(&buffer, &audio_buffer, params, audio_params);
+                        save_clip(
+                            &buffer,
+                            &audio_buffer,
+                            params,
+                            audio_params,
+                            buffer_window,
+                            output_dir.as_deref(),
+                        );
                     });
                 }
                 Err(e) => tracing::warn!(value, error = %e, "ignoring invalid REWYND_FLUSH_AFTER"),
@@ -258,6 +225,9 @@ mod linux {
             &audio_buffer,
             params,
             audio_params,
+            buffer_window,
+            output_dir.as_deref(),
+            config.hotkey_trigger(),
         ));
 
         // Shut the capture loop down, then join it so the GPU pipeline tears down on its
@@ -278,14 +248,15 @@ mod linux {
         result
     }
 
-    /// Spawn a thread that captures `source` and sums each buffer into the shared `mixer`,
-    /// aligned by its capture-relative PTS. A capture error is logged at a severity matching
-    /// the source (a missing mic is benign; a failed system sink loses the primary audio) and
-    /// the thread exits — the mixer simply never sees that source.
+    /// Spawn a thread that captures `source`, applies `gain`, and sums each buffer into the
+    /// shared `mixer`, aligned by its capture-relative PTS. A capture error is logged at a
+    /// severity matching the source (a missing mic is benign; a failed system sink loses the
+    /// primary audio) and the thread exits — the mixer simply never sees that source.
     fn spawn_audio_capture(
         name: &str,
         source: AudioSource,
         audio_params: AudioEncodeParams,
+        gain: f32,
         mixer: SharedMixer,
         stop: &Arc<AtomicBool>,
         epoch: Instant,
@@ -299,10 +270,11 @@ mod linux {
         std::thread::Builder::new()
             .name(name.to_owned())
             .spawn(move || {
-                // Centre the mic to mono before mixing (see `center_mono_into`) so a
-                // single-sided mic isn't stuck in one ear; system audio keeps its stereo image.
-                // The scratch buffer is reused across buffers so the hot path doesn't realloc.
-                let mut centered = Vec::new();
+                // Per-source prep, reused across buffers so the hot path doesn't realloc: the
+                // mic is centred to mono (see `center_mono_into`) so a single-sided mic isn't
+                // stuck in one ear, system audio keeps its stereo image, and the configured
+                // gain is applied to each.
+                let mut prep = Vec::new();
                 // No idle timeout (capture runs until shutdown); the stop flag drives the
                 // watchdog so the loop quits promptly even if the endpoint suspends.
                 let result = capture_audio(
@@ -314,8 +286,18 @@ mod linux {
                     move |pcm, pts| {
                         let prepared = match source {
                             AudioSource::Microphone => {
-                                center_mono_into(pcm, channels, &mut centered);
-                                centered.as_slice()
+                                center_mono_into(pcm, channels, &mut prep);
+                                apply_gain(&mut prep, gain);
+                                prep.as_slice()
+                            }
+                            // Only copy to scale when the gain isn't (near) unity; the common
+                            // gain == 1.0 case passes the buffer through untouched. The predicate
+                            // matches `apply_gain`'s own no-op threshold.
+                            AudioSource::SinkMonitor if (gain - 1.0).abs() >= f32::EPSILON => {
+                                prep.clear();
+                                prep.extend_from_slice(pcm);
+                                apply_gain(&mut prep, gain);
+                                prep.as_slice()
                             }
                             AudioSource::SinkMonitor => pcm,
                         };
@@ -557,16 +539,20 @@ mod linux {
         audio_buffer: &SharedAudioBuffer,
         params: EncodeParams,
         audio_params: AudioEncodeParams,
+        buffer_window: Duration,
+        output_dir: Option<&Path>,
+        hotkey_trigger: &str,
     ) -> Result<()> {
         let shortcuts = GlobalShortcuts::new().await?;
         let session = shortcuts.create_session(Default::default()).await?;
         // Subscribe before binding so no early activation is missed.
         let mut activated = shortcuts.receive_activated().await?;
+        let save_description = format!("Save the last {} seconds", buffer_window.as_secs());
         let bound = shortcuts
             .bind_shortcuts(
                 &session,
-                &[NewShortcut::new(SHORTCUT_ID, "Save the last 60 seconds")
-                    .preferred_trigger(PREFERRED_TRIGGER)],
+                &[NewShortcut::new(SHORTCUT_ID, &save_description)
+                    .preferred_trigger(hotkey_trigger)],
                 None,
                 Default::default(),
             )
@@ -589,7 +575,8 @@ mod linux {
             .all(|s| s.trigger_description().is_empty());
         if needs_trigger && shortcuts.version() >= 2 {
             tracing::info!(
-                "no trigger bound yet — opening the shortcut configuration dialog; assign a key to \"Save the last 60 seconds\""
+                shortcut = %save_description,
+                "no trigger bound yet — opening the shortcut configuration dialog; assign a key to this shortcut"
             );
             if let Err(e) = shortcuts
                 .configure_shortcuts(&session, None, Default::default())
@@ -607,7 +594,14 @@ mod linux {
         while let Some(activation) = activated.next().await {
             tracing::info!(shortcut_id = activation.shortcut_id(), "shortcut activated");
             if activation.shortcut_id() == SHORTCUT_ID {
-                save_clip(buffer, audio_buffer, params, audio_params);
+                save_clip(
+                    buffer,
+                    audio_buffer,
+                    params,
+                    audio_params,
+                    buffer_window,
+                    output_dir,
+                );
             }
         }
 
@@ -615,19 +609,22 @@ mod linux {
         Ok(())
     }
 
-    /// Cut the most recent clip from both rings and write it to an MP4 on disk.
+    /// Cut the most recent `buffer_window` from both rings and write it to an MP4 under
+    /// `output_dir` (or the temp dir when `None`).
     fn save_clip(
         buffer: &SharedBuffer,
         audio_buffer: &SharedAudioBuffer,
         params: EncodeParams,
         audio_params: AudioEncodeParams,
+        buffer_window: Duration,
+        output_dir: Option<&Path>,
     ) {
         // Hold the lock only for the cut (which clones the clip's chunks), then release it
         // so the capture thread keeps filling the buffer while we write the file.
         let clip = buffer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .flush_last(BUFFER_WINDOW);
+            .flush_last(buffer_window);
         let chunks = match clip {
             Ok(chunks) => chunks,
             Err(e) => {
@@ -644,7 +641,7 @@ mod linux {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .flush_from(clip_base);
 
-        let path = clip_output_path();
+        let path = clip_output_path(output_dir);
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -682,16 +679,14 @@ mod linux {
         }
     }
 
-    /// Where to write a saved clip: `$REWYND_OUTPUT_DIR` (default: the temp dir) with a
+    /// Where to write a saved clip: `output_dir` (default: the temp dir) with a
     /// millisecond-stamped, per-process-sequenced name. The sequence number disambiguates
     /// two saves landing in the same millisecond (e.g. the dev-hook flush racing a hotkey
     /// press), which a bare timestamp would collide on.
-    fn clip_output_path() -> std::path::PathBuf {
+    fn clip_output_path(output_dir: Option<&Path>) -> PathBuf {
         use std::sync::atomic::AtomicU32;
         static SEQ: AtomicU32 = AtomicU32::new(0);
-        let dir = std::env::var_os("REWYND_OUTPUT_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
+        let dir = output_dir.map_or_else(std::env::temp_dir, Path::to_path_buf);
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis());
@@ -701,38 +696,7 @@ mod linux {
 
     #[cfg(test)]
     mod tests {
-        use super::{audio_params_from, desktop_exec_value, params_from};
-
-        #[test]
-        fn audio_params_from_applies_bitrate_and_falls_back() {
-            let p =
-                audio_params_from(|k| (k == "REWYND_AUDIO_BITRATE_BPS").then(|| "96000".into()));
-            assert_eq!(p.bitrate_bps, 96_000); // overridden
-            assert_eq!(p.sample_rate, 48_000); // default
-            assert_eq!(p.channels, 2); // default
-
-            // Zero and garbage are rejected → default 128 kbps.
-            let zero = audio_params_from(|_| Some("0".into()));
-            assert_eq!(zero.bitrate_bps, 128_000);
-            let garbage = audio_params_from(|_| Some("nope".into()));
-            assert_eq!(garbage.bitrate_bps, 128_000);
-        }
-
-        #[test]
-        fn params_from_applies_overrides_and_falls_back() {
-            let env = std::collections::HashMap::from([
-                ("REWYND_WIDTH", "1280"),
-                ("REWYND_FPS", "30"),
-                ("REWYND_HEIGHT", "0"),
-                ("REWYND_BITRATE_BPS", "not-a-number"),
-            ]);
-            let p = params_from(|k| env.get(k).map(|s| (*s).to_owned()));
-            assert_eq!(p.width, 1280); // overridden
-            assert_eq!(p.framerate, 30); // overridden
-            assert_eq!(p.height, 1080); // zero rejected → default
-            assert_eq!(p.bitrate_bps, 12_000_000); // unparseable → default
-            assert_eq!(p.idr_period, 60); // absent → default
-        }
+        use super::desktop_exec_value;
 
         #[test]
         fn exec_value_quotes_plain_and_spaced_paths() {

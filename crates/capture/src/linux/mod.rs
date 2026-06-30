@@ -34,7 +34,7 @@ pub use audio::{AudioParams, AudioSource, capture_audio};
 pub use pipewire_capture::{
     CapturedDmabuf, DmabufFrame, capture_one_dmabuf, capture_stream, run_capture_probe,
 };
-pub use portal::{PortalSession, open_portal};
+pub use portal::{PortalSession, open_portal, open_portal_with};
 pub use vulkan_modifiers::query_drm_format_modifiers;
 
 /// PipeWire/portal-backed frame source for Wayland (and X11 via the portal).
