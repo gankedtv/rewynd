@@ -32,11 +32,12 @@ const DEFAULT_CHANNELS: u32 = 2;
 const DEFAULT_AUDIO_BITRATE_BPS: u32 = 128_000;
 /// Default retention window in seconds. 30 s suits most clips; configurable up to the cap below.
 const DEFAULT_BUFFER_SECONDS: u64 = 30;
-/// Upper bound on the retention window (four minutes). The ring buffer holds encoded frames in
-/// memory, so the window is capped: an instant-replay buffer this long is already generous, and a
+/// Upper bound on the retention window (two minutes). The ring buffer holds encoded frames in
+/// memory, so the window is capped: two minutes is already a generous instant-replay buffer, and a
 /// bound keeps a fat-fingered `seconds` from growing it without limit. The settings UI offers the
-/// same ceiling, so the slider and the daemon agree.
-pub const MAX_BUFFER_SECONDS: u64 = 240;
+/// same ceiling, so the slider and the daemon agree (and the 30 s default sits about a quarter of
+/// the way along the slider).
+pub const MAX_BUFFER_SECONDS: u64 = 120;
 /// Default preferred global-shortcut trigger; the compositor may rebind it.
 pub const DEFAULT_HOTKEY_TRIGGER: &str = "CTRL+ALT+R";
 

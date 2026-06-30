@@ -47,7 +47,7 @@ const GAIN_MAX: f32 = 4.0;
 const BUFFER_MIN_S: u32 = 5;
 /// Slider ceiling for the replay length: the same cap the daemon enforces, so the slider and the
 /// recorder agree (no value the slider shows differently from what's used). At this ceiling the
-/// common ~60 s default sits about a quarter of the way along rather than pinned to the left.
+/// 30 s default sits about a quarter of the way along rather than pinned to the left.
 const BUFFER_MAX_S: u32 = config::MAX_BUFFER_SECONDS as u32;
 const BITRATE_MIN_MBPS: u32 = 1;
 const BITRATE_MAX_MBPS: u32 = 50;
