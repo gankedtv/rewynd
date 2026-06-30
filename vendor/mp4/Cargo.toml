@@ -1,0 +1,21 @@
+# Vendored fork of the `mp4` crate (alfg/mp4-rust) v0.14.0, MIT-licensed.
+# Upstream is archived/unmaintained; we vendor it in-tree so we can add an Opus
+# audio track (the `Opus` sample entry + `dOps` box) for rewynd's A/V mux. Kept as
+# close to upstream as possible — our additions live in src/mp4box/opus.rs plus
+# small wiring edits. Benches/criterion dropped; otherwise the source is upstream's.
+[package]
+edition = "2018"
+name = "mp4"
+version = "0.14.0"
+authors = ["Alf <alf.g.jr@gmail.com>"]
+description = "MP4 reader and writer library in Rust (vendored fork with Opus support)."
+license = "MIT"
+repository = "https://github.com/alfg/mp4-rust"
+
+[dependencies]
+byteorder = "1"
+bytes = "1.1.0"
+num-rational = { version = "0.4.0", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"

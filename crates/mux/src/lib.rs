@@ -10,12 +10,14 @@ use std::path::Path;
 use std::time::Duration;
 
 use mp4::{
-    AvcConfig, FourCC, MediaConfig, Mp4Config, Mp4Sample, Mp4Writer, TrackConfig, TrackType,
+    AvcConfig, FourCC, MediaConfig, Mp4Config, Mp4Sample, Mp4Writer, OpusConfig, TrackConfig,
+    TrackType,
 };
-use rewynd_buffer::EncodedChunk;
+use rewynd_buffer::{EncodedAudioChunk, EncodedChunk};
 use thiserror::Error;
 
-/// Microsecond timescale: capture PTS deltas are written exactly, with no fps rounding.
+/// Microsecond timescale for the movie + video track: capture PTS deltas are written
+/// exactly, with no fps rounding.
 const TIMESCALE: u32 = 1_000_000;
 /// H.264 `nal_unit_type` for a sequence parameter set.
 const NAL_SPS: u8 = 7;
@@ -49,6 +51,18 @@ pub trait Muxer {
     fn write_mp4(&mut self, chunks: &[EncodedChunk], path: &Path) -> Result<(), MuxError>;
 }
 
+/// The Opus audio side of an A/V clip, paired with [`Mp4Muxer::write_mp4_with_audio`].
+pub struct AudioTrack<'a> {
+    /// Encoded Opus packets, oldest-first, on the same capture clock as the video chunks.
+    pub chunks: &'a [EncodedAudioChunk],
+    /// Channel count (1 or 2).
+    pub channels: u8,
+    /// Sample rate (the track's media timescale); Opus capture is 48 kHz.
+    pub sample_rate: u32,
+    /// Encoder lookahead in samples — the `dOps` PreSkip and the trim `elst` `media_time`.
+    pub pre_skip: u16,
+}
+
 /// MP4 muxer (Annex-B → AVCC) for a single H.264 video track.
 #[derive(Debug, Clone, Copy)]
 pub struct Mp4Muxer {
@@ -72,9 +86,29 @@ impl Mp4Muxer {
     }
 }
 
-impl Muxer for Mp4Muxer {
-    fn write_mp4(&mut self, chunks: &[EncodedChunk], path: &Path) -> Result<(), MuxError> {
-        let first = chunks.first().ok_or(MuxError::NotKeyframeStart)?;
+impl Mp4Muxer {
+    /// Mux a video clip plus a synced Opus audio track into an MP4 at `path`.
+    ///
+    /// Both tracks rebase against the same clip base (the first video chunk's PTS), so the
+    /// audio keeps its real, small offset from the video start — preserving lip-sync. The
+    /// audio carries an edit list: an empty edit for that start offset, then a trim edit at
+    /// the encoder pre-skip so priming samples aren't presented.
+    pub fn write_mp4_with_audio(
+        &mut self,
+        video: &[EncodedChunk],
+        audio: &AudioTrack,
+        path: &Path,
+    ) -> Result<(), MuxError> {
+        self.write(video, Some(audio), path)
+    }
+
+    fn write(
+        &self,
+        video: &[EncodedChunk],
+        audio: Option<&AudioTrack>,
+        path: &Path,
+    ) -> Result<(), MuxError> {
+        let first = video.first().ok_or(MuxError::NotKeyframeStart)?;
         if !first.is_keyframe {
             return Err(MuxError::NotKeyframeStart);
         }
@@ -83,18 +117,26 @@ impl Muxer for Mp4Muxer {
         let sps = find_nal(&first.bytes, NAL_SPS).ok_or(MuxError::MissingParameterSets)?;
         let pps = find_nal(&first.bytes, NAL_PPS).ok_or(MuxError::MissingParameterSets)?;
 
+        // Only advertise an audio track / Opus brand when there's actually audio.
+        let has_audio = audio.is_some_and(|a| !a.chunks.is_empty());
+
+        let mut compatible_brands = vec![
+            FourCC::from(*b"isom"),
+            FourCC::from(*b"iso2"),
+            FourCC::from(*b"avc1"),
+            FourCC::from(*b"mp41"),
+        ];
+        if has_audio {
+            compatible_brands.push(FourCC::from(*b"Opus"));
+        }
+
         let file = std::fs::File::create(path)?;
         let mut writer = Mp4Writer::write_start(
             file,
             &Mp4Config {
                 major_brand: FourCC::from(*b"isom"),
                 minor_version: 512,
-                compatible_brands: vec![
-                    FourCC::from(*b"isom"),
-                    FourCC::from(*b"iso2"),
-                    FourCC::from(*b"avc1"),
-                    FourCC::from(*b"mp41"),
-                ],
+                compatible_brands,
                 timescale: TIMESCALE,
             },
         )?;
@@ -112,14 +154,14 @@ impl Muxer for Mp4Muxer {
         })?;
 
         let base = first.pts;
-        for (i, chunk) in chunks.iter().enumerate() {
+        for (i, chunk) in video.iter().enumerate() {
             let start = chunk.pts.saturating_sub(base);
             // Duration is the gap to the next frame; the last frame has no successor, so
             // reuse the previous gap, or fall back to one frame period for a single-frame
             // clip (so it stays visible rather than collapsing to ~0s).
-            let duration = match chunks.get(i + 1) {
+            let duration = match video.get(i + 1) {
                 Some(next) => next.pts.saturating_sub(chunk.pts),
-                None if i > 0 => chunk.pts.saturating_sub(chunks[i - 1].pts),
+                None if i > 0 => chunk.pts.saturating_sub(video[i - 1].pts),
                 None => Duration::from_nanos(1_000_000_000 / u64::from(self.framerate)),
             };
             writer.write_sample(
@@ -134,9 +176,86 @@ impl Muxer for Mp4Muxer {
             )?;
         }
 
+        if has_audio {
+            let audio = audio.expect("has_audio implies Some");
+            write_audio_track(&mut writer, audio, base)?;
+        }
+
         writer.write_end()?;
         Ok(())
     }
+}
+
+impl Muxer for Mp4Muxer {
+    fn write_mp4(&mut self, chunks: &[EncodedChunk], path: &Path) -> Result<(), MuxError> {
+        self.write(chunks, None, path)
+    }
+}
+
+/// Add the Opus audio track (track 2) and write its packets, synced to the clip `base`
+/// (the video's first PTS). Audio packets are contiguous in the track's 48 kHz timeline;
+/// an edit list carries the real start offset (an empty edit) and the encoder pre-skip
+/// trim, so the audio presents at the right moment with no priming click.
+fn write_audio_track<W: std::io::Write + std::io::Seek>(
+    writer: &mut Mp4Writer<W>,
+    audio: &AudioTrack,
+    base: Duration,
+) -> Result<(), MuxError> {
+    writer.add_track(&TrackConfig {
+        track_type: TrackType::Audio,
+        timescale: audio.sample_rate,
+        language: String::from("und"),
+        media_conf: MediaConfig::OpusConfig(OpusConfig {
+            channels: audio.channels,
+            sample_rate: audio.sample_rate,
+            pre_skip: audio.pre_skip,
+        }),
+    })?;
+
+    // Track 2 is the second `add_track`. Packets are written back-to-back: each sample's
+    // duration is its real Opus frame length (so the audio sample clock stays exact), and the
+    // cumulative durations form the timeline; `start_time` is informational (the writer uses
+    // only `duration`). This assumes contiguous capture — a mid-clip gap (a sink that
+    // suspends mid-session) would collapse, presenting later audio early. Continuous monitor
+    // capture doesn't produce such gaps; reconstructing one (silence fill / multi-edit elst)
+    // is a future refinement.
+    let mut cumulative: u64 = 0;
+    for chunk in audio.chunks {
+        writer.write_sample(
+            2,
+            &Mp4Sample {
+                start_time: cumulative,
+                duration: chunk.frames,
+                rendering_offset: 0,
+                is_sync: true,
+                bytes: chunk.bytes.clone().into(),
+            },
+        )?;
+        cumulative += u64::from(chunk.frames);
+    }
+
+    // Edit list (only when it does something): an empty edit for the audio's real offset
+    // from the clip base, then a trim edit at the encoder pre-skip. `segment_duration` is in
+    // the movie timescale, `media_time` in the audio (48 kHz) timescale; `media_time = -1`
+    // marks the empty edit. For a mid-stream clip `pre_skip` is 0 (the startup priming isn't
+    // present at the clip's first packet), so the trim is usually identity and we skip the
+    // whole list unless there's a real start offset to honour.
+    let offset = audio.chunks[0].pts.saturating_sub(base);
+    let offset_movie = offset.as_micros().min(u128::from(u64::MAX)) as u64;
+    let pre_skip = u64::from(audio.pre_skip).min(cumulative);
+
+    if offset_movie > 0 || pre_skip > 0 {
+        let trim_movie =
+            (cumulative - pre_skip) * u64::from(TIMESCALE) / u64::from(audio.sample_rate.max(1));
+        let mut edits: Vec<(u64, i64)> = Vec::new();
+        if offset_movie > 0 {
+            edits.push((offset_movie, -1));
+        }
+        edits.push((trim_movie, pre_skip as i64));
+        writer.set_track_edit_list(2, &edits)?;
+    }
+
+    Ok(())
 }
 
 /// Split an Annex-B buffer into NAL unit payloads, dropping the `00 00 01` start codes
@@ -347,6 +466,109 @@ mod tests {
         let sample = reader.read_sample(1, 1).unwrap().expect("one sample");
         // One frame at 60fps on a microsecond timescale ≈ 16_666 ticks, not ~0.
         assert_eq!(sample.duration, 1_000_000 / 60);
+    }
+
+    fn audio_chunk(pts_us: u64) -> EncodedAudioChunk {
+        EncodedAudioChunk {
+            // The container does not decode Opus, so arbitrary bytes round-trip fine.
+            bytes: vec![0xFC, 0xFF, 0xFE],
+            frames: 960,
+            pts: Duration::from_micros(pts_us),
+        }
+    }
+
+    #[test]
+    fn writes_a_two_track_av_mp4_with_opus() {
+        let sps = [0x67, 0x42, 0x00, 0x1f];
+        let pps = [0x68, 0xCE, 0x3c, 0x80];
+        let key = annexb(&[&sps, &pps, &[0x65, 0x88, 0x84]]);
+        let inter = annexb(&[&[0x41, 0x9a, 0x00]]);
+        let video = [
+            chunk(key, true, 1_000),
+            chunk(inter.clone(), false, 17_667),
+            chunk(inter, false, 34_334),
+        ];
+        // Audio starts ~9 ms after the clip base (1000 µs) — a real, preserved offset.
+        let audio_chunks = [
+            audio_chunk(10_000),
+            audio_chunk(30_000),
+            audio_chunk(50_000),
+        ];
+        let audio = AudioTrack {
+            chunks: &audio_chunks,
+            channels: 2,
+            sample_rate: 48_000,
+            pre_skip: 312,
+        };
+
+        let out = TempMp4::new();
+        Mp4Muxer::new(1920, 1080, 60)
+            .write_mp4_with_audio(&video, &audio, &out.0)
+            .expect("write_mp4_with_audio");
+
+        let file = std::fs::File::open(&out.0).unwrap();
+        let size = file.metadata().unwrap().len();
+        let reader = mp4::Mp4Reader::read_header(std::io::BufReader::new(file), size).unwrap();
+
+        assert_eq!(reader.tracks().len(), 2);
+        let video_track = reader.tracks().get(&1).expect("track 1");
+        assert_eq!(video_track.track_type().unwrap(), TrackType::Video);
+        assert_eq!(video_track.sample_count(), 3);
+
+        let audio_track = reader.tracks().get(&2).expect("track 2");
+        assert_eq!(audio_track.track_type().unwrap(), TrackType::Audio);
+        assert_eq!(audio_track.media_type().unwrap(), mp4::MediaType::OPUS);
+        assert_eq!(audio_track.sample_count(), 3);
+
+        // Byte-exact dOps guard, run in CI (the vendored crate's own tests aren't part of
+        // `cargo test --workspace`). 48 kHz / stereo / pre_skip=312, per RFC 7845 §5.1.
+        let bytes = std::fs::read(&out.0).unwrap();
+        let pos = bytes
+            .windows(4)
+            .position(|w| w == b"dOps")
+            .expect("dOps box present in the written file");
+        let dops = &bytes[pos - 4..pos - 4 + 19];
+        assert_eq!(
+            dops,
+            &[
+                0x00, 0x00, 0x00, 0x13, // box size = 19
+                b'd', b'O', b'p', b's', // 'dOps'
+                0x00, // version
+                0x02, // output channel count
+                0x01, 0x38, // pre_skip = 312
+                0x00, 0x00, 0xbb, 0x80, // input sample rate = 48000
+                0x00, 0x00, // output gain
+                0x00, // channel mapping family
+            ]
+        );
+    }
+
+    #[test]
+    fn av_writer_with_empty_audio_is_video_only() {
+        let sps = [0x67, 0x42, 0x00, 0x1f];
+        let pps = [0x68, 0xCE, 0x3c, 0x80];
+        let key = annexb(&[&sps, &pps, &[0x65, 0x88, 0x84]]);
+        let video = [chunk(key, true, 0)];
+        let audio = AudioTrack {
+            chunks: &[],
+            channels: 2,
+            sample_rate: 48_000,
+            pre_skip: 312,
+        };
+
+        let out = TempMp4::new();
+        Mp4Muxer::new(1920, 1080, 60)
+            .write_mp4_with_audio(&video, &audio, &out.0)
+            .expect("write_mp4_with_audio");
+
+        let file = std::fs::File::open(&out.0).unwrap();
+        let size = file.metadata().unwrap().len();
+        let reader = mp4::Mp4Reader::read_header(std::io::BufReader::new(file), size).unwrap();
+        assert_eq!(
+            reader.tracks().len(),
+            1,
+            "no audio track when chunks are empty"
+        );
     }
 
     #[test]

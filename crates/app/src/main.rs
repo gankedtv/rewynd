@@ -19,16 +19,20 @@ mod linux {
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use anyhow::{Context, Result, anyhow};
     use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
     use futures_util::StreamExt;
-    use rewynd_buffer::{EncodedChunk, RingBuffer};
-    use rewynd_capture::linux::{CapturedDmabuf, capture_stream, open_portal};
-    use rewynd_encode::{EncodeParams, Encoder, GpuVideoEncoder, Nv12Converter};
+    use rewynd_buffer::{AudioRingBuffer, EncodedChunk, RingBuffer};
+    use rewynd_capture::linux::{
+        AudioParams, CapturedDmabuf, capture_stream, capture_system_audio, open_portal,
+    };
+    use rewynd_encode::{
+        AudioEncodeParams, EncodeParams, Encoder, GpuVideoEncoder, Nv12Converter, OpusAudioEncoder,
+    };
     use rewynd_gpu::{DmabufImport, GpuContext};
-    use rewynd_mux::{Mp4Muxer, Muxer};
+    use rewynd_mux::{AudioTrack, Mp4Muxer, Muxer};
 
     /// Buffer retention window for the MVP (PLAN §2). Configurable later.
     const BUFFER_WINDOW: Duration = Duration::from_secs(60);
@@ -42,6 +46,27 @@ mod linux {
 
     /// Shared, mutable ring buffer: the capture thread pushes, the hotkey handler cuts.
     type SharedBuffer = Arc<Mutex<RingBuffer>>;
+    /// Shared audio ring: the audio thread pushes Opus packets, the hotkey handler cuts.
+    type SharedAudioBuffer = Arc<Mutex<AudioRingBuffer>>;
+
+    /// Audio encode parameters: 48 kHz stereo Opus (matching capture + Opus's native rate),
+    /// with the bitrate overridable from the environment (`REWYND_AUDIO_BITRATE_BPS`).
+    fn audio_params_from_env() -> AudioEncodeParams {
+        audio_params_from(|key| std::env::var(key).ok())
+    }
+
+    /// Build [`AudioEncodeParams`] from a key→value lookup: the default with a positive
+    /// `REWYND_AUDIO_BITRATE_BPS` override applied. Split from the environment so it's testable.
+    fn audio_params_from(get: impl Fn(&str) -> Option<String>) -> AudioEncodeParams {
+        let mut params = AudioEncodeParams::default();
+        if let Some(v) = get("REWYND_AUDIO_BITRATE_BPS")
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&v| v > 0)
+        {
+            params.bitrate_bps = v;
+        }
+        params
+    }
 
     /// Encode parameters: the 1080p60 default, with each field overridable from the
     /// environment (`REWYND_WIDTH` / `_HEIGHT` / `_FPS` / `_BITRATE_BPS` / `_IDR_PERIOD`).
@@ -92,7 +117,20 @@ mod linux {
             idr_period = params.idr_period,
             "encode parameters"
         );
+        let audio_params = audio_params_from_env();
+        tracing::info!(
+            sample_rate = audio_params.sample_rate,
+            channels = audio_params.channels,
+            bitrate_bps = audio_params.bitrate_bps,
+            "audio encode parameters"
+        );
         let buffer: SharedBuffer = Arc::new(Mutex::new(RingBuffer::new(BUFFER_WINDOW)));
+        let audio_buffer: SharedAudioBuffer =
+            Arc::new(Mutex::new(AudioRingBuffer::new(BUFFER_WINDOW)));
+
+        // One monotonic epoch shared by both capture threads, so the video and audio PTS
+        // are on the same clock and the muxer can align the tracks.
+        let epoch = Instant::now();
 
         // ashpd's portals are async; reuse one runtime for ScreenCast setup and the
         // GlobalShortcuts event loop. (capture runs on its own std thread.)
@@ -130,11 +168,29 @@ mod linux {
         let capture = std::thread::Builder::new()
             .name("rewynd-capture".to_owned())
             .spawn(move || {
-                if let Err(e) = run_capture(node_id, fd, params, capture_buffer, &capture_stop) {
+                if let Err(e) =
+                    run_capture(node_id, fd, params, epoch, capture_buffer, &capture_stop)
+                {
                     tracing::error!(error = %e, "capture loop stopped");
                 }
             })
             .context("spawning the capture thread")?;
+
+        // System audio on its own thread: capture the sink monitor, Opus-encode, push
+        // packets into the audio ring. No portal — PipeWire connects directly. The Opus
+        // encoder is built inside the thread so it never crosses a thread boundary.
+        let audio_capture_buffer = audio_buffer.clone();
+        let audio_stop = stop.clone();
+        let audio_capture = std::thread::Builder::new()
+            .name("rewynd-audio".to_owned())
+            .spawn(move || {
+                if let Err(e) =
+                    run_audio_capture(epoch, audio_params, audio_capture_buffer, &audio_stop)
+                {
+                    tracing::error!(error = %e, "audio capture loop stopped");
+                }
+            })
+            .context("spawning the audio capture thread")?;
 
         // Dev aid: flush once after N seconds without a keypress, so the pipeline can be
         // exercised headlessly. The hotkey is the real trigger.
@@ -142,9 +198,10 @@ mod linux {
             match value.parse::<u64>() {
                 Ok(secs) => {
                     let buffer = buffer.clone();
+                    let audio_buffer = audio_buffer.clone();
                     std::thread::spawn(move || {
                         std::thread::sleep(Duration::from_secs(secs));
-                        save_clip(&buffer, params);
+                        save_clip(&buffer, &audio_buffer, params, audio_params);
                     });
                 }
                 Err(e) => tracing::warn!(value, error = %e, "ignoring invalid REWYND_FLUSH_AFTER"),
@@ -152,8 +209,13 @@ mod linux {
         }
 
         // Block on the hotkey loop until the shortcut session ends (or the process is
-        // killed). The capture thread keeps filling the buffer in the background.
-        let result = runtime.block_on(run_hotkey_loop(&buffer, params));
+        // killed). The capture threads keep filling the buffers in the background.
+        let result = runtime.block_on(run_hotkey_loop(
+            &buffer,
+            &audio_buffer,
+            params,
+            audio_params,
+        ));
 
         // Shut the capture loop down, then join it so the GPU pipeline tears down on its
         // own thread rather than during process exit. The loop only observes `stop` when a
@@ -162,6 +224,10 @@ mod linux {
         stop.store(true, Ordering::Relaxed);
         let _ = runtime.block_on(portal.close());
         let _ = capture.join();
+        // The audio loop observes `stop` on its next buffer (the sink monitor delivers
+        // continuously, including silence), so it quits promptly; join to drop libopus and
+        // the PipeWire stream cleanly rather than racing process exit.
+        let _ = audio_capture.join();
         result
     }
 
@@ -172,6 +238,7 @@ mod linux {
         node_id: u32,
         fd: std::os::fd::OwnedFd,
         params: EncodeParams,
+        epoch: Instant,
         buffer: SharedBuffer,
         stop: &Arc<AtomicBool>,
     ) -> Result<()> {
@@ -180,7 +247,7 @@ mod linux {
         let enc = Rc::new(RefCell::new(GpuVideoEncoder::new(&gpu, params)?));
         tracing::info!("capture pipeline ready; filling the ring buffer");
 
-        capture_stream(node_id, fd, {
+        capture_stream(node_id, fd, epoch, {
             let gpu = gpu.clone();
             let conv = conv.clone();
             let enc = enc.clone();
@@ -202,7 +269,12 @@ mod linux {
                     Ok(chunk) => {
                         // The chunk carries the frame's real capture timestamp, so the
                         // window evicts by wall-clock time regardless of the capture rate.
-                        buffer.lock().expect("ring buffer mutex").push(chunk);
+                        // Recover from a poisoned lock rather than panicking across the
+                        // PipeWire C callback boundary (which would be undefined behaviour).
+                        buffer
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(chunk);
                         frame_index += 1;
                         ControlFlow::Continue(())
                     }
@@ -217,6 +289,49 @@ mod linux {
         drop(enc);
         drop(conv);
         drop(gpu);
+        Ok(())
+    }
+
+    /// Capture the system-audio sink monitor, Opus-encode it, and push packets into the
+    /// audio ring until `stop` is set (observed on the next buffer). The encoder is built
+    /// here so it stays on this thread; `epoch` matches the video capture's clock.
+    fn run_audio_capture(
+        epoch: Instant,
+        audio_params: AudioEncodeParams,
+        buffer: SharedAudioBuffer,
+        stop: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        let mut encoder = OpusAudioEncoder::new(audio_params)?;
+        let capture_params = AudioParams {
+            sample_rate: audio_params.sample_rate,
+            channels: audio_params.channels,
+        };
+        tracing::info!("audio pipeline ready; filling the audio ring");
+
+        // No idle timeout (capture runs until shutdown), but hand the stop flag to the
+        // watchdog so the loop quits promptly even if the sink suspends and stops delivering
+        // buffers — the per-buffer check alone wouldn't fire then.
+        capture_system_audio(
+            capture_params,
+            None,
+            Some(stop.clone()),
+            epoch,
+            move |pcm, pts| {
+                let result = encoder.push(pcm, pts, |chunk| {
+                    // Recover from a poisoned lock instead of panicking: a panic here would
+                    // unwind across the PipeWire C callback boundary (undefined behaviour).
+                    buffer
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(chunk);
+                });
+                if let Err(e) = result {
+                    tracing::error!(error = %e, "audio encode failed; stopping audio capture");
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            },
+        )?;
         Ok(())
     }
 
@@ -312,7 +427,12 @@ mod linux {
     }
 
     /// Register the global shortcut and flush a clip whenever it fires.
-    async fn run_hotkey_loop(buffer: &SharedBuffer, params: EncodeParams) -> Result<()> {
+    async fn run_hotkey_loop(
+        buffer: &SharedBuffer,
+        audio_buffer: &SharedAudioBuffer,
+        params: EncodeParams,
+        audio_params: AudioEncodeParams,
+    ) -> Result<()> {
         let shortcuts = GlobalShortcuts::new().await?;
         let session = shortcuts.create_session(Default::default()).await?;
         // Subscribe before binding so no early activation is missed.
@@ -362,7 +482,7 @@ mod linux {
         while let Some(activation) = activated.next().await {
             tracing::info!(shortcut_id = activation.shortcut_id(), "shortcut activated");
             if activation.shortcut_id() == SHORTCUT_ID {
-                save_clip(buffer, params);
+                save_clip(buffer, audio_buffer, params, audio_params);
             }
         }
 
@@ -370,13 +490,18 @@ mod linux {
         Ok(())
     }
 
-    /// Cut the most recent clip from the buffer and write it to an MP4 on disk.
-    fn save_clip(buffer: &SharedBuffer, params: EncodeParams) {
+    /// Cut the most recent clip from both rings and write it to an MP4 on disk.
+    fn save_clip(
+        buffer: &SharedBuffer,
+        audio_buffer: &SharedAudioBuffer,
+        params: EncodeParams,
+        audio_params: AudioEncodeParams,
+    ) {
         // Hold the lock only for the cut (which clones the clip's chunks), then release it
         // so the capture thread keeps filling the buffer while we write the file.
         let clip = buffer
             .lock()
-            .expect("ring buffer mutex")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .flush_last(BUFFER_WINDOW);
         let chunks = match clip {
             Ok(chunks) => chunks,
@@ -386,12 +511,35 @@ mod linux {
             }
         };
 
+        // The clip starts at its first (keyframe) chunk; take the audio from that instant on
+        // — both PTS share the capture epoch, so this keeps the tracks aligned.
+        let clip_base = chunks.first().map_or(Duration::ZERO, |c| c.pts);
+        let audio_chunks = audio_buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .flush_from(clip_base);
+
         let path = clip_output_path();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        match Mp4Muxer::new(params.width, params.height, params.framerate).write_mp4(&chunks, &path)
-        {
+
+        let mut muxer = Mp4Muxer::new(params.width, params.height, params.framerate);
+        let result = if audio_chunks.is_empty() {
+            muxer.write_mp4(&chunks, &path)
+        } else {
+            let audio = AudioTrack {
+                chunks: &audio_chunks,
+                channels: audio_params.channels as u8,
+                sample_rate: audio_params.sample_rate,
+                // Mid-stream cut: the encoder startup priming isn't present at the clip's
+                // first packet, so don't trim (ADR 0004).
+                pre_skip: 0,
+            };
+            muxer.write_mp4_with_audio(&chunks, &audio, &path)
+        };
+
+        match result {
             Ok(()) => {
                 let span = match (chunks.first(), chunks.last()) {
                     (Some(first), Some(last)) => last.pts.saturating_sub(first.pts),
@@ -400,6 +548,7 @@ mod linux {
                 tracing::info!(
                     path = %path.display(),
                     frames = chunks.len(),
+                    audio_packets = audio_chunks.len(),
                     span_s = span.as_secs_f64(),
                     "saved clip"
                 );
@@ -409,20 +558,40 @@ mod linux {
     }
 
     /// Where to write a saved clip: `$REWYND_OUTPUT_DIR` (default: the temp dir) with a
-    /// millisecond-stamped name so successive saves don't collide.
+    /// millisecond-stamped, per-process-sequenced name. The sequence number disambiguates
+    /// two saves landing in the same millisecond (e.g. the dev-hook flush racing a hotkey
+    /// press), which a bare timestamp would collide on.
     fn clip_output_path() -> std::path::PathBuf {
+        use std::sync::atomic::AtomicU32;
+        static SEQ: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::var_os("REWYND_OUTPUT_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis());
-        dir.join(format!("rewynd-{stamp}.mp4"))
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        dir.join(format!("rewynd-{stamp}-{seq}.mp4"))
     }
 
     #[cfg(test)]
     mod tests {
-        use super::{desktop_exec_value, params_from};
+        use super::{audio_params_from, desktop_exec_value, params_from};
+
+        #[test]
+        fn audio_params_from_applies_bitrate_and_falls_back() {
+            let p =
+                audio_params_from(|k| (k == "REWYND_AUDIO_BITRATE_BPS").then(|| "96000".into()));
+            assert_eq!(p.bitrate_bps, 96_000); // overridden
+            assert_eq!(p.sample_rate, 48_000); // default
+            assert_eq!(p.channels, 2); // default
+
+            // Zero and garbage are rejected → default 128 kbps.
+            let zero = audio_params_from(|_| Some("0".into()));
+            assert_eq!(zero.bitrate_bps, 128_000);
+            let garbage = audio_params_from(|_| Some("nope".into()));
+            assert_eq!(garbage.bitrate_bps, 128_000);
+        }
 
         #[test]
         fn params_from_applies_overrides_and_falls_back() {

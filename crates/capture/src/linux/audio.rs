@@ -15,6 +15,8 @@
 use std::cell::{Cell, RefCell};
 use std::ops::ControlFlow;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use pipewire as pw;
@@ -31,11 +33,9 @@ use crate::CaptureError;
 /// Bytes per interleaved sample. We always negotiate `F32LE`.
 const F32_BYTES: usize = std::mem::size_of::<f32>();
 
-/// Consecutive idle timer ticks (intervals with no buffer) before the idle timeout fires.
-/// Requiring two means stream startup/negotiation latency on a cold sink is absorbed by the
-/// first interval rather than being mistaken for a dead stream, at the cost of detection
-/// taking up to twice the configured window.
-const IDLE_TICKS_BEFORE_QUIT: u32 = 2;
+/// How often the watchdog timer fires to poll the cooperative `stop` flag and accumulate
+/// idle time. Short enough that shutdown is prompt even when the sink delivers no buffers.
+const WATCHDOG_POLL: Duration = Duration::from_millis(200);
 
 /// System-audio capture parameters.
 ///
@@ -78,7 +78,8 @@ struct UserData<F> {
     fatal: Rc<RefCell<Option<String>>>,
     /// Clone of the main loop so a callback can `quit()`.
     main_loop: pw::main_loop::MainLoopRc,
-    /// When the stream started, so each buffer gets a monotonic capture-relative PTS.
+    /// The shared monotonic epoch each buffer's PTS is measured from — the same epoch the
+    /// video capture uses, so the muxer can align the two tracks.
     stream_start: Instant,
 }
 
@@ -132,19 +133,29 @@ fn decode_f32le(raw: &[u8], offset: usize, size: usize, out: &mut Vec<f32>) {
 /// call; copy out anything that must outlive it. Keep the callback cheap — it runs on the
 /// PipeWire main loop, so heavy work there stalls capture.
 ///
-/// `idle_timeout`, when set, makes the call fail if no buffer arrives for a couple of
-/// consecutive windows — a default sink that goes idle can suspend and deliver nothing,
-/// which would otherwise block forever. It is a coarse watchdog (detection takes up to
-/// ~2× the window, so the first window absorbs startup latency), not a precise deadline;
-/// pass a value comfortably larger than stream-startup latency. Continuous consumers that
-/// drive their own shutdown pass `None`.
+/// `stop`, when set, is polled by a watchdog timer (every [`WATCHDOG_POLL`]) so the loop
+/// shuts down promptly even when the sink is suspended and delivers no buffers (the callback
+/// alone can't observe a stop request then). Continuous consumers (the app) pass a stop flag
+/// they raise on shutdown; one-shot consumers pass `None`.
+///
+/// `idle_timeout`, when set, makes the call fail if no buffer arrives within that window — a
+/// default sink that goes idle can suspend and deliver nothing, which would otherwise block
+/// a consumer that has no other stop signal. It is a coarse watchdog (resolution
+/// [`WATCHDOG_POLL`]), not a precise deadline; pass a value comfortably larger than
+/// stream-startup latency. Continuous consumers driving their own shutdown via `stop` pass
+/// `None` here.
+///
+/// Each buffer's PTS is measured from `epoch`; pass the same epoch to the video capture so
+/// the two tracks share one clock and the muxer can align them.
 ///
 /// Blocks (runs the PipeWire main loop) on the calling thread until the callback breaks,
-/// the stream errors, or the idle timeout fires. Returns `Ok(())` on a deliberate stop,
-/// otherwise a [`CaptureError::PipeWire`].
+/// `stop` is raised, the stream errors, or the idle timeout fires. Returns `Ok(())` on a
+/// deliberate stop, otherwise a [`CaptureError::PipeWire`].
 pub fn capture_system_audio(
     params: AudioParams,
     idle_timeout: Option<Duration>,
+    stop: Option<Arc<AtomicBool>>,
+    epoch: Instant,
     on_samples: impl FnMut(&[f32], Duration) -> ControlFlow<()> + 'static,
 ) -> Result<(), CaptureError> {
     if params.sample_rate == 0 || params.channels == 0 {
@@ -179,6 +190,9 @@ pub fn capture_system_audio(
 
     let live = Rc::new(Cell::new(false));
     let success = Rc::new(Cell::new(false));
+    // Set by the watchdog when `stop` is observed — a clean, requested shutdown (vs. the
+    // error/empty-run paths).
+    let stopped = Rc::new(Cell::new(false));
     let fatal: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let user_data = UserData {
         on_samples,
@@ -187,7 +201,7 @@ pub fn capture_system_audio(
         success: success.clone(),
         fatal: fatal.clone(),
         main_loop: main_loop.clone(),
-        stream_start: Instant::now(),
+        stream_start: epoch,
     };
 
     let _listener = stream
@@ -288,48 +302,57 @@ pub fn capture_system_audio(
         )
         .map_err(|e| CaptureError::PipeWire(format!("connect audio stream: {e}")))?;
 
-    // Arm the inactivity guard, if requested: each tick quits the loop unless a buffer
-    // arrived since the previous tick. Held alive (borrows the loop) until the fn returns.
-    let _timer = idle_timeout.map(|timeout| {
-        // The callback owns its own clones; `add_timer` borrows the outer `main_loop`
-        // (which outlives this timer), so the returned source can be held until return.
+    // Watchdog timer, armed when there's a `stop` to poll or an idle deadline to enforce.
+    // It fires every WATCHDOG_POLL so the loop can quit even when no buffers arrive (a
+    // suspended sink), which the per-buffer callback alone cannot do. Held alive (it borrows
+    // the loop) until the fn returns.
+    let _timer = if stop.is_some() || idle_timeout.is_some() {
+        // The callback owns its own clones; `add_timer` borrows the outer `main_loop` (which
+        // outlives this timer), so the returned source can be held until return.
         let live = live.clone();
         let fatal = fatal.clone();
+        let stopped = stopped.clone();
         let quit_loop = main_loop.clone();
-        // Owned by the closure: count of consecutive idle ticks (reset whenever a buffer
-        // arrived in the previous interval).
-        let idle_ticks = Cell::new(0_u32);
+        // Idle time accumulated across polls with no buffer; reset when one arrives.
+        let idle_elapsed = Cell::new(Duration::ZERO);
         let timer = main_loop.loop_().add_timer(move |_expirations| {
-            if live.replace(false) {
-                idle_ticks.set(0);
+            // Cooperative shutdown wins: a requested stop is a clean exit.
+            if stop.as_ref().is_some_and(|s| s.load(Ordering::Relaxed)) {
+                stopped.set(true);
+                quit_loop.quit();
                 return;
             }
-            let ticks = idle_ticks.get() + 1;
-            idle_ticks.set(ticks);
-            if ticks >= IDLE_TICKS_BEFORE_QUIT {
+            let Some(limit) = idle_timeout else { return };
+            if live.replace(false) {
+                idle_elapsed.set(Duration::ZERO);
+                return;
+            }
+            let elapsed = idle_elapsed.get() + WATCHDOG_POLL;
+            idle_elapsed.set(elapsed);
+            if elapsed >= limit {
                 set_first_fatal(
                     &fatal,
-                    format!(
-                        "no audio buffers for {ticks}×{timeout:?} (is the default sink active?)"
-                    ),
+                    format!("no audio buffers within {limit:?} (is the default sink active?)"),
                 );
                 quit_loop.quit();
             }
         });
         if let Err(e) = timer
-            .update_timer(Some(timeout), Some(timeout))
+            .update_timer(Some(WATCHDOG_POLL), Some(WATCHDOG_POLL))
             .into_result()
         {
-            tracing::warn!(error = %e, "failed to arm audio idle-timeout timer; won't auto-stop");
+            tracing::warn!(error = %e, "failed to arm the audio watchdog timer; won't auto-stop");
         }
-        timer
-    });
+        Some(timer)
+    } else {
+        None
+    };
 
     tracing::info!("audio stream connected; entering main loop");
     main_loop.run();
     tracing::info!("audio main loop exited");
 
-    if success.get() {
+    if success.get() || stopped.get() {
         Ok(())
     } else if let Some(msg) = fatal.borrow_mut().take() {
         Err(CaptureError::PipeWire(msg))
@@ -432,6 +455,8 @@ mod tests {
                 channels: 2,
             },
             None,
+            None,
+            Instant::now(),
             |_, _| ControlFlow::Break(()),
         )
         .expect_err("zero sample_rate must be rejected");
@@ -443,6 +468,8 @@ mod tests {
                 channels: 0,
             },
             None,
+            None,
+            Instant::now(),
             |_, _| ControlFlow::Break(()),
         )
         .expect_err("zero channels must be rejected");

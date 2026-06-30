@@ -85,7 +85,7 @@ mod linux {
         let cpu_start = read_self_cpu_seconds();
         let wall_start = Instant::now();
 
-        capture_stream(portal.node_id, portal.take_fd(), {
+        capture_stream(portal.node_id, portal.take_fd(), wall_start, {
             // The whole hot path runs inline on the PipeWire process thread — import +
             // convert + encode + file write all happen before the next frame is dequeued.
             let stats = stats.clone();

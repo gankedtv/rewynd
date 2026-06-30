@@ -111,6 +111,85 @@ impl RingBuffer {
     }
 }
 
+/// A single encoded Opus packet: the audio encoder's output and the audio ring's unit.
+#[derive(Debug, Clone)]
+pub struct EncodedAudioChunk {
+    /// One bare Opus packet (no framing/length prefix).
+    pub bytes: Vec<u8>,
+    /// Samples per channel the packet decodes to — its duration in 48 kHz audio samples.
+    pub frames: u32,
+    /// Capture-relative PTS of the packet's first sample, on the *same* monotonic clock as
+    /// [`EncodedChunk::pts`], so the audio and video tracks align.
+    pub pts: Duration,
+}
+
+/// A time-bounded ring of encoded audio packets, parallel to [`RingBuffer`].
+///
+/// Opus packets have no keyframe concept — any packet is a valid clip start — so the cut is
+/// a plain time window ([`flush_from`](AudioRingBuffer::flush_from)) rather than the
+/// keyframe-aware cut the video ring needs.
+#[derive(Debug)]
+pub struct AudioRingBuffer {
+    window: Duration,
+    chunks: VecDeque<EncodedAudioChunk>,
+}
+
+impl AudioRingBuffer {
+    /// Create a buffer that retains roughly `window` of audio.
+    #[must_use]
+    pub fn new(window: Duration) -> Self {
+        Self {
+            window,
+            chunks: VecDeque::new(),
+        }
+    }
+
+    /// Append a freshly encoded packet, evicting any packet older than `window` relative to
+    /// the newest one (same eviction policy as [`RingBuffer::push`]).
+    pub fn push(&mut self, chunk: EncodedAudioChunk) {
+        let newest = chunk.pts;
+        self.chunks.push_back(chunk);
+        while let Some(front) = self.chunks.front() {
+            if newest.saturating_sub(front.pts) > self.window {
+                self.chunks.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Return every retained packet whose PTS is at or after `start`, oldest-first — the
+    /// audio covering a clip whose video begins at `start`. Filtering on `pts >= start`
+    /// keeps the audio track's rebased start non-negative and preserves the small real
+    /// offset between the clip start and the first audio packet (so lip-sync is kept).
+    #[must_use]
+    pub fn flush_from(&self, start: Duration) -> Vec<EncodedAudioChunk> {
+        self.chunks
+            .iter()
+            .filter(|c| c.pts >= start)
+            .cloned()
+            .collect()
+    }
+
+    /// Number of buffered packets.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Whether the buffer holds no packets.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    /// The retention window this buffer was created with.
+    #[must_use]
+    pub fn window(&self) -> Duration {
+        self.window
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +299,46 @@ mod tests {
             BufferError::NoKeyframe(Duration::from_secs(5)).to_string(),
             "no keyframe within the requested 5s window"
         );
+    }
+
+    fn audio(secs: u64) -> EncodedAudioChunk {
+        EncodedAudioChunk {
+            bytes: vec![0; 8],
+            frames: 960,
+            pts: Duration::from_secs(secs),
+        }
+    }
+
+    #[test]
+    fn audio_ring_evicts_packets_older_than_window() {
+        let mut buf = AudioRingBuffer::new(Duration::from_secs(60));
+        assert!(buf.is_empty());
+        assert_eq!(buf.window(), Duration::from_secs(60));
+        for s in 0..130 {
+            buf.push(audio(s));
+        }
+        // Newest pts is 129s; packets more than 60s older (pts < 69s) are evicted,
+        // leaving pts 69..=129 inclusive.
+        assert_eq!(buf.len(), 61);
+    }
+
+    #[test]
+    fn audio_flush_from_returns_packets_at_or_after_start() {
+        let mut buf = AudioRingBuffer::new(Duration::from_secs(60));
+        for s in 0..=10 {
+            buf.push(audio(s));
+        }
+        let clip = buf.flush_from(Duration::from_secs(4));
+        let secs: Vec<u64> = clip.iter().map(|c| c.pts.as_secs()).collect();
+        assert_eq!(secs, vec![4, 5, 6, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn audio_flush_from_future_start_is_empty() {
+        let mut buf = AudioRingBuffer::new(Duration::from_secs(60));
+        for s in 0..=5 {
+            buf.push(audio(s));
+        }
+        assert!(buf.flush_from(Duration::from_secs(10)).is_empty());
     }
 }
