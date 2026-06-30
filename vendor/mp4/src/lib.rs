@@ -1,3 +1,7 @@
+// Vendored third-party crate (alfg/mp4-rust 0.14): silence upstream's lint noise so a plain
+// `cargo build` of the workspace stays quiet. Our additions live in `mp4box/opus.rs`.
+#![allow(mismatched_lifetime_syntaxes)]
+
 //! `mp4` is a Rust library to read and write ISO-MP4 files.
 //!
 //! This package contains MPEG-4 specifications defined in parts:
