@@ -2608,6 +2608,7 @@ dependencies = [
  "iced",
  "rewynd-config",
  "rfd",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

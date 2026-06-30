@@ -374,6 +374,21 @@ pub fn default_output_dir() -> Option<PathBuf> {
     dirs::video_dir()
 }
 
+/// Path to the recorder's pid file. The recorder writes its pid here on start; the settings app
+/// reads it to stop the running recorder before relaunching it.
+#[must_use]
+pub fn recorder_pid_path() -> PathBuf {
+    recorder_pid_path_from(std::env::var_os("XDG_RUNTIME_DIR"), std::env::temp_dir())
+}
+
+fn recorder_pid_path_from(runtime_dir: Option<OsString>, temp: PathBuf) -> PathBuf {
+    let base = runtime_dir
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or(temp);
+    base.join("rewynd").join("recorder.pid")
+}
+
 /// Read the config file at `path` (if any) and layer `REWYND_*` overrides via `get_env`. A
 /// missing or malformed file falls back to the built-in defaults (logging why). The testable
 /// core of [`load`].
@@ -620,6 +635,17 @@ mod tests {
             1600,
             "unparseable override ignored → file value"
         );
+    }
+
+    #[test]
+    fn recorder_pid_path_prefers_runtime_dir() {
+        let rt = recorder_pid_path_from(Some(OsString::from("/run/u")), PathBuf::from("/tmp"));
+        assert_eq!(rt, PathBuf::from("/run/u/rewynd/recorder.pid"));
+        // Unset or relative runtime dir falls back to the temp dir.
+        let fb = recorder_pid_path_from(None, PathBuf::from("/tmp"));
+        assert_eq!(fb, PathBuf::from("/tmp/rewynd/recorder.pid"));
+        let rel = recorder_pid_path_from(Some(OsString::from("rel")), PathBuf::from("/tmp"));
+        assert_eq!(rel, PathBuf::from("/tmp/rewynd/recorder.pid"));
     }
 
     #[test]
