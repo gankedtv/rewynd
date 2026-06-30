@@ -374,19 +374,127 @@ pub fn default_output_dir() -> Option<PathBuf> {
     dirs::video_dir()
 }
 
-/// Path to the recorder's pid file. The recorder writes its pid here on start; the settings app
-/// reads it to stop the running recorder before relaunching it.
-#[must_use]
-pub fn recorder_pid_path() -> PathBuf {
-    recorder_pid_path_from(std::env::var_os("XDG_RUNTIME_DIR"), std::env::temp_dir())
+/// Per-user runtime directory for rewynd's pid/lock files: `$XDG_RUNTIME_DIR/rewynd`, falling
+/// back to a uid-scoped dir under the temp dir when the runtime dir is unset or relative (so the
+/// guard stays per-user rather than machine-wide on a shared, world-writable `/tmp`).
+fn instance_dir_from(runtime_dir: Option<OsString>, temp: PathBuf) -> PathBuf {
+    if let Some(base) = runtime_dir.map(PathBuf::from).filter(|p| p.is_absolute()) {
+        return base.join("rewynd");
+    }
+    #[cfg(unix)]
+    let name = {
+        // SAFETY: `geteuid` is infallible and takes no arguments.
+        let uid = unsafe { libc::geteuid() };
+        format!("rewynd-{uid}")
+    };
+    #[cfg(not(unix))]
+    let name = "rewynd".to_owned();
+    temp.join(name)
 }
 
-fn recorder_pid_path_from(runtime_dir: Option<OsString>, temp: PathBuf) -> PathBuf {
-    let base = runtime_dir
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .unwrap_or(temp);
-    base.join("rewynd").join("recorder.pid")
+/// [`instance_dir_from`] resolved against the process environment.
+fn instance_dir() -> PathBuf {
+    instance_dir_from(std::env::var_os("XDG_RUNTIME_DIR"), std::env::temp_dir())
+}
+
+/// Path to the recorder's pid file. The recorder locks it (single-instance guard) and writes its
+/// pid here on start; the settings app reads it to stop the running recorder before relaunching.
+#[must_use]
+pub fn recorder_pid_path() -> PathBuf {
+    instance_dir().join("recorder.pid")
+}
+
+/// Path to the settings app's single-instance lock file.
+#[must_use]
+pub fn settings_lock_path() -> PathBuf {
+    instance_dir().join("settings.lock")
+}
+
+/// A held single-instance lock (advisory `flock`). Keep it alive for the whole run: dropping it,
+/// or the process exiting/crashing, releases the lock so the next instance can start. The kernel
+/// drops the lock on process death, so there is no stale-lock to clean up.
+#[cfg(unix)]
+#[must_use = "the single-instance lock releases as soon as this guard is dropped"]
+pub struct InstanceLock {
+    _file: std::fs::File,
+}
+
+/// Open `path` and take a non-blocking exclusive advisory lock. `Ok(None)` means another process
+/// already holds it; the file is created if absent (its contents are left untouched on lock failure).
+#[cfg(unix)]
+fn lock_file(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::fd::AsRawFd;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        // Don't truncate on open: a failed lock must leave the holder's pid intact. We truncate
+        // only after the lock is ours (in `acquire_pid_lock_at`).
+        .truncate(false)
+        .open(path)?;
+    loop {
+        // SAFETY: FFI call; `file` owns a valid open fd for the duration of the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(file));
+        }
+        let err = std::io::Error::last_os_error();
+        match err.kind() {
+            // LOCK_NB returns EWOULDBLOCK when another process holds the lock — not an error.
+            std::io::ErrorKind::WouldBlock => return Ok(None),
+            // A signal interrupted the call before it took effect; retry rather than treat the
+            // lock as free (which would let a second instance through).
+            std::io::ErrorKind::Interrupted => continue,
+            _ => return Err(err),
+        }
+    }
+}
+
+/// Take the lock at `path` and (re)write our pid into it, so a peer can find this process.
+#[cfg(unix)]
+fn acquire_pid_lock_at(path: &Path) -> std::io::Result<Option<InstanceLock>> {
+    use std::io::Write;
+    let Some(mut file) = lock_file(path)? else {
+        return Ok(None);
+    };
+    // Newline-framed and written before truncating: a concurrent unlocked reader never sees an
+    // empty file, and by taking the first line it gets a clean pid even if a longer previous pid
+    // briefly leaves a tail; the truncate then drops that tail.
+    let line = format!("{}\n", std::process::id());
+    file.write_all(line.as_bytes())?;
+    file.set_len(line.len() as u64)?;
+    Ok(Some(InstanceLock { _file: file }))
+}
+
+/// Acquire the recorder's single-instance lock (on [`recorder_pid_path`]), writing our pid for the
+/// settings app's restart path. `Ok(None)` means another live recorder already holds it.
+#[cfg(unix)]
+pub fn acquire_recorder_lock() -> std::io::Result<Option<InstanceLock>> {
+    acquire_pid_lock_at(&recorder_pid_path())
+}
+
+/// Acquire the settings app's single-instance lock (on [`settings_lock_path`]). `Ok(None)` means a
+/// settings window is already open.
+#[cfg(unix)]
+pub fn acquire_settings_lock() -> std::io::Result<Option<InstanceLock>> {
+    Ok(lock_file(&settings_lock_path())?.map(|file| InstanceLock { _file: file }))
+}
+
+// No `flock` off unix yet, so the guard is a no-op there (a Windows named-mutex equivalent lands
+// with Windows parity). Stubs keep the public API total so callers need no `#[cfg]`.
+#[cfg(not(unix))]
+pub struct InstanceLock;
+
+#[cfg(not(unix))]
+pub fn acquire_recorder_lock() -> std::io::Result<Option<InstanceLock>> {
+    Ok(Some(InstanceLock))
+}
+
+#[cfg(not(unix))]
+pub fn acquire_settings_lock() -> std::io::Result<Option<InstanceLock>> {
+    Ok(Some(InstanceLock))
 }
 
 /// Read the config file at `path` (if any) and layer `REWYND_*` overrides via `get_env`. A
@@ -638,14 +746,76 @@ mod tests {
     }
 
     #[test]
-    fn recorder_pid_path_prefers_runtime_dir() {
-        let rt = recorder_pid_path_from(Some(OsString::from("/run/u")), PathBuf::from("/tmp"));
-        assert_eq!(rt, PathBuf::from("/run/u/rewynd/recorder.pid"));
-        // Unset or relative runtime dir falls back to the temp dir.
-        let fb = recorder_pid_path_from(None, PathBuf::from("/tmp"));
-        assert_eq!(fb, PathBuf::from("/tmp/rewynd/recorder.pid"));
-        let rel = recorder_pid_path_from(Some(OsString::from("rel")), PathBuf::from("/tmp"));
-        assert_eq!(rel, PathBuf::from("/tmp/rewynd/recorder.pid"));
+    fn instance_dir_prefers_runtime_dir() {
+        let rt = instance_dir_from(Some(OsString::from("/run/u")), PathBuf::from("/tmp"));
+        assert_eq!(rt, PathBuf::from("/run/u/rewynd"));
+        // Unset or relative runtime dir falls back under the temp dir, scoped per user on unix.
+        #[cfg(unix)]
+        let expected = {
+            // SAFETY: `geteuid` is infallible and takes no arguments.
+            let uid = unsafe { libc::geteuid() };
+            PathBuf::from(format!("/tmp/rewynd-{uid}"))
+        };
+        #[cfg(not(unix))]
+        let expected = PathBuf::from("/tmp/rewynd");
+        assert_eq!(instance_dir_from(None, PathBuf::from("/tmp")), expected);
+        assert_eq!(
+            instance_dir_from(Some(OsString::from("rel")), PathBuf::from("/tmp")),
+            expected
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instance_lock_is_exclusive_and_releases_on_drop() {
+        let path = unique_tmp_path();
+        let first = lock_file(&path).expect("io ok").expect("first acquires");
+        assert!(
+            lock_file(&path).expect("io ok").is_none(),
+            "a second lock on the same file is refused"
+        );
+        drop(first);
+        assert!(
+            lock_file(&path).expect("io ok").is_some(),
+            "the lock is free once the first holder drops it"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_lock_writes_the_current_pid_and_is_exclusive() {
+        let path = unique_tmp_path();
+        let lock = acquire_pid_lock_at(&path)
+            .expect("io ok")
+            .expect("acquires");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read pid"),
+            format!("{}\n", std::process::id())
+        );
+        assert!(
+            acquire_pid_lock_at(&path).expect("io ok").is_none(),
+            "a peer is refused while the lock is held"
+        );
+        drop(lock);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_lock_overwrites_a_longer_stale_pid() {
+        let path = unique_tmp_path();
+        // A leftover pid longer than ours must be fully replaced, not left with a trailing tail.
+        std::fs::write(&path, "9999999999999").expect("seed stale pid");
+        let lock = acquire_pid_lock_at(&path)
+            .expect("io ok")
+            .expect("acquires");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read pid"),
+            format!("{}\n", std::process::id())
+        );
+        drop(lock);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

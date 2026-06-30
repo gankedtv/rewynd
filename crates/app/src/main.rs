@@ -93,8 +93,23 @@ mod linux {
         config::ensure_default_file();
         let config = config::load();
 
-        // Publish our pid so the settings app can restart us to apply a config change.
-        write_pid_file();
+        // Single-instance guard: hold the recorder lock (which also publishes our pid for the
+        // settings app's restart). Two recorders would mean two ScreenCast sessions and two
+        // shortcut bindings fighting each other, so a second launch bows out here. The lock is
+        // held in `_instance` for the rest of `run` and released when the process exits.
+        let _instance = match config::acquire_recorder_lock() {
+            Ok(Some(lock)) => Some(lock),
+            Ok(None) => {
+                tracing::error!("another rewynd recorder is already running; exiting");
+                return Ok(());
+            }
+            // A lock-file IO error is near-impossible at startup; if it happens we still record
+            // (degraded: no guard and no pid for the settings restart) rather than refuse to run.
+            Err(e) => {
+                tracing::warn!(error = %e, "could not acquire the recorder lock; starting without one");
+                None
+            }
+        };
 
         // Resolution / framerate / bitrate stay parameters (PLAN §9), sourced from the config.
         let params = encode_params(config.video());
@@ -314,24 +329,10 @@ mod linux {
         let _ = mic_audio.join();
         captures_done.store(true, Ordering::Relaxed);
         let _ = audio_mixer.join();
-        remove_pid_file();
+        // The pid file isn't removed on exit: the kernel releases the `flock` when the process
+        // dies, and unlinking it would race a relock by an incoming instance. A leftover pid is
+        // harmless — the settings app verifies it against `/proc` before signalling it.
         result
-    }
-
-    /// Write our pid to `config::recorder_pid_path()` (best-effort) so the settings app can find
-    /// and restart this recorder.
-    fn write_pid_file() {
-        let path = config::recorder_pid_path();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Err(e) = std::fs::write(&path, std::process::id().to_string()) {
-            tracing::warn!(error = %e, path = %path.display(), "could not write pid file");
-        }
-    }
-
-    fn remove_pid_file() {
-        let _ = std::fs::remove_file(config::recorder_pid_path());
     }
 
     /// Launch the sibling settings binary (best-effort), for the tray's "Open settings".

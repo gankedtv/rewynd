@@ -48,6 +48,21 @@ const BITS_PER_MBIT: u32 = 1_000_000;
 
 fn main() -> iced::Result {
     tracing_subscriber::fmt::init();
+
+    // Single-instance guard: a second window edits the same file, where its save clobbers the
+    // first's. Held until `run` returns; the kernel releases it when the process exits.
+    let _instance: Option<config::InstanceLock> = match config::acquire_settings_lock() {
+        Ok(Some(lock)) => Some(lock),
+        Ok(None) => {
+            tracing::info!("rewynd settings is already open; not opening a second window");
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not acquire the settings lock; opening anyway");
+            None
+        }
+    };
+
     iced::application(App::load, App::update, App::view)
         .title("rewynd settings")
         .theme(App::theme)
@@ -564,27 +579,72 @@ fn restart_recorder() -> Result<(), String> {
 /// it has dropped the global hotkey and ScreenCast portal before the replacement starts.
 #[cfg(unix)]
 fn stop_running_recorder() {
-    use std::time::{Duration, Instant};
-    let Ok(pid) = std::fs::read_to_string(config::recorder_pid_path()) else {
+    use std::time::Duration;
+    let Ok(contents) = std::fs::read_to_string(config::recorder_pid_path()) else {
         return;
     };
-    let pid = pid.trim();
+    // The pid file is newline-framed; the first line is a clean pid even mid-rewrite.
+    let pid = contents.lines().next().unwrap_or("").trim();
     if pid.is_empty() {
         return;
     }
-    // Guard against a stale/reused pid: only signal it if it's still a rewynd process.
-    let proc_dir = std::path::PathBuf::from(format!("/proc/{pid}"));
-    let is_recorder =
-        std::fs::read_to_string(proc_dir.join("comm")).is_ok_and(|comm| comm.trim() == "rewynd");
-    if !is_recorder {
+    // Guard against a stale/reused pid: only signal it if it's still a rewynd process, and pin its
+    // start-time identity so a pid reused mid-shutdown can't be mistaken for it (and SIGKILLed).
+    if !std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim() == "rewynd") {
         return;
     }
+    let identity = proc_start_time(pid);
     let _ = std::process::Command::new("kill").arg(pid).status();
-    // The recorder releases the portal/hotkey as it dies; wait (bounded) for that before relaunch.
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while proc_dir.exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(30));
+    // The recorder releases the portal/hotkey (and the single-instance lock) as it dies; wait
+    // (bounded) for that before relaunch.
+    if wait_for_exit(pid, &identity, Duration::from_secs(3)) {
+        return;
     }
+    // It outlived SIGTERM and is still the same process — escalate so the replacement isn't
+    // refused by the lock the old process still holds.
+    let _ = std::process::Command::new("kill")
+        .arg("-KILL")
+        .arg(pid)
+        .status();
+    wait_for_exit(pid, &identity, Duration::from_secs(2));
+}
+
+/// `/proc/<pid>/stat` field 22 (start time in clock ticks): with the pid, a stable identity that
+/// distinguishes the original process from a reused pid. `None` if unreadable.
+#[cfg(unix)]
+fn proc_start_time(pid: &str) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm (field 2) is parenthesised and may itself contain spaces/parens, so resume after the
+    // last ')': the remaining tokens start at field 3, putting start time at index 19.
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)
+        .map(str::to_owned)
+}
+
+/// Whether the original recorder (pid + start-time identity) is still running.
+#[cfg(unix)]
+fn still_running(pid: &str, identity: &Option<String>) -> bool {
+    match identity {
+        Some(start) => proc_start_time(pid).as_deref() == Some(start),
+        // No identity captured: fall back to bare pid existence.
+        None => std::path::Path::new(&format!("/proc/{pid}")).exists(),
+    }
+}
+
+/// Poll until the original recorder has exited (or its pid was reused) or the timeout elapses.
+#[cfg(unix)]
+fn wait_for_exit(pid: &str, identity: &Option<String>, timeout: std::time::Duration) -> bool {
+    use std::time::Instant;
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !still_running(pid, identity) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    !still_running(pid, identity)
 }
 
 #[cfg(not(unix))]
