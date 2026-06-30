@@ -299,10 +299,9 @@ mod linux {
         std::thread::Builder::new()
             .name(name.to_owned())
             .spawn(move || {
-                // The mic is collapsed to centered mono before mixing (a single-channel mic on
-                // a multi-channel device lands on one channel and would play from one speaker);
-                // system audio keeps its true stereo image. Reused across buffers so the hot
-                // path doesn't reallocate.
+                // Centre the mic to mono before mixing (see `center_mono_into`) so a
+                // single-sided mic isn't stuck in one ear; system audio keeps its stereo image.
+                // The scratch buffer is reused across buffers so the hot path doesn't realloc.
                 let mut centered = Vec::new();
                 // No idle timeout (capture runs until shutdown); the stop flag drives the
                 // watchdog so the loop quits promptly even if the endpoint suspends.

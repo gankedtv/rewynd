@@ -31,14 +31,18 @@ const MAX_BUFFERED: Duration = Duration::from_secs(5);
 /// Collapse an interleaved multi-channel buffer to *centered mono*, writing the result (same
 /// frame count and channel width) into `out` (cleared first).
 ///
-/// Each frame's channels are **summed** into one value placed on every output channel. A mono
-/// source wired to a single channel of a multi-channel capture device — e.g. an XLR mic on
-/// input 1 of a 2-in interface, which arrives on the left channel with the right silent —
-/// otherwise plays from one speaker; centering puts it in front. Summing (rather than
-/// averaging) keeps that single-channel case at its original level; a source carrying
-/// correlated signal on several channels can exceed full scale, but [`AudioMixer`] clamps on
-/// drain and per-source gain is a future refinement. Whole frames only: a trailing partial
-/// frame is dropped, matching [`AudioMixer::add`]. A `channels <= 1` buffer is copied verbatim.
+/// Each frame's channels are **summed** into one value placed on every output channel, so a
+/// microphone plays from the centre instead of one side. The two ways a mic reaches a stereo
+/// capture both end up centred:
+/// - **One channel carries signal, the other is silent** — e.g. an XLR mic on input 1 of a
+///   2-in interface. Summing recovers the signal at its original level (`L + 0 = L`).
+/// - **The signal is duplicated on every channel** — what PipeWire's upmix does to a true
+///   mono device. Summing doubles it (`L + L = 2L`, +6 dB); [`AudioMixer`] clamps on drain so
+///   it can't overflow, and per-source gain (a future refinement) is where to trim it.
+///
+/// Summing is chosen over averaging because it keeps the silent-other-channel case at unity
+/// instead of halving it. Whole frames only: a trailing partial frame is dropped, matching
+/// [`AudioMixer::add`]. A `channels <= 1` buffer is copied verbatim.
 pub fn center_mono_into(pcm: &[f32], channels: usize, out: &mut Vec<f32>) {
     out.clear();
     let channels = channels.max(1);
@@ -49,9 +53,7 @@ pub fn center_mono_into(pcm: &[f32], channels: usize, out: &mut Vec<f32>) {
     out.reserve(pcm.len());
     for frame in pcm.chunks_exact(channels) {
         let sum: f32 = frame.iter().sum();
-        for _ in 0..channels {
-            out.push(sum);
-        }
+        out.extend(std::iter::repeat_n(sum, channels));
     }
 }
 
@@ -361,6 +363,24 @@ mod tests {
         center_mono_into(&[0.3, 0.2], 2, &mut out);
         assert!((out[0] - 0.5).abs() < 1e-6);
         assert!((out[1] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn center_mono_duplicated_signal_doubles_then_mixer_clamps() {
+        // A true-mono mic the OS duplicates onto both channels sums to 2x — the deliberate
+        // tradeoff (unity for a single-sided mic costs +6 dB here). The drain clamp keeps it
+        // from overflowing, and per-source gain is the tuning path.
+        let mut out = Vec::new();
+        center_mono_into(&[0.6, 0.6], 2, &mut out);
+        assert!((out[0] - 1.2).abs() < 1e-6);
+        assert!((out[1] - 1.2).abs() < 1e-6);
+        let mut m = AudioMixer::new(SR, CH, ms(100));
+        m.add(&out, Duration::ZERO);
+        let (_, drained) = m.drain_all().expect("tail");
+        assert!(
+            drained.iter().all(|&s| (s - 1.0).abs() < 1e-6),
+            "1.2 clamps to 1.0 on drain"
+        );
     }
 
     #[test]
