@@ -88,10 +88,13 @@ mod linux {
                 }
                 overall_peak.set(overall_peak.get().max(peak));
                 nonfinite.set(nonfinite.get() + nan);
-                let rms = if pcm.is_empty() {
+                // Divide by the finite-sample count (sum_sq skipped the non-finite ones), so
+                // a NaN/inf-laden buffer isn't reported as artificially quieter than it is.
+                let finite = pcm.len() as u64 - nan;
+                let rms = if finite == 0 {
                     0.0
                 } else {
-                    (sum_sq / pcm.len() as f64).sqrt()
+                    (sum_sq / finite as f64).sqrt()
                 };
 
                 tracing::info!(

@@ -31,6 +31,12 @@ use crate::CaptureError;
 /// Bytes per interleaved sample. We always negotiate `F32LE`.
 const F32_BYTES: usize = std::mem::size_of::<f32>();
 
+/// Consecutive idle timer ticks (intervals with no buffer) before the idle timeout fires.
+/// Requiring two means stream startup/negotiation latency on a cold sink is absorbed by the
+/// first interval rather than being mistaken for a dead stream, at the cost of detection
+/// taking up to twice the configured window.
+const IDLE_TICKS_BEFORE_QUIT: u32 = 2;
+
 /// System-audio capture parameters.
 ///
 /// Opus operates natively at 48 kHz, and stereo matches a typical desktop sink, so those
@@ -126,9 +132,12 @@ fn decode_f32le(raw: &[u8], offset: usize, size: usize, out: &mut Vec<f32>) {
 /// call; copy out anything that must outlive it. Keep the callback cheap — it runs on the
 /// PipeWire main loop, so heavy work there stalls capture.
 ///
-/// `idle_timeout`, when set, makes the call fail if no buffer arrives within that window —
-/// a default sink that goes idle can suspend and deliver nothing, which would otherwise
-/// block forever. Continuous consumers that drive their own shutdown pass `None`.
+/// `idle_timeout`, when set, makes the call fail if no buffer arrives for a couple of
+/// consecutive windows — a default sink that goes idle can suspend and deliver nothing,
+/// which would otherwise block forever. It is a coarse watchdog (detection takes up to
+/// ~2× the window, so the first window absorbs startup latency), not a precise deadline;
+/// pass a value comfortably larger than stream-startup latency. Continuous consumers that
+/// drive their own shutdown pass `None`.
 ///
 /// Blocks (runs the PipeWire main loop) on the calling thread until the callback breaks,
 /// the stream errors, or the idle timeout fires. Returns `Ok(())` on a deliberate stop,
@@ -209,15 +218,19 @@ pub fn capture_system_audio(
                 tracing::error!(error = ?e, "failed to parse negotiated audio format");
                 return;
             }
-            let (rate, channels) = (info.rate(), info.channels());
-            tracing::info!(rate, channels, format = ?info.format(), "negotiated audio format");
-            // We pin the format, so audioconvert should match it. If it ever doesn't, the
-            // caller would deinterleave by the requested channel count and silently corrupt
-            // the audio — fail loudly instead.
-            if rate != params.sample_rate || channels != params.channels {
+            let (format, rate, channels) = (info.format(), info.rate(), info.channels());
+            tracing::info!(rate, channels, ?format, "negotiated audio format");
+            // We pin F32LE at the requested rate/channels, so audioconvert should match all
+            // three. If it ever doesn't, `decode_f32le` would reinterpret the bytes (wrong
+            // sample format) or the caller would deinterleave by the wrong channel count —
+            // either way silently corrupting the audio. Fail loudly instead.
+            if format != AudioFormat::F32LE
+                || rate != params.sample_rate
+                || channels != params.channels
+            {
                 let msg = format!(
-                    "negotiated audio format {rate} Hz / {channels} ch differs from \
-                     requested {} Hz / {} ch",
+                    "negotiated audio format {format:?} {rate} Hz / {channels} ch differs \
+                     from requested F32LE {} Hz / {} ch",
                     params.sample_rate, params.channels
                 );
                 tracing::error!("{msg}");
@@ -283,11 +296,22 @@ pub fn capture_system_audio(
         let live = live.clone();
         let fatal = fatal.clone();
         let quit_loop = main_loop.clone();
+        // Owned by the closure: count of consecutive idle ticks (reset whenever a buffer
+        // arrived in the previous interval).
+        let idle_ticks = Cell::new(0_u32);
         let timer = main_loop.loop_().add_timer(move |_expirations| {
-            if !live.replace(false) {
+            if live.replace(false) {
+                idle_ticks.set(0);
+                return;
+            }
+            let ticks = idle_ticks.get() + 1;
+            idle_ticks.set(ticks);
+            if ticks >= IDLE_TICKS_BEFORE_QUIT {
                 set_first_fatal(
                     &fatal,
-                    format!("no audio buffers within {timeout:?} (is the default sink active?)"),
+                    format!(
+                        "no audio buffers for {ticks}×{timeout:?} (is the default sink active?)"
+                    ),
                 );
                 quit_loop.quit();
             }
