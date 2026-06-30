@@ -37,7 +37,7 @@ const DEFAULT_BUFFER_SECONDS: u64 = 60;
 /// hour rather than let a typo OOM the machine.
 const MAX_BUFFER_SECONDS: u64 = 3600;
 /// Default preferred global-shortcut trigger; the compositor may rebind it.
-const DEFAULT_HOTKEY_TRIGGER: &str = "CTRL+ALT+R";
+pub const DEFAULT_HOTKEY_TRIGGER: &str = "CTRL+ALT+R";
 
 /// Plain video encode settings (the consumer maps these onto its encoder param type).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,13 +294,6 @@ impl Config {
             bitrate_bps: v.bitrate_bps,
             idr_period: v.idr_period,
         };
-    }
-
-    /// Replace the audio rate / channels / bitrate (leaving the gains untouched).
-    pub fn set_audio(&mut self, a: AudioSettings) {
-        self.audio.sample_rate = a.sample_rate;
-        self.audio.channels = a.channels;
-        self.audio.bitrate_bps = a.bitrate_bps;
     }
 
     /// Set the microphone mix gain.
@@ -728,18 +721,13 @@ mod tests {
             bitrate_bps: 25_000_000,
             idr_period: 144,
         });
-        c.set_audio(AudioSettings {
-            sample_rate: 44_100,
-            channels: 1,
-            bitrate_bps: 96_000,
-        });
 
         let toml = c.to_toml_string().expect("serialize");
         let back = Config::from_toml_str(&toml).expect("reparse");
         assert_eq!(back, c, "config survives a TOML round-trip");
         // Spot-check via the public view.
         assert_eq!(back.video().width, 2560);
-        assert_eq!(back.audio().channels, 1);
+        assert_eq!(back.video().framerate, 144);
         assert_eq!(back.mic_gain(), 2.5);
         assert_eq!(back.buffer_seconds(), 120);
         assert_eq!(back.output_directory(), Some("/tmp/clips"));

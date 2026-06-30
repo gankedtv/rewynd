@@ -41,7 +41,9 @@ mod palette {
 /// Slider bounds (kept generous but sane).
 const GAIN_MAX: f32 = 4.0;
 const BUFFER_MIN_S: u32 = 5;
-const BUFFER_MAX_S: u32 = 300;
+/// Matches the config's own retention cap, so the slider can represent any valid stored value
+/// (and the daemon clamps to the same ceiling at runtime).
+const BUFFER_MAX_S: u32 = 3600;
 const BITRATE_MIN_MBPS: u32 = 1;
 const BITRATE_MAX_MBPS: u32 = 50;
 /// Frame-rate options offered in the dropdown.
@@ -145,7 +147,12 @@ enum Message {
 impl App {
     fn load() -> Self {
         // Edit the file's own values (no env overrides — those are a runtime concern).
-        let config = config::load_file();
+        let mut config = config::load_file();
+        // Snap the stored values into the ranges the controls can represent, so what the window
+        // shows is exactly what Save will write back (no slider that displays a clamped value
+        // while the file keeps a different one). Resolution and the keyframe interval are left
+        // alone — a custom resolution is shown verbatim, and the GOP is only retuned with the fps.
+        normalize(&mut config);
         Self {
             output_dir: config.output_directory().unwrap_or_default().to_owned(),
             hotkey: config.hotkey_trigger().to_owned(),
@@ -194,6 +201,9 @@ impl App {
             Message::FpsPicked(fps) => {
                 let mut v = self.config.video();
                 v.framerate = fps;
+                // Keep ~1 keyframe per second so the ring buffer's cut granularity tracks the
+                // frame rate (the defaults couple these); the UI doesn't expose the GOP directly.
+                v.idr_period = fps;
                 self.config.set_video(v);
                 self.touch();
             }
@@ -240,8 +250,14 @@ impl App {
         let dir = self.output_dir.trim();
         self.config
             .set_output_directory((!dir.is_empty()).then(|| dir.to_owned()));
-        self.config
-            .set_hotkey_trigger(self.hotkey.trim().to_owned());
+        // An empty field means "use the default"; write the default trigger rather than an empty
+        // string, so the file matches what the daemon will actually bind.
+        let trigger = self.hotkey.trim();
+        self.config.set_hotkey_trigger(if trigger.is_empty() {
+            config::DEFAULT_HOTKEY_TRIGGER.to_owned()
+        } else {
+            trigger.to_owned()
+        });
 
         self.status = match config::config_path() {
             Some(path) => match self.config.save_to(&path) {
@@ -256,9 +272,11 @@ impl App {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        // `normalize` (on load) keeps these in range; clamp on the u64 before narrowing so a
+        // pathological stored value can't wrap the cast.
         let v = self.config.video();
-        let mbps = (v.bitrate_bps / BITS_PER_MBIT).clamp(BITRATE_MIN_MBPS, BITRATE_MAX_MBPS);
-        let secs = (self.config.buffer_seconds() as u32).clamp(BUFFER_MIN_S, BUFFER_MAX_S);
+        let mbps = v.bitrate_bps / BITS_PER_MBIT;
+        let secs = self.config.buffer_seconds().min(u64::from(BUFFER_MAX_S)) as u32;
 
         let audio = section(
             "Audio",
@@ -285,7 +303,7 @@ impl App {
                     slider(BUFFER_MIN_S..=BUFFER_MAX_S, secs, Message::BufferSeconds).into(),
                 ),
                 labelled(
-                    "Resolution",
+                    &format!("Resolution — currently {}×{}", v.width, v.height),
                     pick_list(
                         &Resolution::ALL[..],
                         Resolution::from_dims(v.width, v.height),
@@ -362,6 +380,24 @@ impl App {
             .height(Length::Fill)
             .into()
     }
+}
+
+/// Clamp the editable numeric settings into the ranges the controls can represent, so the view
+/// (which reads these back) and Save (which writes them) agree — no control that shows a value
+/// the file doesn't actually hold. Gains are sanitized and capped, the buffer window is clamped
+/// to the daemon's own range, and the bitrate is snapped to whole Mbps. Resolution, frame rate,
+/// and the keyframe interval are left as stored (a custom resolution stays custom).
+fn normalize(c: &mut Config) {
+    c.set_mic_gain(c.mic_gain().clamp(0.0, GAIN_MAX));
+    c.set_system_gain(c.system_gain().clamp(0.0, GAIN_MAX));
+    c.set_buffer_seconds(
+        c.buffer_seconds()
+            .clamp(u64::from(BUFFER_MIN_S), u64::from(BUFFER_MAX_S)),
+    );
+    let mut v = c.video();
+    let mbps = (v.bitrate_bps / BITS_PER_MBIT).clamp(BITRATE_MIN_MBPS, BITRATE_MAX_MBPS);
+    v.bitrate_bps = mbps * BITS_PER_MBIT;
+    c.set_video(v);
 }
 
 /// A titled section card: an accent header over its content.
