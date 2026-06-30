@@ -15,7 +15,7 @@ use iced::theme::Palette;
 use iced::widget::{
     button, checkbox, column, container, pick_list, row, scrollable, slider, text, text_input,
 };
-use iced::{Element, Length, Task, Theme};
+use iced::{Background, Border, Element, Length, Task, Theme};
 
 use rewynd_config::{self as config, Config};
 
@@ -28,6 +28,10 @@ mod palette {
     pub const TEXT: Color = Color::from_rgb8(0xe7, 0xe9, 0xf0);
     /// Vibrant indigo/violet accent for buttons, slider rails, active controls.
     pub const ACCENT: Color = Color::from_rgb8(0x7c, 0x5c, 0xff);
+    /// Raised card surface, a step lighter than the window background.
+    pub const PANEL: Color = Color::from_rgb8(0x1d, 0x20, 0x2b);
+    /// Hairline border around cards.
+    pub const BORDER: Color = Color::from_rgb8(0x2c, 0x30, 0x3e);
     /// Green for the "saved" confirmation.
     pub const SUCCESS: Color = Color::from_rgb8(0x40, 0xd0, 0x8b);
     /// Amber for the restart hint.
@@ -41,9 +45,10 @@ mod palette {
 /// Slider bounds (kept generous but sane).
 const GAIN_MAX: f32 = 4.0;
 const BUFFER_MIN_S: u32 = 5;
-/// Matches the config's own retention cap, so the slider can represent any valid stored value
-/// (and the daemon clamps to the same ceiling at runtime).
-const BUFFER_MAX_S: u32 = 3600;
+/// Slider ceiling for the replay length (4 minutes), so the common ~60 s default sits a quarter
+/// of the way along rather than pinned to the left. The config/daemon allow more via hand-edit;
+/// a larger stored value is shown clamped to this ceiling here.
+const BUFFER_MAX_S: u32 = 240;
 const BITRATE_MIN_MBPS: u32 = 1;
 const BITRATE_MAX_MBPS: u32 = 50;
 /// Frame-rate options offered in the dropdown.
@@ -53,7 +58,7 @@ const BITS_PER_MBIT: u32 = 1_000_000;
 fn main() -> iced::Result {
     tracing_subscriber::fmt::init();
     iced::application(App::load, App::update, App::view)
-        .title("rewynd — Settings")
+        .title("rewynd settings")
         .theme(App::theme)
         .window_size((540.0, 700.0))
         .centered()
@@ -96,14 +101,13 @@ impl Resolution {
 
 impl fmt::Display for Resolution {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (w, h) = self.dims();
-        let label = match self {
+        // The concrete W×H is shown next to the dropdown, so the option label stays clean.
+        f.write_str(match self {
             Resolution::P2160 => "2160p (4K)",
             Resolution::P1440 => "1440p (QHD)",
             Resolution::P1080 => "1080p (Full HD)",
             Resolution::P720 => "720p (HD)",
-        };
-        write!(f, "{label} — {w}×{h}")
+        })
     }
 }
 
@@ -275,105 +279,124 @@ impl App {
         // `normalize` (on load) keeps these in range; clamp on the u64 before narrowing so a
         // pathological stored value can't wrap the cast.
         let v = self.config.video();
+        let a = self.config.audio();
         let mbps = v.bitrate_bps / BITS_PER_MBIT;
         let secs = self.config.buffer_seconds().min(u64::from(BUFFER_MAX_S)) as u32;
+        // Rough clip size from the target bitrate (video + audio) over the replay window.
+        let est_mb = u64::from(v.bitrate_bps)
+            .saturating_add(u64::from(a.bitrate_bps))
+            .saturating_mul(u64::from(secs))
+            / 8
+            / 1_000_000;
 
-        let audio = section(
-            "Audio",
+        let audio = card(
+            "AUDIO",
             column![
-                gain_row(
+                setting(
                     "Microphone volume",
-                    self.config.mic_gain(),
-                    Message::MicGain
+                    format!("{:.2}x", self.config.mic_gain()),
+                    slider(0.0..=GAIN_MAX, self.config.mic_gain(), Message::MicGain).step(0.05),
                 ),
-                gain_row(
+                setting(
                     "System volume",
-                    self.config.system_gain(),
-                    Message::SystemGain
+                    format!("{:.2}x", self.config.system_gain()),
+                    slider(
+                        0.0..=GAIN_MAX,
+                        self.config.system_gain(),
+                        Message::SystemGain
+                    )
+                    .step(0.05),
                 ),
             ]
-            .spacing(14),
+            .spacing(18),
         );
 
-        let recording = section(
-            "Recording",
+        let recording = card(
+            "RECORDING",
             column![
-                labelled(
-                    &format!("Replay length — {secs} s"),
-                    slider(BUFFER_MIN_S..=BUFFER_MAX_S, secs, Message::BufferSeconds).into(),
+                setting(
+                    "Replay length",
+                    format!("{secs} s"),
+                    slider(BUFFER_MIN_S..=BUFFER_MAX_S, secs, Message::BufferSeconds),
                 ),
-                labelled(
-                    &format!("Resolution — currently {}×{}", v.width, v.height),
+                setting(
+                    "Resolution",
+                    format!("{}x{}", v.width, v.height),
                     pick_list(
                         &Resolution::ALL[..],
                         Resolution::from_dims(v.width, v.height),
                         Message::ResolutionPicked,
                     )
-                    .width(Length::Fill)
-                    .into(),
+                    .width(Length::Fill),
                 ),
-                labelled(
+                setting(
                     "Frame rate",
+                    format!("{} fps", v.framerate),
                     pick_list(&FPS_OPTIONS[..], Some(v.framerate), Message::FpsPicked)
-                        .width(Length::Fill)
-                        .into(),
+                        .width(Length::Fill),
                 ),
-                labelled(
-                    &format!("Quality — {mbps} Mbps"),
+                setting(
+                    "Quality",
+                    format!("{mbps} Mbps"),
                     slider(
                         BITRATE_MIN_MBPS..=BITRATE_MAX_MBPS,
                         mbps,
                         Message::BitrateMbps
-                    )
-                    .into(),
+                    ),
                 ),
+                value_row("Estimated clip size", format!("about {est_mb} MB")),
             ]
-            .spacing(14),
+            .spacing(18),
         );
 
-        let output = section(
-            "Output & capture",
+        let placeholder = config::default_output_dir().map_or_else(
+            || "Leave empty for the system temp folder".to_owned(),
+            |p| format!("Leave empty for {}", p.display()),
+        );
+        let output = card(
+            "OUTPUT & CAPTURE",
             column![
-                labelled(
-                    "Save clips to",
+                column![
+                    text("Save clips to").size(14),
                     row![
-                        text_input("Default (temp folder)", &self.output_dir)
+                        text_input(&placeholder, &self.output_dir)
                             .on_input(Message::OutputDirEdited),
-                        button("Browse…").on_press(Message::BrowseDir),
+                        button("Browse").on_press(Message::BrowseDir),
                     ]
-                    .spacing(8)
-                    .into(),
-                ),
-                labelled(
-                    "Hotkey",
-                    column![
-                        text_input("CTRL+ALT+R", &self.hotkey).on_input(Message::HotkeyEdited),
-                        hint("The desktop may let you rebind this in its shortcut settings."),
-                    ]
-                    .spacing(4)
-                    .into(),
-                ),
+                    .spacing(8),
+                ]
+                .spacing(8),
+                column![
+                    text("Hotkey").size(14),
+                    text_input("CTRL+ALT+R", &self.hotkey).on_input(Message::HotkeyEdited),
+                    hint("Your desktop may let you rebind this in its shortcut settings."),
+                ]
+                .spacing(6),
                 checkbox(self.config.always_prompt())
                     .label("Re-pick the monitor on next launch")
                     .on_toggle(Message::AlwaysPrompt),
             ]
-            .spacing(14),
+            .spacing(18),
         );
 
-        let body = column![
-            text("rewynd settings").size(26),
-            hint("Changes are saved to your config file and apply the next time you clip."),
-            audio,
-            recording,
-            output,
-            button(text("Save").size(16))
+        let header = column![
+            text("rewynd settings").size(28),
+            hint("Tune how clips are captured and where they are saved. Changes take effect the next time you clip."),
+        ]
+        .spacing(6);
+
+        let save = column![
+            button(text("Save settings").size(15))
                 .on_press(Message::Save)
-                .padding([10, 24]),
+                .padding([12, 28]),
             status_line(&self.status),
         ]
-        .spacing(20)
-        .padding(28)
-        .max_width(560);
+        .spacing(10);
+
+        let body = column![header, audio, recording, output, save]
+            .spacing(20)
+            .padding(28)
+            .max_width(600);
 
         container(scrollable(body))
             .width(Length::Fill)
@@ -400,35 +423,51 @@ fn normalize(c: &mut Config) {
     c.set_video(v);
 }
 
-/// A titled section card: an accent header over its content.
-fn section<'a>(title: &'a str, content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    column![
-        text(title).size(18).style(|_: &Theme| text::Style {
-            color: Some(palette::ACCENT)
+/// A grouped settings card: an accent title over its content, on a raised rounded panel.
+fn card<'a>(title: &'a str, content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    let inner = column![
+        text(title).size(13).style(|_: &Theme| text::Style {
+            color: Some(palette::ACCENT),
         }),
         content.into(),
     ]
-    .spacing(10)
-    .into()
-}
-
-/// A control with a label above it.
-fn labelled<'a>(label: &str, control: Element<'a, Message>) -> Element<'a, Message> {
-    column![text(label.to_owned()).size(14), control]
-        .spacing(6)
+    .spacing(16);
+    container(inner)
+        .width(Length::Fill)
+        .padding(20)
+        .style(|_: &Theme| container::Style {
+            background: Some(Background::Color(palette::PANEL)),
+            border: Border {
+                color: palette::BORDER,
+                width: 1.0,
+                radius: 14.0.into(),
+            },
+            ..container::Style::default()
+        })
         .into()
 }
 
-/// A label + a 0..=GAIN_MAX gain slider, with a ×N readout.
-fn gain_row(
-    label: &str,
-    gain: f32,
-    on_change: impl Fn(f32) -> Message + 'static,
-) -> Element<'_, Message> {
-    labelled(
-        &format!("{label} — ×{gain:.2}"),
-        slider(0.0..=GAIN_MAX, gain, on_change).step(0.05).into(),
-    )
+/// One setting: the label on the left, its current value on the right (accent), and the control
+/// directly beneath spanning the full width.
+fn setting<'a>(
+    label: &'a str,
+    value: String,
+    control: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    column![value_row(label, value), control.into()]
+        .spacing(8)
+        .into()
+}
+
+/// A label (left) and a value (right, accent) on one row — also used for read-only readouts.
+fn value_row<'a>(label: &'a str, value: String) -> Element<'a, Message> {
+    row![
+        text(label).size(14).width(Length::Fill),
+        text(value).size(14).style(|_: &Theme| text::Style {
+            color: Some(palette::ACCENT),
+        }),
+    ]
+    .into()
 }
 
 /// Muted hint text.
@@ -446,7 +485,7 @@ fn status_line(status: &Status) -> Element<'_, Message> {
     let (msg, color) = match status {
         Status::Editing => (String::new(), palette::MUTED),
         Status::Saved => (
-            "Saved — restart rewynd to apply the changes.".to_owned(),
+            "Saved. Restart rewynd to apply the changes.".to_owned(),
             palette::SUCCESS,
         ),
         Status::Error(e) => (e.clone(), palette::DANGER),

@@ -364,6 +364,14 @@ pub fn config_path() -> Option<PathBuf> {
     config_path_from(|k| std::env::var_os(k))
 }
 
+/// The default directory for saved clips when none is configured: the user's **Videos** folder
+/// (XDG user-dirs on Linux, the Known Folder on Windows). `None` if it can't be resolved, in
+/// which case the caller falls back (e.g. the temp dir).
+#[must_use]
+pub fn default_output_dir() -> Option<PathBuf> {
+    dirs::video_dir()
+}
+
 /// Read the config file at `path` (if any) and layer `REWYND_*` overrides via `get_env`. A
 /// missing or malformed file falls back to the built-in defaults (logging why). The testable
 /// core of [`load`].

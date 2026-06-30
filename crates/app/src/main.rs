@@ -699,14 +699,17 @@ mod linux {
         }
     }
 
-    /// Where to write a saved clip: `output_dir` (default: the temp dir) with a
-    /// millisecond-stamped, per-process-sequenced name. The sequence number disambiguates
-    /// two saves landing in the same millisecond (e.g. the dev-hook flush racing a hotkey
-    /// press), which a bare timestamp would collide on.
+    /// Where to write a saved clip: `output_dir` if configured, else the user's Videos folder,
+    /// else the temp dir — with a millisecond-stamped, per-process-sequenced name. The sequence
+    /// number disambiguates two saves landing in the same millisecond (e.g. the dev-hook flush
+    /// racing a hotkey press), which a bare timestamp would collide on.
     fn clip_output_path(output_dir: Option<&Path>) -> PathBuf {
         use std::sync::atomic::AtomicU32;
         static SEQ: AtomicU32 = AtomicU32::new(0);
-        let dir = output_dir.map_or_else(std::env::temp_dir, Path::to_path_buf);
+        let dir = output_dir
+            .map(Path::to_path_buf)
+            .or_else(config::default_output_dir)
+            .unwrap_or_else(std::env::temp_dir);
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis());
