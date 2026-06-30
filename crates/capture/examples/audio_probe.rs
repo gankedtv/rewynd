@@ -22,6 +22,7 @@ mod linux {
     use std::cell::Cell;
     use std::ops::ControlFlow;
     use std::rc::Rc;
+    use std::time::Duration;
 
     use rewynd_capture::linux::{AudioParams, capture_system_audio};
 
@@ -30,6 +31,9 @@ mod linux {
     /// Peak amplitude (of normalized `f32` PCM) above which we call the capture
     /// non-silent. Comfortably above dithered-silence noise, well below real signal.
     const SILENCE_PEAK: f32 = 1.0e-4;
+    /// Give up (with a clear error) if no audio buffers arrive within this window — an idle
+    /// default sink can suspend and deliver nothing, which would otherwise hang the probe.
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(3);
 
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         tracing_subscriber::fmt()
@@ -55,23 +59,39 @@ mod linux {
         let buffers_seen = Rc::new(Cell::new(0_u32));
         let total_frames = Rc::new(Cell::new(0_u64));
         let overall_peak = Rc::new(Cell::new(0.0_f32));
+        let nonfinite = Rc::new(Cell::new(0_u64));
 
-        capture_system_audio(params, {
+        capture_system_audio(params, Some(IDLE_TIMEOUT), {
             let buffers_seen = buffers_seen.clone();
             let total_frames = total_frames.clone();
             let overall_peak = overall_peak.clone();
+            let nonfinite = nonfinite.clone();
             move |pcm, pts| {
                 let n = buffers_seen.get() + 1;
                 buffers_seen.set(n);
                 let frames = pcm.len() as u64 / u64::from(params.channels.max(1));
                 total_frames.set(total_frames.get() + frames);
 
-                let peak = pcm.iter().fold(0.0_f32, |m, &s| m.max(s.abs()));
+                // One pass: peak amplitude + sum of squares (f64 accumulator avoids
+                // overflow/precision loss), tracking any non-finite samples separately so a
+                // NaN run can't masquerade as silence in the `.max()` fold.
+                let mut peak = 0.0_f32;
+                let mut sum_sq = 0.0_f64;
+                let mut nan = 0_u64;
+                for &s in pcm {
+                    if s.is_finite() {
+                        peak = peak.max(s.abs());
+                        sum_sq += f64::from(s) * f64::from(s);
+                    } else {
+                        nan += 1;
+                    }
+                }
                 overall_peak.set(overall_peak.get().max(peak));
+                nonfinite.set(nonfinite.get() + nan);
                 let rms = if pcm.is_empty() {
                     0.0
                 } else {
-                    (pcm.iter().map(|&s| s * s).sum::<f32>() / pcm.len() as f32).sqrt()
+                    (sum_sq / pcm.len() as f64).sqrt()
                 };
 
                 tracing::info!(
@@ -93,12 +113,17 @@ mod linux {
         })?;
 
         let overall_peak = overall_peak.get();
+        let nonfinite = nonfinite.get();
         tracing::info!(
             buffers = buffers_seen.get(),
             total_frames = total_frames.get(),
             overall_peak = format_args!("{overall_peak:.5}"),
+            nonfinite,
             "audio capture probe finished"
         );
+        if nonfinite > 0 {
+            tracing::warn!(nonfinite, "captured non-finite (NaN/inf) samples");
+        }
         if overall_peak > SILENCE_PEAK {
             tracing::info!("non-silent capture confirmed ✔");
         } else {

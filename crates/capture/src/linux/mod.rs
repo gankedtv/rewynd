@@ -8,12 +8,27 @@
 //! `FrameSource` → [`GpuFrame`] is not yet wired; [`PipewireCapture`] returns
 //! [`CaptureError::NotImplemented`].
 
+use std::io::Cursor;
+
+use pipewire as pw;
+use pw::spa::pod::serialize::PodSerializer;
+use pw::spa::pod::{Object, Value};
+
 use super::{CaptureError, FrameSource, GpuFrame};
 
 pub mod audio;
 pub mod pipewire_capture;
 pub mod portal;
 pub mod vulkan_modifiers;
+
+/// Serialize a pod [`Object`] to bytes (suitable for `Pod::from_bytes`). Shared by the
+/// video and audio stream setups, which both build PipeWire format/buffer pods.
+pub(crate) fn serialize_object(obj: Object) -> Vec<u8> {
+    PodSerializer::serialize(Cursor::new(Vec::new()), &Value::Object(obj))
+        .expect("pod serialization cannot fail for in-memory buffer")
+        .0
+        .into_inner()
+}
 
 pub use audio::{AudioParams, capture_system_audio};
 pub use pipewire_capture::{

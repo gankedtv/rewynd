@@ -12,8 +12,7 @@
 //! each buffer's interleaved PCM to a callback, stamped with a monotonic capture-relative
 //! timestamp (the same PTS discipline as the video path's [`super::DmabufFrame::pts`]).
 
-use std::cell::Cell;
-use std::io::Cursor;
+use std::cell::{Cell, RefCell};
 use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -24,8 +23,7 @@ use pw::spa::param::ParamType;
 use pw::spa::param::audio::{AudioFormat, AudioInfoRaw};
 use pw::spa::param::format::{MediaSubtype, MediaType};
 use pw::spa::param::format_utils;
-use pw::spa::pod::serialize::PodSerializer;
-use pw::spa::pod::{Object, Pod, Value};
+use pw::spa::pod::{Object, Pod};
 use pw::spa::utils::SpaTypes;
 
 use crate::CaptureError;
@@ -57,23 +55,34 @@ impl Default for AudioParams {
 
 /// Per-stream state threaded through the PipeWire callbacks.
 struct UserData<F> {
-    /// The most recently negotiated raw audio format.
-    format: AudioInfoRaw,
     /// Per-buffer callback. Receives the interleaved PCM (frames of
     /// [`AudioParams::channels`] samples each) plus a monotonic capture-relative PTS, and
     /// returns [`ControlFlow::Break`] to stop the loop.
     on_samples: F,
     /// Reused decode buffer so the hot path allocates only when it has to grow.
     scratch: Vec<f32>,
-    /// Set once the callback breaks deliberately; read after the loop to tell a clean
-    /// stop from an error/empty run.
+    /// Set true on every dequeued buffer; the idle-timeout timer reads and resets it to
+    /// detect a stream that has stopped delivering (e.g. a suspended sink).
+    live: Rc<Cell<bool>>,
+    /// Set once the callback breaks deliberately; read after the loop to tell a clean stop
+    /// from an error/empty run.
     success: Rc<Cell<bool>>,
+    /// First fatal reason (stream error, format mismatch, idle timeout), surfaced as the
+    /// returned error instead of the generic "no samples" message.
+    fatal: Rc<RefCell<Option<String>>>,
     /// Clone of the main loop so a callback can `quit()`.
     main_loop: pw::main_loop::MainLoopRc,
     /// When the stream started, so each buffer gets a monotonic capture-relative PTS.
     stream_start: Instant,
-    /// The format we requested, to flag a mismatch the caller's framing wouldn't expect.
-    want: AudioParams,
+}
+
+/// Record the first fatal reason; later ones don't overwrite it (the first is the root
+/// cause). Single-threaded — only ever touched on the PipeWire loop thread.
+fn set_first_fatal(slot: &RefCell<Option<String>>, msg: String) {
+    let mut slot = slot.borrow_mut();
+    if slot.is_none() {
+        *slot = Some(msg);
+    }
 }
 
 /// Build the `EnumFormat` object pinning interleaved `F32LE` at the requested rate and
@@ -89,14 +98,6 @@ fn build_audio_format(params: AudioParams) -> Object {
         id: ParamType::EnumFormat.as_raw(),
         properties: info.into(),
     }
-}
-
-/// Serialize a pod [`Object`] to bytes (suitable for `Pod::from_bytes`).
-fn serialize_object(obj: Object) -> Vec<u8> {
-    PodSerializer::serialize(Cursor::new(Vec::new()), &Value::Object(obj))
-        .expect("pod serialization cannot fail for in-memory buffer")
-        .0
-        .into_inner()
 }
 
 /// Decode the valid region of an `F32LE` audio buffer into `out` (cleared first).
@@ -125,13 +126,24 @@ fn decode_f32le(raw: &[u8], offset: usize, size: usize, out: &mut Vec<f32>) {
 /// call; copy out anything that must outlive it. Keep the callback cheap — it runs on the
 /// PipeWire main loop, so heavy work there stalls capture.
 ///
-/// Blocks (runs the PipeWire main loop) on the calling thread until the callback breaks or
-/// the stream errors. Returns `Ok(())` on a deliberate stop, otherwise a
-/// [`CaptureError::PipeWire`].
+/// `idle_timeout`, when set, makes the call fail if no buffer arrives within that window —
+/// a default sink that goes idle can suspend and deliver nothing, which would otherwise
+/// block forever. Continuous consumers that drive their own shutdown pass `None`.
+///
+/// Blocks (runs the PipeWire main loop) on the calling thread until the callback breaks,
+/// the stream errors, or the idle timeout fires. Returns `Ok(())` on a deliberate stop,
+/// otherwise a [`CaptureError::PipeWire`].
 pub fn capture_system_audio(
     params: AudioParams,
+    idle_timeout: Option<Duration>,
     on_samples: impl FnMut(&[f32], Duration) -> ControlFlow<()> + 'static,
 ) -> Result<(), CaptureError> {
+    if params.sample_rate == 0 || params.channels == 0 {
+        return Err(CaptureError::PipeWire(
+            "audio sample_rate and channels must be > 0".to_owned(),
+        ));
+    }
+
     pw::init();
 
     let main_loop = pw::main_loop::MainLoopRc::new(None)
@@ -156,61 +168,61 @@ pub fn capture_system_audio(
     )
     .map_err(|e| CaptureError::PipeWire(format!("create stream: {e}")))?;
 
+    let live = Rc::new(Cell::new(false));
     let success = Rc::new(Cell::new(false));
+    let fatal: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let user_data = UserData {
-        format: AudioInfoRaw::default(),
         on_samples,
         scratch: Vec::new(),
+        live: live.clone(),
         success: success.clone(),
+        fatal: fatal.clone(),
         main_loop: main_loop.clone(),
         stream_start: Instant::now(),
-        want: params,
     };
 
     let _listener = stream
         .add_local_listener_with_user_data(user_data)
         .state_changed(|_stream, ud, old, new| {
             tracing::info!(?old, ?new, "audio stream state changed");
-            // run() doesn't exit on its own when the stream errors — quit so the caller
-            // gets an error instead of hanging.
+            // run() doesn't exit on its own when the stream errors — record the real reason
+            // and quit so the caller gets it instead of hanging or the generic message.
             if let pw::stream::StreamState::Error(err) = &new {
                 tracing::error!(error = %err, "pipewire audio stream error; stopping");
+                set_first_fatal(&ud.fatal, format!("stream error: {err}"));
                 ud.main_loop.quit();
             }
         })
-        .param_changed(|_stream, ud, id, param| {
+        .param_changed(move |_stream, ud, id, param| {
             let Some(param) = param else { return };
             if id != ParamType::Format.as_raw() {
                 return;
             }
-            let (media_type, media_subtype) = match format_utils::parse_format(param) {
-                Ok(v) => v,
-                Err(_) => return,
+            let Ok((media_type, media_subtype)) = format_utils::parse_format(param) else {
+                return;
             };
             if media_type != MediaType::Audio || media_subtype != MediaSubtype::Raw {
                 return;
             }
-            if let Err(e) = ud.format.parse(param) {
+            let mut info = AudioInfoRaw::default();
+            if let Err(e) = info.parse(param) {
                 tracing::error!(error = ?e, "failed to parse negotiated audio format");
                 return;
             }
-            let (rate, channels) = (ud.format.rate(), ud.format.channels());
-            tracing::info!(
-                rate,
-                channels,
-                format = ?ud.format.format(),
-                "negotiated audio format"
-            );
-            // We pin the format, so audioconvert should match it; warn loudly if not,
-            // since the caller deinterleaves by the requested channel count.
-            if rate != ud.want.sample_rate || channels != ud.want.channels {
-                tracing::warn!(
-                    got_rate = rate,
-                    got_channels = channels,
-                    want_rate = ud.want.sample_rate,
-                    want_channels = ud.want.channels,
-                    "negotiated audio format differs from requested"
+            let (rate, channels) = (info.rate(), info.channels());
+            tracing::info!(rate, channels, format = ?info.format(), "negotiated audio format");
+            // We pin the format, so audioconvert should match it. If it ever doesn't, the
+            // caller would deinterleave by the requested channel count and silently corrupt
+            // the audio — fail loudly instead.
+            if rate != params.sample_rate || channels != params.channels {
+                let msg = format!(
+                    "negotiated audio format {rate} Hz / {channels} ch differs from \
+                     requested {} Hz / {} ch",
+                    params.sample_rate, params.channels
                 );
+                tracing::error!("{msg}");
+                set_first_fatal(&ud.fatal, msg);
+                ud.main_loop.quit();
             }
         })
         .process(move |stream, ud| {
@@ -218,6 +230,9 @@ pub fn capture_system_audio(
                 tracing::warn!("audio process: out of buffers");
                 return;
             };
+            // A buffer arrived: the stream is delivering (not suspended). Mark liveness
+            // before any skip path so the idle timer never trips on an active stream.
+            ud.live.set(true);
             // Stamp the PTS at dequeue, before any decode work, so it reflects arrival.
             let pts = ud.stream_start.elapsed();
             let datas = buffer.datas_mut();
@@ -244,7 +259,7 @@ pub fn capture_system_audio(
         .register()
         .map_err(|e| CaptureError::PipeWire(format!("register audio stream listener: {e}")))?;
 
-    let format = serialize_object(build_audio_format(params));
+    let format = super::serialize_object(build_audio_format(params));
     let mut pod_params = [Pod::from_bytes(&format)
         .ok_or_else(|| CaptureError::PipeWire("invalid audio EnumFormat pod".to_owned()))?];
 
@@ -260,12 +275,40 @@ pub fn capture_system_audio(
         )
         .map_err(|e| CaptureError::PipeWire(format!("connect audio stream: {e}")))?;
 
+    // Arm the inactivity guard, if requested: each tick quits the loop unless a buffer
+    // arrived since the previous tick. Held alive (borrows the loop) until the fn returns.
+    let _timer = idle_timeout.map(|timeout| {
+        // The callback owns its own clones; `add_timer` borrows the outer `main_loop`
+        // (which outlives this timer), so the returned source can be held until return.
+        let live = live.clone();
+        let fatal = fatal.clone();
+        let quit_loop = main_loop.clone();
+        let timer = main_loop.loop_().add_timer(move |_expirations| {
+            if !live.replace(false) {
+                set_first_fatal(
+                    &fatal,
+                    format!("no audio buffers within {timeout:?} (is the default sink active?)"),
+                );
+                quit_loop.quit();
+            }
+        });
+        if let Err(e) = timer
+            .update_timer(Some(timeout), Some(timeout))
+            .into_result()
+        {
+            tracing::warn!(error = %e, "failed to arm audio idle-timeout timer; won't auto-stop");
+        }
+        timer
+    });
+
     tracing::info!("audio stream connected; entering main loop");
     main_loop.run();
     tracing::info!("audio main loop exited");
 
     if success.get() {
         Ok(())
+    } else if let Some(msg) = fatal.borrow_mut().take() {
+        Err(CaptureError::PipeWire(msg))
     } else {
         Err(CaptureError::PipeWire(
             "audio stream ended without delivering samples \
@@ -278,6 +321,8 @@ pub fn capture_system_audio(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linux::serialize_object;
+    use pw::spa::pod::Value;
     use pw::spa::pod::deserialize::PodDeserializer;
 
     #[test]
@@ -353,5 +398,38 @@ mod tests {
         let mut out = Vec::new();
         decode_f32le(&bytes, 0, bytes.len(), &mut out);
         assert_eq!(out, [0.25]);
+    }
+
+    #[test]
+    fn zero_rate_or_channels_is_rejected() {
+        let err = capture_system_audio(
+            AudioParams {
+                sample_rate: 0,
+                channels: 2,
+            },
+            None,
+            |_, _| ControlFlow::Break(()),
+        )
+        .expect_err("zero sample_rate must be rejected");
+        assert!(matches!(err, CaptureError::PipeWire(_)));
+
+        let err = capture_system_audio(
+            AudioParams {
+                sample_rate: 48_000,
+                channels: 0,
+            },
+            None,
+            |_, _| ControlFlow::Break(()),
+        )
+        .expect_err("zero channels must be rejected");
+        assert!(matches!(err, CaptureError::PipeWire(_)));
+    }
+
+    #[test]
+    fn set_first_fatal_keeps_the_first() {
+        let slot = RefCell::new(None);
+        set_first_fatal(&slot, "first".to_owned());
+        set_first_fatal(&slot, "second".to_owned());
+        assert_eq!(slot.borrow().as_deref(), Some("first"));
     }
 }
