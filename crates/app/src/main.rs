@@ -50,9 +50,15 @@ mod linux {
     }
 
     /// Build [`EncodeParams`] from a key→value lookup: the 1080p60 default with any
-    /// parseable `u32` overrides applied. Split out from the environment so it's testable.
+    /// positive `u32` overrides applied. Split out from the environment so it's testable.
     fn params_from(get: impl Fn(&str) -> Option<String>) -> EncodeParams {
-        let u32_of = |key: &str| get(key).and_then(|v| v.parse::<u32>().ok());
+        // Ignore unparseable or non-positive overrides: every field must be > 0 (the
+        // encoder rejects zero), so fall back to the default rather than fail at startup.
+        let u32_of = |key: &str| {
+            get(key)
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|&v| v > 0)
+        };
         let mut params = EncodeParams::default();
         if let Some(v) = u32_of("REWYND_WIDTH") {
             params.width = v;
@@ -423,12 +429,13 @@ mod linux {
             let env = std::collections::HashMap::from([
                 ("REWYND_WIDTH", "1280"),
                 ("REWYND_FPS", "30"),
+                ("REWYND_HEIGHT", "0"),
                 ("REWYND_BITRATE_BPS", "not-a-number"),
             ]);
             let p = params_from(|k| env.get(k).map(|s| (*s).to_owned()));
             assert_eq!(p.width, 1280); // overridden
             assert_eq!(p.framerate, 30); // overridden
-            assert_eq!(p.height, 1080); // absent → default
+            assert_eq!(p.height, 1080); // zero rejected → default
             assert_eq!(p.bitrate_bps, 12_000_000); // unparseable → default
             assert_eq!(p.idr_period, 60); // absent → default
         }
