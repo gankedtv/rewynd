@@ -1346,7 +1346,9 @@ dependencies = [
  "rewynd-encode",
  "rewynd-gpu",
  "rewynd-mux",
+ "serde",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]

@@ -57,6 +57,18 @@ pub fn center_mono_into(pcm: &[f32], channels: usize, out: &mut Vec<f32>) {
     }
 }
 
+/// Scale every sample of an interleaved buffer in place by a linear `gain` (per-source mix
+/// level). A `gain` of 1.0 (or a non-finite value) is a no-op; [`AudioMixer`] clamps the
+/// summed result on drain, so a gain above unity can't overflow the output.
+pub fn apply_gain(pcm: &mut [f32], gain: f32) {
+    if !gain.is_finite() || (gain - 1.0).abs() < f32::EPSILON {
+        return;
+    }
+    for s in pcm {
+        *s *= gain;
+    }
+}
+
 /// Sums multiple capture sources onto one PTS-aligned interleaved-`f32` timeline.
 #[derive(Debug)]
 pub struct AudioMixer {
@@ -407,6 +419,26 @@ mod tests {
         let mut out = vec![1.0, 2.0, 3.0];
         center_mono_into(&[], 2, &mut out);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn apply_gain_scales_and_no_ops_at_unity() {
+        let mut buf = [0.1, -0.2, 0.3, -0.4];
+        apply_gain(&mut buf, 2.0);
+        assert!((buf[0] - 0.2).abs() < 1e-6);
+        assert!((buf[1] + 0.4).abs() < 1e-6);
+
+        let mut unchanged = [0.5, -0.5];
+        apply_gain(&mut unchanged, 1.0);
+        assert_eq!(unchanged, [0.5, -0.5], "unity is a no-op");
+
+        let mut nonfinite = [0.5, -0.5];
+        apply_gain(&mut nonfinite, f32::NAN);
+        assert_eq!(nonfinite, [0.5, -0.5], "non-finite gain is a no-op");
+
+        let mut silence = [0.5, -0.5];
+        apply_gain(&mut silence, 0.0);
+        assert_eq!(silence, [0.0, 0.0], "zero gain mutes");
     }
 
     #[test]

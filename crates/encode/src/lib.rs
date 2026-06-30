@@ -88,7 +88,7 @@ pub use opus_audio::{AudioEncodeError, AudioEncodeParams, OpusAudioEncoder};
 
 // System + mic mixing — pure CPU logic, platform-agnostic.
 mod audio_mix;
-pub use audio_mix::{AudioMixer, center_mono_into};
+pub use audio_mix::{AudioMixer, apply_gain, center_mono_into};
 
 #[cfg(test)]
 mod tests {
