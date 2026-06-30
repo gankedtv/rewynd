@@ -22,7 +22,6 @@
 //!   and returns its descriptor for the wgpu import.
 
 use std::cell::{Cell, RefCell};
-use std::io::Cursor;
 use std::ops::ControlFlow;
 use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::rc::Rc;
@@ -36,7 +35,6 @@ use pw::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
 use pw::spa::param::format_utils;
 use pw::spa::param::video::{VideoFormat, VideoInfoRaw};
 use pw::spa::pod::deserialize::PodDeserializer;
-use pw::spa::pod::serialize::PodSerializer;
 use pw::spa::pod::{ChoiceValue, Object, Pod, Property, PropertyFlags, Value, object, property};
 use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction, Id, Rectangle, SpaTypes};
 
@@ -189,14 +187,6 @@ struct UserData<F> {
     main_loop: pw::main_loop::MainLoopRc,
     /// When the stream started, so each frame gets a monotonic capture-relative PTS.
     stream_start: Instant,
-}
-
-/// Serialize a pod [`Object`] to bytes (suitable for `Pod::from_bytes`).
-fn serialize_object(obj: Object) -> Vec<u8> {
-    PodSerializer::serialize(Cursor::new(Vec::new()), &Value::Object(obj))
-        .expect("pod serialization cannot fail for in-memory buffer")
-        .0
-        .into_inner()
 }
 
 /// Build the by-hand `VideoModifier` property carrying a `SPA_CHOICE_Enum` of
@@ -530,7 +520,8 @@ where
                         chosen = format_args!("{chosen:#018x}"),
                         "modifier unfixated; pinning a server-proposed modifier (pass 2)"
                     );
-                    let fixed = serialize_object(build_enum_format(Some(&modifiers), Some(chosen)));
+                    let fixed =
+                        super::serialize_object(build_enum_format(Some(&modifiers), Some(chosen)));
                     let Some(pod) = Pod::from_bytes(&fixed) else {
                         tracing::error!("failed to build fixated EnumFormat pod");
                         return;
@@ -558,7 +549,7 @@ where
                         "MemFd|MemPtr (SHM fallback)"
                     }
                 );
-                let buffers = serialize_object(build_buffers_param(want_dmabuf));
+                let buffers = super::serialize_object(build_buffers_param(want_dmabuf));
                 let Some(pod) = Pod::from_bytes(&buffers) else {
                     tracing::error!("failed to build Buffers pod");
                     return;
@@ -638,8 +629,8 @@ where
     // Build the initial EnumFormat params: a DMA-BUF-capable format (with the
     // modifier choice) first, then a no-modifier SHM fallback. The server picks
     // the best it can satisfy.
-    let dmabuf_format = serialize_object(build_enum_format(Some(&modifiers), None));
-    let shm_format = serialize_object(build_enum_format(None, None));
+    let dmabuf_format = super::serialize_object(build_enum_format(Some(&modifiers), None));
+    let shm_format = super::serialize_object(build_enum_format(None, None));
     let mut params = [
         Pod::from_bytes(&dmabuf_format)
             .ok_or_else(|| CaptureError::PipeWire("invalid dmabuf EnumFormat pod".to_owned()))?,
