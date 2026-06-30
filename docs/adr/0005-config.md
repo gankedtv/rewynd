@@ -64,6 +64,7 @@ startup.
 - `capture.always_prompt` is a **portal-specific** knob (Wayland's ScreenCast portal owns monitor
   choice). A future Windows backend has no portal, so it will need a different mechanism — likely a
   concrete `[capture] monitor = "..."` selector — and the schema may diverge per-OS there.
-- `buffer.seconds` is clamped to a ceiling (four minutes) so a fat-fingered value degrades to a
+- `buffer.seconds` is clamped to a ceiling (two minutes) so a fat-fingered value degrades to a
   capped window rather than growing the in-memory ring buffer until it OOMs. The settings UI offers
-  the same ceiling, so the slider and the daemon agree on the maximum.
+  the same ceiling, so the slider and the daemon agree on the maximum (and the 30 s default sits
+  about a quarter along the slider).
