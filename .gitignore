@@ -1,5 +1,7 @@
-# Rust build output
+# Rust build output (workspace root, and the workspace-excluded vendored crate, which
+# builds into its own target/ since it isn't a member).
 /target
+vendor/mp4/target/
 
 # Editor / OS cruft
 *.rs.bk
