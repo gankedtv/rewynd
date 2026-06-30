@@ -14,6 +14,11 @@
 //! [`OpusAudioEncoder`](crate::OpusAudioEncoder) re-anchors per push, so a non-contiguous
 //! drain would inject a gap the muxer can't reconstruct.
 //!
+//! Sources are summed in whatever channel layout they arrive in. A microphone often arrives on
+//! a single channel of a multi-channel device (the right silent), which would play from one
+//! speaker; [`center_mono_into`] collapses such a source to centered mono before it's added,
+//! so the mic sits in front while system audio keeps its true stereo image.
+//!
 //! The mixer is pure CPU logic (no hardware), so it's fully unit-tested.
 
 use std::collections::VecDeque;
@@ -22,6 +27,33 @@ use std::time::Duration;
 /// Guards against a source reporting a wildly-future PTS (a clock glitch): never buffer more
 /// than this many seconds of mixed audio ahead of the drained position.
 const MAX_BUFFERED: Duration = Duration::from_secs(5);
+
+/// Collapse an interleaved multi-channel buffer to *centered mono*, writing the result (same
+/// frame count and channel width) into `out` (cleared first).
+///
+/// Each frame's channels are **summed** into one value placed on every output channel. A mono
+/// source wired to a single channel of a multi-channel capture device — e.g. an XLR mic on
+/// input 1 of a 2-in interface, which arrives on the left channel with the right silent —
+/// otherwise plays from one speaker; centering puts it in front. Summing (rather than
+/// averaging) keeps that single-channel case at its original level; a source carrying
+/// correlated signal on several channels can exceed full scale, but [`AudioMixer`] clamps on
+/// drain and per-source gain is a future refinement. Whole frames only: a trailing partial
+/// frame is dropped, matching [`AudioMixer::add`]. A `channels <= 1` buffer is copied verbatim.
+pub fn center_mono_into(pcm: &[f32], channels: usize, out: &mut Vec<f32>) {
+    out.clear();
+    let channels = channels.max(1);
+    if channels == 1 {
+        out.extend_from_slice(pcm);
+        return;
+    }
+    out.reserve(pcm.len());
+    for frame in pcm.chunks_exact(channels) {
+        let sum: f32 = frame.iter().sum();
+        for _ in 0..channels {
+            out.push(sum);
+        }
+    }
+}
 
 /// Sums multiple capture sources onto one PTS-aligned interleaved-`f32` timeline.
 #[derive(Debug)]
@@ -305,5 +337,71 @@ mod tests {
         m.add(&[0.5, 0.5, 0.5, 0.5, 0.9], Duration::ZERO);
         let (_, out) = m.drain_all().expect("tail");
         assert_eq!(out.len(), 4, "only the 2 whole frames are kept");
+    }
+
+    #[test]
+    fn center_mono_spreads_left_only_signal_to_both_channels() {
+        // A mic on the left channel only (right silent) — the common XLR-on-input-1 case.
+        let mut out = vec![999.0]; // pre-existing content must be cleared
+        center_mono_into(&[0.4, 0.0, 0.7, 0.0], 2, &mut out);
+        // Each frame's sum (0.4, 0.7) lands on both channels at its original level.
+        assert_eq!(out, [0.4, 0.4, 0.7, 0.7]);
+    }
+
+    #[test]
+    fn center_mono_spreads_right_only_signal_to_both_channels() {
+        let mut out = Vec::new();
+        center_mono_into(&[0.0, 0.5, 0.0, -0.25], 2, &mut out);
+        assert_eq!(out, [0.5, 0.5, -0.25, -0.25]);
+    }
+
+    #[test]
+    fn center_mono_sums_both_channels() {
+        let mut out = Vec::new();
+        center_mono_into(&[0.3, 0.2], 2, &mut out);
+        assert!((out[0] - 0.5).abs() < 1e-6);
+        assert!((out[1] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn center_mono_mono_input_is_copied_verbatim() {
+        let mut out = Vec::new();
+        center_mono_into(&[0.1, 0.2, 0.3], 1, &mut out);
+        assert_eq!(out, [0.1, 0.2, 0.3]);
+        // channels == 0 is treated as mono (max(1)), not a divide-by-zero.
+        let mut out0 = Vec::new();
+        center_mono_into(&[0.4, 0.5], 0, &mut out0);
+        assert_eq!(out0, [0.4, 0.5]);
+    }
+
+    #[test]
+    fn center_mono_drops_partial_trailing_frame() {
+        let mut out = Vec::new();
+        // 1.5 stereo frames — the trailing half-frame is dropped (matches add()).
+        center_mono_into(&[0.2, 0.2, 0.9], 2, &mut out);
+        assert_eq!(out, [0.4, 0.4]);
+    }
+
+    #[test]
+    fn center_mono_empty_clears_out() {
+        let mut out = vec![1.0, 2.0, 3.0];
+        center_mono_into(&[], 2, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn center_mono_then_mixed_lands_on_both_channels() {
+        // End-to-end: a left-only mic, centered, sums into both channels of the timeline.
+        let mut m = AudioMixer::new(SR, CH, ms(100));
+        let mic: Vec<f32> = (0..480).flat_map(|_| [0.5, 0.0]).collect(); // left only
+        let mut centered = Vec::new();
+        center_mono_into(&mic, 2, &mut centered);
+        m.add(&centered, Duration::ZERO);
+        let (_, out) = m.drain_settled(ms(200)).expect("settled");
+        assert_eq!(out.len(), 480 * 2);
+        assert!(
+            out.iter().all(|&s| (s - 0.5).abs() < 1e-6),
+            "both channels carry the mic"
+        );
     }
 }
