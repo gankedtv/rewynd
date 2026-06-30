@@ -88,6 +88,9 @@ mod linux {
         config::ensure_default_file();
         let config = config::load();
 
+        // Publish our pid so the settings app can restart us to apply a config change.
+        write_pid_file();
+
         // Resolution / framerate / bitrate stay parameters (PLAN §9), sourced from the config.
         let params = encode_params(config.video());
         tracing::info!(
@@ -265,7 +268,24 @@ mod linux {
         let _ = mic_audio.join();
         captures_done.store(true, Ordering::Relaxed);
         let _ = audio_mixer.join();
+        remove_pid_file();
         result
+    }
+
+    /// Write our pid to `config::recorder_pid_path()` (best-effort) so the settings app can find
+    /// and restart this recorder.
+    fn write_pid_file() {
+        let path = config::recorder_pid_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(&path, std::process::id().to_string()) {
+            tracing::warn!(error = %e, path = %path.display(), "could not write pid file");
+        }
+    }
+
+    fn remove_pid_file() {
+        let _ = std::fs::remove_file(config::recorder_pid_path());
     }
 
     /// Spawn a thread that captures `source`, applies `gain`, and sums each buffer into the

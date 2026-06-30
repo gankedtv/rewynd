@@ -19,27 +19,17 @@ use iced::{Background, Border, Element, Length, Task, Theme};
 
 use rewynd_config::{self as config, Config};
 
-/// Theme colours — a modern slate/cyan palette. Every colour the window uses lives here, so
-/// swapping the whole look (or moving to the ganked.tv house style later) is a one-place edit.
+// Theme colours, kept in one place so restyling (or a future ganked.tv house style) is one edit.
 mod palette {
     use iced::Color;
-    /// Near-black slate window background.
     pub const BACKGROUND: Color = Color::from_rgb8(0x0d, 0x11, 0x17);
-    /// Soft off-white text.
     pub const TEXT: Color = Color::from_rgb8(0xe6, 0xed, 0xf3);
-    /// Vivid cyan accent for buttons, slider rails, active controls.
     pub const ACCENT: Color = Color::from_rgb8(0x22, 0xd3, 0xee);
-    /// Raised card surface, a step lighter than the window background.
     pub const PANEL: Color = Color::from_rgb8(0x16, 0x1b, 0x22);
-    /// Hairline border around cards.
     pub const BORDER: Color = Color::from_rgb8(0x2d, 0x33, 0x3b);
-    /// Green for the "saved" confirmation.
     pub const SUCCESS: Color = Color::from_rgb8(0x3f, 0xb9, 0x50);
-    /// Amber for the restart hint.
     pub const WARNING: Color = Color::from_rgb8(0xf0, 0xb4, 0x29);
-    /// Red for errors.
     pub const DANGER: Color = Color::from_rgb8(0xf8, 0x51, 0x49);
-    /// Muted text for hints/sublabels.
     pub const MUTED: Color = Color::from_rgb8(0x8b, 0x94, 0x9e);
 }
 
@@ -112,14 +102,11 @@ impl fmt::Display for Resolution {
     }
 }
 
-/// Save feedback shown under the Save button.
 #[derive(Debug, Clone)]
 enum Status {
-    /// Unsaved edits (or a fresh load).
     Editing,
-    /// Written to disk; the recorder must restart to pick it up.
     Saved,
-    /// Writing failed.
+    Restarted,
     Error(String),
 }
 
@@ -147,6 +134,7 @@ enum Message {
     HotkeyEdited(String),
     AlwaysPrompt(bool),
     Save,
+    Restart,
 }
 
 impl App {
@@ -241,6 +229,12 @@ impl App {
                 self.touch();
             }
             Message::Save => self.save(),
+            Message::Restart => {
+                self.status = match restart_recorder() {
+                    Ok(()) => Status::Restarted,
+                    Err(e) => Status::Error(e),
+                };
+            }
         }
         Task::none()
     }
@@ -387,15 +381,27 @@ impl App {
         ]
         .spacing(6);
 
+        let mut save_items: Vec<Element<Message>> = vec![
+            button(text("Save settings").size(15))
+                .on_press(Message::Save)
+                .padding([12, 28])
+                .into(),
+            status_line(&self.status),
+        ];
+        // Offer a one-click restart once the file is saved, since changes only apply on restart.
+        if matches!(self.status, Status::Saved) {
+            save_items.push(
+                button(text("Restart rewynd now").size(14))
+                    .on_press(Message::Restart)
+                    .padding([8, 22])
+                    .style(button::secondary)
+                    .into(),
+            );
+        }
         let save = container(
-            column![
-                button(text("Save settings").size(15))
-                    .on_press(Message::Save)
-                    .padding([12, 28]),
-                status_line(&self.status),
-            ]
-            .spacing(10)
-            .align_x(iced::Alignment::Center),
+            column(save_items)
+                .spacing(10)
+                .align_x(iced::Alignment::Center),
         )
         .center_x(Length::Fill);
 
@@ -504,6 +510,10 @@ fn status_line(status: &Status) -> Element<'_, Message> {
             "Saved. Restart rewynd to apply the changes.".to_owned(),
             palette::SUCCESS,
         ),
+        Status::Restarted => (
+            "Restarted rewynd with the new settings.".to_owned(),
+            palette::SUCCESS,
+        ),
         Status::Error(e) => (e.clone(), palette::DANGER),
     };
     text(msg)
@@ -511,6 +521,48 @@ fn status_line(status: &Status) -> Element<'_, Message> {
         .style(move |_: &Theme| text::Style { color: Some(color) })
         .into()
 }
+
+/// Recorder binary, expected next to this settings binary.
+const RECORDER_BIN: &str = if cfg!(windows) {
+    "rewynd.exe"
+} else {
+    "rewynd"
+};
+
+/// Stop the running recorder (if any) and launch a fresh one so it re-reads the saved config.
+fn restart_recorder() -> Result<(), String> {
+    stop_running_recorder();
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let recorder = exe
+        .parent()
+        .ok_or_else(|| "settings binary has no parent directory".to_owned())?
+        .join(RECORDER_BIN);
+    std::process::Command::new(&recorder)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("could not start {}: {e}", recorder.display()))
+}
+
+#[cfg(unix)]
+fn stop_running_recorder() {
+    let Ok(pid) = std::fs::read_to_string(config::recorder_pid_path()) else {
+        return;
+    };
+    let pid = pid.trim();
+    if pid.is_empty() {
+        return;
+    }
+    // Guard against a stale/reused pid: only signal it if it's still a rewynd process.
+    let is_recorder = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .is_ok_and(|comm| comm.trim() == "rewynd");
+    if is_recorder {
+        // kill's default SIGTERM lets the recorder release the portal/hotkey before we relaunch.
+        let _ = std::process::Command::new("kill").arg(pid).status();
+    }
+}
+
+#[cfg(not(unix))]
+fn stop_running_recorder() {}
 
 #[cfg(test)]
 mod tests {
