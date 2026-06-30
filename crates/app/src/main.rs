@@ -204,8 +204,8 @@ mod linux {
             &stop,
             epoch,
         )?;
-        // The mic is optional: if there's no input device the capture errors and we carry on
-        // with system-only audio (the mixer simply never receives mic samples).
+        // The mic is optional: with no input device the mixer simply never receives mic
+        // samples (the stream idles until shutdown), so clips are system-only.
         let mic_audio = spawn_audio_capture(
             "rewynd-audio-mic",
             AudioSource::Microphone,
@@ -215,14 +215,17 @@ mod linux {
             epoch,
         )?;
 
+        // Set once the capture threads have stopped delivering (after their join), so the
+        // mixer's final drain catches every sample they added.
+        let captures_done = Arc::new(AtomicBool::new(false));
         let mixer_buffer = audio_buffer.clone();
         let mixer_mixer = mixer.clone();
-        let mixer_stop = stop.clone();
+        let mixer_done = captures_done.clone();
         let audio_mixer = std::thread::Builder::new()
             .name("rewynd-audio-mixer".to_owned())
             .spawn(move || {
                 if let Err(e) =
-                    run_audio_mixer(epoch, audio_params, mixer_mixer, mixer_buffer, &mixer_stop)
+                    run_audio_mixer(epoch, audio_params, mixer_mixer, mixer_buffer, &mixer_done)
                 {
                     tracing::error!(error = %e, "audio mixer loop stopped");
                 }
@@ -262,17 +265,20 @@ mod linux {
         let _ = runtime.block_on(portal.close());
         let _ = capture.join();
         // The audio capture loops poll `stop` via their watchdog timers (so they quit even if
-        // a sink is suspended), and the mixer thread checks `stop` each tick; join all three
-        // to drop libopus and the PipeWire streams cleanly rather than racing process exit.
+        // an endpoint is suspended). Join them first so they've stopped adding to the mixer,
+        // *then* signal `captures_done` so the mixer's final drain catches their last samples
+        // before it flushes and exits.
         let _ = system_audio.join();
         let _ = mic_audio.join();
+        captures_done.store(true, Ordering::Relaxed);
         let _ = audio_mixer.join();
         result
     }
 
     /// Spawn a thread that captures `source` and sums each buffer into the shared `mixer`,
-    /// aligned by its capture-relative PTS. A capture error (e.g. no microphone) is logged
-    /// and the thread exits — the mixer simply never sees that source.
+    /// aligned by its capture-relative PTS. A capture error is logged at a severity matching
+    /// the source (a missing mic is benign; a failed system sink loses the primary audio) and
+    /// the thread exits — the mixer simply never sees that source.
     fn spawn_audio_capture(
         name: &str,
         source: AudioSource,
@@ -306,7 +312,16 @@ mod linux {
                     },
                 );
                 if let Err(e) = result {
-                    tracing::warn!(error = %e, ?source, "audio capture stopped (continuing without this source)");
+                    // A missing mic is expected; a failed system sink means the clip loses its
+                    // primary audio, so surface that louder.
+                    match source {
+                        AudioSource::Microphone => {
+                            tracing::info!(error = %e, "no microphone capture; clips use system audio only");
+                        }
+                        AudioSource::SinkMonitor => {
+                            tracing::error!(error = %e, "system-audio capture failed; clips will have no system sound");
+                        }
+                    }
                 }
             })
             .with_context(|| format!("spawning the {name} thread"))
@@ -374,14 +389,16 @@ mod linux {
     }
 
     /// Drain settled mixed audio from `mixer`, Opus-encode it, and push packets into the
-    /// audio ring until `stop` is set. The encoder is built here so it stays on this thread;
-    /// `epoch` matches the capture clock the mixer aligns against.
+    /// audio ring. Runs until `captures_done` is set — which the shutdown path raises only
+    /// *after* the capture threads are joined, so the final `drain_all` catches every sample
+    /// they added (a tail the steady-state settle window would still be holding). The encoder
+    /// is built here so it stays on this thread; `epoch` matches the mixer's alignment clock.
     fn run_audio_mixer(
         epoch: Instant,
         audio_params: AudioEncodeParams,
         mixer: SharedMixer,
         buffer: SharedAudioBuffer,
-        stop: &Arc<AtomicBool>,
+        captures_done: &Arc<AtomicBool>,
     ) -> Result<()> {
         let mut encoder = OpusAudioEncoder::new(audio_params)?;
         tracing::info!("audio pipeline ready; mixing system + mic into the audio ring");
@@ -395,15 +412,15 @@ mod linux {
 
         loop {
             std::thread::sleep(AUDIO_DRAIN_INTERVAL);
-            let stopping = stop.load(Ordering::Relaxed);
+            let finalize = captures_done.load(Ordering::Relaxed);
 
-            // Drain under the mixer lock, encode outside it. On shutdown take the whole tail
-            // (ignoring the settle delay) so the last fraction of a second isn't lost.
+            // Drain under the mixer lock, encode outside it. Once finalizing, take the whole
+            // tail (ignoring the settle delay) since no more samples will arrive.
             let drained = {
                 let mut guard = mixer
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if stopping {
+                if finalize {
                     guard.drain_all()
                 } else {
                     guard.drain_settled(epoch.elapsed())
@@ -412,11 +429,14 @@ mod linux {
             if let Some((pts, pcm)) = drained {
                 if let Err(e) = encoder.push(&pcm, pts, |chunk| push_packet(&buffer, chunk)) {
                     tracing::error!(error = %e, "audio encode failed; stopping mixer");
-                    break;
+                    // Mid-stream this stops the mixer; while finalizing, still flush below.
+                    if !finalize {
+                        break;
+                    }
                 }
             }
 
-            if stopping {
+            if finalize {
                 // Flush the encoder's final sub-frame so the tail isn't dropped.
                 if let Err(e) = encoder.flush(|chunk| push_packet(&buffer, chunk)) {
                     tracing::error!(error = %e, "audio flush failed");

@@ -8,8 +8,8 @@
 //! and channel count (PipeWire's audioconvert resamples/remixes transparently), so the
 //! delivered samples are ready to hand straight to an Opus encoder.
 //!
-//! [`capture_system_audio`] runs the PipeWire main loop on the calling thread and hands
-//! each buffer's interleaved PCM to a callback, stamped with a monotonic capture-relative
+//! [`capture_audio`] runs the PipeWire main loop on the calling thread and hands each
+//! buffer's interleaved PCM to a callback, stamped with a monotonic capture-relative
 //! timestamp (the same PTS discipline as the video path's [`super::DmabufFrame::pts`]).
 
 use std::cell::{Cell, RefCell};
@@ -52,6 +52,14 @@ impl AudioSource {
         match self {
             AudioSource::SinkMonitor => "rewynd-audio-monitor",
             AudioSource::Microphone => "rewynd-audio-mic",
+        }
+    }
+
+    /// `media.role` hint for the session manager's routing/ducking policy.
+    fn media_role(self) -> &'static str {
+        match self {
+            AudioSource::SinkMonitor => "Music",
+            AudioSource::Microphone => "Production",
         }
     }
 }
@@ -197,8 +205,8 @@ pub fn capture_audio(
     let mut props = pw::properties::properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Capture",
-        *pw::keys::MEDIA_ROLE => "Music",
     };
+    props.insert(*pw::keys::MEDIA_ROLE, source.media_role());
     // Sink-monitor capture attaches to the default sink's monitor ports = the system output
     // mix (what you hear). Without this property a Capture stream attaches to the default
     // *source* — the microphone.

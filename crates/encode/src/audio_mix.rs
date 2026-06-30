@@ -1,11 +1,18 @@
-//! Mixing two capture sources (system output + microphone) into one PCM stream (issue #41).
+//! Mixing two capture sources (system output + microphone) into one PCM stream.
 //!
 //! The system-monitor and mic streams arrive on separate threads with independent buffering,
 //! but both stamp each buffer with a PTS on the *same* capture epoch. [`AudioMixer`] places
 //! each buffer onto a shared sample timeline at `frame = pts × sample_rate` and **sums**
-//! overlapping samples, so the two sources line up by capture time. A drain releases only
+//! overlapping samples, so the two sources line up by arrival time. A drain releases only
 //! samples old enough that both sources have had time to contribute (a *settle* delay) — for
 //! a replay buffer the added latency is irrelevant, and it absorbs the streams' jitter.
+//!
+//! Two notes on alignment: the PTS is each buffer's dequeue time, not a hardware capture
+//! timestamp, so the two sources align to within their pipeline-latency delta (tens of ms —
+//! within lip-sync tolerance; true hardware-timestamp alignment is a future refinement). And
+//! the drain output **must stay PTS-contiguous** (gaps are zero-filled, never skipped):
+//! [`OpusAudioEncoder`](crate::OpusAudioEncoder) re-anchors per push, so a non-contiguous
+//! drain would inject a gap the muxer can't reconstruct.
 //!
 //! The mixer is pure CPU logic (no hardware), so it's fully unit-tested.
 
@@ -52,9 +59,11 @@ impl AudioMixer {
         (pts.as_nanos() * u128::from(self.sample_rate) / 1_000_000_000) as u64
     }
 
-    /// The PTS of an absolute frame index (inverse of [`frame_at`](Self::frame_at)).
+    /// The PTS of an absolute frame index (inverse of [`frame_at`](Self::frame_at)). Computed
+    /// in u128 so a multi-day session (frame index past ~1.8e10) can't overflow the multiply.
     fn pts_of(&self, frame: u64) -> Duration {
-        Duration::from_nanos(frame * 1_000_000_000 / u64::from(self.sample_rate))
+        let nanos = u128::from(frame) * 1_000_000_000 / u128::from(self.sample_rate);
+        Duration::from_nanos(nanos as u64)
     }
 
     /// Sum one source's interleaved buffer onto the timeline at its capture `pts`. Samples
@@ -81,7 +90,13 @@ impl AudioMixer {
         if skip >= pcm.len() {
             return; // entirely before the drained window
         }
+        // Only sum whole frames: a torn buffer with a partial trailing frame would otherwise
+        // leave an orphan sample that permanently shifts the L/R interleaving.
         let src = &pcm[skip..];
+        let src = &src[..src.len() - src.len() % self.channels];
+        if src.is_empty() {
+            return;
+        }
 
         // Clamp how far ahead we'll buffer (a glitchy future PTS shouldn't OOM us).
         let max_frames = (MAX_BUFFERED.as_nanos() * u128::from(self.sample_rate) / 1_000_000_000)
@@ -102,10 +117,34 @@ impl AudioMixer {
         }
     }
 
-    /// Drain every frame settled before `now` (i.e. older than `now - settle`), returning the
-    /// PTS of the first drained frame and the mixed interleaved samples (each clamped to
-    /// [-1, 1] since summed sources can exceed full scale). Returns `None` when nothing is
-    /// ready yet.
+    /// Drain `n_frames` from the front, returning the PTS of the first and the interleaved
+    /// samples. Each sample is sanitized to a finite value in [-1, 1] (summed sources can
+    /// exceed full scale, and a glitchy source could deliver a non-finite sample that must
+    /// not reach the Opus encoder). Advances `base_frame` so drains stay PTS-contiguous.
+    fn take_frames(&mut self, n_frames: usize) -> Option<(Duration, Vec<f32>)> {
+        if n_frames == 0 {
+            return None;
+        }
+        let n = n_frames * self.channels;
+        let start_pts = self.pts_of(self.base_frame);
+        let out: Vec<f32> = self
+            .buf
+            .drain(..n)
+            .map(|s| {
+                if s.is_finite() {
+                    s.clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        self.base_frame += n_frames as u64;
+        Some((start_pts, out))
+    }
+
+    /// Drain every frame settled before `now` (i.e. older than `now - settle`). Returns the
+    /// PTS of the first drained frame and the mixed interleaved samples, or `None` when
+    /// nothing is ready yet.
     pub fn drain_settled(&mut self, now: Duration) -> Option<(Duration, Vec<f32>)> {
         if !self.started {
             return None;
@@ -113,29 +152,16 @@ impl AudioMixer {
         let settle_frame = self.frame_at(now.saturating_sub(self.settle));
         let ready_frames = settle_frame.saturating_sub(self.base_frame) as usize;
         let available_frames = self.buf.len() / self.channels;
-        let n_frames = ready_frames.min(available_frames);
-        if n_frames == 0 {
-            return None;
-        }
-        let n = n_frames * self.channels;
-        let start_pts = self.pts_of(self.base_frame);
-        let out: Vec<f32> = self.buf.drain(..n).map(|s| s.clamp(-1.0, 1.0)).collect();
-        self.base_frame += n_frames as u64;
-        Some((start_pts, out))
+        self.take_frames(ready_frames.min(available_frames))
     }
 
     /// Drain everything buffered regardless of the settle delay — used at shutdown to flush
     /// the tail.
     pub fn drain_all(&mut self) -> Option<(Duration, Vec<f32>)> {
-        if !self.started || self.buf.is_empty() {
+        if !self.started {
             return None;
         }
-        let start_pts = self.pts_of(self.base_frame);
-        let n_frames = self.buf.len() / self.channels;
-        let n = n_frames * self.channels;
-        let out: Vec<f32> = self.buf.drain(..n).map(|s| s.clamp(-1.0, 1.0)).collect();
-        self.base_frame += n_frames as u64;
-        Some((start_pts, out))
+        self.take_frames(self.buf.len() / self.channels)
     }
 }
 
@@ -253,5 +279,31 @@ mod tests {
         let mut m = AudioMixer::new(SR, CH, ms(100));
         m.add(&[], ms(10));
         assert!(m.drain_settled(ms(1000)).is_none());
+    }
+
+    #[test]
+    fn non_finite_samples_are_sanitized_to_zero() {
+        let mut m = AudioMixer::new(SR, CH, ms(100));
+        let mut pcm = vec![0.3_f32; 480 * 2];
+        pcm[0] = f32::NAN;
+        pcm[1] = f32::INFINITY;
+        pcm[2] = f32::NEG_INFINITY;
+        m.add(&pcm, Duration::ZERO);
+        let (_, out) = m.drain_all().expect("tail");
+        assert_eq!(out[0], 0.0, "NaN → 0");
+        assert_eq!(out[1], 0.0, "inf → 0");
+        assert_eq!(out[2], 0.0, "-inf → 0");
+        assert!((out[3] - 0.3).abs() < 1e-6);
+        assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn partial_trailing_frame_is_not_summed() {
+        let mut m = AudioMixer::new(SR, CH, ms(100));
+        // 2.5 stereo frames (5 samples) — the trailing half-frame must be dropped so it
+        // can't shift the L/R interleaving of later buffers.
+        m.add(&[0.5, 0.5, 0.5, 0.5, 0.9], Duration::ZERO);
+        let (_, out) = m.drain_all().expect("tail");
+        assert_eq!(out.len(), 4, "only the 2 whole frames are kept");
     }
 }
