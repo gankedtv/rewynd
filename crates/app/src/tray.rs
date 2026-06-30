@@ -52,6 +52,15 @@ impl Tray for RewyndTray {
         ICON.clone()
     }
 
+    // Fall back to a themed icon only if the embedded mark failed to decode (else the pixmap wins).
+    fn icon_name(&self) -> String {
+        if ICON.is_empty() {
+            "camera-video".to_owned()
+        } else {
+            String::new()
+        }
+    }
+
     fn tool_tip(&self) -> ToolTip {
         ToolTip {
             title: "rewynd is recording".to_owned(),
@@ -100,14 +109,16 @@ pub async fn spawn() -> anyhow::Result<(Handle<RewyndTray>, UnboundedReceiver<Tr
     Ok((handle, rx))
 }
 
-/// Best-effort "clip saved" desktop notification.
-pub fn clip_saved_toast(path: &Path) {
+/// Best-effort "clip saved" desktop notification. Async: the zbus backend's blocking `show()`
+/// would panic if called inside our tokio runtime, so the notification is sent via `show_async`.
+pub async fn clip_saved_toast(path: &Path) {
     if let Err(e) = notify_rust::Notification::new()
         .summary("Clip saved")
         .body(&path.display().to_string())
         .icon("tv.ganked.rewynd")
         .appname("rewynd")
-        .show()
+        .show_async()
+        .await
     {
         tracing::warn!(error = %e, "could not show clip-saved notification");
     }

@@ -263,14 +263,20 @@ mod linux {
                 let _handle = handle; // dropping it would remove the icon
                 while let Some(cmd) = rx.recv().await {
                     match cmd {
-                        tray::TrayCmd::SaveClip => save_clip(
-                            &tray_buffer,
-                            &tray_audio,
-                            params,
-                            audio_params,
-                            buffer_window,
-                            tray_output.as_deref(),
-                        ),
+                        tray::TrayCmd::SaveClip => {
+                            // The cut + mux is blocking; run it off the runtime worker, then toast.
+                            let (b, a, o) =
+                                (tray_buffer.clone(), tray_audio.clone(), tray_output.clone());
+                            let saved = tokio::task::spawn_blocking(move || {
+                                save_clip(&b, &a, params, audio_params, buffer_window, o.as_deref())
+                            })
+                            .await
+                            .ok()
+                            .flatten();
+                            if let Some(path) = saved {
+                                tray::clip_saved_toast(&path).await;
+                            }
+                        }
                         tray::TrayCmd::OpenSettings => open_settings(),
                         tray::TrayCmd::Quit => {
                             tracing::info!("quit requested from the tray");
@@ -687,14 +693,16 @@ mod linux {
         while let Some(activation) = activated.next().await {
             tracing::info!(shortcut_id = activation.shortcut_id(), "shortcut activated");
             if activation.shortcut_id() == SHORTCUT_ID {
-                save_clip(
+                if let Some(path) = save_clip(
                     buffer,
                     audio_buffer,
                     params,
                     audio_params,
                     buffer_window,
                     output_dir,
-                );
+                ) {
+                    tray::clip_saved_toast(&path).await;
+                }
             }
         }
 
@@ -703,7 +711,8 @@ mod linux {
     }
 
     /// Cut the most recent `buffer_window` from both rings and write it to an MP4 under
-    /// `output_dir` (or the temp dir when `None`).
+    /// `output_dir` (or the temp dir when `None`). Returns the written path on success so the
+    /// caller can show a notification (the toast is async, so it can't fire from here).
     fn save_clip(
         buffer: &SharedBuffer,
         audio_buffer: &SharedAudioBuffer,
@@ -711,7 +720,7 @@ mod linux {
         audio_params: AudioEncodeParams,
         buffer_window: Duration,
         output_dir: Option<&Path>,
-    ) {
+    ) -> Option<PathBuf> {
         // Hold the lock only for the cut (which clones the clip's chunks), then release it
         // so the capture thread keeps filling the buffer while we write the file.
         let clip = buffer
@@ -722,7 +731,7 @@ mod linux {
             Ok(chunks) => chunks,
             Err(e) => {
                 tracing::warn!(error = %e, "nothing to save yet");
-                return;
+                return None;
             }
         };
 
@@ -767,9 +776,12 @@ mod linux {
                     span_s = span.as_secs_f64(),
                     "saved clip"
                 );
-                tray::clip_saved_toast(&path);
+                Some(path)
             }
-            Err(e) => tracing::error!(error = %e, path = %path.display(), "failed to write clip"),
+            Err(e) => {
+                tracing::error!(error = %e, path = %path.display(), "failed to write clip");
+                None
+            }
         }
     }
 
