@@ -95,11 +95,8 @@ fn read_plane(
     packed
 }
 
-#[test]
-#[ignore = "requires a Vulkan GPU; run with --ignored on the dev box"]
-fn grey_rgba_converts_to_bt709_limited_nv12() {
-    let gpu = pollster::block_on(GpuContext::new()).expect("create shared wgpu device");
-
+/// A solid-colour RGBA8 source texture (usable as converter input).
+fn make_rgba(gpu: &GpuContext, color: [u8; 4]) -> wgpu::Texture {
     let rgba = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("test rgba source"),
         size: wgpu::Extent3d {
@@ -114,8 +111,7 @@ fn grey_rgba_converts_to_bt709_limited_nv12() {
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-
-    let pixels: Vec<u8> = GREY
+    let pixels: Vec<u8> = color
         .iter()
         .copied()
         .cycle()
@@ -140,14 +136,20 @@ fn grey_rgba_converts_to_bt709_limited_nv12() {
             depth_or_array_layers: 1,
         },
     );
+    rgba
+}
 
-    let nv12 = Nv12Converter::new(&gpu)
-        .expect("build BT.709 limited RGBA->NV12 converter")
-        .convert(&gpu, &rgba);
+#[test]
+#[ignore = "requires a Vulkan GPU; run with --ignored on the dev box"]
+fn grey_rgba_converts_to_bt709_limited_nv12() {
+    let gpu = pollster::block_on(GpuContext::new()).expect("create shared wgpu device");
+    let converter = Nv12Converter::new(&gpu).expect("build BT.709 limited RGBA->NV12 converter");
 
-    // Y plane: full resolution, single R8 channel.
+    let close = |actual: u8, expected: u8| actual.abs_diff(expected) <= TOLERANCE;
+
+    // First frame: mid-grey → Y≈126, neutral chroma ≈128.
+    let nv12 = converter.convert(&gpu, &make_rgba(&gpu, GREY));
     let y = read_plane(&gpu, &nv12, wgpu::TextureAspect::Plane0, SIZE, SIZE, 1);
-    // UV plane: half resolution in both axes, interleaved Rg8 (U then V).
     let uv = read_plane(
         &gpu,
         &nv12,
@@ -156,8 +158,6 @@ fn grey_rgba_converts_to_bt709_limited_nv12() {
         SIZE / 2,
         2,
     );
-
-    let close = |actual: u8, expected: u8| actual.abs_diff(expected) <= TOLERANCE;
 
     for (i, &v) in y.iter().enumerate() {
         assert!(
@@ -175,6 +175,18 @@ fn grey_rgba_converts_to_bt709_limited_nv12() {
             close(chunk[1], EXPECTED_UV),
             "V[{i}] = {} expected ~{EXPECTED_UV} (±{TOLERANCE})",
             chunk[1]
+        );
+    }
+
+    // Second frame on the SAME converter exercises the reused output texture: black →
+    // limited-range Y≈16, proving the cached target is rewritten in place (not stale).
+    const EXPECTED_BLACK_Y: u8 = 16;
+    let black = converter.convert(&gpu, &make_rgba(&gpu, [0, 0, 0, 255]));
+    let yb = read_plane(&gpu, &black, wgpu::TextureAspect::Plane0, SIZE, SIZE, 1);
+    for (i, &v) in yb.iter().enumerate() {
+        assert!(
+            close(v, EXPECTED_BLACK_Y),
+            "black Y[{i}] = {v}, expected ~{EXPECTED_BLACK_Y} (±{TOLERANCE})"
         );
     }
 }
