@@ -61,3 +61,8 @@ startup.
 - `deny_unknown_fields` means a single stray/typo'd key fails the whole parse (logged) and falls
   back to defaults — a deliberate trade favouring a loud, actionable error over a silent partial
   apply.
+- `capture.always_prompt` is a **portal-specific** knob (Wayland's ScreenCast portal owns monitor
+  choice). A future Windows backend has no portal, so it will need a different mechanism — likely a
+  concrete `[capture] monitor = "..."` selector — and the schema may diverge per-OS there.
+- `buffer.seconds` is clamped to a generous ceiling (an hour) so a fat-fingered value degrades to a
+  capped window rather than growing the in-memory ring buffer until it OOMs.

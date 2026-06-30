@@ -1,4 +1,4 @@
-//! Runtime configuration (issue #16, docs/adr/0005): a TOML file layered under the built-in
+//! Runtime configuration (see docs/adr/0005): a TOML file layered under the built-in
 //! defaults and overridden by `REWYND_*` environment variables.
 //!
 //! Precedence, low → high: **built-in defaults < `config.toml` < environment overrides**.
@@ -18,6 +18,10 @@ use serde::Deserialize;
 
 /// Default retention window in seconds (PLAN §2's 60 s, now configurable).
 const DEFAULT_BUFFER_SECONDS: u64 = 60;
+/// Upper bound on the retention window. The ring buffer holds encoded frames in memory, so an
+/// absurd value (a fat-fingered `seconds`) would grow it without limit; cap it to a generous
+/// hour rather than let a typo OOM the machine.
+const MAX_BUFFER_SECONDS: u64 = 3600;
 /// Default preferred global-shortcut trigger; the compositor may rebind it.
 const DEFAULT_HOTKEY_TRIGGER: &str = "CTRL+ALT+R";
 
@@ -201,10 +205,11 @@ impl Config {
         sanitize_gain(self.audio.system_gain)
     }
 
-    /// Retention window; at least one second (a zero window would keep nothing).
+    /// Retention window, clamped to `[1, MAX_BUFFER_SECONDS]`: a zero window would keep
+    /// nothing, and an unbounded one would grow the in-memory ring buffer until it OOMs.
     #[must_use]
     pub fn buffer_window(&self) -> Duration {
-        Duration::from_secs(self.buffer.seconds.max(1))
+        Duration::from_secs(self.buffer.seconds.clamp(1, MAX_BUFFER_SECONDS))
     }
 
     /// The configured output directory, if any (else the caller picks a default).
@@ -452,24 +457,57 @@ mod tests {
 
     #[test]
     fn env_overrides_take_precedence_over_file() {
+        // Every numeric override lands on its own distinct field (guards against a copy-paste
+        // mix-up), with a deliberately distinct value each, plus the non-positive/unparseable
+        // fallbacks and the output-dir string override.
         let mut c = Config::from_toml_str("[video]\nwidth = 1280\n[audio]\nbitrate_bps = 64000\n")
             .expect("parses");
         let env = std::collections::HashMap::from([
             ("REWYND_WIDTH", "3840"),
+            ("REWYND_HEIGHT", "2160"),
             ("REWYND_FPS", "120"),
+            ("REWYND_BITRATE_BPS", "25000000"),
+            ("REWYND_IDR_PERIOD", "240"),
             ("REWYND_AUDIO_BITRATE_BPS", "0"), // non-positive → ignored
             ("REWYND_OUTPUT_DIR", "/tmp/over"),
         ]);
         c.apply_env_overrides(|k| env.get(k).map(|s| (*s).to_owned()));
         let e = c.encode_params();
-        assert_eq!(e.width, 3840, "env overrides the file value");
-        assert_eq!(e.framerate, 120, "env overrides the default");
+        assert_eq!(e.width, 3840, "WIDTH overrides the file value");
+        assert_eq!(e.height, 2160, "HEIGHT overrides the default");
+        assert_eq!(e.framerate, 120, "FPS overrides the default");
+        assert_eq!(
+            e.bitrate_bps, 25_000_000,
+            "BITRATE_BPS overrides the default"
+        );
+        assert_eq!(e.idr_period, 240, "IDR_PERIOD overrides the default");
         assert_eq!(
             c.audio_params().bitrate_bps,
             64_000,
-            "zero env override ignored → file value"
+            "zero AUDIO_BITRATE_BPS ignored → file value"
         );
         assert_eq!(c.output_dir(), Some(PathBuf::from("/tmp/over")));
+
+        // An unparseable numeric override is ignored, leaving the file/default value intact.
+        let mut c2 = Config::from_toml_str("[video]\nwidth = 1600\n").expect("parses");
+        let bad = std::collections::HashMap::from([("REWYND_WIDTH", "not-a-number")]);
+        c2.apply_env_overrides(|k| bad.get(k).map(|s| (*s).to_owned()));
+        assert_eq!(
+            c2.encode_params().width,
+            1600,
+            "unparseable override ignored → file value"
+        );
+    }
+
+    #[test]
+    fn buffer_seconds_is_clamped_to_the_ceiling() {
+        let c =
+            Config::from_toml_str(&format!("[buffer]\nseconds = {}\n", u64::MAX)).expect("parses");
+        assert_eq!(
+            c.buffer_window(),
+            Duration::from_secs(MAX_BUFFER_SECONDS),
+            "an absurd window is capped, not left to grow the ring buffer unbounded"
+        );
     }
 
     /// A unique temp path per call, so parallel IO tests don't collide. Removed by the caller.

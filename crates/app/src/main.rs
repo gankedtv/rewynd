@@ -290,7 +290,10 @@ mod linux {
                                 apply_gain(&mut prep, gain);
                                 prep.as_slice()
                             }
-                            AudioSource::SinkMonitor if gain != 1.0 => {
+                            // Only copy to scale when the gain isn't (near) unity; the common
+                            // gain == 1.0 case passes the buffer through untouched. The predicate
+                            // matches `apply_gain`'s own no-op threshold.
+                            AudioSource::SinkMonitor if (gain - 1.0).abs() >= f32::EPSILON => {
                                 prep.clear();
                                 prep.extend_from_slice(pcm);
                                 apply_gain(&mut prep, gain);
