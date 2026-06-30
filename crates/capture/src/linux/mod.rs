@@ -30,7 +30,7 @@ pub(crate) fn serialize_object(obj: Object) -> Vec<u8> {
         .into_inner()
 }
 
-pub use audio::{AudioParams, capture_system_audio};
+pub use audio::{AudioParams, AudioSource, capture_audio};
 pub use pipewire_capture::{
     CapturedDmabuf, DmabufFrame, capture_one_dmabuf, capture_stream, run_capture_probe,
 };

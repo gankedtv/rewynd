@@ -8,8 +8,8 @@
 //! and channel count (PipeWire's audioconvert resamples/remixes transparently), so the
 //! delivered samples are ready to hand straight to an Opus encoder.
 //!
-//! [`capture_system_audio`] runs the PipeWire main loop on the calling thread and hands
-//! each buffer's interleaved PCM to a callback, stamped with a monotonic capture-relative
+//! [`capture_audio`] runs the PipeWire main loop on the calling thread and hands each
+//! buffer's interleaved PCM to a callback, stamped with a monotonic capture-relative
 //! timestamp (the same PTS discipline as the video path's [`super::DmabufFrame::pts`]).
 
 use std::cell::{Cell, RefCell};
@@ -36,6 +36,33 @@ const F32_BYTES: usize = std::mem::size_of::<f32>();
 /// How often the watchdog timer fires to poll the cooperative `stop` flag and accumulate
 /// idle time. Short enough that shutdown is prompt even when the sink delivers no buffers.
 const WATCHDOG_POLL: Duration = Duration::from_millis(200);
+
+/// Which audio endpoint to capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioSource {
+    /// The default sink's monitor — the system output mix (what you hear).
+    SinkMonitor,
+    /// The default source — the microphone.
+    Microphone,
+}
+
+impl AudioSource {
+    /// Stream name for logs / the PipeWire graph.
+    fn stream_name(self) -> &'static str {
+        match self {
+            AudioSource::SinkMonitor => "rewynd-audio-monitor",
+            AudioSource::Microphone => "rewynd-audio-mic",
+        }
+    }
+
+    /// `media.role` hint for the session manager's routing/ducking policy.
+    fn media_role(self) -> &'static str {
+        match self {
+            AudioSource::SinkMonitor => "Music",
+            AudioSource::Microphone => "Production",
+        }
+    }
+}
 
 /// System-audio capture parameters.
 ///
@@ -123,8 +150,8 @@ fn decode_f32le(raw: &[u8], offset: usize, size: usize, out: &mut Vec<f32>) {
     );
 }
 
-/// Capture the default sink's monitor (system audio output) and hand each buffer's
-/// interleaved PCM to `on_samples`.
+/// Capture an audio endpoint (`source`: the system output mix, or the microphone) and hand
+/// each buffer's interleaved PCM to `on_samples`.
 ///
 /// `on_samples(pcm, pts)` receives interleaved `f32` samples — frames of
 /// [`AudioParams::channels`] samples each — and the buffer's monotonic capture-relative
@@ -151,8 +178,9 @@ fn decode_f32le(raw: &[u8], offset: usize, size: usize, out: &mut Vec<f32>) {
 /// Blocks (runs the PipeWire main loop) on the calling thread until the callback breaks,
 /// `stop` is raised, the stream errors, or the idle timeout fires. Returns `Ok(())` on a
 /// deliberate stop, otherwise a [`CaptureError::PipeWire`].
-pub fn capture_system_audio(
+pub fn capture_audio(
     params: AudioParams,
+    source: AudioSource,
     idle_timeout: Option<Duration>,
     stop: Option<Arc<AtomicBool>>,
     epoch: Instant,
@@ -174,19 +202,19 @@ pub fn capture_system_audio(
         .connect_rc(None)
         .map_err(|e| CaptureError::PipeWire(format!("connect to pipewire: {e}")))?;
 
-    let stream = pw::stream::StreamRc::new(
-        core,
-        "rewynd-audio-capture",
-        pw::properties::properties! {
-            *pw::keys::MEDIA_TYPE => "Audio",
-            *pw::keys::MEDIA_CATEGORY => "Capture",
-            *pw::keys::MEDIA_ROLE => "Music",
-            // Attach to the default sink's monitor ports = the system output mix (what you
-            // hear), not a microphone. This is the whole point of the sink-monitor route.
-            *pw::keys::STREAM_CAPTURE_SINK => "true",
-        },
-    )
-    .map_err(|e| CaptureError::PipeWire(format!("create stream: {e}")))?;
+    let mut props = pw::properties::properties! {
+        *pw::keys::MEDIA_TYPE => "Audio",
+        *pw::keys::MEDIA_CATEGORY => "Capture",
+    };
+    props.insert(*pw::keys::MEDIA_ROLE, source.media_role());
+    // Sink-monitor capture attaches to the default sink's monitor ports = the system output
+    // mix (what you hear). Without this property a Capture stream attaches to the default
+    // *source* — the microphone.
+    if source == AudioSource::SinkMonitor {
+        props.insert(*pw::keys::STREAM_CAPTURE_SINK, "true");
+    }
+    let stream = pw::stream::StreamRc::new(core, source.stream_name(), props)
+        .map_err(|e| CaptureError::PipeWire(format!("create stream: {e}")))?;
 
     let live = Rc::new(Cell::new(false));
     let success = Rc::new(Cell::new(false));
@@ -449,11 +477,12 @@ mod tests {
 
     #[test]
     fn zero_rate_or_channels_is_rejected() {
-        let err = capture_system_audio(
+        let err = capture_audio(
             AudioParams {
                 sample_rate: 0,
                 channels: 2,
             },
+            AudioSource::SinkMonitor,
             None,
             None,
             Instant::now(),
@@ -462,11 +491,12 @@ mod tests {
         .expect_err("zero sample_rate must be rejected");
         assert!(matches!(err, CaptureError::PipeWire(_)));
 
-        let err = capture_system_audio(
+        let err = capture_audio(
             AudioParams {
                 sample_rate: 48_000,
                 channels: 0,
             },
+            AudioSource::SinkMonitor,
             None,
             None,
             Instant::now(),
