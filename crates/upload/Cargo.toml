@@ -7,9 +7,16 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
+description = "ganked.tv upload client: API-key auth over the 3-step presigned upload flow."
 
 [dependencies]
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "time"] }
 
 [dev-dependencies]
-pollster.workspace = true
+# test-util pauses tokio's clock so the device-login polling tests run instantly.
+tokio = { workspace = true, features = ["fs", "time", "macros", "rt-multi-thread", "test-util"] }
+wiremock.workspace = true

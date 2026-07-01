@@ -55,6 +55,8 @@ mod linux {
     type SharedAudioBuffer = Arc<Mutex<AudioRingBuffer>>;
     /// Shared mixer: the system + mic capture threads sum into it, the mixer thread drains it.
     type SharedMixer = Arc<Mutex<AudioMixer>>;
+    /// The most recently saved clip, so the tray's "Upload last clip" knows what to send.
+    type SharedLastClip = Arc<Mutex<Option<PathBuf>>>;
 
     /// How far behind real time the mixer holds audio before encoding it, so the system and
     /// mic streams have both contributed. Latency is irrelevant for a replay buffer; this
@@ -136,6 +138,7 @@ mod linux {
         let buffer: SharedBuffer = Arc::new(Mutex::new(RingBuffer::new(buffer_window)));
         let audio_buffer: SharedAudioBuffer =
             Arc::new(Mutex::new(AudioRingBuffer::new(buffer_window)));
+        let last_clip: SharedLastClip = Arc::new(Mutex::new(None));
         // The system + mic capture threads sum into this; the mixer thread drains + encodes it.
         let mixer: SharedMixer = Arc::new(Mutex::new(AudioMixer::new(
             audio_params.sample_rate,
@@ -245,16 +248,19 @@ mod linux {
                     let buffer = buffer.clone();
                     let audio_buffer = audio_buffer.clone();
                     let output_dir = output_dir.clone();
+                    let flush_last = last_clip.clone();
                     std::thread::spawn(move || {
                         std::thread::sleep(Duration::from_secs(secs));
-                        save_clip(
+                        if let Some(path) = save_clip(
                             &buffer,
                             &audio_buffer,
                             params,
                             audio_params,
                             buffer_window,
                             output_dir.as_deref(),
-                        );
+                        ) {
+                            remember_clip(&flush_last, &path);
+                        }
                     });
                 }
                 Err(e) => tracing::warn!(value, error = %e, "ignoring invalid REWYND_FLUSH_AFTER"),
@@ -267,6 +273,8 @@ mod linux {
             let tray_buffer = buffer.clone();
             let tray_audio = audio_buffer.clone();
             let tray_output = output_dir.clone();
+            let tray_last = last_clip.clone();
+            let upload_busy = Arc::new(AtomicBool::new(false));
             runtime.spawn(async move {
                 let (handle, mut rx) = match tray::spawn().await {
                     Ok(v) => v,
@@ -289,12 +297,57 @@ mod linux {
                             .ok()
                             .flatten();
                             if let Some(path) = saved {
+                                remember_clip(&tray_last, &path);
                                 tray::clip_saved_toast(&path).await;
+                            }
+                        }
+                        tray::TrayCmd::UploadClip => {
+                            let clip = tray_last
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .clone();
+                            // Fresh config each click: enabling uploads or changing the key in
+                            // the settings works without restarting the recorder.
+                            match (build_uploader(config::load().upload()), clip) {
+                                (Some(up), Some(path)) => {
+                                    if upload_busy.swap(true, Ordering::SeqCst) {
+                                        tray::toast(
+                                            "Upload already running",
+                                            "Wait for the current upload to finish.",
+                                        )
+                                        .await;
+                                    } else {
+                                        // Its own task so a slow upload never stalls the tray menu.
+                                        tokio::spawn(upload_and_toast(
+                                            up,
+                                            path,
+                                            upload_busy.clone(),
+                                        ));
+                                    }
+                                }
+                                (None, _) => {
+                                    tray::toast(
+                                        "Upload not configured",
+                                        "Enable uploads and add your ganked.tv API key in the settings.",
+                                    )
+                                    .await;
+                                }
+                                (Some(_), None) => {
+                                    tray::toast("No clip yet", "Save a clip first, then upload it.")
+                                        .await;
+                                }
                             }
                         }
                         tray::TrayCmd::OpenSettings => open_settings(),
                         tray::TrayCmd::Quit => {
                             tracing::info!("quit requested from the tray");
+                            if upload_busy.load(Ordering::SeqCst) {
+                                tray::toast(
+                                    "Upload cancelled",
+                                    "rewynd quit while an upload was still running.",
+                                )
+                                .await;
+                            }
                             std::process::exit(0);
                         }
                     }
@@ -312,6 +365,7 @@ mod linux {
             buffer_window,
             output_dir.as_deref(),
             config.hotkey_trigger(),
+            &last_clip,
         ));
 
         // Shut the capture loop down, then join it so the GPU pipeline tears down on its
@@ -346,6 +400,80 @@ mod linux {
             }
             Err(e) => tracing::warn!(error = %e, "could not locate the settings binary"),
         }
+    }
+
+    /// ganked.tv upload wiring, built from the config at the moment of use.
+    struct Uploader {
+        client: rewynd_upload::GankedClient,
+        visibility: rewynd_upload::Visibility,
+        share_base: String,
+    }
+
+    fn build_uploader(settings: rewynd_config::UploadSettings) -> Option<Uploader> {
+        if !settings.enabled {
+            return None;
+        }
+        let vis = settings.visibility.trim();
+        if !vis.eq_ignore_ascii_case("public") && !vis.eq_ignore_ascii_case("unlisted") {
+            // A typo must not silently widen visibility; parse() below falls back to public.
+            tracing::warn!(visibility = vis, "unknown upload visibility; using public");
+        }
+        match rewynd_upload::GankedClient::new(&settings.api_url, &settings.api_key) {
+            Ok(client) => Some(Uploader {
+                client,
+                visibility: rewynd_upload::Visibility::parse(vis),
+                share_base: settings.share_url,
+            }),
+            Err(e) => {
+                tracing::warn!(error = %e, "uploads unavailable: could not build the ganked.tv client");
+                None
+            }
+        }
+    }
+
+    /// Clears the upload-busy flag on drop, so a panicking upload task can't wedge the tray's
+    /// "Upload last clip" in the busy state.
+    struct BusyGuard(Arc<AtomicBool>);
+
+    impl Drop for BusyGuard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Upload `path` and toast the outcome, releasing `busy` when done. Runs as its own task so
+    /// nothing else waits on it.
+    async fn upload_and_toast(up: Uploader, path: PathBuf, busy: Arc<AtomicBool>) {
+        let _busy = BusyGuard(busy);
+        let title = format!("rewynd {}", jiff::Zoned::now().strftime("%Y-%m-%d %H:%M"));
+        tray::toast("Uploading clip", "Sending to ganked.tv...").await;
+        match up.client.upload(&path, &title, up.visibility).await {
+            Ok(clip) if clip.failed() => {
+                tracing::error!(clip_id = %clip.id, "server rejected the clip after upload");
+                tray::toast(
+                    "Upload failed",
+                    "ganked.tv could not process the clip (check its length and format).",
+                )
+                .await;
+            }
+            Ok(clip) => {
+                let body = clip
+                    .share_url(&up.share_base)
+                    .unwrap_or_else(|| "Processing on ganked.tv".to_owned());
+                tracing::info!(clip_id = %clip.id, "clip uploaded");
+                tray::toast("Clip uploaded", &body).await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, path = %path.display(), "upload failed");
+                tray::toast("Upload failed", &e.to_string()).await;
+            }
+        }
+    }
+
+    fn remember_clip(last: &SharedLastClip, path: &Path) {
+        *last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path.to_path_buf());
     }
 
     /// Spawn a thread that captures `source`, applies `gain`, and sums each buffer into the
@@ -634,6 +762,7 @@ mod linux {
     }
 
     /// Register the global shortcut and flush a clip whenever it fires.
+    #[allow(clippy::too_many_arguments)]
     async fn run_hotkey_loop(
         buffer: &SharedBuffer,
         audio_buffer: &SharedAudioBuffer,
@@ -642,6 +771,7 @@ mod linux {
         buffer_window: Duration,
         output_dir: Option<&Path>,
         hotkey_trigger: &str,
+        last_clip: &SharedLastClip,
     ) -> Result<()> {
         let shortcuts = GlobalShortcuts::new().await?;
         let session = shortcuts.create_session(Default::default()).await?;
@@ -702,6 +832,7 @@ mod linux {
                     buffer_window,
                     output_dir,
                 ) {
+                    remember_clip(last_clip, &path);
                     tray::clip_saved_toast(&path).await;
                 }
             }

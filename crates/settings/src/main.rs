@@ -66,7 +66,7 @@ fn main() -> iced::Result {
     iced::application(App::load, App::update, App::view)
         .title("rewynd settings")
         .theme(App::theme)
-        .window_size((900.0, 740.0))
+        .window_size((900.0, 900.0))
         .centered()
         .run()
 }
@@ -133,7 +133,60 @@ struct App {
     output_dir: String,
     /// Mirror of the hotkey trigger for the text box.
     hotkey: String,
+    /// Mirror of the ganked.tv API key.
+    api_key: String,
+    /// Mirror of the ganked.tv API base URL (empty = "use the default").
+    api_url: String,
+    /// Mirror of the share-link base URL (empty = "use the default").
+    share_url: String,
+    login: LoginState,
     status: Status,
+}
+
+/// Where the ganked.tv device login stands. "Connected" is not a state here — it is derived from
+/// a non-empty API key.
+#[derive(Debug, Clone)]
+enum LoginState {
+    Idle,
+    Starting,
+    /// Waiting for browser approval of this user code.
+    Waiting(String),
+    Failed(String),
+}
+
+/// Upload visibility choices, mirroring what the ganked.tv API accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadVis {
+    Public,
+    Unlisted,
+}
+
+impl UploadVis {
+    const ALL: [UploadVis; 2] = [UploadVis::Public, UploadVis::Unlisted];
+
+    fn as_config(self) -> &'static str {
+        match self {
+            UploadVis::Public => "public",
+            UploadVis::Unlisted => "unlisted",
+        }
+    }
+
+    fn from_config(s: &str) -> UploadVis {
+        if s.trim().eq_ignore_ascii_case("unlisted") {
+            UploadVis::Unlisted
+        } else {
+            UploadVis::Public
+        }
+    }
+}
+
+impl fmt::Display for UploadVis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            UploadVis::Public => "Public",
+            UploadVis::Unlisted => "Unlisted",
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +202,15 @@ enum Message {
     DirPicked(Option<String>),
     HotkeyEdited(String),
     AlwaysPrompt(bool),
+    UploadEnabled(bool),
+    ApiKeyEdited(String),
+    ApiUrlEdited(String),
+    ShareUrlEdited(String),
+    VisibilityPicked(UploadVis),
+    LoginPressed,
+    LoginStarted(Result<rewynd_upload::DeviceLogin, String>),
+    LoginDone(Result<String, String>),
+    LogoutPressed,
     Save,
     Restart,
     Restarted(Result<(), String>),
@@ -166,8 +228,22 @@ impl App {
         Self {
             output_dir: config.output_directory().unwrap_or_default().to_owned(),
             hotkey: config.hotkey_trigger().to_owned(),
+            api_key: config.upload_api_key().to_owned(),
+            api_url: config.upload_api_url().to_owned(),
+            share_url: config.upload_share_url().to_owned(),
             config,
+            login: LoginState::Idle,
             status: Status::Editing,
+        }
+    }
+
+    /// The API base the login flow should talk to: the (unsaved) field value, or the default.
+    fn effective_api_url(&self) -> String {
+        let url = self.api_url.trim();
+        if url.is_empty() {
+            config::DEFAULT_UPLOAD_API_URL.to_owned()
+        } else {
+            url.to_owned()
         }
     }
 
@@ -245,6 +321,68 @@ impl App {
                 self.config.set_always_prompt(on);
                 self.touch();
             }
+            Message::UploadEnabled(on) => {
+                self.config.set_upload_enabled(on);
+                self.touch();
+            }
+            Message::ApiKeyEdited(s) => {
+                self.api_key = s;
+                self.touch();
+            }
+            Message::ApiUrlEdited(s) => {
+                self.api_url = s;
+                self.touch();
+            }
+            Message::ShareUrlEdited(s) => {
+                self.share_url = s;
+                self.touch();
+            }
+            Message::VisibilityPicked(v) => {
+                self.config.set_upload_visibility(v.as_config().to_owned());
+                self.touch();
+            }
+            Message::LoginPressed => {
+                self.login = LoginState::Starting;
+                let base = self.effective_api_url();
+                return Task::perform(
+                    async move {
+                        rewynd_upload::device_login_start(&base, "rewynd")
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    Message::LoginStarted,
+                );
+            }
+            Message::LoginStarted(Ok(login)) => {
+                if let Err(e) = open::that_detached(&login.verification_uri_complete) {
+                    tracing::warn!(error = %e, "could not open the browser for approval");
+                }
+                self.login = LoginState::Waiting(login.user_code.clone());
+                let base = self.effective_api_url();
+                return Task::perform(
+                    async move {
+                        rewynd_upload::device_login_wait(&base, &login)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    Message::LoginDone,
+                );
+            }
+            Message::LoginStarted(Err(e)) => self.login = LoginState::Failed(e),
+            Message::LoginDone(Ok(key)) => {
+                // Logging in states intent: switch uploads on and persist right away.
+                self.api_key = key;
+                self.config.set_upload_enabled(true);
+                self.login = LoginState::Idle;
+                self.save();
+            }
+            Message::LoginDone(Err(e)) => self.login = LoginState::Failed(e),
+            Message::LogoutPressed => {
+                self.api_key.clear();
+                self.config.set_upload_enabled(false);
+                self.login = LoginState::Idle;
+                self.save();
+            }
             Message::Save => self.save(),
             Message::Restart => {
                 self.status = Status::Restarting;
@@ -286,6 +424,14 @@ impl App {
         } else {
             trigger.to_owned()
         });
+        self.config
+            .set_upload_api_key(self.api_key.trim().to_owned());
+        // Empty URL fields are stored empty: "use the default" lives in one place (the config
+        // read side), so a future default change reaches everyone who didn't pick a custom URL.
+        self.config
+            .set_upload_api_url(self.api_url.trim().to_owned());
+        self.config
+            .set_upload_share_url(self.share_url.trim().to_owned());
 
         self.status = match config::config_path() {
             Some(path) => match self.config.save_to(&path) {
@@ -404,6 +550,89 @@ impl App {
             .spacing(18),
         );
 
+        // Account area: a one-click browser login (device grant); the key it mints is stored
+        // invisibly. Connectedness is simply "a key is present".
+        let account: Element<Message> = if !self.api_key.trim().is_empty() {
+            row![
+                text("Connected to ganked.tv").size(14).width(Length::Fill),
+                button(text("Log out").size(13))
+                    .on_press(Message::LogoutPressed)
+                    .style(button::secondary)
+                    .padding([6, 14]),
+            ]
+            .align_y(iced::Alignment::Center)
+            .into()
+        } else {
+            match &self.login {
+                LoginState::Idle => column![
+                    button(text("Log in with ganked.tv").size(14))
+                        .on_press(Message::LoginPressed)
+                        .padding([10, 20]),
+                    hint("Approve rewynd in your browser; no password is stored on this device."),
+                ]
+                .spacing(6)
+                .into(),
+                LoginState::Starting => text("Contacting ganked.tv...").size(14).into(),
+                LoginState::Waiting(code) => column![
+                    text(format!("Approve in your browser with code {code}")).size(14),
+                    hint("Browser did not open? Go to ganked.tv/device and enter the code."),
+                ]
+                .spacing(6)
+                .into(),
+                LoginState::Failed(e) => column![
+                    button(text("Log in with ganked.tv").size(14))
+                        .on_press(Message::LoginPressed)
+                        .padding([10, 20]),
+                    text(e.clone()).size(12).style(|_: &Theme| text::Style {
+                        color: Some(palette::DANGER),
+                    }),
+                ]
+                .spacing(6)
+                .into(),
+            }
+        };
+
+        let upload = card(
+            "GANKED.TV",
+            column![
+                account,
+                checkbox(self.config.upload_enabled())
+                    .label("Enable uploads (tray: Upload last clip)")
+                    .on_toggle(Message::UploadEnabled),
+                setting(
+                    "Visibility",
+                    UploadVis::from_config(self.config.upload_visibility()).to_string(),
+                    pick_list(
+                        &UploadVis::ALL[..],
+                        Some(UploadVis::from_config(self.config.upload_visibility())),
+                        Message::VisibilityPicked,
+                    )
+                    .width(Length::Fill),
+                ),
+                column![
+                    text("API server").size(14),
+                    text_input(config::DEFAULT_UPLOAD_API_URL, &self.api_url)
+                        .on_input(Message::ApiUrlEdited),
+                ]
+                .spacing(6),
+                column![
+                    text("Share links").size(14),
+                    text_input(config::DEFAULT_UPLOAD_SHARE_URL, &self.share_url)
+                        .on_input(Message::ShareUrlEdited),
+                    hint("Leave both empty for ganked.tv. Self-hosting? An API key can be pasted below."),
+                ]
+                .spacing(6),
+                column![
+                    text("API key (advanced)").size(14),
+                    text_input("gtv_...", &self.api_key)
+                        .secure(true)
+                        .on_input(Message::ApiKeyEdited),
+                ]
+                .spacing(6),
+            ]
+            .spacing(18),
+        );
+
         let header = column![
             text("rewynd settings").size(28),
             hint("Tune how clips are captured and where they are saved. Changes take effect the next time you clip."),
@@ -435,11 +664,11 @@ impl App {
         )
         .center_x(Length::Fill);
 
-        // Two columns so everything fits in a landscape window without scrolling: the tall
-        // Recording card on the left, the shorter Audio and Output cards stacked on the right.
+        // Two columns so everything fits in a landscape window without scrolling: Recording and
+        // Audio on the left, Output and Upload on the right.
         let columns = row![
-            recording,
-            column![audio, output].spacing(20).width(Length::Fill),
+            column![recording, audio].spacing(20).width(Length::Fill),
+            column![output, upload].spacing(20).width(Length::Fill),
         ]
         .spacing(20);
 
@@ -668,5 +897,13 @@ mod tests {
         // The view shows bps/1_000_000; a message multiplies back.
         assert_eq!(12_000_000 / BITS_PER_MBIT, 12);
         assert_eq!(25u32.saturating_mul(BITS_PER_MBIT), 25_000_000);
+    }
+
+    #[test]
+    fn upload_visibility_round_trips_through_config_strings() {
+        for v in UploadVis::ALL {
+            assert_eq!(UploadVis::from_config(v.as_config()), v);
+        }
+        assert_eq!(UploadVis::from_config("garbage"), UploadVis::Public);
     }
 }

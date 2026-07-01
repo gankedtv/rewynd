@@ -59,6 +59,13 @@ serde = { version = "1", features = ["derive"] }
 toml = "1"
 # `flock` for the single-instance guard (docs/adr/0008). Unix-only, MIT/Apache.
 libc = "0.2"
+# ganked.tv upload client (docs/adr/0009): HTTP over rustls (no system TLS dep). MIT/Apache.
+reqwest = { version = "0.13", features = ["json"] }
+serde_json = "1"
+# Local-time clip titles for uploads. Unlicense/MIT.
+jiff = "0.2"
+# HTTP mock server for the upload client's tests (dev-only). MIT/Apache.
+wiremock = "0.6"
 
 # Linux capture (PLAN §3.5): XDG ScreenCast portal + PipeWire. Linux-only.
 ashpd = { version = "0.13", features = ["screencast"] }

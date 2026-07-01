@@ -2,6 +2,8 @@
 //! and overridden by `REWYND_*` environment variables.
 //!
 //! Precedence, low → high: **built-in defaults < `config.toml` < environment overrides**.
+//! Env overrides exist for the video/audio/output settings (see [`Config::apply_env_overrides`]);
+//! the other sections are file-only.
 //! Resolution / framerate / bitrate (and the audio rate / channels / bitrate) stay parameters
 //! sourced here, never hard-coded (PLAN §9).
 //!
@@ -40,6 +42,10 @@ const DEFAULT_BUFFER_SECONDS: u64 = 30;
 pub const MAX_BUFFER_SECONDS: u64 = 120;
 /// Default preferred global-shortcut trigger; the compositor may rebind it.
 pub const DEFAULT_HOTKEY_TRIGGER: &str = "CTRL+ALT+R";
+/// Default ganked.tv API base for uploads.
+pub const DEFAULT_UPLOAD_API_URL: &str = "https://api.ganked.tv";
+/// Default base for share links (`<share>/c/<code>`).
+pub const DEFAULT_UPLOAD_SHARE_URL: &str = "https://ganked.tv";
 
 /// Plain video encode settings (the consumer maps these onto its encoder param type).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +63,18 @@ pub struct AudioSettings {
     pub sample_rate: u32,
     pub channels: u32,
     pub bitrate_bps: u32,
+}
+
+/// Plain ganked.tv upload settings (the consumer maps these onto its client).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadSettings {
+    /// Only true when uploads are switched on AND an API key is set.
+    pub enabled: bool,
+    pub api_url: String,
+    pub share_url: String,
+    pub api_key: String,
+    /// `"public"` or `"unlisted"` (the consumer parses it; unknown values mean public).
+    pub visibility: String,
 }
 
 /// Video encode settings as parsed from TOML, defaulting to the built-ins.
@@ -155,6 +173,29 @@ struct CaptureConfig {
     always_prompt: bool,
 }
 
+/// ganked.tv upload settings. `api_key` is a secret — `save_to` tightens the file mode for it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct UploadConfig {
+    enabled: bool,
+    api_url: String,
+    share_url: String,
+    api_key: String,
+    visibility: String,
+}
+
+impl Default for UploadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_url: DEFAULT_UPLOAD_API_URL.to_owned(),
+            share_url: DEFAULT_UPLOAD_SHARE_URL.to_owned(),
+            api_key: String::new(),
+            visibility: "public".to_owned(),
+        }
+    }
+}
+
 /// The parsed, layered configuration. Build it with [`load`]; read it through the accessors.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -165,6 +206,7 @@ pub struct Config {
     output: OutputConfig,
     hotkey: HotkeyConfig,
     capture: CaptureConfig,
+    upload: UploadConfig,
 }
 
 impl Config {
@@ -271,6 +313,24 @@ impl Config {
         self.capture.always_prompt
     }
 
+    /// The validated upload settings: `enabled` requires an API key, and empty URLs fall back to
+    /// the ganked.tv defaults.
+    #[must_use]
+    pub fn upload(&self) -> UploadSettings {
+        let key = self.upload.api_key.trim();
+        let or_default = |value: &str, default: &str| {
+            let v = value.trim();
+            if v.is_empty() { default } else { v }.to_owned()
+        };
+        UploadSettings {
+            enabled: self.upload.enabled && !key.is_empty(),
+            api_url: or_default(&self.upload.api_url, DEFAULT_UPLOAD_API_URL),
+            share_url: or_default(&self.upload.share_url, DEFAULT_UPLOAD_SHARE_URL),
+            api_key: key.to_owned(),
+            visibility: self.upload.visibility.clone(),
+        }
+    }
+
     // --- Raw getters + setters for an editor (the settings UI). The getters return the
     // configured value as stored (unclamped/unfiltered) so a round-trip through the editor
     // doesn't silently rewrite it; the daemon should keep using the validating accessors above.
@@ -285,6 +345,36 @@ impl Config {
     #[must_use]
     pub fn output_directory(&self) -> Option<&str> {
         self.output.directory.as_deref()
+    }
+
+    /// The upload toggle as stored (before [`upload`]'s has-a-key requirement).
+    #[must_use]
+    pub fn upload_enabled(&self) -> bool {
+        self.upload.enabled
+    }
+
+    /// The API key as stored.
+    #[must_use]
+    pub fn upload_api_key(&self) -> &str {
+        &self.upload.api_key
+    }
+
+    /// The API base URL as stored (before [`upload`]'s empty fallback).
+    #[must_use]
+    pub fn upload_api_url(&self) -> &str {
+        &self.upload.api_url
+    }
+
+    /// The share-link base URL as stored (before [`upload`]'s empty fallback).
+    #[must_use]
+    pub fn upload_share_url(&self) -> &str {
+        &self.upload.share_url
+    }
+
+    /// The visibility string as stored.
+    #[must_use]
+    pub fn upload_visibility(&self) -> &str {
+        &self.upload.visibility
     }
 
     /// Replace the video settings.
@@ -328,20 +418,66 @@ impl Config {
         self.capture.always_prompt = always_prompt;
     }
 
+    /// Switch uploads on/off (takes effect only once a key is set — see [`upload`]).
+    pub fn set_upload_enabled(&mut self, enabled: bool) {
+        self.upload.enabled = enabled;
+    }
+
+    /// Set the ganked.tv API key.
+    pub fn set_upload_api_key(&mut self, key: String) {
+        self.upload.api_key = key;
+    }
+
+    /// Set the API base URL; an empty string means "use the default".
+    pub fn set_upload_api_url(&mut self, url: String) {
+        self.upload.api_url = url;
+    }
+
+    /// Set the share-link base URL; an empty string means "use the default".
+    pub fn set_upload_share_url(&mut self, url: String) {
+        self.upload.share_url = url;
+    }
+
+    /// Set the upload visibility string.
+    pub fn set_upload_visibility(&mut self, visibility: String) {
+        self.upload.visibility = visibility;
+    }
+
     /// Serialize to a TOML string (the editor writes this back to the config file).
     pub fn to_toml_string(&self) -> Result<String, toml::ser::Error> {
         toml::to_string_pretty(self)
     }
 
-    /// Serialize and write the config to `path`, creating parent directories.
+    /// Serialize and write the config to `path`, creating parent directories. The write is
+    /// atomic (temp file + rename), so a crash or full disk can't leave a truncated config; the
+    /// file may hold the upload API key, so on unix the temp is created 0600 and the rename
+    /// carries that mode over any looser pre-existing file.
     pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
+        use std::io::Write;
         let toml = self
             .to_toml_string()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, toml)
+        let tmp = path.with_extension("toml.tmp");
+        // Drop any stale temp from a crashed save: `mode` below only applies at creation.
+        let _ = std::fs::remove_file(&tmp);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let result = options
+            .open(&tmp)
+            .and_then(|mut file| file.write_all(toml.as_bytes()))
+            .and_then(|()| std::fs::rename(&tmp, path));
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
     }
 }
 
@@ -548,7 +684,7 @@ pub fn load_file() -> Config {
 pub const DEFAULT_TEMPLATE: &str = "\
 # rewynd configuration. Values shown are the defaults; uncomment and edit to change.
 # Precedence: these settings override the built-in defaults, and REWYND_* environment
-# variables override these.
+# variables override the video/audio/output settings.
 
 [video]
 width = 1920
@@ -581,6 +717,16 @@ trigger = \"CTRL+ALT+R\"
 [capture]
 # Re-show the monitor picker each launch (so you can pick a different screen).
 always_prompt = false
+
+[upload]
+# Upload saved clips to ganked.tv from the tray (\"Upload last clip\"). Create an API key at
+# ganked.tv/settings/api-keys and paste it here.
+enabled = false
+api_url = \"https://api.ganked.tv\"
+share_url = \"https://ganked.tv\"
+api_key = \"\"
+# \"public\" or \"unlisted\"
+visibility = \"public\"
 ";
 
 /// Write [`DEFAULT_TEMPLATE`] to `path`, creating parent directories. The testable core of
@@ -677,6 +823,85 @@ mod tests {
         assert!(c.always_prompt());
         assert_eq!(c.hotkey_trigger(), "CTRL+ALT+K");
         assert_eq!(c.buffer_window(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn upload_defaults_and_key_requirement() {
+        let c = Config::from_toml_str("").expect("parses");
+        let u = c.upload();
+        assert!(!u.enabled);
+        assert_eq!(u.api_url, DEFAULT_UPLOAD_API_URL);
+        assert_eq!(u.share_url, DEFAULT_UPLOAD_SHARE_URL);
+        assert_eq!(u.visibility, "public");
+
+        // Enabled without a key stays disabled; empty URL falls back to the default.
+        let c =
+            Config::from_toml_str("[upload]\nenabled = true\napi_url = \"\"\n").expect("parses");
+        assert!(!c.upload().enabled, "no key → not enabled");
+        assert_eq!(c.upload().api_url, DEFAULT_UPLOAD_API_URL);
+
+        let c = Config::from_toml_str(
+            "[upload]\nenabled = true\napi_key = \" gtv_k \"\napi_url = \"http://localhost:5050/\"\nvisibility = \"unlisted\"\n",
+        )
+        .expect("parses");
+        let u = c.upload();
+        assert!(u.enabled);
+        assert_eq!(u.api_key, "gtv_k", "key is trimmed");
+        assert_eq!(u.api_url, "http://localhost:5050/");
+        assert_eq!(u.visibility, "unlisted");
+    }
+
+    #[test]
+    fn upload_setters_round_trip() {
+        let mut c = Config::default();
+        c.set_upload_enabled(true);
+        c.set_upload_api_key("gtv_abc".to_owned());
+        c.set_upload_api_url("http://localhost:5050".to_owned());
+        c.set_upload_share_url("http://localhost:5173".to_owned());
+        c.set_upload_visibility("unlisted".to_owned());
+        let back = Config::from_toml_str(&c.to_toml_string().expect("serialize")).expect("reparse");
+        assert_eq!(back, c);
+        assert!(back.upload_enabled());
+        assert_eq!(back.upload_api_key(), "gtv_abc");
+        assert_eq!(back.upload_api_url(), "http://localhost:5050");
+        assert_eq!(back.upload_share_url(), "http://localhost:5173");
+        assert_eq!(back.upload_visibility(), "unlisted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_to_tightens_the_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut c = Config::default();
+        c.set_upload_api_key("gtv_secret".to_owned());
+
+        // Fresh file: created owner-only.
+        let path = unique_tmp_path();
+        c.save_to(&path).expect("save");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "config holding a key is owner-only");
+
+        // The first-run case: a world-readable template already exists. The atomic rename must
+        // replace it with an owner-only file, never exposing the key at the old mode.
+        let loose = unique_tmp_path();
+        std::fs::write(&loose, "# template").expect("seed");
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        c.save_to(&loose).expect("save over loose file");
+        let mode = std::fs::metadata(&loose)
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "pre-existing 0644 file is replaced by 0600"
+        );
+        let back = Config::from_toml_str(&std::fs::read_to_string(&loose).expect("read"))
+            .expect("reparse");
+        assert_eq!(back, c, "content survives the atomic replace");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&loose);
     }
 
     #[test]
