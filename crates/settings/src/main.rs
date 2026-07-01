@@ -261,14 +261,14 @@ impl App {
             }
             Message::ResolutionPicked(r) => {
                 let (width, height) = r.dims();
-                let mut v = self.config.video();
+                let mut v = self.config.video_stored();
                 v.width = width;
                 v.height = height;
                 self.config.set_video(v);
                 self.touch();
             }
             Message::FpsPicked(fps) => {
-                let mut v = self.config.video();
+                let mut v = self.config.video_stored();
                 v.framerate = fps;
                 // Keep ~1 keyframe per second so the ring buffer's cut granularity tracks the
                 // frame rate (the defaults couple these); the UI doesn't expose the GOP directly.
@@ -277,7 +277,7 @@ impl App {
                 self.touch();
             }
             Message::BitrateMbps(mbps) => {
-                let mut v = self.config.video();
+                let mut v = self.config.video_stored();
                 v.bitrate_bps = mbps.saturating_mul(BITS_PER_MBIT);
                 self.config.set_video(v);
                 self.touch();
@@ -469,8 +469,8 @@ impl App {
     fn view(&self) -> Element<'_, Message> {
         // `normalize` (on load) keeps these in range; clamp on the u64 before narrowing so a
         // pathological stored value can't wrap the cast.
-        let v = self.config.video();
-        let a = self.config.audio();
+        let v = self.config.video_stored();
+        let a = self.config.audio_stored();
         let mbps = v.bitrate_bps / BITS_PER_MBIT;
         let secs = self.config.buffer_seconds().min(u64::from(BUFFER_MAX_S)) as u32;
         // Rough clip size from the target bitrate (video + audio) over the replay window,
@@ -727,7 +727,7 @@ fn normalize(c: &mut Config) {
         c.buffer_seconds()
             .clamp(u64::from(BUFFER_MIN_S), u64::from(BUFFER_MAX_S)),
     );
-    let mut v = c.video();
+    let mut v = c.video_stored();
     let mbps = (v.bitrate_bps / BITS_PER_MBIT).clamp(BITRATE_MIN_MBPS, BITRATE_MAX_MBPS);
     v.bitrate_bps = mbps * BITS_PER_MBIT;
     c.set_video(v);
@@ -821,17 +821,28 @@ fn recorder_path() -> Option<std::path::PathBuf> {
 /// The stop half (pid verification, SIGTERM→SIGKILL escalation, start-time identity guard)
 /// lives in rewynd-config next to the pid file's writer.
 fn restart_recorder() -> Result<(), String> {
-    if let Err(e) = config::stop_recorder(
+    match config::stop_recorder(
         std::time::Duration::from_secs(3),
         std::time::Duration::from_secs(2),
     ) {
-        tracing::warn!(error = %e, "could not stop the running recorder");
+        Ok(true) => {}
+        Ok(false) => {
+            // Spawning now would just bounce off the old process's single-instance lock.
+            return Err("the running recorder did not stop; try again".to_owned());
+        }
+        Err(e) => tracing::warn!(error = %e, "could not stop the running recorder"),
     }
     let recorder =
         recorder_path().ok_or_else(|| "could not locate the recorder binary".to_owned())?;
     std::process::Command::new(&recorder)
         .spawn()
-        .map(|_| ())
+        .map(|mut child| {
+            // Reap in the background: an unreaped child stays a zombie whose /proc identity
+            // makes the NEXT restart's stop wait think the old recorder never exited.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        })
         .map_err(|e| format!("could not start {}: {e}", recorder.display()))
 }
 

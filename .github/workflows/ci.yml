@@ -44,6 +44,10 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # The probe diagnostics + their examples are feature-gated and would otherwise bitrot.
+      - name: clippy (capture probes)
+        run: cargo clippy -p rewynd-capture --all-targets --features probes --locked -- -D warnings
+
       - name: build
         run: cargo build --workspace --all-targets --locked
 
@@ -51,9 +55,10 @@ jobs:
         run: cargo test --workspace --locked
 
       # The vendored muxer fork (ADR 0004) is workspace-excluded, so its inherited test
-      # suite (elst/dOps round-trips our A/V sync depends on) needs an explicit run.
+      # suite (elst/dOps round-trips our A/V sync depends on) needs an explicit run. Lib
+      # tests only: an upstream doctest expects a sample file that isn't vendored.
       - name: test vendored mp4 fork
-        run: cargo test --manifest-path vendor/mp4/Cargo.toml --locked
+        run: cargo test --manifest-path vendor/mp4/Cargo.toml --locked --lib
 
   deny:
     name: advisories · licenses · sources

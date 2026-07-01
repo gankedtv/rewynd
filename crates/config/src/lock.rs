@@ -26,6 +26,8 @@ fn lock_file(path: &Path) -> std::io::Result<Option<std::fs::File>> {
         .read(true)
         .write(true)
         .create(true)
+        // Owner-only at creation, matching the 0600/0700 posture of everything else here.
+        .mode(0o600)
         // Don't truncate on open: a failed lock must leave the holder's pid intact. We truncate
         // only after the lock is ours (in `acquire_pid_lock_at`).
         .truncate(false)

@@ -27,7 +27,7 @@ rewynd-clip.workspace = true
 ashpd = { workspace = true, features = ["global_shortcuts"] }
 # macros/sync drive the select!-based hotkey loop; signal funnels SIGTERM/SIGINT through the
 # same orderly shutdown as tray Quit.
-tokio = { workspace = true, features = ["macros", "signal", "sync"] }
+tokio = { workspace = true, features = ["macros", "signal", "sync", "time"] }
 pollster.workspace = true
 futures-util.workspace = true
 # Tray (StatusNotifierItem over D-Bus, no GTK — reuses our zbus stack) + desktop toast +

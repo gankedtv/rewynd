@@ -109,6 +109,7 @@ mod linux {
                         &gpu,
                         &conv,
                         &mut enc.borrow_mut(),
+                        params,
                         captured,
                         frame_index,
                         &mut writer,
@@ -193,10 +194,12 @@ mod linux {
         is_keyframe: bool,
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_one(
         gpu: &GpuContext,
         conv: &Nv12Converter,
         enc: &mut GpuVideoEncoder,
+        params: EncodeParams,
         captured: CapturedDmabuf,
         frame_index: u32,
         writer: &mut impl Write,
@@ -225,7 +228,7 @@ mod linux {
         // SAFETY: `captured` came straight from the PipeWire negotiation, so the fd is a
         // valid single-plane DMA-BUF whose format/modifier/stride/offset match `import`.
         let texture = unsafe { gpu.import_dmabuf(import)? };
-        let nv12 = conv.convert(gpu, &texture, texture.width(), texture.height());
+        let nv12 = conv.convert(gpu, &texture, params.width, params.height);
 
         // Force a keyframe on the very first frame so the file is decodable from the
         // start (the encoder's own GOP handles the rest via EncodeParams.idr_period).

@@ -15,11 +15,9 @@
 //! - re-emit a single-modifier `EnumFormat` to fixate, then a `SPA_PARAM_Buffers`
 //!   pinning `dataType = 1 << SPA_DATA_DmaBuf`.
 //!
-//! Two entry points share all of the above negotiation machinery via
-//! [`run_stream`]:
-//! - [`run_capture_probe`]: a diagnostic that logs the first N DMA-BUF frames.
-//! - [`capture_one_dmabuf`]: `dup()`s the first usable DMA-BUF fd into an [`OwnedFd`]
-//!   and returns its descriptor for the wgpu import.
+//! Three entry points share all of the above negotiation machinery via [`run_stream`]:
+//! [`capture_stream`] (the live pipeline), plus the `probes`-gated diagnostics
+//! `run_capture_probe` and `capture_one_dmabuf`.
 
 use std::cell::Cell;
 #[cfg(feature = "probes")]
@@ -73,8 +71,8 @@ const MAX_FIXATION_ATTEMPTS: u32 = 4;
 
 /// A self-contained description of one captured DMA-BUF plane + its format.
 ///
-/// The import into a `wgpu::Texture` (turning this into a [`crate::GpuFrame`]) goes
-/// via [`capture_one_dmabuf`] + `rewynd_gpu::GpuContext::import_dmabuf`.
+/// The import into a `wgpu::Texture` goes via the probe helper `capture_one_dmabuf`
+/// (feature `probes`) or the live path's `rewynd_gpu::GpuContext::import_dmabuf`.
 #[derive(Debug, Clone)]
 pub struct DmabufFrame {
     /// The DMA-BUF file descriptor for the plane (borrowed from PipeWire; valid
@@ -422,20 +420,6 @@ fn modifier_choices_inner(param: &Pod) -> Vec<u64> {
     }
 }
 
-/// Drive the shared portal→stream→negotiation machinery and deliver each usable
-/// (single-plane DMA-BUF carrying data) frame to `on_usable`.
-///
-/// `on_usable(frame, plane_fd)` receives the frame's [`DmabufFrame`] descriptor
-/// plus the *borrowed* plane fd (valid only for that call), and returns
-/// [`ControlFlow::Break`] to stop the loop (success) or [`ControlFlow::Continue`]
-/// to keep receiving frames. The callback is responsible for `dup()`ing the fd if
-/// it needs to outlive the call (PipeWire recycles it on the next dequeue).
-///
-/// Returns `Ok(())` once the loop quits with the success flag set, otherwise a
-/// [`CaptureError::PipeWire`] describing why negotiation/capture failed.
-///
-/// Blocks (runs the PipeWire main loop) on the calling thread, which must own the
-/// `fd`; keep the portal `Session` (and any tokio runtime) alive for the whole call.
 /// Everything one stream run needs besides the connection + callback.
 struct StreamConfig<'a> {
     stream_name: &'a str,
@@ -445,6 +429,20 @@ struct StreamConfig<'a> {
     no_frame_error: &'a str,
 }
 
+/// Drive the shared portal→stream→negotiation machinery and deliver each usable
+/// (single-plane DMA-BUF carrying data) frame to `on_usable`.
+///
+/// `on_usable(frame, plane_fd)` receives the frame's [`DmabufFrame`] descriptor
+/// plus the *borrowed* plane fd (valid only for that call), and returns
+/// [`ControlFlow::Break`] to stop the loop (success) or [`ControlFlow::Continue`]
+/// to keep receiving frames. The callback is responsible for `dup()`ing the fd if
+/// it needs to outlive the call (PipeWire recycles it on the next dequeue).
+///
+/// Returns `Ok(())` once the loop quits with the success flag set (a cooperative stop counts),
+/// otherwise a [`CaptureError::PipeWire`] describing why negotiation/capture failed.
+///
+/// Blocks (runs the PipeWire main loop) on the calling thread, which must own the
+/// `fd`; keep the portal `Session` (and any tokio runtime) alive for the whole call.
 fn run_stream<F>(
     node_id: u32,
     fd: OwnedFd,

@@ -100,14 +100,16 @@ pub(crate) fn ensure_instance_dir(dir: &InstanceDir) -> std::io::Result<()> {
     let meta = std::fs::symlink_metadata(&dir.path)?;
     // SAFETY: `geteuid` is infallible and takes no arguments.
     let euid = unsafe { libc::geteuid() };
-    if !meta.file_type().is_dir()
-        || meta.uid() != euid
-        || meta.permissions().mode() & 0o777 != 0o700
-    {
+    if !meta.file_type().is_dir() || meta.uid() != euid {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!("refusing unsafe instance dir {}", dir.path.display()),
         ));
+    }
+    // A dir we own but with a loose mode (an older release created it 0755) is tightened, not
+    // refused: failing closed here would silently disable the single-instance guard forever.
+    if meta.permissions().mode() & 0o077 != 0 {
+        std::fs::set_permissions(&dir.path, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
 }
@@ -253,7 +255,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn ensure_instance_dir_rejects_symlink_and_loose_mode() {
+    fn ensure_instance_dir_rejects_symlinks_and_tightens_loose_modes() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().expect("tempdir");
 
@@ -266,6 +268,8 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link.path).expect("symlink");
         assert!(ensure_instance_dir(&link).is_err(), "symlink is rejected");
 
+        // A loose dir WE own (an older release created it 0755) is tightened, not refused —
+        // refusing would permanently disable the single-instance guard on upgrade.
         let loose = InstanceDir {
             path: tmp.path().join("loose"),
             in_shared_temp: true,
@@ -273,10 +277,12 @@ mod tests {
         std::fs::create_dir(&loose.path).expect("dir");
         std::fs::set_permissions(&loose.path, std::fs::Permissions::from_mode(0o755))
             .expect("chmod");
-        assert!(
-            ensure_instance_dir(&loose).is_err(),
-            "group/other access is rejected"
-        );
+        ensure_instance_dir(&loose).expect("owned loose dir is accepted");
+        let mode = std::fs::metadata(&loose.path)
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "loose mode is tightened to 0700");
     }
 
     #[cfg(unix)]

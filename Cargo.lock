@@ -3457,6 +3457,7 @@ dependencies = [
 name = "rewynd-clip"
 version = "0.1.0"
 dependencies = [
+ "dirs",
  "libc",
  "rewynd-buffer",
  "rewynd-config",

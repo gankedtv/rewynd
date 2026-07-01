@@ -71,7 +71,7 @@ impl std::fmt::Display for Visibility {
 pub enum UploadError {
     #[error("could not read the clip: {0}")]
     Io(#[from] std::io::Error),
-    #[error("clip is {} MB; ganked.tv accepts at most {} MB", size / 1_000_000, max / 1_000_000)]
+    #[error("clip is {} MB; ganked.tv accepts at most {} MB", size.div_ceil(1_000_000), max / 1_000_000)]
     TooLarge { size: u64, max: u64 },
     #[error("request failed: {0}")]
     Http(#[from] reqwest::Error),
@@ -600,7 +600,9 @@ mod tests {
         Mock::given(method("PUT"))
             .and(path("/storage/obj"))
             .and(header("content-type", "video/mp4"))
-            // The API key must never reach the storage host.
+            // The streamed body must arrive byte-for-byte, and the API key must never reach
+            // the storage host.
+            .and(wiremock::matchers::body_bytes(b"mp4!".to_vec()))
             .and(|req: &wiremock::Request| !req.headers.contains_key("authorization"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)

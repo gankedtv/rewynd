@@ -156,10 +156,13 @@ impl ClipSaver {
         if let Some(path) = lock_unpoisoned(&self.last_clip).clone() {
             return Some(path);
         }
+        // Mirror clip_output_path's chain exactly, or clips saved to a fallback dir would be
+        // invisible after a restart.
         let dir = self
             .output_dir
             .clone()
-            .or_else(rewynd_config::default_output_dir)?;
+            .or_else(rewynd_config::default_output_dir)
+            .unwrap_or_else(private_temp_dir);
         newest_clip_in(&dir)
     }
 }
@@ -197,17 +200,37 @@ fn clip_output_path(output_dir: Option<&Path>) -> PathBuf {
 }
 
 /// Last-resort clip directory: per-user and non-world-readable, since clips are screen + mic
-/// recordings and the shared temp root is world-readable.
+/// recordings. The shared temp root is world-writable, so a pre-existing directory is only
+/// trusted after an ownership check; a squatted name falls back to a home-scoped directory.
 fn private_temp_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("rewynd-clips-{}", euid()));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+    if ensure_private_dir(&dir) {
+        return dir;
     }
-    #[cfg(not(unix))]
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+    tracing::warn!(dir = %dir.display(), "temp clip dir is not safely ours; using a home dir");
+    match dirs::home_dir() {
+        Some(home) => {
+            let fallback = home.join(".rewynd-clips");
+            let _ = std::fs::create_dir_all(&fallback);
+            fallback
+        }
+        None => dir,
+    }
+}
+
+/// Create `dir` 0700 if missing and verify it is a real directory owned by us with no group or
+/// world access (never following a planted symlink).
+#[cfg(unix)]
+fn ensure_private_dir(dir: &Path) -> bool {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let _ = std::fs::DirBuilder::new().mode(0o700).create(dir);
+    std::fs::symlink_metadata(dir)
+        .is_ok_and(|meta| meta.is_dir() && meta.uid() == euid() && meta.mode() & 0o077 == 0)
+}
+
+#[cfg(not(unix))]
+fn ensure_private_dir(dir: &Path) -> bool {
+    std::fs::create_dir_all(dir).is_ok()
 }
 
 #[cfg(unix)]

@@ -29,7 +29,7 @@ process's lifetime (an `InstanceLock` guard). The pid file is **not** removed on
 | --- | --- |
 | **advisory `flock`** | **chosen** — kernel releases it on process death (including crash/SIGKILL), so no stale-lock recovery; the existing pid file doubles as the recorder's lock target |
 | pid-file existence check | rejected — racy (TOCTOU between two launches) and needs stale-pid recovery after a crash |
-| `std::fs::File::try_lock` | rejected — stabilised in Rust 1.89, past our 1.85 MSRV |
+| `std::fs::File::try_lock` | rejected at the time (needed 1.89 vs our then-1.85 MSRV); *erratum:* the MSRV is now 1.89 (ADR 0010), but the libc path stays for `O_NOFOLLOW` open flags and uniform pid-file semantics |
 | abstract-socket / D-Bus name | rejected — heavier than the problem; we already have the pid file |
 
 ## Rationale

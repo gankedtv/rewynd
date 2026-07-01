@@ -19,9 +19,13 @@ fn main() -> anyhow::Result<()> {
     if let Err(e) = &result {
         // The recorder is a windowless background app (often autostarted): without this, a
         // fatal startup error is invisible. Blocking `show` is fine — no runtime is live here.
+        let body = format!("{e:#}")
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
         let _ = notify_rust::Notification::new()
             .summary("rewynd could not start")
-            .body(&format!("{e:#}"))
+            .body(&body)
             .icon(rewynd_config::APP_ID)
             .appname("rewynd")
             .show();
@@ -543,7 +547,9 @@ mod linux {
         };
         match std::process::Command::new(&settings).spawn() {
             Ok(mut child) => {
-                tokio::task::spawn_blocking(move || {
+                // A plain thread, NOT spawn_blocking: dropping the runtime at shutdown waits
+                // for blocking tasks, and this one parks until the settings window closes.
+                std::thread::spawn(move || {
                     let _ = child.wait();
                 });
             }
@@ -679,8 +685,10 @@ mod linux {
                 // stuck in one ear, system audio keeps its stereo image, and the configured
                 // gain is applied to each.
                 let mut prep = Vec::new();
+                let panicked = std::rc::Rc::new(std::cell::Cell::new(false));
                 // No idle timeout (capture runs until shutdown); the stop flag drives the
                 // watchdog so the loop quits promptly even if the endpoint suspends.
+                let panicked_flag = panicked.clone();
                 let result = capture_audio(
                     capture_params,
                     source,
@@ -716,11 +724,19 @@ mod linux {
                             Ok(()) => ControlFlow::Continue(()),
                             Err(_) => {
                                 tracing::error!("audio callback panicked; stopping this capture");
+                                panicked_flag.set(true);
                                 ControlFlow::Break(())
                             }
                         }
                     },
                 );
+                // A panic Break reads as a clean stream end; surface it like a capture error.
+                let result = match result {
+                    Ok(()) if panicked.get() => Err(rewynd_capture::CaptureError::PipeWire(
+                        "the audio callback panicked".to_owned(),
+                    )),
+                    other => other,
+                };
                 if let Err(e) = result {
                     // A missing mic is expected; a failed system sink means the clip loses its
                     // primary audio, so surface that louder (and to the tray).
@@ -763,11 +779,16 @@ mod linux {
             height: params.height,
             framerate: params.framerate,
         };
+        // A callback Break reads as a clean stop to the stream; record the real reason so it
+        // still surfaces as this function's Err (and from there as a RecorderEvent).
+        let failure: Rc<std::cell::Cell<Option<&'static str>>> =
+            Rc::new(std::cell::Cell::new(None));
         capture_stream(node_id, fd, epoch, prefs, Some(stop.clone()), {
             let gpu = gpu.clone();
             let conv = conv.clone();
             let enc = enc.clone();
             let stop = stop.clone();
+            let failure = failure.clone();
             let mut frame_index: u64 = 0;
             move |captured: CapturedDmabuf| -> ControlFlow<()> {
                 if stop.load(Ordering::Relaxed) {
@@ -796,10 +817,12 @@ mod linux {
                     }
                     Ok(Err(e)) => {
                         tracing::error!(error = %e, "frame failed; stopping capture");
+                        failure.set(Some("a frame failed to encode"));
                         ControlFlow::Break(())
                     }
                     Err(_) => {
                         tracing::error!("frame panicked (GPU error?); stopping capture");
+                        failure.set(Some("the GPU pipeline panicked"));
                         ControlFlow::Break(())
                     }
                 }
@@ -809,7 +832,10 @@ mod linux {
         drop(enc);
         drop(conv);
         drop(gpu);
-        Ok(())
+        match failure.get() {
+            Some(reason) => Err(anyhow!("{reason} (see the log for details)")),
+            None => Ok(()),
+        }
     }
 
     /// Drain settled mixed audio from `mixer`, Opus-encode it, and push packets into the
@@ -856,8 +882,9 @@ mod linux {
                 // audio for the rest of the session (and would skip the shutdown flush).
                 tracing::error!(error = %e, "audio encode failed; dropping this chunk");
             }
-            // Cleared only after the drained packets are in the ring: the saver waits on this.
-            if drain_all && !finalize {
+            // Cleared only after the drained packets are in the ring: the saver waits on this
+            // (also on the finalize pass, so a save racing shutdown is not left waiting).
+            if drain_all {
                 drain_now.store(false, Ordering::SeqCst);
             }
 
@@ -937,7 +964,12 @@ mod linux {
             .await
             {
                 Ok(HotkeyExit::Shutdown) => return Ok(()),
-                Ok(HotkeyExit::SessionEnded) => {
+                Ok(HotkeyExit::SessionEnded { lasted }) => {
+                    // A session that ran for a while resets the budget: the counter guards
+                    // against a rapid rebind loop, not a compositor restarting once a week.
+                    if lasted > Duration::from_secs(60) {
+                        attempts = 0;
+                    }
                     attempts += 1;
                     if attempts > HOTKEY_REBIND_ATTEMPTS {
                         tracing::error!("hotkey session keeps ending; continuing tray-only");
@@ -975,7 +1007,11 @@ mod linux {
 
     enum HotkeyExit {
         Shutdown,
-        SessionEnded,
+        /// The portal session ended; `lasted` distinguishes a healthy long-lived session (a
+        /// compositor restart — rebinding is fine indefinitely) from a rapid failure loop.
+        SessionEnded {
+            lasted: Duration,
+        },
     }
 
     /// One bind-and-listen session of the GlobalShortcuts portal.
@@ -988,80 +1024,88 @@ mod linux {
     ) -> Result<HotkeyExit> {
         let shortcuts = GlobalShortcuts::new().await?;
         let session = shortcuts.create_session(Default::default()).await?;
-        // Subscribe before binding so no early activation is missed.
-        let mut activated = shortcuts.receive_activated().await?;
-        let save_description = format!("Save the last {} seconds", saver_window_secs(saver));
-        let bound = shortcuts
-            .bind_shortcuts(
-                &session,
-                &[NewShortcut::new(SHORTCUT_ID, &save_description)
-                    .preferred_trigger(hotkey_trigger)],
-                None,
-                Default::default(),
-            )
-            .await?
-            .response()?;
-        for shortcut in bound.shortcuts() {
-            tracing::info!(
-                id = shortcut.id(),
-                trigger = shortcut.trigger_description(),
-                "bound shortcut"
-            );
-        }
-
-        // A freshly bound shortcut often has no trigger yet (the preferred trigger is only
-        // a hint). Open the portal's configuration dialog so the user can assign a key to
-        // *this* shortcut — assigning it elsewhere won't deliver the activation signal.
-        let needs_trigger = bound
-            .shortcuts()
-            .iter()
-            .all(|s| s.trigger_description().is_empty());
-        if needs_trigger && shortcuts.version() >= 2 {
-            tracing::info!(
-                shortcut = %save_description,
-                "no trigger bound yet — opening the shortcut configuration dialog; assign a key to this shortcut"
-            );
-            if let Err(e) = shortcuts
-                .configure_shortcuts(&session, None, Default::default())
-                .await
-            {
-                tracing::warn!(error = %e, "could not open the shortcut configuration dialog");
+        // From here on the session must be closed on EVERY path (its Drop does not send Close,
+        // and the shared D-Bus connection lives as long as the process), so the fallible rest
+        // runs in a block whose result is awaited before the close.
+        let started = Instant::now();
+        let result = async {
+            // Subscribe before binding so no early activation is missed.
+            let mut activated = shortcuts.receive_activated().await?;
+            let save_description = format!("Save the last {} seconds", saver_window_secs(saver));
+            let bound = shortcuts
+                .bind_shortcuts(
+                    &session,
+                    &[NewShortcut::new(SHORTCUT_ID, &save_description)
+                        .preferred_trigger(hotkey_trigger)],
+                    None,
+                    Default::default(),
+                )
+                .await?
+                .response()?;
+            for shortcut in bound.shortcuts() {
+                tracing::info!(
+                    id = shortcut.id(),
+                    trigger = shortcut.trigger_description(),
+                    "bound shortcut"
+                );
             }
-        }
 
-        tracing::info!(
-            shortcut = SHORTCUT_ID,
-            "global shortcut ready; press the configured key to save a clip"
-        );
+            // A freshly bound shortcut often has no trigger yet (the preferred trigger is only
+            // a hint). Open the portal's configuration dialog so the user can assign a key to
+            // *this* shortcut — assigning it elsewhere won't deliver the activation signal.
+            let needs_trigger = bound
+                .shortcuts()
+                .iter()
+                .all(|s| s.trigger_description().is_empty());
+            if needs_trigger && shortcuts.version() >= 2 {
+                tracing::info!(
+                    shortcut = %save_description,
+                    "no trigger bound yet — opening the shortcut configuration dialog; assign a key to this shortcut"
+                );
+                if let Err(e) = shortcuts
+                    .configure_shortcuts(&session, None, Default::default())
+                    .await
+                {
+                    tracing::warn!(error = %e, "could not open the shortcut configuration dialog");
+                }
+            }
 
-        let exit = loop {
-            tokio::select! {
-                activation = activated.next() => {
-                    let Some(activation) = activation else {
-                        break HotkeyExit::SessionEnded;
-                    };
-                    tracing::info!(shortcut_id = activation.shortcut_id(), "shortcut activated");
-                    if activation.shortcut_id() == SHORTCUT_ID {
-                        // Blocking cut + mux off the runtime worker so activations keep flowing.
-                        let s = saver.clone();
-                        let saved = tokio::task::spawn_blocking(move || s.save()).await;
-                        toast_save_outcome(saved).await;
+            tracing::info!(
+                shortcut = SHORTCUT_ID,
+                "global shortcut ready; press the configured key to save a clip"
+            );
+
+            let exit = loop {
+                tokio::select! {
+                    activation = activated.next() => {
+                        let Some(activation) = activation else {
+                            break HotkeyExit::SessionEnded { lasted: started.elapsed() };
+                        };
+                        tracing::info!(shortcut_id = activation.shortcut_id(), "shortcut activated");
+                        if activation.shortcut_id() == SHORTCUT_ID {
+                            // Blocking cut + mux off the runtime worker so activations keep flowing.
+                            let s = saver.clone();
+                            let saved = tokio::task::spawn_blocking(move || s.save()).await;
+                            toast_save_outcome(saved).await;
+                        }
+                    }
+                    _ = shutdown.changed() => break HotkeyExit::Shutdown,
+                    _ = sigterm.recv() => {
+                        tracing::info!("SIGTERM received; shutting down");
+                        break HotkeyExit::Shutdown;
+                    }
+                    _ = sigint.recv() => {
+                        tracing::info!("SIGINT received; shutting down");
+                        break HotkeyExit::Shutdown;
                     }
                 }
-                _ = shutdown.changed() => break HotkeyExit::Shutdown,
-                _ = sigterm.recv() => {
-                    tracing::info!("SIGTERM received; shutting down");
-                    break HotkeyExit::Shutdown;
-                }
-                _ = sigint.recv() => {
-                    tracing::info!("SIGINT received; shutting down");
-                    break HotkeyExit::Shutdown;
-                }
-            }
-        };
+            };
+            Ok(exit)
+        }
+        .await;
 
         session.close().await.ok();
-        Ok(exit)
+        result
     }
 
     /// Park until shutdown is requested by the tray or a signal (degraded, tray-only mode).

@@ -303,6 +303,30 @@ impl Config {
         sanitized
     }
 
+    /// The video settings exactly as stored (no sanitizing) — for the settings editor, so an
+    /// edit-and-save round-trip never rewrites values the daemon merely clamps at use.
+    #[must_use]
+    pub fn video_stored(&self) -> VideoSettings {
+        VideoSettings {
+            width: self.video.width,
+            height: self.video.height,
+            framerate: self.video.framerate,
+            bitrate_bps: self.video.bitrate_bps,
+            idr_period: self.video.idr_period,
+        }
+    }
+
+    /// The audio settings exactly as stored (no sanitizing) — the editor-side twin of
+    /// [`video_stored`](Self::video_stored).
+    #[must_use]
+    pub fn audio_stored(&self) -> AudioSettings {
+        AudioSettings {
+            sample_rate: self.audio.sample_rate,
+            channels: self.audio.channels,
+            bitrate_bps: self.audio.bitrate_bps,
+        }
+    }
+
     /// Linear gain for the microphone before mixing (sanitized to a finite, non-negative value).
     #[must_use]
     pub fn mic_gain(&self) -> f32 {
