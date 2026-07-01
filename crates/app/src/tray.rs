@@ -42,7 +42,7 @@ pub struct RewyndTray {
 
 impl Tray for RewyndTray {
     fn id(&self) -> String {
-        "tv.ganked.rewynd".to_owned()
+        rewynd_config::APP_ID.to_owned()
     }
 
     fn title(&self) -> String {
@@ -124,7 +124,7 @@ pub async fn toast(summary: &str, body: &str) {
     if let Err(e) = notify_rust::Notification::new()
         .summary(summary)
         .body(body)
-        .icon("tv.ganked.rewynd")
+        .icon(rewynd_config::APP_ID)
         .appname("rewynd")
         .show_async()
         .await

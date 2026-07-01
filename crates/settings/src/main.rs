@@ -139,6 +139,10 @@ struct App {
     api_url: String,
     /// Mirror of the share-link base URL (empty = "use the default").
     share_url: String,
+    /// The start-on-boot state the autostart entry currently reflects. Save only touches the
+    /// entry when the toggle moved away from this, so an entry the user manages through their
+    /// desktop environment is never clobbered by unrelated saves.
+    applied_on_boot: bool,
     login: LoginState,
     status: Status,
 }
@@ -208,6 +212,7 @@ enum Message {
     DirPicked(Option<String>),
     HotkeyEdited(String),
     AlwaysPrompt(bool),
+    StartOnBoot(bool),
     UploadEnabled(bool),
     ApiKeyEdited(String),
     ApiUrlEdited(String),
@@ -237,6 +242,7 @@ impl App {
             api_key: config.upload_api_key().to_owned(),
             api_url: config.upload_api_url().to_owned(),
             share_url: config.upload_share_url().to_owned(),
+            applied_on_boot: config.start_on_boot(),
             config,
             login: LoginState::Idle,
             status: Status::Editing,
@@ -325,6 +331,10 @@ impl App {
             }
             Message::AlwaysPrompt(on) => {
                 self.config.set_always_prompt(on);
+                self.touch();
+            }
+            Message::StartOnBoot(on) => {
+                self.config.set_start_on_boot(on);
                 self.touch();
             }
             Message::UploadEnabled(on) => {
@@ -446,12 +456,43 @@ impl App {
             Some(path) => match self.config.save_to(&path) {
                 Ok(()) => {
                     tracing::info!(path = %path.display(), "saved config");
-                    Status::Saved
+                    self.apply_autostart()
                 }
                 Err(e) => Status::Error(format!("could not write {}: {e}", path.display())),
             },
             None => Status::Error("no config path (set $HOME or $XDG_CONFIG_HOME)".to_owned()),
         };
+    }
+
+    /// Bring the login autostart entry in line with a just-saved toggle CHANGE. Touching the
+    /// entry only on a change keeps a desktop-managed entry (same filename) safe from unrelated
+    /// saves; removal needs no recorder path, installation refuses a missing binary out loud.
+    fn apply_autostart(&mut self) -> Status {
+        let on_boot = self.config.start_on_boot();
+        if on_boot == self.applied_on_boot {
+            return Status::Saved;
+        }
+        let result = if on_boot {
+            match recorder_path() {
+                Some(recorder) if recorder.is_file() => config::install_autostart(&recorder),
+                Some(recorder) => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("recorder not found at {}", recorder.display()),
+                )),
+                None => Err(std::io::Error::other(
+                    "could not locate the recorder binary",
+                )),
+            }
+        } else {
+            config::remove_autostart()
+        };
+        match result {
+            Ok(()) => {
+                self.applied_on_boot = on_boot;
+                Status::Saved
+            }
+            Err(e) => Status::Error(format!("saved, but autostart update failed: {e}")),
+        }
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -555,6 +596,9 @@ impl App {
                 checkbox(self.config.always_prompt())
                     .label("Re-pick the monitor on next launch")
                     .on_toggle(Message::AlwaysPrompt),
+                checkbox(self.config.start_on_boot())
+                    .label("Start rewynd when I log in")
+                    .on_toggle(Message::StartOnBoot),
             ]
             .spacing(18),
         );
@@ -803,15 +847,19 @@ const RECORDER_BIN: &str = if cfg!(windows) {
     "rewynd"
 };
 
+/// The recorder binary, expected as a sibling of this settings binary.
+fn recorder_path() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(RECORDER_BIN)))
+}
+
 /// Stop the running recorder (if any), wait for it to exit, then launch a fresh one so it picks
 /// up the saved config. Blocking — runs on a `spawn_blocking` thread, not the UI thread.
 fn restart_recorder() -> Result<(), String> {
     stop_running_recorder();
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let recorder = exe
-        .parent()
-        .ok_or_else(|| "settings binary has no parent directory".to_owned())?
-        .join(RECORDER_BIN);
+    let recorder =
+        recorder_path().ok_or_else(|| "could not locate the recorder binary".to_owned())?;
     std::process::Command::new(&recorder)
         .spawn()
         .map(|_| ())
