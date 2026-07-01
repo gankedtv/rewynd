@@ -45,7 +45,7 @@ mod linux {
 
     /// Application id, registered with the portal so the GlobalShortcuts backend (e.g.
     /// KWin) can attribute and persist our shortcut. Unsandboxed apps must register one.
-    const APP_ID: &str = "tv.ganked.rewynd";
+    const APP_ID: &str = config::APP_ID;
     /// Stable id for our one shortcut; the compositor binds a trigger to it.
     const SHORTCUT_ID: &str = "save-clip";
 
@@ -157,7 +157,9 @@ mod linux {
             .build()?;
 
         // The portal Registry only accepts an app id that has an installed desktop entry,
-        // so make sure one exists before registering.
+        // so make sure one exists before registering. The login autostart entry is the settings
+        // app's business alone (it only touches the file when the toggle changes, so a
+        // desktop-managed entry is never clobbered by simply running the recorder).
         if let Err(e) = ensure_desktop_entry() {
             tracing::warn!(error = %e, "could not write a desktop entry; the hotkey may not bind");
         }
@@ -709,24 +711,6 @@ mod linux {
         Ok(enc.encode(&nv12, force_keyframe, pts)?)
     }
 
-    /// Render a path as a single quoted `Exec` value, applying both unescaping layers
-    /// the Desktop Entry spec runs on read: wrap in double quotes and backslash-escape
-    /// the reserved characters (`"` `` ` `` `$` `\`), then escape every backslash again
-    /// for the string-value layer. So a literal `\` ends up as four backslashes, and a
-    /// path with spaces is simply quoted.
-    fn desktop_exec_value(path: &str) -> String {
-        let mut quoted = String::with_capacity(path.len() + 2);
-        quoted.push('"');
-        for ch in path.chars() {
-            if matches!(ch, '"' | '`' | '$' | '\\') {
-                quoted.push('\\');
-            }
-            quoted.push(ch);
-        }
-        quoted.push('"');
-        quoted.replace('\\', "\\\\")
-    }
-
     /// Write a minimal desktop entry for [`APP_ID`] under `$XDG_DATA_HOME/applications`
     /// if one isn't already present. The GlobalShortcuts portal rejects an app id with
     /// no installed desktop entry ("app info not found"); a packaged install ships this
@@ -748,16 +732,7 @@ mod linux {
         }
 
         let exec = std::env::current_exe()?;
-        let exec_value = desktop_exec_value(&exec.to_string_lossy());
-        let entry = format!(
-            "[Desktop Entry]\n\
-             Type=Application\n\
-             Name=rewynd\n\
-             Comment=Instant-replay clip recorder\n\
-             Exec={exec_value}\n\
-             Terminal=false\n\
-             Categories=AudioVideo;Recorder;\n",
-        );
+        let entry = config::desktop_entry(&exec, "Categories=AudioVideo;Recorder;\n");
         std::fs::create_dir_all(path.parent().expect("path has a parent"))?;
         std::fs::write(&path, entry)?;
         tracing::info!(path = %path.display(), "wrote desktop entry for the global shortcut");
@@ -940,7 +915,7 @@ mod linux {
 
     #[cfg(test)]
     mod tests {
-        use super::{audio_encode_params, desktop_exec_value, encode_params};
+        use super::{audio_encode_params, encode_params};
         use rewynd_config::Config;
         use rewynd_encode::{AudioEncodeParams, EncodeParams};
 
@@ -962,26 +937,6 @@ mod linux {
                 (a.sample_rate, a.channels, a.bitrate_bps),
                 (ad.sample_rate, ad.channels, ad.bitrate_bps)
             );
-        }
-
-        #[test]
-        fn exec_value_quotes_plain_and_spaced_paths() {
-            assert_eq!(
-                desktop_exec_value("/usr/bin/rewynd"),
-                r#""/usr/bin/rewynd""#
-            );
-            assert_eq!(
-                desktop_exec_value("/home/a b/rewynd"),
-                r#""/home/a b/rewynd""#
-            );
-        }
-
-        #[test]
-        fn exec_value_double_escapes_reserved_characters() {
-            // `$` -> `\$` (quote layer) -> `\\$` (string layer).
-            assert_eq!(desktop_exec_value("/x/$y/rewynd"), r#""/x/\\$y/rewynd""#);
-            // A literal backslash becomes four.
-            assert_eq!(desktop_exec_value("/x\\y"), r#""/x\\\\y""#);
         }
     }
 }

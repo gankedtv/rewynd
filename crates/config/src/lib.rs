@@ -42,6 +42,8 @@ const DEFAULT_BUFFER_SECONDS: u64 = 30;
 pub const MAX_BUFFER_SECONDS: u64 = 120;
 /// Default preferred global-shortcut trigger; the compositor may rebind it.
 pub const DEFAULT_HOTKEY_TRIGGER: &str = "CTRL+ALT+R";
+/// The application id: portal registration, desktop-entry filenames, tray/notification icon.
+pub const APP_ID: &str = "tv.ganked.rewynd";
 /// Default ganked.tv API base for uploads.
 pub const DEFAULT_UPLOAD_API_URL: &str = "https://api.ganked.tv";
 /// Default base for share links (`<share>/c/<code>`).
@@ -174,6 +176,14 @@ struct CaptureConfig {
     always_prompt: bool,
 }
 
+/// Desktop-session startup behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct StartupConfig {
+    /// Start the recorder automatically at login (an XDG autostart entry manages this).
+    on_boot: bool,
+}
+
 /// ganked.tv upload settings. `api_key` is a secret — `save_to` tightens the file mode for it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -207,6 +217,7 @@ pub struct Config {
     output: OutputConfig,
     hotkey: HotkeyConfig,
     capture: CaptureConfig,
+    startup: StartupConfig,
     upload: UploadConfig,
 }
 
@@ -312,6 +323,17 @@ impl Config {
     #[must_use]
     pub fn always_prompt(&self) -> bool {
         self.capture.always_prompt
+    }
+
+    /// Whether the recorder should start automatically at login.
+    #[must_use]
+    pub fn start_on_boot(&self) -> bool {
+        self.startup.on_boot
+    }
+
+    /// Set whether the recorder starts automatically at login.
+    pub fn set_start_on_boot(&mut self, on_boot: bool) {
+        self.startup.on_boot = on_boot;
     }
 
     /// The validated upload settings: `enabled` requires an API key, and empty URLs fall back to
@@ -490,14 +512,21 @@ fn sanitize_gain(g: f32) -> f32 {
     if g.is_finite() && g >= 0.0 { g } else { 1.0 }
 }
 
+/// The user's config home from an environment lookup: `$XDG_CONFIG_HOME`, falling back to
+/// `$HOME/.config`. Relative values are rejected (a relative path would silently resolve
+/// against the process cwd). `None` if neither var is usable.
+fn config_home_from(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    get("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| get("HOME").map(|h| Path::new(&h).join(".config")))
+        .filter(|p| p.is_absolute())
+}
+
 /// Resolve the config file path from an environment lookup: `$XDG_CONFIG_HOME/rewynd/config.toml`,
 /// falling back to `$HOME/.config/rewynd/config.toml`. `None` if neither var is usable.
 fn config_path_from(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    let base = get("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| get("HOME").map(|h| Path::new(&h).join(".config")))?;
-    Some(base.join("rewynd").join("config.toml"))
+    Some(config_home_from(get)?.join("rewynd").join("config.toml"))
 }
 
 /// The config file path using the process environment.
@@ -637,6 +666,93 @@ pub fn acquire_settings_lock() -> std::io::Result<Option<InstanceLock>> {
     Ok(Some(InstanceLock))
 }
 
+/// Render a path as a single quoted desktop-entry `Exec` value, applying the unescaping layers
+/// the Desktop Entry spec runs on read: wrap in double quotes and backslash-escape the reserved
+/// characters (`"` `` ` `` `$` `\`), escape every backslash again for the string-value layer,
+/// and double `%` so it can't read as a field code. So a literal `\` ends up as four
+/// backslashes, and a path with spaces is simply quoted.
+#[must_use]
+pub fn desktop_exec_value(path: &str) -> String {
+    let mut quoted = String::with_capacity(path.len() + 2);
+    quoted.push('"');
+    for ch in path.chars() {
+        if matches!(ch, '"' | '`' | '$' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('"');
+    quoted.replace('\\', "\\\\").replace('%', "%%")
+}
+
+/// A minimal `[Desktop Entry]` body for `exec`, with `extra` key-lines appended — the shared
+/// core of the launcher entry (app id registration) and the login autostart entry.
+#[must_use]
+pub fn desktop_entry(exec: &Path, extra: &str) -> String {
+    format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=rewynd\n\
+         Comment=Instant-replay clip recorder\n\
+         Exec={}\n\
+         Terminal=false\n\
+         {extra}",
+        desktop_exec_value(&exec.to_string_lossy()),
+    )
+}
+
+/// Path of rewynd's XDG autostart entry (`<config-home>/autostart/<APP_ID>.desktop`), or `None`
+/// if the environment can't resolve one.
+#[must_use]
+pub fn autostart_path() -> Option<PathBuf> {
+    config_home_from(|k| std::env::var_os(k))
+        .map(|home| home.join("autostart").join(format!("{APP_ID}.desktop")))
+}
+
+/// Install (or refresh) the autostart entry at `path`, launching `exec` at login. Atomic
+/// (temp + rename): a crash can't leave a truncated entry that would silently break autostart.
+/// The testable core of [`install_autostart`].
+fn install_autostart_at(path: &Path, exec: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("desktop.tmp");
+    let result = std::fs::write(&tmp, desktop_entry(exec, "StartupNotify=false\n"))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Remove the autostart entry at `path`; an already-absent entry is fine. The testable core of
+/// [`remove_autostart`].
+fn remove_autostart_at(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+fn autostart_path_or_err() -> std::io::Result<PathBuf> {
+    autostart_path().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "neither XDG_CONFIG_HOME nor HOME is set",
+        )
+    })
+}
+
+/// Install (or refresh) the login autostart entry, launching `exec` at login.
+pub fn install_autostart(exec: &Path) -> std::io::Result<()> {
+    install_autostart_at(&autostart_path_or_err()?, exec)
+}
+
+/// Remove the login autostart entry (absent is fine).
+pub fn remove_autostart() -> std::io::Result<()> {
+    remove_autostart_at(&autostart_path_or_err()?)
+}
+
 /// Read the config file at `path` (if any) and layer `REWYND_*` overrides via `get_env`. A
 /// missing or malformed file falls back to the built-in defaults (logging why). The testable
 /// core of [`load`].
@@ -721,6 +837,10 @@ trigger = \"CTRL+ALT+R\"
 [capture]
 # Re-show the monitor picker each launch (so you can pick a different screen).
 always_prompt = false
+
+[startup]
+# Start rewynd automatically when you log in.
+on_boot = false
 
 [upload]
 # Upload saved clips to ganked.tv from the tray (\"Upload last clip\"). Create an API key at
@@ -827,6 +947,73 @@ mod tests {
         assert!(c.always_prompt());
         assert_eq!(c.hotkey_trigger(), "CTRL+ALT+K");
         assert_eq!(c.buffer_window(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn start_on_boot_round_trips() {
+        let mut c = Config::default();
+        assert!(!c.start_on_boot(), "off by default");
+        c.set_start_on_boot(true);
+        let back = Config::from_toml_str(&c.to_toml_string().expect("serialize")).expect("reparse");
+        assert!(back.start_on_boot());
+    }
+
+    #[test]
+    fn config_home_rejects_relative_values() {
+        // Relative XDG_CONFIG_HOME falls back to HOME; a relative HOME resolves to nothing.
+        let rel_home = config_home_from(|k| (k == "HOME").then(|| OsString::from("relative")));
+        assert_eq!(rel_home, None);
+        let both = config_home_from(|k| match k {
+            "XDG_CONFIG_HOME" => Some(OsString::from("rel")),
+            "HOME" => Some(OsString::from("/home/u")),
+            _ => None,
+        });
+        assert_eq!(both, Some(PathBuf::from("/home/u/.config")));
+    }
+
+    #[test]
+    fn autostart_install_refresh_and_remove() {
+        let path = unique_tmp_path();
+
+        install_autostart_at(&path, Path::new("/opt/rewynd/rewynd")).expect("install");
+        let entry = std::fs::read_to_string(&path).expect("read entry");
+        assert!(entry.starts_with("[Desktop Entry]\n"));
+        assert!(entry.contains("Exec=\"/opt/rewynd/rewynd\"\n"));
+        assert!(entry.contains("StartupNotify=false\n"));
+
+        // Re-installing refreshes a stale Exec path in place.
+        install_autostart_at(&path, Path::new("/new/rewynd")).expect("refresh");
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("read refreshed")
+                .contains("Exec=\"/new/rewynd\"\n")
+        );
+
+        remove_autostart_at(&path).expect("remove");
+        assert!(!path.exists(), "disabling removes the entry");
+        remove_autostart_at(&path).expect("idempotent remove");
+    }
+
+    #[test]
+    fn exec_value_quotes_plain_and_spaced_paths() {
+        assert_eq!(
+            desktop_exec_value("/usr/bin/rewynd"),
+            r#""/usr/bin/rewynd""#
+        );
+        assert_eq!(
+            desktop_exec_value("/home/a b/rewynd"),
+            r#""/home/a b/rewynd""#
+        );
+    }
+
+    #[test]
+    fn exec_value_double_escapes_reserved_characters() {
+        // `$` -> `\$` (quote layer) -> `\\$` (string layer).
+        assert_eq!(desktop_exec_value("/x/$y/rewynd"), r#""/x/\\$y/rewynd""#);
+        // A literal backslash becomes four.
+        assert_eq!(desktop_exec_value("/x\\y"), r#""/x\\\\y""#);
+        // `%` doubles so it can't read as an Exec field code.
+        assert_eq!(desktop_exec_value("/x/100%f/y"), r#""/x/100%%f/y""#);
     }
 
     #[test]
