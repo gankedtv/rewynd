@@ -149,8 +149,12 @@ struct App {
 enum LoginState {
     Idle,
     Starting,
-    /// Waiting for browser approval of this user code.
-    Waiting(String),
+    /// Waiting for browser approval: the user code plus the server's verification page (shown as
+    /// the fallback when the browser did not open — it may not be ganked.tv when self-hosting).
+    Waiting {
+        code: String,
+        verification_uri: String,
+    },
     Failed(String),
 }
 
@@ -171,11 +175,13 @@ impl UploadVis {
         }
     }
 
+    /// Fails closed like the uploader: only an explicit `public` maps to Public, so a hand-edited
+    /// typo can't be rewritten into a wider visibility on save.
     fn from_config(s: &str) -> UploadVis {
-        if s.trim().eq_ignore_ascii_case("unlisted") {
-            UploadVis::Unlisted
-        } else {
+        if s.trim().eq_ignore_ascii_case("public") {
             UploadVis::Public
+        } else {
+            UploadVis::Unlisted
         }
     }
 }
@@ -357,11 +363,14 @@ impl App {
                 if let Err(e) = open::that_detached(&login.verification_uri_complete) {
                     tracing::warn!(error = %e, "could not open the browser for approval");
                 }
-                self.login = LoginState::Waiting(login.user_code.clone());
-                let base = self.effective_api_url();
+                self.login = LoginState::Waiting {
+                    code: login.user_code.clone(),
+                    verification_uri: login.verification_uri.clone(),
+                };
+                // The login itself remembers which server issued it; no base to recompute.
                 return Task::perform(
                     async move {
-                        rewynd_upload::device_login_wait(&base, &login)
+                        rewynd_upload::device_login_wait(&login)
                             .await
                             .map_err(|e| e.to_string())
                     },
@@ -573,9 +582,14 @@ impl App {
                 .spacing(6)
                 .into(),
                 LoginState::Starting => text("Contacting ganked.tv...").size(14).into(),
-                LoginState::Waiting(code) => column![
+                LoginState::Waiting {
+                    code,
+                    verification_uri,
+                } => column![
                     text(format!("Approve in your browser with code {code}")).size(14),
-                    hint("Browser did not open? Go to ganked.tv/device and enter the code."),
+                    hint(format!(
+                        "Browser did not open? Go to {verification_uri} and enter the code."
+                    )),
                 ]
                 .spacing(6)
                 .into(),
@@ -752,8 +766,8 @@ fn value_row<'a>(label: &'a str, value: String) -> Element<'a, Message> {
 }
 
 /// Muted hint text.
-fn hint(s: &str) -> Element<'_, Message> {
-    text(s.to_owned())
+fn hint<'a>(s: impl Into<String>) -> Element<'a, Message> {
+    text(s.into())
         .size(12)
         .style(|_: &Theme| text::Style {
             color: Some(palette::MUTED),
@@ -900,10 +914,11 @@ mod tests {
     }
 
     #[test]
-    fn upload_visibility_round_trips_through_config_strings() {
+    fn upload_visibility_round_trips_and_fails_closed() {
         for v in UploadVis::ALL {
             assert_eq!(UploadVis::from_config(v.as_config()), v);
         }
-        assert_eq!(UploadVis::from_config("garbage"), UploadVis::Public);
+        // A typo must never widen visibility.
+        assert_eq!(UploadVis::from_config("garbage"), UploadVis::Unlisted);
     }
 }

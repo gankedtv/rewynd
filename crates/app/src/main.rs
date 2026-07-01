@@ -415,8 +415,11 @@ mod linux {
         }
         let vis = settings.visibility.trim();
         if !vis.eq_ignore_ascii_case("public") && !vis.eq_ignore_ascii_case("unlisted") {
-            // A typo must not silently widen visibility; parse() below falls back to public.
-            tracing::warn!(visibility = vis, "unknown upload visibility; using public");
+            // parse() fails closed to unlisted; still tell the user their config has a typo.
+            tracing::warn!(
+                visibility = vis,
+                "unknown upload visibility; using unlisted"
+            );
         }
         match rewynd_upload::GankedClient::new(&settings.api_url, &settings.api_key) {
             Ok(client) => Some(Uploader {

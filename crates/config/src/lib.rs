@@ -73,7 +73,8 @@ pub struct UploadSettings {
     pub api_url: String,
     pub share_url: String,
     pub api_key: String,
-    /// `"public"` or `"unlisted"` (the consumer parses it; unknown values mean public).
+    /// `"public"` or `"unlisted"`. Consumers fail closed: anything else is treated as unlisted,
+    /// so a typo can never widen a clip's visibility.
     pub visibility: String,
 }
 
@@ -458,7 +459,10 @@ impl Config {
             .to_toml_string()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            // A bare relative filename has an empty parent; create_dir_all("") would error.
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
         }
         let tmp = path.with_extension("toml.tmp");
         // Drop any stale temp from a crashed save: `mode` below only applies at creation.

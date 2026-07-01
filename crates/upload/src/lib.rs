@@ -42,13 +42,14 @@ impl Visibility {
         }
     }
 
-    /// Parse a config value; anything unrecognized falls back to the server default (public).
+    /// Parse a config value. Fails closed: only an explicit `public` publishes; anything
+    /// unrecognized (a typo, say) becomes unlisted rather than widening visibility.
     #[must_use]
     pub fn parse(s: &str) -> Self {
-        if s.trim().eq_ignore_ascii_case("unlisted") {
-            Self::Unlisted
-        } else {
+        if s.trim().eq_ignore_ascii_case("public") {
             Self::Public
+        } else {
+            Self::Unlisted
         }
     }
 }
@@ -247,10 +248,14 @@ fn http_client() -> Result<reqwest::Client, UploadError> {
         .build()?)
 }
 
-/// Validate an API base URL and normalize it (no trailing slash).
+/// Validate an API base URL (http/https with a host) and normalize it (no trailing slash).
 fn checked_base(api_base: &str) -> Result<String, UploadError> {
     let base = api_base.trim().trim_end_matches('/');
     match reqwest::Url::parse(base) {
+        Ok(url) if !matches!(url.scheme(), "http" | "https") => Err(UploadError::InvalidUrl {
+            url: base.to_owned(),
+            reason: format!("unsupported scheme {:?}", url.scheme()),
+        }),
         Ok(url) if url.has_host() => Ok(base.to_owned()),
         Ok(_) => Err(UploadError::InvalidUrl {
             url: base.to_owned(),
@@ -289,12 +294,14 @@ async fn api_request(req: reqwest::RequestBuilder) -> Result<reqwest::Response, 
 }
 
 /// A started ganked.tv device login (RFC 8628): the user approves `user_code` in the browser
-/// while the app polls with the (private) device code.
+/// while the app polls with the (private) device code. Carries the API base it was started
+/// against, so polling can't drift to a different server than the one that issued the code.
 #[derive(Debug, Clone)]
 pub struct DeviceLogin {
     pub user_code: String,
     pub verification_uri: String,
     pub verification_uri_complete: String,
+    api_base: String,
     device_code: String,
     interval_secs: u64,
     expires_in_secs: u64,
@@ -335,6 +342,7 @@ pub async fn device_login_start(
         user_code: resp.user_code,
         verification_uri: resp.verification_uri,
         verification_uri_complete: resp.verification_uri_complete,
+        api_base: base,
         device_code: resp.device_code,
         interval_secs: resp.interval,
         expires_in_secs: resp.expires_in,
@@ -344,9 +352,9 @@ pub async fn device_login_start(
 /// Poll until the user approves (returning the minted `gtv_` API key) or the flow terminates:
 /// denial/expiry surface as [`UploadError::Api`] with the server's code, a locally-passed
 /// deadline as [`UploadError::LoginExpired`]. Honors the server's interval and `slow_down`.
-pub async fn device_login_wait(api_base: &str, login: &DeviceLogin) -> Result<String, UploadError> {
+pub async fn device_login_wait(login: &DeviceLogin) -> Result<String, UploadError> {
     let http = http_client()?;
-    let base = checked_base(api_base)?;
+    let base = &login.api_base;
     // tokio's clock (not std) so the deadline follows the runtime's virtual time in tests.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(login.expires_in_secs);
     let mut interval = Duration::from_secs(login.interval_secs);
@@ -416,13 +424,14 @@ mod tests {
     }
 
     #[test]
-    fn visibility_round_trip() {
+    fn visibility_round_trip_and_fails_closed() {
         assert_eq!(Visibility::parse("unlisted"), Visibility::Unlisted);
-        assert_eq!(Visibility::parse("UNLISTED "), Visibility::Unlisted);
+        assert_eq!(Visibility::parse("PUBLIC "), Visibility::Public);
         assert_eq!(Visibility::parse("public"), Visibility::Public);
-        assert_eq!(Visibility::parse("garbage"), Visibility::Public);
+        // A typo must never widen visibility.
+        assert_eq!(Visibility::parse("publik"), Visibility::Unlisted);
+        assert_eq!(Visibility::parse(""), Visibility::Unlisted);
         assert_eq!(Visibility::Unlisted.as_str(), "unlisted");
-        assert_eq!(Visibility::default(), Visibility::Public);
     }
 
     #[test]
@@ -784,6 +793,10 @@ mod tests {
             Err(UploadError::InvalidUrl { .. })
         ));
         assert!(matches!(
+            checked_base("file:///etc/passwd"),
+            Err(UploadError::InvalidUrl { .. })
+        ));
+        assert!(matches!(
             GankedClient::new("not a url", "gtv_k"),
             Err(UploadError::InvalidUrl { .. })
         ));
@@ -819,11 +832,12 @@ mod tests {
     }
 
     /// Zero-interval login fixture so the polling tests run without real sleeps.
-    fn instant_login(device_code: &str, expires_in_secs: u64) -> DeviceLogin {
+    fn instant_login(api_base: &str, device_code: &str, expires_in_secs: u64) -> DeviceLogin {
         DeviceLogin {
             user_code: "ABCD-1234".into(),
             verification_uri: String::new(),
             verification_uri_complete: String::new(),
+            api_base: api_base.trim_end_matches('/').to_owned(),
             device_code: device_code.into(),
             interval_secs: 0,
             expires_in_secs,
@@ -854,7 +868,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let token = device_login_wait(&server.uri(), &instant_login("dvc_s", 600))
+        let token = device_login_wait(&instant_login(&server.uri(), "dvc_s", 600))
             .await
             .expect("approved");
         assert_eq!(token, "gtv_minted");
@@ -885,7 +899,7 @@ mod tests {
             .await;
 
         let started = std::time::Instant::now();
-        let token = device_login_wait(&server.uri(), &instant_login("dvc_s", 600))
+        let token = device_login_wait(&instant_login(&server.uri(), "dvc_s", 600))
             .await
             .expect("approved after backoff");
         assert_eq!(token, "gtv_late");
@@ -906,7 +920,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        match device_login_wait(&server.uri(), &instant_login("dvc_x", 600))
+        match device_login_wait(&instant_login(&server.uri(), "dvc_x", 600))
             .await
             .expect_err("denied")
         {
@@ -915,7 +929,7 @@ mod tests {
         }
 
         // A zero-lifetime login trips the local deadline before any poll succeeds.
-        match device_login_wait(&server.uri(), &instant_login("dvc_x", 0))
+        match device_login_wait(&instant_login(&server.uri(), "dvc_x", 0))
             .await
             .expect_err("expires")
         {

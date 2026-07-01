@@ -16,9 +16,12 @@ Limits: 500 MiB, `video/mp4` (we already encode H.264 MP4), 120 s (our buffer ca
 
 - **`rewynd-upload`** wraps the flow in a `GankedClient` (reqwest 0.13, **rustls** default TLS — no
   system TLS build dep). Errors surface the server's problem `code`/`detail` verbatim.
-- **Auth = API key** as `Authorization: Bearer gtv_…`. The user creates the key at
-  `ganked.tv/settings/api-keys` and pastes it into the settings window (masked input). The key
-  lives in `config.toml` under `[upload]`; `save_to` tightens the file to `0600` on unix.
+- **Auth = the device authorization grant (RFC 8628) as the primary flow**: "Log in with
+  ganked.tv" in the settings opens the server's approval page in the browser; the app polls
+  (honoring the interval and `slow_down`) and stores the minted `gtv_` key invisibly — the user
+  never handles an API key. A masked paste field stays as an advanced fallback for self-hosters.
+  Either way the key authenticates as `Authorization: Bearer gtv_…` and lives in `config.toml`
+  under `[upload]`; saves are atomic (temp + rename) and `0600` on unix.
 - **Trigger = explicit tray action** ("Upload last clip"), per the user's choice — saving stays
   local-only; nothing leaves the machine without a deliberate click. The recorder remembers the
   last saved clip path; the upload runs as its own tokio task (one at a time — a second click
@@ -27,7 +30,8 @@ Limits: 500 MiB, `video/mp4` (we already encode H.264 MP4), 120 s (our buffer ca
   re-read from the config **per click**, so enabling uploads or fixing the key needs no recorder
   restart.
 - **Visibility** (`public`/`unlisted`) is a config default with a settings dropdown; per-clip
-  choice arrives with the trim/upload UI (issue #51).
+  choice arrives with the trim/upload UI (issue #51). Parsing **fails closed**: any unrecognized
+  value uploads as unlisted, never widening visibility on a typo.
 - Defaults: API `https://api.ganked.tv`, share links `https://ganked.tv`; both overridable (dev
   runs against `http://localhost:5050`).
 
@@ -37,7 +41,7 @@ Limits: 500 MiB, `video/mp4` (we already encode H.264 MP4), 120 s (our buffer ca
 | --- | --- |
 | **reqwest 0.13 (rustls)** | **chosen** — de-facto standard client, async fits our runtime, rustls avoids OpenSSL |
 | ureq (blocking) | rejected — would need its own threads next to an existing tokio runtime |
-| Device authorization grant (RFC 8628, also in gankedtv#155) | deferred — better UX (no copy-paste; rewynd shows a code, user approves in the browser) but more moving parts; the client shape stays the same, so it can replace key-pasting later |
+| Device authorization grant (RFC 8628, also in gankedtv#155) | **chosen** as the primary flow — the end user is not expected to know what an API key is; manual key-pasting stays as the advanced fallback |
 | Secret-service/keyring for the key | deferred — plaintext-in-`0600`-config matches common CLI practice; a keyring adds another D-Bus dependency and failure mode |
 
 ## Consequences
