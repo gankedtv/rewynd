@@ -6,6 +6,7 @@
 //! interesting logic is fully unit-testable.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -13,11 +14,26 @@ use thiserror::Error;
 /// A single encoded H.264 access unit: the encoder's output and the buffer's stored unit.
 #[derive(Debug, Clone)]
 pub struct EncodedChunk {
-    /// Annex-B encoded bytes for one frame (with inline SPS/PPS before IDRs).
-    pub bytes: Vec<u8>,
+    /// Annex-B encoded bytes for one frame (with inline SPS/PPS before IDRs). Shared so
+    /// cutting a clip clones ref-counts, not payloads — the cut happens under the ring
+    /// mutex on the capture thread's lock, so it must stay O(chunks).
+    pub bytes: Arc<[u8]>,
     /// Whether this chunk begins with an IDR (keyframe) — a valid clip start.
     pub is_keyframe: bool,
     /// Presentation timestamp relative to the start of capture.
+    pub pts: Duration,
+}
+
+/// A single encoded Opus packet: the audio encoder's output and the audio ring's unit.
+#[derive(Debug, Clone)]
+pub struct EncodedAudioChunk {
+    /// One bare Opus packet (no framing/length prefix). Shared for the same
+    /// O(chunks)-cut reason as [`EncodedChunk::bytes`].
+    pub bytes: Arc<[u8]>,
+    /// Samples per channel the packet decodes to — its duration in 48 kHz audio samples.
+    pub frames: u32,
+    /// Capture-relative PTS of the packet's first sample, on the *same* monotonic clock as
+    /// [`EncodedChunk::pts`], so the audio and video tracks align.
     pub pts: Duration,
 }
 
@@ -29,12 +45,69 @@ pub enum BufferError {
     NoKeyframe(Duration),
 }
 
+/// PTS accessor shared by the ring's element types.
+trait HasPts {
+    fn pts(&self) -> Duration;
+}
+
+impl HasPts for EncodedChunk {
+    fn pts(&self) -> Duration {
+        self.pts
+    }
+}
+
+impl HasPts for EncodedAudioChunk {
+    fn pts(&self) -> Duration {
+        self.pts
+    }
+}
+
+/// The shared time-bounded ring: retains roughly `window` of items, evicting the oldest
+/// relative to the newest item's PTS. The public wrappers add their cut semantics on top.
+#[derive(Debug)]
+struct TimeRing<T> {
+    window: Duration,
+    chunks: VecDeque<T>,
+}
+
+impl<T: HasPts> TimeRing<T> {
+    fn new(window: Duration) -> Self {
+        Self {
+            window,
+            chunks: VecDeque::new(),
+        }
+    }
+
+    fn push(&mut self, chunk: T) {
+        let newest = chunk.pts();
+        self.chunks.push_back(chunk);
+        while let Some(front) = self.chunks.front() {
+            if newest.saturating_sub(front.pts()) > self.window {
+                self.chunks.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.chunks.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    fn window(&self) -> Duration {
+        self.window
+    }
+}
+
 /// A time-bounded ring of encoded chunks with a keyframe-aware cut
 /// ([`flush_last`](RingBuffer::flush_last)).
 #[derive(Debug)]
 pub struct RingBuffer {
-    window: Duration,
-    chunks: VecDeque<EncodedChunk>,
+    ring: TimeRing<EncodedChunk>,
 }
 
 impl RingBuffer {
@@ -42,23 +115,14 @@ impl RingBuffer {
     #[must_use]
     pub fn new(window: Duration) -> Self {
         Self {
-            window,
-            chunks: VecDeque::new(),
+            ring: TimeRing::new(window),
         }
     }
 
     /// Append a freshly encoded chunk, evicting any chunk older than `window`
     /// relative to the newest chunk.
     pub fn push(&mut self, chunk: EncodedChunk) {
-        let newest = chunk.pts;
-        self.chunks.push_back(chunk);
-        while let Some(front) = self.chunks.front() {
-            if newest.saturating_sub(front.pts) > self.window {
-                self.chunks.pop_front();
-            } else {
-                break;
-            }
-        }
+        self.ring.push(chunk);
     }
 
     /// Cut a self-decodable clip of the most recent ~`duration` of footage, returning
@@ -71,56 +135,40 @@ impl RingBuffer {
     /// IDR (the whole buffer from its first keyframe). Returns [`BufferError::NoKeyframe`]
     /// only when the buffer holds no IDR at all.
     pub fn flush_last(&self, duration: Duration) -> Result<Vec<EncodedChunk>, BufferError> {
-        let newest = self
-            .chunks
-            .back()
-            .ok_or(BufferError::NoKeyframe(duration))?
-            .pts;
+        let chunks = &self.ring.chunks;
+        let newest = chunks.back().ok_or(BufferError::NoKeyframe(duration))?.pts;
         let cutoff = newest.saturating_sub(duration);
 
         // Prefer the most recent IDR at or before the cutoff (covers >= duration); fall
         // back to the earliest retained IDR when none is that old.
-        let start = self
-            .chunks
+        let start = chunks
             .iter()
             .enumerate()
             .rfind(|(_, c)| c.is_keyframe && c.pts <= cutoff)
             .map(|(i, _)| i)
-            .or_else(|| self.chunks.iter().position(|c| c.is_keyframe))
+            .or_else(|| chunks.iter().position(|c| c.is_keyframe))
             .ok_or(BufferError::NoKeyframe(duration))?;
 
-        Ok(self.chunks.iter().skip(start).cloned().collect())
+        Ok(chunks.iter().skip(start).cloned().collect())
     }
 
     /// Number of buffered chunks.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.chunks.len()
+        self.ring.len()
     }
 
     /// Whether the buffer holds no chunks.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.chunks.is_empty()
+        self.ring.is_empty()
     }
 
     /// The retention window this buffer was created with.
     #[must_use]
     pub fn window(&self) -> Duration {
-        self.window
+        self.ring.window()
     }
-}
-
-/// A single encoded Opus packet: the audio encoder's output and the audio ring's unit.
-#[derive(Debug, Clone)]
-pub struct EncodedAudioChunk {
-    /// One bare Opus packet (no framing/length prefix).
-    pub bytes: Vec<u8>,
-    /// Samples per channel the packet decodes to — its duration in 48 kHz audio samples.
-    pub frames: u32,
-    /// Capture-relative PTS of the packet's first sample, on the *same* monotonic clock as
-    /// [`EncodedChunk::pts`], so the audio and video tracks align.
-    pub pts: Duration,
 }
 
 /// A time-bounded ring of encoded audio packets, parallel to [`RingBuffer`].
@@ -130,8 +178,7 @@ pub struct EncodedAudioChunk {
 /// keyframe-aware cut the video ring needs.
 #[derive(Debug)]
 pub struct AudioRingBuffer {
-    window: Duration,
-    chunks: VecDeque<EncodedAudioChunk>,
+    ring: TimeRing<EncodedAudioChunk>,
 }
 
 impl AudioRingBuffer {
@@ -139,23 +186,14 @@ impl AudioRingBuffer {
     #[must_use]
     pub fn new(window: Duration) -> Self {
         Self {
-            window,
-            chunks: VecDeque::new(),
+            ring: TimeRing::new(window),
         }
     }
 
     /// Append a freshly encoded packet, evicting any packet older than `window` relative to
     /// the newest one (same eviction policy as [`RingBuffer::push`]).
     pub fn push(&mut self, chunk: EncodedAudioChunk) {
-        let newest = chunk.pts;
-        self.chunks.push_back(chunk);
-        while let Some(front) = self.chunks.front() {
-            if newest.saturating_sub(front.pts) > self.window {
-                self.chunks.pop_front();
-            } else {
-                break;
-            }
-        }
+        self.ring.push(chunk);
     }
 
     /// Return every retained packet whose PTS is at or after `start`, oldest-first — the
@@ -164,7 +202,8 @@ impl AudioRingBuffer {
     /// offset between the clip start and the first audio packet (so lip-sync is kept).
     #[must_use]
     pub fn flush_from(&self, start: Duration) -> Vec<EncodedAudioChunk> {
-        self.chunks
+        self.ring
+            .chunks
             .iter()
             .filter(|c| c.pts >= start)
             .cloned()
@@ -174,19 +213,19 @@ impl AudioRingBuffer {
     /// Number of buffered packets.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.chunks.len()
+        self.ring.len()
     }
 
     /// Whether the buffer holds no packets.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.chunks.is_empty()
+        self.ring.is_empty()
     }
 
     /// The retention window this buffer was created with.
     #[must_use]
     pub fn window(&self) -> Duration {
-        self.window
+        self.ring.window()
     }
 }
 
@@ -196,7 +235,7 @@ mod tests {
 
     fn chunk(secs: u64, keyframe: bool) -> EncodedChunk {
         EncodedChunk {
-            bytes: vec![0; 4],
+            bytes: vec![0; 4].into(),
             is_keyframe: keyframe,
             pts: Duration::from_secs(secs),
         }
@@ -294,6 +333,18 @@ mod tests {
     }
 
     #[test]
+    fn flushed_chunks_share_payloads_with_the_ring() {
+        let mut buf = RingBuffer::new(Duration::from_secs(60));
+        buf.push(chunk(0, true));
+        let clip = buf.flush_last(Duration::from_secs(10)).unwrap();
+        let again = buf.flush_last(Duration::from_secs(10)).unwrap();
+        assert!(
+            Arc::ptr_eq(&clip[0].bytes, &again[0].bytes),
+            "a cut clones the Arc, not the payload"
+        );
+    }
+
+    #[test]
     fn error_variant_displays() {
         assert_eq!(
             BufferError::NoKeyframe(Duration::from_secs(5)).to_string(),
@@ -303,7 +354,7 @@ mod tests {
 
     fn audio(secs: u64) -> EncodedAudioChunk {
         EncodedAudioChunk {
-            bytes: vec![0; 8],
+            bytes: vec![0; 8].into(),
             frames: 960,
             pts: Duration::from_secs(secs),
         }
@@ -340,5 +391,27 @@ mod tests {
             buf.push(audio(s));
         }
         assert!(buf.flush_from(Duration::from_secs(10)).is_empty());
+    }
+
+    #[test]
+    fn video_and_audio_rings_evict_identically() {
+        // Both wrappers share TimeRing; the same irregular pts sequence must leave the
+        // same retained set in each.
+        let window = Duration::from_secs(15);
+        let mut video = RingBuffer::new(window);
+        let mut audio_ring = AudioRingBuffer::new(window);
+        for &s in &[0u64, 3, 4, 9, 15, 16, 30] {
+            video.push(chunk(s, true));
+            audio_ring.push(audio(s));
+        }
+        let video_pts = pts_secs(&video.flush_last(Duration::from_secs(600)).unwrap());
+        let audio_pts: Vec<u64> = audio_ring
+            .flush_from(Duration::ZERO)
+            .iter()
+            .map(|c| c.pts.as_secs())
+            .collect();
+        assert_eq!(video_pts, vec![15, 16, 30]);
+        assert_eq!(video_pts, audio_pts);
+        assert_eq!(video.len(), audio_ring.len());
     }
 }

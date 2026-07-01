@@ -309,6 +309,40 @@ mod tests {
     }
 
     #[test]
+    fn far_future_pts_is_dropped_by_the_buffer_cap() {
+        let mut m = AudioMixer::new(SR, CH, ms(100));
+        m.add(&vec![0.2_f32; 480 * 2], Duration::ZERO);
+        // Stamped 6 s ahead of the drained base — past the 5 s cap, so it's dropped
+        // instead of ballooning the ring.
+        m.add(&vec![0.9_f32; 480 * 2], ms(6_000));
+        let (pts, out) = m.drain_all().expect("anchored audio");
+        assert_eq!(pts, Duration::ZERO);
+        assert_eq!(out.len(), 480 * 2, "only the anchored 10 ms is buffered");
+        assert!(out.iter().all(|&s| (s - 0.2).abs() < 1e-6));
+        assert!(m.drain_all().is_none(), "the future buffer never lands");
+    }
+
+    #[test]
+    fn straddling_buffer_sums_only_trailing_frames_keeping_interleaving() {
+        let mut m = AudioMixer::new(SR, CH, ms(100));
+        m.add(&vec![0.0_f32; 480 * 2], Duration::ZERO);
+        let _ = m.drain_all(); // base advances to frame 480 (10 ms)
+        // 480 frames starting at 5 ms straddle the drained base: the first 240 frames
+        // are already drained and dropped; the trailing 240 land at the base with their
+        // L/R interleaving intact.
+        let pcm: Vec<f32> = (0..480).flat_map(|_| [0.5, -0.5]).collect();
+        m.add(&pcm, ms(5));
+        let (pts, out) = m.drain_all().expect("trailing half");
+        assert_eq!(pts, ms(10));
+        assert_eq!(out.len(), 240 * 2);
+        assert!(
+            out.chunks_exact(2)
+                .all(|f| (f[0] - 0.5).abs() < 1e-6 && (f[1] + 0.5).abs() < 1e-6),
+            "left stays left, right stays right"
+        );
+    }
+
+    #[test]
     fn drain_all_flushes_tail_ignoring_settle() {
         let mut m = AudioMixer::new(SR, CH, ms(100));
         m.add(&vec![0.2_f32; 480 * 2], Duration::ZERO);

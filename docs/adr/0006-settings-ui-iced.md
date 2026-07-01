@@ -58,8 +58,7 @@ IPC. Changes apply on the recorder's next clip / restart; the window says so aft
 - New permissive deps: `iced` (MIT) + `rfd` (MIT). CI gains one build dep, `libxkbcommon-dev`.
 - The GUI needs a display to run, so `run` has no headless test; the pure mapping helpers are
   unit-tested and `settings/src/` is excluded from the coverage gate (like the GPU/portal code).
-- A **tray icon + "clip saved" toast** (the rest of #17) is deferred: the user already gets a
-  recording indicator from the ScreenCast portal. When added, `tray-icon` (MIT/Apache) + a GTK
-  thread on Linux is the path; it can launch this settings binary.
+- A **tray icon + "clip saved" toast** was deferred here and has since landed — superseded on
+  this point by ADR 0007, which chose `ksni` (no GTK) over the `tray-icon` path sketched below.
 - Sanity-check on dependency drift: `cargo tree -p rewynd-settings | grep -i wgpu` must stay empty.
   If iced later moves to wgpu-only, hold iced at this line or revisit per ADR 0001.

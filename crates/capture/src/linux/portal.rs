@@ -103,11 +103,11 @@ fn save_token(token: &str) {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let path = token_path();
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            tracing::warn!(error = %e, path = %parent.display(), "could not create token dir");
-            return;
-        }
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(error = %e, path = %parent.display(), "could not create token dir");
+        return;
     }
     // The restore token enables prompt-less screen capture, so treat it as a secret:
     // create it owner-only (0600).

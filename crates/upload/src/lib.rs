@@ -34,6 +34,8 @@ pub enum Visibility {
 }
 
 impl Visibility {
+    pub const ALL: [Visibility; 2] = [Visibility::Public, Visibility::Unlisted];
+
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -54,12 +56,22 @@ impl Visibility {
     }
 }
 
+// Rendered directly in the settings pick_list.
+impl std::fmt::Display for Visibility {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Public => "Public",
+            Self::Unlisted => "Unlisted",
+        })
+    }
+}
+
 /// Errors from talking to ganked.tv.
 #[derive(Debug, Error)]
 pub enum UploadError {
     #[error("could not read the clip: {0}")]
     Io(#[from] std::io::Error),
-    #[error("clip is {size} bytes; ganked.tv accepts at most {max}")]
+    #[error("clip is {} MB; ganked.tv accepts at most {} MB", size / 1_000_000, max / 1_000_000)]
     TooLarge { size: u64, max: u64 },
     #[error("request failed: {0}")]
     Http(#[from] reqwest::Error),
@@ -87,11 +99,18 @@ pub struct UploadedClip {
 }
 
 impl UploadedClip {
-    /// Public watch URL under `share_base` (e.g. `https://ganked.tv`), if a share code was issued.
+    /// Public watch URL under `share_base` (e.g. `https://ganked.tv`), if a share code was
+    /// issued. The code is server-provided text headed for a URL and a notification, so anything
+    /// outside the code alphabet yields `None` rather than an injectable string.
     #[must_use]
     pub fn share_url(&self, share_base: &str) -> Option<String> {
         self.share_code
             .as_ref()
+            .filter(|c| {
+                !c.is_empty()
+                    && c.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            })
             .map(|code| format!("{}/c/{code}", share_base.trim_end_matches('/')))
     }
 
@@ -123,12 +142,23 @@ struct ClipStatus {
 }
 
 /// Client for uploading finished clips to ganked.tv.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GankedClient {
     http: reqwest::Client,
     api_base: String,
     api_key: String,
     max_upload_bytes: u64,
+}
+
+// Manual Debug: the API key must never reach logs through an innocent `{:?}`.
+impl std::fmt::Debug for GankedClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GankedClient")
+            .field("api_base", &self.api_base)
+            .field("api_key", &"gtv_***")
+            .field("max_upload_bytes", &self.max_upload_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl GankedClient {
@@ -182,14 +212,19 @@ impl GankedClient {
             .await?;
 
         // Straight to storage, deliberately WITHOUT the bearer key (it must not leak to the
-        // storage host); the presigned signature covers the exact content type, so echo it.
-        let data = tokio::fs::read(path).await?;
+        // storage host); the presigned signature covers the exact content type, so echo it. The
+        // body streams from disk (an explicit Content-Length keeps S3-style endpoints happy)
+        // instead of buffering a whole clip next to the live ring buffers.
+        let file = tokio::fs::File::open(path).await?;
         let put = self
             .http
             .put(&target.url)
             .header(reqwest::header::CONTENT_TYPE, &target.content_type)
+            .header(reqwest::header::CONTENT_LENGTH, size)
             .timeout(put_timeout(size))
-            .body(data)
+            .body(reqwest::Body::wrap_stream(
+                tokio_util::io::ReaderStream::new(file),
+            ))
             .send()
             .await?;
         if !put.status().is_success() {
@@ -241,32 +276,56 @@ impl GankedClient {
     }
 }
 
-/// An HTTP client with the shared connect timeout.
+/// An HTTP client with the shared connect timeout. Redirects are refused outright: every URL in
+/// the flow is either configured or presigned, so a redirect can only mislead (and reqwest would
+/// re-send the bearer header to wherever it points).
 fn http_client() -> Result<reqwest::Client, UploadError> {
     Ok(reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()?)
 }
 
-/// Validate an API base URL (http/https with a host) and normalize it (no trailing slash).
+/// Whether `url` may be reached over plain http: only loopback (the dev server). Anything else
+/// would put the bearer key and device codes on the wire in cleartext.
+fn is_loopback(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // IPv6 hosts come bracketed in URLs.
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Validate an API base URL and normalize it (no trailing slash): https anywhere, http only on
+/// loopback.
 fn checked_base(api_base: &str) -> Result<String, UploadError> {
     let base = api_base.trim().trim_end_matches('/');
+    let invalid = |reason: String| UploadError::InvalidUrl {
+        url: base.to_owned(),
+        reason,
+    };
     match reqwest::Url::parse(base) {
-        Ok(url) if !matches!(url.scheme(), "http" | "https") => Err(UploadError::InvalidUrl {
-            url: base.to_owned(),
-            reason: format!("unsupported scheme {:?}", url.scheme()),
-        }),
+        Ok(url) if url.scheme() == "http" && !is_loopback(&url) => {
+            Err(invalid("http is only allowed for localhost".to_owned()))
+        }
+        Ok(url) if !matches!(url.scheme(), "http" | "https") => {
+            Err(invalid(format!("unsupported scheme {:?}", url.scheme())))
+        }
         Ok(url) if url.has_host() => Ok(base.to_owned()),
-        Ok(_) => Err(UploadError::InvalidUrl {
-            url: base.to_owned(),
-            reason: "no host".to_owned(),
-        }),
-        Err(e) => Err(UploadError::InvalidUrl {
-            url: base.to_owned(),
-            reason: e.to_string(),
-        }),
+        Ok(_) => Err(invalid("no host".to_owned())),
+        Err(e) => Err(invalid(e.to_string())),
     }
 }
+
+/// Cap on how much of an error body is read for diagnostics; the expected problem JSON is tiny,
+/// and an unbounded read would let a hostile server exhaust the recorder's memory.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
 /// Send an API request; return the response on 2xx, or the parsed RFC 7807 problem as
 /// [`UploadError::Api`]. The `code` may be flat or nested under `extensions`.
@@ -276,7 +335,7 @@ async fn api_request(req: reqwest::RequestBuilder) -> Result<reqwest::Response, 
     if status.is_success() {
         return Ok(resp);
     }
-    let body = resp.text().await.unwrap_or_default();
+    let body = bounded_text(resp).await;
     let problem: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
     let string_of =
         |v: Option<&serde_json::Value>| v.and_then(serde_json::Value::as_str).map(str::to_owned);
@@ -293,10 +352,25 @@ async fn api_request(req: reqwest::RequestBuilder) -> Result<reqwest::Response, 
     })
 }
 
+/// Read at most [`MAX_ERROR_BODY_BYTES`] of a response body as (lossy) text.
+async fn bounded_text(resp: reqwest::Response) -> String {
+    use futures_util::StreamExt;
+    let mut collected: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(Ok(chunk)) = stream.next().await {
+        let room = MAX_ERROR_BODY_BYTES - collected.len();
+        collected.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        if collected.len() >= MAX_ERROR_BODY_BYTES {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&collected).into_owned()
+}
+
 /// A started ganked.tv device login (RFC 8628): the user approves `user_code` in the browser
 /// while the app polls with the (private) device code. Carries the API base it was started
 /// against, so polling can't drift to a different server than the one that issued the code.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DeviceLogin {
     pub user_code: String,
     pub verification_uri: String,
@@ -305,6 +379,19 @@ pub struct DeviceLogin {
     device_code: String,
     interval_secs: u64,
     expires_in_secs: u64,
+    /// RFC 8628's backoff step on `slow_down` (5 s); a field so tests can shrink it.
+    slow_down_step: Duration,
+}
+
+// Manual Debug: the device code mints an API key on approval; keep it out of logs.
+impl std::fmt::Debug for DeviceLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceLogin")
+            .field("user_code", &self.user_code)
+            .field("api_base", &self.api_base)
+            .field("device_code", &"dvc_***")
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Deserialize)]
@@ -344,8 +431,11 @@ pub async fn device_login_start(
         verification_uri_complete: resp.verification_uri_complete,
         api_base: base,
         device_code: resp.device_code,
-        interval_secs: resp.interval,
-        expires_in_secs: resp.expires_in,
+        // Server-controlled values, clamped so a hostile response can't wedge the login task
+        // (u64::MAX would overflow the deadline arithmetic) or spin the poll loop.
+        interval_secs: resp.interval.clamp(1, 60),
+        expires_in_secs: resp.expires_in.min(1800),
+        slow_down_step: Duration::from_secs(5),
     })
 }
 
@@ -372,7 +462,7 @@ pub async fn device_login_wait(login: &DeviceLogin) -> Result<String, UploadErro
             Ok(resp) => return Ok(resp.json::<DeviceTokenResponse>().await?.token),
             Err(UploadError::Api { ref code, .. }) if code == "authorization_pending" => {}
             Err(UploadError::Api { ref code, .. }) if code == "slow_down" => {
-                interval += Duration::from_secs(5);
+                interval += login.slow_down_step;
             }
             Err(e) => return Err(e),
         }
@@ -841,6 +931,7 @@ mod tests {
             device_code: device_code.into(),
             interval_secs: 0,
             expires_in_secs,
+            slow_down_step: Duration::from_millis(50),
         }
     }
 
@@ -874,7 +965,7 @@ mod tests {
         assert_eq!(token, "gtv_minted");
     }
 
-    // Real-time test: the slow_down bump is a fixed 5 s (RFC 8628), so this one sleeps ~5 s.
+    // The backoff step is shrunk by the fixture so this asserts the mechanism without real sleeps.
     #[tokio::test]
     async fn device_login_wait_honors_slow_down() {
         let server = MockServer::start().await;
@@ -904,7 +995,7 @@ mod tests {
             .expect("approved after backoff");
         assert_eq!(token, "gtv_late");
         assert!(
-            started.elapsed() >= Duration::from_secs(5),
+            started.elapsed() >= Duration::from_millis(50),
             "slow_down must actually back off"
         );
     }

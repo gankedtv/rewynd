@@ -1,0 +1,49 @@
+# cargo-deny gate (PLAN §3.7: GPL-compatibility re-verified on every dependency change;
+# ADR 0001: exactly one wgpu source).
+
+[advisories]
+version = 2
+yanked = "deny"
+# Unmaintained-only advisories, each consciously accepted:
+ignore = [
+    "RUSTSEC-2026-0150", # audiopus_sys unmaintained — we link SYSTEM libopus via pkg-config, the bundled-CMake path never runs
+    "RUSTSEC-2026-0192", # ttf-parser unmaintained — transitive via iced/winit; upstream migration (skrifa) is theirs
+    "RUSTSEC-2024-0388", # derivative unmaintained — inside the ADR-0001-pinned gpu-video rev
+]
+
+[licenses]
+version = 2
+# GPL-3.0-or-later (our own crates) plus GPLv3-compatible permissive licenses only.
+allow = [
+    "GPL-3.0-or-later",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unlicense",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+multiple-versions = "allow"
+[[bans.deny]]
+# ADR 0001: wgpu must come from the single pinned git source, never crates.io.
+crate = "wgpu"
+wrappers = []
+deny-multiple-versions = true
+
+[sources]
+unknown-git = "deny"
+unknown-registry = "deny"
+allow-git = [
+    "https://github.com/gfx-rs/wgpu",
+    "https://github.com/software-mansion/smelter",
+]

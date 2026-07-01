@@ -85,60 +85,67 @@ mod linux {
         let cpu_start = read_self_cpu_seconds();
         let wall_start = Instant::now();
 
-        capture_stream(portal.node_id, portal.take_fd(), wall_start, {
-            // The whole hot path runs inline on the PipeWire process thread — import +
-            // convert + encode + file write all happen before the next frame is dequeued.
-            let stats = stats.clone();
-            let gpu = gpu.clone();
-            let conv = conv.clone();
-            let enc = enc.clone();
-            let mut writer = writer;
-            move |captured: CapturedDmabuf| -> ControlFlow<()> {
-                let mut s = stats.borrow_mut();
-                let frame_index = s.frames;
-                let span = tracing::debug_span!("frame", index = frame_index);
-                let _e = span.enter();
+        capture_stream(
+            portal.node_id,
+            portal.take_fd(),
+            wall_start,
+            rewynd_capture::linux::StreamPrefs::default(),
+            None,
+            {
+                // The whole hot path runs inline on the PipeWire process thread — import +
+                // convert + encode + file write all happen before the next frame is dequeued.
+                let stats = stats.clone();
+                let gpu = gpu.clone();
+                let conv = conv.clone();
+                let enc = enc.clone();
+                let mut writer = writer;
+                move |captured: CapturedDmabuf| -> ControlFlow<()> {
+                    let mut s = stats.borrow_mut();
+                    let frame_index = s.frames;
+                    let span = tracing::debug_span!("frame", index = frame_index);
+                    let _e = span.enter();
 
-                match encode_one(
-                    &gpu,
-                    &conv,
-                    &mut enc.borrow_mut(),
-                    captured,
-                    frame_index,
-                    &mut writer,
-                ) {
-                    Ok(chunk) => {
-                        s.total_bytes += chunk.bytes as u64;
-                        if chunk.is_keyframe {
-                            s.keyframes += 1;
-                        }
-                        tracing::debug!(
-                            index = frame_index,
-                            bytes = chunk.bytes,
-                            is_keyframe = chunk.is_keyframe,
-                            "encoded frame"
-                        );
-                        s.frames += 1;
-                        if s.frames >= max_frames {
-                            // Flush before the writer is dropped so all bytes hit the file.
-                            if let Err(e) = writer.flush() {
-                                s.error = Some(e.to_string());
+                    match encode_one(
+                        &gpu,
+                        &conv,
+                        &mut enc.borrow_mut(),
+                        captured,
+                        frame_index,
+                        &mut writer,
+                    ) {
+                        Ok(chunk) => {
+                            s.total_bytes += chunk.bytes as u64;
+                            if chunk.is_keyframe {
+                                s.keyframes += 1;
                             }
-                            ControlFlow::Break(())
-                        } else {
-                            ControlFlow::Continue(())
+                            tracing::debug!(
+                                index = frame_index,
+                                bytes = chunk.bytes,
+                                is_keyframe = chunk.is_keyframe,
+                                "encoded frame"
+                            );
+                            s.frames += 1;
+                            if s.frames >= max_frames {
+                                // Flush before the writer is dropped so all bytes hit the file.
+                                if let Err(e) = writer.flush() {
+                                    s.error = Some(e.to_string());
+                                }
+                                ControlFlow::Break(())
+                            } else {
+                                ControlFlow::Continue(())
+                            }
                         }
-                    }
-                    Err(e) => {
-                        // Don't hang on a per-frame failure: log it, surface it, and stop.
-                        tracing::error!(index = frame_index, error = %e, "frame failed; stopping");
-                        let _ = writer.flush();
-                        s.error = Some(e.to_string());
-                        ControlFlow::Break(())
+                        Err(e) => {
+                            // Don't hang on a per-frame failure: log it, surface it, and stop.
+                            tracing::error!(index = frame_index, error = %e, "frame failed; stopping");
+                            let _ = writer.flush();
+                            s.error = Some(e.to_string());
+                            ControlFlow::Break(())
+                        }
                     }
                 }
-            }
-        })?;
+            },
+        )?;
 
         let wall = wall_start.elapsed();
         let cpu = read_self_cpu_seconds().map(|end| end - cpu_start.unwrap_or(end));
@@ -218,7 +225,7 @@ mod linux {
         // SAFETY: `captured` came straight from the PipeWire negotiation, so the fd is a
         // valid single-plane DMA-BUF whose format/modifier/stride/offset match `import`.
         let texture = unsafe { gpu.import_dmabuf(import)? };
-        let nv12 = conv.convert(gpu, &texture);
+        let nv12 = conv.convert(gpu, &texture, texture.width(), texture.height());
 
         // Force a keyframe on the very first frame so the file is decodable from the
         // start (the encoder's own GOP handles the rest via EncodeParams.idr_period).

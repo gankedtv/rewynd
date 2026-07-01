@@ -107,7 +107,7 @@ impl Encoder for GpuVideoEncoder {
             .map_err(|e| EncodeError::Encode(e.to_string()))?;
 
         Ok(EncodedChunk {
-            bytes: chunk.data,
+            bytes: chunk.data.into(),
             is_keyframe: chunk.is_keyframe,
             // The capture-relative timestamp, carried through verbatim for the ring
             // buffer's window eviction and the muxer's per-sample timing.
@@ -155,7 +155,9 @@ impl Nv12Converter {
     }
 
     /// Convert an RGBA/BGRA texture (usage must include `TEXTURE_BINDING`) into an NV12
-    /// [`wgpu::Texture`] of the same size and return its handle.
+    /// [`wgpu::Texture`] of `out_width`×`out_height` and return its handle. The pass samples
+    /// with normalized UVs through a linear sampler, so a differing output size scales the
+    /// frame for free (captured monitor size → configured encode size).
     ///
     /// The NV12 output texture is reused across calls (re-created only when the frame
     /// size changes), so this allocates no per-frame GPU texture on the hot path. The
@@ -163,8 +165,14 @@ impl Nv12Converter {
     /// which overwrites the same texture; the GPU queue orders that write after the
     /// encoder's read, so per-frame `convert → encode` is safe.
     #[must_use]
-    pub fn convert(&self, gpu: &GpuContext, rgba: &wgpu::Texture) -> wgpu::Texture {
-        let (width, height) = (rgba.width(), rgba.height());
+    pub fn convert(
+        &self,
+        gpu: &GpuContext,
+        rgba: &wgpu::Texture,
+        out_width: u32,
+        out_height: u32,
+    ) -> wgpu::Texture {
+        let (width, height) = (out_width, out_height);
         let mut slot = self.output.borrow_mut();
         if slot
             .as_ref()

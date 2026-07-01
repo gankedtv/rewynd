@@ -41,16 +41,6 @@ pub enum MuxError {
     Mp4(#[from] mp4::Error),
 }
 
-/// Writes encoded chunks into a container file with correct timestamps.
-pub trait Muxer {
-    /// Mux `chunks` — which must begin on an IDR — into an MP4 at `path`.
-    ///
-    /// [`EncodedChunk::pts`] is capture-relative and a flushed clip is a mid-stream
-    /// slice, so the muxer rebases timestamps against the first chunk's PTS: the
-    /// written clip starts at PTS zero.
-    fn write_mp4(&mut self, chunks: &[EncodedChunk], path: &Path) -> Result<(), MuxError>;
-}
-
 /// The Opus audio side of an A/V clip, paired with [`Mp4Muxer::write_mp4_with_audio`].
 pub struct AudioTrack<'a> {
     /// Encoded Opus packets, oldest-first, on the same capture clock as the video chunks.
@@ -84,9 +74,16 @@ impl Mp4Muxer {
             framerate: framerate.max(1),
         }
     }
-}
 
-impl Mp4Muxer {
+    /// Mux `chunks` — which must begin on an IDR — into an MP4 at `path`.
+    ///
+    /// [`EncodedChunk::pts`] is capture-relative and a flushed clip is a mid-stream
+    /// slice, so the muxer rebases timestamps against the first chunk's PTS: the
+    /// written clip starts at PTS zero.
+    pub fn write_mp4(&self, chunks: &[EncodedChunk], path: &Path) -> Result<(), MuxError> {
+        self.write(chunks, None, path)
+    }
+
     /// Mux a video clip plus a synced Opus audio track into an MP4 at `path`.
     ///
     /// Both tracks rebase against the same clip base (the first video chunk's PTS), so the
@@ -94,7 +91,7 @@ impl Mp4Muxer {
     /// audio carries an edit list: an empty edit for that start offset, then a trim edit at
     /// the encoder pre-skip so priming samples aren't presented.
     pub fn write_mp4_with_audio(
-        &mut self,
+        &self,
         video: &[EncodedChunk],
         audio: &AudioTrack,
         path: &Path,
@@ -130,65 +127,75 @@ impl Mp4Muxer {
             compatible_brands.push(FourCC::from(*b"Opus"));
         }
 
-        let file = std::fs::File::create(path)?;
-        let mut writer = Mp4Writer::write_start(
-            file,
-            &Mp4Config {
-                major_brand: FourCC::from(*b"isom"),
-                minor_version: 512,
-                compatible_brands,
-                timescale: TIMESCALE,
-            },
-        )?;
-
-        writer.add_track(&TrackConfig {
-            track_type: TrackType::Video,
-            timescale: TIMESCALE,
-            language: String::from("und"),
-            media_conf: MediaConfig::AvcConfig(AvcConfig {
-                width: self.width,
-                height: self.height,
-                seq_param_set: sps.to_vec(),
-                pic_param_set: pps.to_vec(),
-            }),
-        })?;
-
-        let base = first.pts;
-        for (i, chunk) in video.iter().enumerate() {
-            let start = chunk.pts.saturating_sub(base);
-            // Duration is the gap to the next frame; the last frame has no successor, so
-            // reuse the previous gap, or fall back to one frame period for a single-frame
-            // clip (so it stays visible rather than collapsing to ~0s).
-            let duration = match video.get(i + 1) {
-                Some(next) => next.pts.saturating_sub(chunk.pts),
-                None if i > 0 => chunk.pts.saturating_sub(video[i - 1].pts),
-                None => Duration::from_nanos(1_000_000_000 / u64::from(self.framerate)),
-            };
-            writer.write_sample(
-                1,
-                &Mp4Sample {
-                    start_time: start.as_micros() as u64,
-                    duration: duration.as_micros().min(u128::from(u32::MAX)) as u32,
-                    rendering_offset: 0,
-                    is_sync: chunk.is_keyframe,
-                    bytes: annexb_to_avcc(&chunk.bytes).into(),
+        // Write to a sibling temp name and rename into place only on success, so an
+        // interrupted save never leaves a plausible-looking but corrupt .mp4.
+        let tmp = path.with_extension("mp4.part");
+        let result = (|| -> Result<(), MuxError> {
+            let file = std::fs::File::create(&tmp)?;
+            let mut writer = Mp4Writer::write_start(
+                file,
+                &Mp4Config {
+                    major_brand: FourCC::from(*b"isom"),
+                    minor_version: 512,
+                    compatible_brands,
+                    timescale: TIMESCALE,
                 },
             )?;
+
+            writer.add_track(&TrackConfig {
+                track_type: TrackType::Video,
+                timescale: TIMESCALE,
+                language: String::from("und"),
+                media_conf: MediaConfig::AvcConfig(AvcConfig {
+                    width: self.width,
+                    height: self.height,
+                    seq_param_set: sps.to_vec(),
+                    pic_param_set: pps.to_vec(),
+                }),
+            })?;
+
+            let base = first.pts;
+            for (i, chunk) in video.iter().enumerate() {
+                let start = chunk.pts.saturating_sub(base);
+                // Duration is the gap to the next frame; the last frame has no successor, so
+                // reuse the previous gap, or fall back to one frame period for a single-frame
+                // clip (so it stays visible rather than collapsing to ~0s).
+                let duration = match video.get(i + 1) {
+                    Some(next) => next.pts.saturating_sub(chunk.pts),
+                    None if i > 0 => chunk.pts.saturating_sub(video[i - 1].pts),
+                    None => Duration::from_nanos(1_000_000_000 / u64::from(self.framerate)),
+                };
+                writer.write_sample(
+                    1,
+                    &Mp4Sample {
+                        start_time: start.as_micros() as u64,
+                        duration: duration.as_micros().min(u128::from(u32::MAX)) as u32,
+                        rendering_offset: 0,
+                        is_sync: chunk.is_keyframe,
+                        bytes: annexb_to_avcc(&chunk.bytes).into(),
+                    },
+                )?;
+            }
+
+            if has_audio {
+                let audio = audio.expect("has_audio implies Some");
+                write_audio_track(&mut writer, audio, base)?;
+            }
+
+            writer.write_end()?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => std::fs::rename(&tmp, path).map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                MuxError::from(e)
+            }),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
         }
-
-        if has_audio {
-            let audio = audio.expect("has_audio implies Some");
-            write_audio_track(&mut writer, audio, base)?;
-        }
-
-        writer.write_end()?;
-        Ok(())
-    }
-}
-
-impl Muxer for Mp4Muxer {
-    fn write_mp4(&mut self, chunks: &[EncodedChunk], path: &Path) -> Result<(), MuxError> {
-        self.write(chunks, None, path)
     }
 }
 
@@ -228,7 +235,7 @@ fn write_audio_track<W: std::io::Write + std::io::Seek>(
                 duration: chunk.frames,
                 rendering_offset: 0,
                 is_sync: true,
-                bytes: chunk.bytes.clone().into(),
+                bytes: chunk.bytes.to_vec().into(),
             },
         )?;
         cumulative += u64::from(chunk.frames);
@@ -324,7 +331,7 @@ mod tests {
 
     fn chunk(bytes: Vec<u8>, is_keyframe: bool, pts_us: u64) -> EncodedChunk {
         EncodedChunk {
-            bytes,
+            bytes: bytes.into(),
             is_keyframe,
             pts: Duration::from_micros(pts_us),
         }
@@ -393,7 +400,7 @@ mod tests {
 
     #[test]
     fn rejects_non_keyframe_start_and_empty() {
-        let mut muxer = Mp4Muxer::new(1920, 1080, 60);
+        let muxer = Mp4Muxer::new(1920, 1080, 60);
         let chunks = [chunk(annexb(&[&[0x41]]), false, 0)];
         assert!(matches!(
             muxer
@@ -409,7 +416,7 @@ mod tests {
 
     #[test]
     fn keyframe_without_parameter_sets_errors() {
-        let mut muxer = Mp4Muxer::new(1920, 1080, 60);
+        let muxer = Mp4Muxer::new(1920, 1080, 60);
         let chunks = [chunk(annexb(&[&[0x65, 0x88]]), true, 0)];
         assert!(matches!(
             muxer
@@ -468,10 +475,117 @@ mod tests {
         assert_eq!(sample.duration, 1_000_000 / 60);
     }
 
+    /// Read back each video sample's (start_time, duration) via the mp4 reader.
+    fn read_sample_timing(path: &Path, count: u32) -> Vec<(u64, u32)> {
+        let file = std::fs::File::open(path).unwrap();
+        let size = file.metadata().unwrap().len();
+        let mut reader = mp4::Mp4Reader::read_header(std::io::BufReader::new(file), size).unwrap();
+        (1..=count)
+            .map(|id| {
+                let s = reader.read_sample(1, id).unwrap().expect("sample");
+                (s.start_time, s.duration)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn irregular_pts_write_next_gap_then_previous_gap_durations() {
+        let sps = [0x67, 0x42, 0x00, 0x1f];
+        let pps = [0x68, 0xCE, 0x3c, 0x80];
+        let key = annexb(&[&sps, &pps, &[0x65, 0x88, 0x84]]);
+        let inter = annexb(&[&[0x41, 0x9a, 0x00]]);
+        // Uneven gaps: 10 ms, 15 ms, 35 ms. Each sample's duration is the gap to the
+        // next pts; the last (no successor) reuses the previous gap.
+        let chunks = [
+            chunk(key, true, 0),
+            chunk(inter.clone(), false, 10_000),
+            chunk(inter.clone(), false, 25_000),
+            chunk(inter, false, 60_000),
+        ];
+
+        let out = TempMp4::new();
+        Mp4Muxer::new(1920, 1080, 60)
+            .write_mp4(&chunks, &out.0)
+            .expect("write_mp4");
+
+        assert_eq!(
+            read_sample_timing(&out.0, 4),
+            vec![
+                (0, 10_000),
+                (10_000, 15_000),
+                (25_000, 35_000),
+                (60_000, 35_000)
+            ]
+        );
+    }
+
+    #[test]
+    fn backwards_pts_saturate_to_zero_duration() {
+        let sps = [0x67, 0x42, 0x00, 0x1f];
+        let pps = [0x68, 0xCE, 0x3c, 0x80];
+        let key = annexb(&[&sps, &pps, &[0x65, 0x88, 0x84]]);
+        let inter = annexb(&[&[0x41, 0x9a, 0x00]]);
+        // pts go 0 → 20 ms → 15 ms. Pinned current behavior (the documented floor): a
+        // backwards gap saturates to a 0-tick duration, for both the next-gap sample and
+        // the last sample's previous-gap fallback. Frames 2 and 3 collapse rather than
+        // reordering or erroring.
+        let chunks = [
+            chunk(key, true, 0),
+            chunk(inter.clone(), false, 20_000),
+            chunk(inter, false, 15_000),
+        ];
+
+        let out = TempMp4::new();
+        Mp4Muxer::new(1920, 1080, 60)
+            .write_mp4(&chunks, &out.0)
+            .expect("write_mp4");
+
+        assert_eq!(
+            read_sample_timing(&out.0, 3),
+            vec![(0, 20_000), (20_000, 0), (20_000, 0)]
+        );
+    }
+
+    #[test]
+    fn successful_write_leaves_no_part_file() {
+        let sps = [0x67, 0x42, 0x00, 0x1f];
+        let pps = [0x68, 0xCE, 0x3c, 0x80];
+        let key = annexb(&[&sps, &pps, &[0x65, 0x88, 0x84]]);
+
+        let out = TempMp4::new();
+        Mp4Muxer::new(1920, 1080, 60)
+            .write_mp4(&[chunk(key, true, 0)], &out.0)
+            .expect("write_mp4");
+
+        assert!(out.0.exists(), "final .mp4 is in place");
+        assert!(
+            !out.0.with_extension("mp4.part").exists(),
+            "temp file was renamed away"
+        );
+    }
+
+    #[test]
+    fn failed_write_leaves_nothing_at_the_final_path() {
+        let sps = [0x67, 0x42, 0x00, 0x1f];
+        let pps = [0x68, 0xCE, 0x3c, 0x80];
+        let key = annexb(&[&sps, &pps, &[0x65, 0x88, 0x84]]);
+
+        // Occupy the temp name with a directory so the write fails mid-flight; the
+        // final path must not appear.
+        let out = TempMp4::new();
+        let part = out.0.with_extension("mp4.part");
+        std::fs::create_dir(&part).unwrap();
+        let result = Mp4Muxer::new(1920, 1080, 60).write_mp4(&[chunk(key, true, 0)], &out.0);
+        std::fs::remove_dir(&part).unwrap();
+
+        assert!(matches!(result.unwrap_err(), MuxError::Io(_)));
+        assert!(!out.0.exists(), "no plausible-looking .mp4 on failure");
+    }
+
     fn audio_chunk(pts_us: u64) -> EncodedAudioChunk {
         EncodedAudioChunk {
             // The container does not decode Opus, so arbitrary bytes round-trip fine.
-            bytes: vec![0xFC, 0xFF, 0xFE],
+            bytes: vec![0xFC, 0xFF, 0xFE].into(),
             frames: 960,
             pts: Duration::from_micros(pts_us),
         }
@@ -539,6 +653,31 @@ mod tests {
                 0x00, 0x00, 0xbb, 0x80, // input sample rate = 48000
                 0x00, 0x00, // output gain
                 0x00, // channel mapping family
+            ]
+        );
+
+        // Byte-exact elst guard. Empty edit: the audio starts 9 ms after the clip base
+        // (10_000 µs - 1_000 µs, in movie-timescale ticks), media_time -1. Trim edit:
+        // 3 packets × 960 frames = 2880 samples, minus pre_skip 312 → 2568 samples at
+        // 48 kHz = 53_500 movie ticks, media_time = pre_skip.
+        let pos = bytes
+            .windows(4)
+            .position(|w| w == b"elst")
+            .expect("elst box present in the written file");
+        let elst = &bytes[pos - 4..pos - 4 + 40];
+        assert_eq!(
+            elst,
+            &[
+                0x00, 0x00, 0x00, 0x28, // box size = 40
+                b'e', b'l', b's', b't', // 'elst'
+                0x00, 0x00, 0x00, 0x00, // version 0, flags 0
+                0x00, 0x00, 0x00, 0x02, // entry_count = 2
+                0x00, 0x00, 0x23, 0x28, // segment_duration = 9_000 (movie ticks)
+                0xFF, 0xFF, 0xFF, 0xFF, // media_time = -1 (empty edit)
+                0x00, 0x01, 0x00, 0x00, // media_rate = 1.0
+                0x00, 0x00, 0xD0, 0xFC, // segment_duration = 53_500 (movie ticks)
+                0x00, 0x00, 0x01, 0x38, // media_time = 312 (pre-skip, 48 kHz samples)
+                0x00, 0x01, 0x00, 0x00, // media_rate = 1.0
             ]
         );
     }

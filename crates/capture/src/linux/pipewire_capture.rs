@@ -21,7 +21,9 @@
 //! - [`capture_one_dmabuf`]: `dup()`s the first usable DMA-BUF fd into an [`OwnedFd`]
 //!   and returns its descriptor for the wgpu import.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
+#[cfg(feature = "probes")]
+use std::cell::RefCell;
 use std::ops::ControlFlow;
 use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::rc::Rc;
@@ -59,6 +61,7 @@ const SPA_PARAM_BUFFERS_BLOCKS: u32 = 2;
 const SPA_PARAM_BUFFERS_DATA_TYPE: u32 = 6;
 
 /// How many DMA-BUF frames to log before quitting the probe.
+#[cfg(feature = "probes")]
 const FRAMES_TO_LOG: u32 = 5;
 /// Stop logging repeated non-DMA-BUF buffers after this many (avoids log spam).
 const NON_DMABUF_LOG_LIMIT: u32 = 3;
@@ -162,11 +165,44 @@ fn spa_format_to_drm_fourcc(format: VideoFormat) -> Option<u32> {
 /// Outcome of a per-frame callback: keep running the loop, or stop it.
 type FrameAction = ControlFlow<()>;
 
+/// Negotiation preferences offered to the compositor (which may still pick differently —
+/// the negotiated format is what arrives in the frames).
+#[derive(Debug, Clone, Copy)]
+pub struct StreamPrefs {
+    pub width: u32,
+    pub height: u32,
+    pub framerate: u32,
+}
+
+impl Default for StreamPrefs {
+    fn default() -> Self {
+        Self {
+            width: 1920,
+            height: 1080,
+            framerate: 60,
+        }
+    }
+}
+
+/// How often the video watchdog polls the cooperative stop flag.
+const VIDEO_WATCHDOG_POLL: Duration = Duration::from_millis(200);
+
+const STREAM_NO_FRAME_ERROR: &str = "stream ended without capturing any usable DMA-BUF frames \
+     (modifier fixation or buffer negotiation failed — see logs)";
+#[cfg(feature = "probes")]
+const PROBE_NO_FRAME_ERROR: &str = "stream ended without capturing any DMA-BUF frames \
+     (modifier fixation or buffer negotiation failed — see logs)";
+#[cfg(feature = "probes")]
+const IMPORT_NO_FRAME_ERROR: &str = "stream ended without capturing a usable DMA-BUF frame \
+     (modifier fixation or buffer negotiation failed — see logs)";
+
 /// Per-stream state threaded through the PipeWire callbacks.
 ///
 /// The negotiation fields are identical for both entry points; only the
 /// per-usable-frame behaviour (`on_usable`) and the abort/log bookkeeping differ.
 struct UserData<F> {
+    /// Negotiation preferences, re-offered when the modifier fixation pass re-emits.
+    prefs: StreamPrefs,
     /// The most recently negotiated raw video format.
     format: VideoInfoRaw,
     /// Whether we have already fixated the modifier (so we only do the second
@@ -232,7 +268,11 @@ fn video_modifier_property(modifiers: &[u64], fixate_to: Option<u64>) -> Propert
 ///   property (mandatory). When `fixate` is set, the modifier is pinned (second
 ///   pass).
 /// - `modifiers = None` → the SHM-fallback format with no modifier property at all.
-fn build_enum_format(modifiers: Option<&[u64]>, fixate_to: Option<u64>) -> Object {
+fn build_enum_format(
+    modifiers: Option<&[u64]>,
+    fixate_to: Option<u64>,
+    prefs: StreamPrefs,
+) -> Object {
     // Common video properties shared by every variant we offer.
     let mut obj = object! {
         SpaTypes::ObjectParamFormat,
@@ -257,7 +297,10 @@ fn build_enum_format(modifiers: Option<&[u64]>, fixate_to: Option<u64>) -> Objec
             Choice,
             Range,
             Rectangle,
-            Rectangle { width: 1920, height: 1080 },
+            Rectangle {
+                width: prefs.width,
+                height: prefs.height
+            },
             Rectangle { width: 1, height: 1 },
             Rectangle { width: 8192, height: 8192 }
         ),
@@ -266,7 +309,10 @@ fn build_enum_format(modifiers: Option<&[u64]>, fixate_to: Option<u64>) -> Objec
             Choice,
             Range,
             Fraction,
-            Fraction { num: 60, denom: 1 },
+            Fraction {
+                num: prefs.framerate,
+                denom: 1
+            },
             Fraction { num: 0, denom: 1 },
             Fraction { num: 1000, denom: 1 }
         ),
@@ -390,17 +436,31 @@ fn modifier_choices_inner(param: &Pod) -> Vec<u64> {
 ///
 /// Blocks (runs the PipeWire main loop) on the calling thread, which must own the
 /// `fd`; keep the portal `Session` (and any tokio runtime) alive for the whole call.
+/// Everything one stream run needs besides the connection + callback.
+struct StreamConfig<'a> {
+    stream_name: &'a str,
+    epoch: Instant,
+    prefs: StreamPrefs,
+    stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    no_frame_error: &'a str,
+}
+
 fn run_stream<F>(
     node_id: u32,
     fd: OwnedFd,
-    stream_name: &str,
-    epoch: Instant,
+    cfg: StreamConfig<'_>,
     on_usable: F,
-    no_frame_error: &str,
 ) -> Result<(), CaptureError>
 where
     F: FnMut(&DmabufFrame, BorrowedFd<'_>) -> FrameAction + 'static,
 {
+    let StreamConfig {
+        stream_name,
+        epoch,
+        prefs,
+        stop,
+        no_frame_error,
+    } = cfg;
     pw::init();
 
     let main_loop = pw::main_loop::MainLoopRc::new(None)
@@ -439,6 +499,7 @@ where
 
     let success = Rc::new(Cell::new(false));
     let user_data = UserData {
+        prefs,
         format: VideoInfoRaw::default(),
         fixated: false,
         fixation_attempts: 0,
@@ -447,6 +508,32 @@ where
         success: success.clone(),
         main_loop: main_loop.clone(),
         stream_start: epoch,
+    };
+
+    // Cooperative stop: the loop otherwise only observes shutdown when a frame arrives, so an
+    // idle screen (or a failed portal close) would hang it. Set when the flag is seen, making
+    // that exit a clean one. Arming failure is fatal: a capture that can never be stopped is
+    // worse than one that fails at startup.
+    let stopped = Rc::new(Cell::new(false));
+    let _watchdog = match stop {
+        Some(stop) => {
+            let stopped = stopped.clone();
+            let quit_loop = main_loop.clone();
+            let timer = main_loop.loop_().add_timer(move |_expirations| {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    stopped.set(true);
+                    quit_loop.quit();
+                }
+            });
+            timer
+                .update_timer(Some(VIDEO_WATCHDOG_POLL), Some(VIDEO_WATCHDOG_POLL))
+                .into_result()
+                .map_err(|e| {
+                    CaptureError::PipeWire(format!("failed to arm the stop watchdog: {e}"))
+                })?;
+            Some(timer)
+        }
+        None => None,
     };
 
     let _listener = stream
@@ -522,8 +609,11 @@ where
                         chosen = format_args!("{chosen:#018x}"),
                         "modifier unfixated; pinning a server-proposed modifier (pass 2)"
                     );
-                    let fixed =
-                        super::serialize_object(build_enum_format(Some(&modifiers), Some(chosen)));
+                    let fixed = super::serialize_object(build_enum_format(
+                        Some(&modifiers),
+                        Some(chosen),
+                        ud.prefs,
+                    ));
                     let Some(pod) = Pod::from_bytes(&fixed) else {
                         tracing::error!("failed to build fixated EnumFormat pod");
                         return;
@@ -631,8 +721,8 @@ where
     // Build the initial EnumFormat params: a DMA-BUF-capable format (with the
     // modifier choice) first, then a no-modifier SHM fallback. The server picks
     // the best it can satisfy.
-    let dmabuf_format = super::serialize_object(build_enum_format(Some(&modifiers), None));
-    let shm_format = super::serialize_object(build_enum_format(None, None));
+    let dmabuf_format = super::serialize_object(build_enum_format(Some(&modifiers), None, prefs));
+    let shm_format = super::serialize_object(build_enum_format(None, None, prefs));
     let mut params = [
         Pod::from_bytes(&dmabuf_format)
             .ok_or_else(|| CaptureError::PipeWire("invalid dmabuf EnumFormat pod".to_owned()))?,
@@ -654,7 +744,7 @@ where
     main_loop.run();
     tracing::info!("main loop exited");
 
-    if success.get() {
+    if success.get() || stopped.get() {
         Ok(())
     } else {
         Err(CaptureError::PipeWire(no_frame_error.to_owned()))
@@ -668,14 +758,20 @@ where
 /// Blocks (runs the PipeWire main loop) until enough frames are seen or the
 /// stream errors. Must be called on a thread that owns the `fd`; keep the portal
 /// `Session` (and any tokio runtime) alive for the whole call.
+#[cfg(feature = "probes")]
 pub fn run_capture_probe(node_id: u32, fd: OwnedFd) -> Result<(), CaptureError> {
     let mut frames_logged: u32 = 0;
     run_stream(
         node_id,
         fd,
-        "rewynd-capture-probe",
-        // The probe logs frames; its PTS isn't muxed, so any epoch works.
-        Instant::now(),
+        StreamConfig {
+            stream_name: "rewynd-capture-probe",
+            // The probe logs frames; its PTS isn't muxed, so any epoch works.
+            epoch: Instant::now(),
+            prefs: StreamPrefs::default(),
+            stop: None,
+            no_frame_error: PROBE_NO_FRAME_ERROR,
+        },
         move |frame, _plane_fd| {
             tracing::info!(
                 fd = frame.fd,
@@ -696,8 +792,6 @@ pub fn run_capture_probe(node_id: u32, fd: OwnedFd) -> Result<(), CaptureError> 
                 ControlFlow::Continue(())
             }
         },
-        "stream ended without capturing any DMA-BUF frames \
-         (modifier fixation or buffer negotiation failed — see logs)",
     )
 }
 
@@ -737,6 +831,7 @@ fn dup_captured_frame(frame: &DmabufFrame, plane_fd: BorrowedFd) -> Option<Captu
 /// Blocks (runs the PipeWire main loop) until one frame is captured or the stream
 /// errors. Must be called on a thread that owns the `fd`; keep the portal
 /// `Session` (and any tokio runtime) alive for the whole call.
+#[cfg(feature = "probes")]
 pub fn capture_one_dmabuf(node_id: u32, fd: OwnedFd) -> Result<CapturedDmabuf, CaptureError> {
     // The callback fills this in on the first usable frame; we read it back out
     // after the loop quits. `Rc<RefCell<..>>` so the 'static callback can own a
@@ -746,9 +841,14 @@ pub fn capture_one_dmabuf(node_id: u32, fd: OwnedFd) -> Result<CapturedDmabuf, C
     run_stream(
         node_id,
         fd,
-        "rewynd-capture-import",
-        // A single-frame readback; its PTS isn't muxed, so any epoch works.
-        Instant::now(),
+        StreamConfig {
+            stream_name: "rewynd-capture-import",
+            // A single-frame readback; its PTS isn't muxed, so any epoch works.
+            epoch: Instant::now(),
+            prefs: StreamPrefs::default(),
+            stop: None,
+            no_frame_error: IMPORT_NO_FRAME_ERROR,
+        },
         {
             let captured = captured.clone();
             move |frame, plane_fd| {
@@ -768,8 +868,6 @@ pub fn capture_one_dmabuf(node_id: u32, fd: OwnedFd) -> Result<CapturedDmabuf, C
                 ControlFlow::Break(())
             }
         },
-        "stream ended without capturing a usable DMA-BUF frame \
-         (modifier fixation or buffer negotiation failed — see logs)",
     )?;
 
     // The loop only reports success after the callback stored a frame, so this is
@@ -800,6 +898,8 @@ pub fn capture_stream(
     node_id: u32,
     fd: OwnedFd,
     epoch: Instant,
+    prefs: StreamPrefs,
+    stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     mut on_frame: impl FnMut(CapturedDmabuf) -> ControlFlow<()> + 'static,
 ) -> Result<(), CaptureError> {
     // A failed dup inside the callback can only break the loop, which `run_stream`
@@ -809,8 +909,13 @@ pub fn capture_stream(
     run_stream(
         node_id,
         fd,
-        "rewynd-capture-stream",
-        epoch,
+        StreamConfig {
+            stream_name: "rewynd-capture-stream",
+            epoch,
+            prefs,
+            stop,
+            no_frame_error: STREAM_NO_FRAME_ERROR,
+        },
         {
             let dup_failed = dup_failed.clone();
             move |frame, plane_fd| match dup_captured_frame(frame, plane_fd) {
@@ -821,8 +926,6 @@ pub fn capture_stream(
                 }
             }
         },
-        "stream ended without capturing any usable DMA-BUF frames \
-         (modifier fixation or buffer negotiation failed — see logs)",
     )?;
 
     if dup_failed.get() {

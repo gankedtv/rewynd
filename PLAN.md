@@ -1,6 +1,6 @@
 # Rewynd — Project Plan & Build Spec
 
-*Rewynd — a lightweight instant-replay clip recorder: it keeps the last 60 seconds on the GPU and writes a clip on a hotkey.*
+*Rewynd — a lightweight instant-replay clip recorder: it keeps a configurable replay window (default 30 s, up to 120 s) on the GPU and writes a clip on a hotkey.*
 
 > **For the human:** drop this file in the repo root (or `docs/PLAN.md`) and hand it to Claude Code.
 > **For Claude Code:** read this entire document before doing anything. It is the single source of truth for *what* we are building and *why* every major decision was made. Do not re-litigate the locked decisions in §3 without flagging it explicitly. Your **first task** is §10 (create the GitHub milestones and issues). After that, work phase by phase per §7, respecting the guardrails in §9.
@@ -9,7 +9,7 @@
 
 ## 1. Mission
 
-**Rewynd** is a lightweight, native, cross-platform (**Linux + Windows**, macOS explicitly out of scope) "instant replay" clip recorder for gameplay. It continuously keeps the **last 60 seconds** of the screen in a GPU-encoded ring buffer; on a hotkey it flushes that buffer to an MP4. The whole point is **low resource usage** — it must be comfortable to run while gaming on lower-end PCs, which means the frame stays on the GPU from capture through hardware encode (zero-copy), never round-tripping through the CPU.
+**Rewynd** is a lightweight, native, cross-platform (**Linux + Windows**, macOS explicitly out of scope) "instant replay" clip recorder for gameplay. It continuously keeps a **configurable replay window** (default 30 s, up to 120 s) of the screen in a GPU-encoded ring buffer; on a hotkey it flushes that buffer to an MP4. The whole point is **low resource usage** — it must be comfortable to run while gaming on lower-end PCs, which means the frame stays on the GPU from capture through hardware encode (zero-copy), never round-tripping through the CPU.
 
 It is **general-purpose first**: it produces standalone video files and is not tied to any platform. Integration with **ganked.tv** (the author's clip-sharing platform) — auto-upload triggered from the UI — is a planned *later* feature, not a dependency and not part of the core identity. Build the general-purpose recorder first; add the ganked.tv connection afterward.
 

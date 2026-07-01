@@ -35,17 +35,23 @@ png = "0.18"
 # Live-pipeline recording spike: NV12 conversion + H.264 encode of captured frames.
 rewynd-encode.workspace = true
 
+[features]
+# Diagnostic probe entry points (single-frame capture, format logging) for the examples.
+probes = []
+
 # Diagnostic probe: logs PipeWire node id, negotiated format, and per-frame
 # DMA-BUF descriptors. Linux-only at runtime; the binary compiles everywhere via a
 # `#[cfg(not(target_os = "linux"))]` stub `main`.
 [[example]]
 name = "linux_capture_probe"
+required-features = ["probes"]
 
 # Import the first captured DMA-BUF as a wgpu::Texture and save it as
 # `screenshot.png`, proving the import + readback path. Linux-only at runtime;
 # compiles everywhere via a `#[cfg(not(target_os = "linux"))]` stub `main`.
 [[example]]
 name = "import_to_png"
+required-features = ["probes"]
 
 # Live-pipeline spike: capture → import → RGBA/BGRx→NV12 → H.264 encode → write an
 # Annex-B `.h264` file, then print a CPU/GPU overhead report. Linux-only at runtime;

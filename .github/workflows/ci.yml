@@ -13,7 +13,8 @@ jobs:
     name: fmt · clippy · build · test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      # Third-party actions are pinned to commit SHAs (tags are mutable).
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
 
@@ -28,12 +29,13 @@ jobs:
             pkg-config libpipewire-0.3-dev clang libclang-dev libopus-dev libxkbcommon-dev
 
       - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:
+          toolchain: stable
           components: clippy, rustfmt
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       # Fails fast before the heavy GPU-stack compile.
       - name: rustfmt
@@ -48,11 +50,31 @@ jobs:
       - name: test
         run: cargo test --workspace --locked
 
+      # The vendored muxer fork (ADR 0004) is workspace-excluded, so its inherited test
+      # suite (elst/dOps round-trips our A/V sync depends on) needs an explicit run.
+      - name: test vendored mp4 fork
+        run: cargo test --manifest-path vendor/mp4/Cargo.toml --locked
+
+  deny:
+    name: advisories · licenses · sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      # Gates RUSTSEC advisories, the GPL-compatible license allowlist (PLAN §3.7), and
+      # the single-wgpu-source invariant (ADR 0001). Config in deny.toml.
+      - name: cargo deny
+        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
+        with:
+          rust-version: stable
+
   coverage:
     name: coverage gate (CI-testable surface)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
 
@@ -63,17 +85,18 @@ jobs:
             pkg-config libpipewire-0.3-dev clang libclang-dev libopus-dev libxkbcommon-dev
 
       - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:
+          toolchain: stable
           components: llvm-tools-preview
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2
         with:
           tool: cargo-llvm-cov
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       # Gates 85% line coverage on CI-testable code only. GPU/portal code needs a
       # GPU/live Wayland session CI does not have, so it is excluded here and covered

@@ -148,7 +148,8 @@ fn grey_rgba_converts_to_bt709_limited_nv12() {
     let close = |actual: u8, expected: u8| actual.abs_diff(expected) <= TOLERANCE;
 
     // First frame: mid-grey → Y≈126, neutral chroma ≈128.
-    let nv12 = converter.convert(&gpu, &make_rgba(&gpu, GREY));
+    let src = make_rgba(&gpu, GREY);
+    let nv12 = converter.convert(&gpu, &src, src.width(), src.height());
     let y = read_plane(&gpu, &nv12, wgpu::TextureAspect::Plane0, SIZE, SIZE, 1);
     let uv = read_plane(
         &gpu,
@@ -181,12 +182,34 @@ fn grey_rgba_converts_to_bt709_limited_nv12() {
     // Second frame on the SAME converter exercises the reused output texture: black →
     // limited-range Y≈16, proving the cached target is rewritten in place (not stale).
     const EXPECTED_BLACK_Y: u8 = 16;
-    let black = converter.convert(&gpu, &make_rgba(&gpu, [0, 0, 0, 255]));
+    let src = make_rgba(&gpu, [0, 0, 0, 255]);
+    let black = converter.convert(&gpu, &src, src.width(), src.height());
     let yb = read_plane(&gpu, &black, wgpu::TextureAspect::Plane0, SIZE, SIZE, 1);
     for (i, &v) in yb.iter().enumerate() {
         assert!(
             close(v, EXPECTED_BLACK_Y),
             "black Y[{i}] = {v}, expected ~{EXPECTED_BLACK_Y} (±{TOLERANCE})"
+        );
+    }
+
+    // Downscale: a grey input at half the output size — the linear-sampled fullscreen pass is
+    // the recorder's capture-size → encode-size scaler, so a scaled solid frame must stay
+    // uniform (and the output texture must have the REQUESTED size, not the input's).
+    let src = make_rgba(&gpu, GREY);
+    let scaled = converter.convert(&gpu, &src, SIZE / 2, SIZE / 2);
+    assert_eq!((scaled.width(), scaled.height()), (SIZE / 2, SIZE / 2));
+    let ys = read_plane(
+        &gpu,
+        &scaled,
+        wgpu::TextureAspect::Plane0,
+        SIZE / 2,
+        SIZE / 2,
+        1,
+    );
+    for (i, &v) in ys.iter().enumerate() {
+        assert!(
+            close(v, EXPECTED_Y),
+            "scaled Y[{i}] = {v}, expected ~{EXPECTED_Y} (±{TOLERANCE})"
         );
     }
 }

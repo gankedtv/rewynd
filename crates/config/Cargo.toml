@@ -22,3 +22,6 @@ dirs = "6"
 # Advisory `flock` for the single-instance guard (docs/adr/0008); unix-only.
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

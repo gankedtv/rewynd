@@ -13,6 +13,8 @@ description = "ganked.tv upload client: API-key auth over the 3-step presigned u
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+futures-util.workspace = true
+tokio-util.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "time"] }
 
