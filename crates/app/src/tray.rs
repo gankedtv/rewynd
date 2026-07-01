@@ -11,6 +11,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 /// What a tray menu click asks the recorder to do.
 pub enum TrayCmd {
     SaveClip,
+    UploadClip,
     OpenSettings,
     Quit,
 }
@@ -81,6 +82,14 @@ impl Tray for RewyndTray {
             }
             .into(),
             StandardItem {
+                label: "Upload last clip".to_owned(),
+                activate: Box::new(|t: &mut Self| {
+                    let _ = t.tx.send(TrayCmd::UploadClip);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
                 label: "Open settings".to_owned(),
                 activate: Box::new(|t: &mut Self| {
                     let _ = t.tx.send(TrayCmd::OpenSettings);
@@ -109,17 +118,22 @@ pub async fn spawn() -> anyhow::Result<(Handle<RewyndTray>, UnboundedReceiver<Tr
     Ok((handle, rx))
 }
 
-/// Best-effort "clip saved" desktop notification. Async: the zbus backend's blocking `show()`
-/// would panic if called inside our tokio runtime, so the notification is sent via `show_async`.
-pub async fn clip_saved_toast(path: &Path) {
+/// Best-effort desktop notification. Async: the zbus backend's blocking `show()` would panic if
+/// called inside our tokio runtime, so it is sent via `show_async`.
+pub async fn toast(summary: &str, body: &str) {
     if let Err(e) = notify_rust::Notification::new()
-        .summary("Clip saved")
-        .body(&path.display().to_string())
+        .summary(summary)
+        .body(body)
         .icon("tv.ganked.rewynd")
         .appname("rewynd")
         .show_async()
         .await
     {
-        tracing::warn!(error = %e, "could not show clip-saved notification");
+        tracing::warn!(error = %e, summary, "could not show notification");
     }
+}
+
+/// "Clip saved" notification for a freshly written clip.
+pub async fn clip_saved_toast(path: &Path) {
+    toast("Clip saved", &path.display().to_string()).await;
 }

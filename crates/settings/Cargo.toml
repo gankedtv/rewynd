@@ -29,3 +29,7 @@ iced = { version = "0.14", default-features = false, features = [
 # Folder picker via the XDG Desktop Portal (no GTK build dep), matching our portal-based capture.
 # The async dialog future is executor-agnostic — iced's tokio executor drives it.
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+# ganked.tv device login (docs/adr/0009): the settings window drives the in-app login flow.
+rewynd-upload.workspace = true
+# Opens the approval page in the user's browser.
+open = "5"
