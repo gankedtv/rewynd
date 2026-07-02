@@ -1,9 +1,15 @@
-//! Desktop integration: `.desktop` entries for the launcher (app-id registration) and the
-//! login autostart, plus the brand icons both entries' `Icon=` name resolves to.
+//! Desktop integration: the login autostart (an XDG `.desktop` entry on Linux, an HKCU
+//! Run-key value on Windows), the Linux launcher entry (app-id registration), and the
+//! brand icons.
 
-use std::path::{Path, PathBuf};
+#[cfg(any(unix, windows))]
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
-use crate::paths::{APP_ID, config_home_from, data_home_from};
+use crate::paths::APP_ID;
+#[cfg(unix)]
+use crate::paths::{config_home_from, data_home_from};
 
 /// The brand mark's PNG renders as `(pixel_size, png_bytes)`, smallest first — the one owner
 /// for every consumer: the hicolor install below, the recorder's tray pixmaps, and the
@@ -23,6 +29,7 @@ pub const BRAND_ICONS: &[(u32, &[u8])] = &[
 /// backslashes, and a path with spaces is simply quoted. ASCII control characters cannot be
 /// represented (a newline would smuggle extra entry lines) and never occur in a legitimate
 /// binary path, so they are stripped with a warning.
+#[cfg(unix)]
 #[must_use]
 pub fn desktop_exec_value(path: &str) -> String {
     if path.chars().any(|c| c.is_ascii_control()) {
@@ -43,6 +50,7 @@ pub fn desktop_exec_value(path: &str) -> String {
 /// A minimal `[Desktop Entry]` body for `exec`, with `extra` key-lines appended — the shared
 /// core of the launcher entry (app id registration) and the login autostart entry. `Icon` is
 /// the app id, resolved through the icon theme (see [`install_icons`]).
+#[cfg(unix)]
 #[must_use]
 pub fn desktop_entry(exec: &Path, extra: &str) -> String {
     format!(
@@ -60,6 +68,7 @@ pub fn desktop_entry(exec: &Path, extra: &str) -> String {
 
 /// Path of rewynd's XDG autostart entry (`<config-home>/autostart/<APP_ID>.desktop`), or `None`
 /// if the environment can't resolve one.
+#[cfg(unix)]
 #[must_use]
 pub fn autostart_path() -> Option<PathBuf> {
     config_home_from(|k| std::env::var_os(k))
@@ -68,6 +77,7 @@ pub fn autostart_path() -> Option<PathBuf> {
 
 /// Write `contents` to `path` atomically (temp + rename), creating parent directories: a crash
 /// can't leave a truncated file that would silently break the launcher, autostart, or icon.
+#[cfg(unix)]
 fn write_file_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -82,6 +92,7 @@ fn write_file_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 
 /// Install (or refresh) the autostart entry at `path`, launching `exec` at login. The testable
 /// core of [`install_autostart`].
+#[cfg(unix)]
 fn install_autostart_at(path: &Path, exec: &Path) -> std::io::Result<()> {
     write_file_atomic(
         path,
@@ -91,6 +102,7 @@ fn install_autostart_at(path: &Path, exec: &Path) -> std::io::Result<()> {
 
 /// Remove the autostart entry at `path`; an already-absent entry is fine. The testable core of
 /// [`remove_autostart`].
+#[cfg(unix)]
 fn remove_autostart_at(path: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -98,6 +110,7 @@ fn remove_autostart_at(path: &Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(unix)]
 fn autostart_path_or_err() -> std::io::Result<PathBuf> {
     autostart_path().ok_or_else(|| {
         std::io::Error::new(
@@ -108,11 +121,13 @@ fn autostart_path_or_err() -> std::io::Result<PathBuf> {
 }
 
 /// Install (or refresh) the login autostart entry, launching `exec` at login.
+#[cfg(unix)]
 pub fn install_autostart(exec: &Path) -> std::io::Result<()> {
     install_autostart_at(&autostart_path_or_err()?, exec)
 }
 
 /// Remove the login autostart entry (absent is fine).
+#[cfg(unix)]
 pub fn remove_autostart() -> std::io::Result<()> {
     remove_autostart_at(&autostart_path_or_err()?)
 }
@@ -121,6 +136,7 @@ pub fn remove_autostart() -> std::io::Result<()> {
 /// id, so trays/notifications resolve rewynd's name and icon — unless one already exists:
 /// packaged installs ship the entry, and a package-managed file must stay untouched. Returns the
 /// entry path either way.
+#[cfg(unix)]
 pub fn install_launcher_entry(exec: &Path) -> std::io::Result<PathBuf> {
     let path = data_home_from(|k| std::env::var_os(k))
         .map(|home| home.join("applications").join(format!("{APP_ID}.desktop")))
@@ -138,6 +154,7 @@ pub fn install_launcher_entry(exec: &Path) -> std::io::Result<PathBuf> {
 /// space around `=`, optional `[locale]` suffix. Used as the ownership heuristic below — every
 /// entry we write (and any real packaged one) has an icon, so a missing key marks one of our
 /// own pre-icon self-installs.
+#[cfg(unix)]
 fn has_icon_key(entry: &str) -> bool {
     entry.lines().any(|line| {
         let Some(rest) = line.trim_start().strip_prefix("Icon") else {
@@ -157,6 +174,7 @@ fn has_icon_key(entry: &str) -> bool {
 /// Refresh `path` with a fresh entry unless the existing one carries an Icon key (then it is
 /// packaged or user-managed and must stay untouched). Unreadable-as-text entries are treated
 /// as foreign and also left alone.
+#[cfg(unix)]
 fn refresh_iconless_entry_at(path: &Path, entry: &str) -> std::io::Result<()> {
     match std::fs::read_to_string(path) {
         Ok(existing) if has_icon_key(&existing) => return Ok(()),
@@ -169,6 +187,7 @@ fn refresh_iconless_entry_at(path: &Path, entry: &str) -> std::io::Result<()> {
 }
 
 /// The testable core of [`install_launcher_entry`].
+#[cfg(unix)]
 fn install_launcher_entry_at(path: &Path, exec: &Path) -> std::io::Result<()> {
     refresh_iconless_entry_at(
         path,
@@ -179,11 +198,13 @@ fn install_launcher_entry_at(path: &Path, exec: &Path) -> std::io::Result<()> {
 /// Bring a pre-icon autostart entry up to date so it gains the `Icon=` key. Only an existing,
 /// icon-less entry is rewritten: a missing one means start-on-boot is off (this must not turn
 /// it on), and one with an icon may be user-managed.
+#[cfg(unix)]
 pub fn refresh_autostart(exec: &Path) -> std::io::Result<()> {
     refresh_autostart_at(&autostart_path_or_err()?, exec)
 }
 
 /// The testable core of [`refresh_autostart`].
+#[cfg(unix)]
 fn refresh_autostart_at(path: &Path, exec: &Path) -> std::io::Result<()> {
     if !path.exists() {
         return Ok(());
@@ -196,6 +217,7 @@ fn refresh_autostart_at(path: &Path, exec: &Path) -> std::io::Result<()> {
 /// `Icon=` name in our entries, the taskbar icon for our app id, and notification icons.
 /// Unlike the launcher entry a stale icon is refreshed: packaged icons live under
 /// `/usr/share/icons`, never in the user's data home, so nothing package-managed is at risk.
+#[cfg(unix)]
 pub fn install_icons() -> std::io::Result<()> {
     let hicolor = data_home_from(|k| std::env::var_os(k))
         .map(|home| home.join("icons").join("hicolor"))
@@ -210,6 +232,7 @@ pub fn install_icons() -> std::io::Result<()> {
 
 /// The testable core of [`install_icons`]. Writes only what differs — the common case (every
 /// start after the first install) touches nothing.
+#[cfg(unix)]
 fn install_icons_at(hicolor: &Path, icons: &[(u32, &[u8])]) -> std::io::Result<()> {
     let mut changed = false;
     for (size, png) in icons {
@@ -232,7 +255,191 @@ fn install_icons_at(hicolor: &Path, icons: &[(u32, &[u8])]) -> std::io::Result<(
     Ok(())
 }
 
-#[cfg(test)]
+// Windows autostart: a value under the per-user Run key. The kernel object model has no
+// packaged-vs-user distinction here, so the ownership heuristic is the value's target:
+// only a command pointing at a rewynd binary is ever rewritten.
+#[cfg(windows)]
+const RUN_KEY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+
+#[cfg(windows)]
+fn registry_io_err(e: windows::core::Error) -> std::io::Error {
+    std::io::Error::other(e)
+}
+
+/// `ERROR_FILE_NOT_FOUND` as the HRESULT the registry API reports for a missing
+/// key or value — the "autostart is off" case, not an error.
+#[cfg(windows)]
+fn is_not_found(e: &windows::core::Error) -> bool {
+    e.code().0 as u32 == 0x8007_0002
+}
+
+/// The Run-key command for `exec`: quoted, so paths with spaces survive.
+#[cfg(windows)]
+fn run_command_value(exec: &Path) -> String {
+    format!("\"{}\"", exec.display())
+}
+
+/// Whether an existing Run-key command points at a rewynd binary (ours to manage);
+/// a user-managed wrapper stays untouched.
+#[cfg(windows)]
+fn is_rewynd_command(command: &str) -> bool {
+    command
+        .trim()
+        .trim_matches('"')
+        .to_ascii_lowercase()
+        .ends_with("rewynd.exe")
+}
+
+/// Set the autostart value under `key_path`. The testable core of [`install_autostart`].
+#[cfg(windows)]
+fn install_autostart_at_key(key_path: &str, exec: &Path) -> std::io::Result<()> {
+    windows_registry::CURRENT_USER
+        .create(key_path)
+        .and_then(|key| key.set_string(APP_ID, run_command_value(exec)))
+        .map_err(registry_io_err)
+}
+
+/// Remove the autostart value under `key_path`; absent is fine. The testable core of
+/// [`remove_autostart`].
+#[cfg(windows)]
+fn remove_autostart_at_key(key_path: &str) -> std::io::Result<()> {
+    match windows_registry::CURRENT_USER
+        .create(key_path)
+        .and_then(|key| key.remove_value(APP_ID))
+    {
+        Err(e) if is_not_found(&e) => Ok(()),
+        other => other.map_err(registry_io_err),
+    }
+}
+
+/// Refresh an existing autostart value under `key_path` to point at `exec`. Only an
+/// existing value is touched (absent = start-on-boot is off; this must not turn it on),
+/// and only one pointing at a rewynd binary. The testable core of [`refresh_autostart`].
+#[cfg(windows)]
+fn refresh_autostart_at_key(key_path: &str, exec: &Path) -> std::io::Result<()> {
+    let key = windows_registry::CURRENT_USER
+        .create(key_path)
+        .map_err(registry_io_err)?;
+    let current = match key.get_string(APP_ID) {
+        Err(e) if is_not_found(&e) => return Ok(()),
+        other => other.map_err(registry_io_err)?,
+    };
+    if !is_rewynd_command(&current) {
+        return Ok(());
+    }
+    let desired = run_command_value(exec);
+    if current == desired {
+        return Ok(());
+    }
+    key.set_string(APP_ID, desired).map_err(registry_io_err)
+}
+
+/// Install (or refresh) the login autostart Run-key value, launching `exec` at login.
+#[cfg(windows)]
+pub fn install_autostart(exec: &Path) -> std::io::Result<()> {
+    install_autostart_at_key(RUN_KEY_PATH, exec)
+}
+
+/// Remove the login autostart Run-key value (absent is fine).
+#[cfg(windows)]
+pub fn remove_autostart() -> std::io::Result<()> {
+    remove_autostart_at_key(RUN_KEY_PATH)
+}
+
+/// Point an existing autostart value at the current binary (e.g. after the install
+/// moved). Missing or user-managed values stay untouched.
+#[cfg(windows)]
+pub fn refresh_autostart(exec: &Path) -> std::io::Result<()> {
+    refresh_autostart_at_key(RUN_KEY_PATH, exec)
+}
+
+// No autostart mechanism on other targets; the settings toggle surfaces the error.
+#[cfg(not(any(unix, windows)))]
+pub fn install_autostart(_exec: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "autostart is not supported on this platform",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn remove_autostart() -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn refresh_autostart(_exec: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// A registry key unique to one test, so parallel tests never collide. Removed
+    /// (tree and all) by [`TestKey`]'s drop.
+    struct TestKey(String);
+
+    impl TestKey {
+        fn new(tag: &str) -> Self {
+            Self(format!(
+                r"Software\rewynd-test-{}-{tag}",
+                std::process::id()
+            ))
+        }
+        fn value(&self) -> Option<String> {
+            windows_registry::CURRENT_USER
+                .create(&self.0)
+                .and_then(|key| key.get_string(crate::paths::APP_ID))
+                .ok()
+        }
+    }
+
+    impl Drop for TestKey {
+        fn drop(&mut self) {
+            let _ = windows_registry::CURRENT_USER.remove_tree(&self.0);
+        }
+    }
+
+    #[test]
+    fn autostart_value_installs_refreshes_and_removes() {
+        let key = TestKey::new("cycle");
+        install_autostart_at_key(&key.0, Path::new(r"C:\apps\re wynd\rewynd.exe"))
+            .expect("install");
+        assert_eq!(
+            key.value().as_deref(),
+            Some(r#""C:\apps\re wynd\rewynd.exe""#)
+        );
+
+        // A rewynd-owned value follows the binary when it moves; idempotent after that.
+        refresh_autostart_at_key(&key.0, Path::new(r"C:\new\rewynd.exe")).expect("refresh");
+        assert_eq!(key.value().as_deref(), Some(r#""C:\new\rewynd.exe""#));
+        refresh_autostart_at_key(&key.0, Path::new(r"C:\new\rewynd.exe")).expect("idempotent");
+        assert_eq!(key.value().as_deref(), Some(r#""C:\new\rewynd.exe""#));
+
+        remove_autostart_at_key(&key.0).expect("remove");
+        assert_eq!(key.value(), None, "disabling removes the value");
+        remove_autostart_at_key(&key.0).expect("idempotent remove");
+    }
+
+    #[test]
+    fn refresh_leaves_missing_and_user_managed_values_alone() {
+        let key = TestKey::new("refresh");
+        // Missing value: start-on-boot is off; the refresh must not create one.
+        refresh_autostart_at_key(&key.0, Path::new(r"C:\x\rewynd.exe")).expect("absent ok");
+        assert_eq!(key.value(), None);
+
+        // A command pointing at something that isn't a rewynd binary is user-managed.
+        windows_registry::CURRENT_USER
+            .create(&key.0)
+            .and_then(|k| k.set_string(crate::paths::APP_ID, r#""C:\wrapper\launcher.exe""#))
+            .expect("seed");
+        refresh_autostart_at_key(&key.0, Path::new(r"C:\x\rewynd.exe")).expect("no-op");
+        assert_eq!(key.value().as_deref(), Some(r#""C:\wrapper\launcher.exe""#));
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
