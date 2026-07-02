@@ -39,8 +39,8 @@ image.workspace = true
 rewynd-upload.workspace = true
 jiff.workspace = true
 
-# Windows wiring: WGC capture + D3D11 import + a RegisterHotKey message loop.
-# Tray/upload follow with later parity issues.
+# Windows wiring: WGC capture + D3D11 import + a RegisterHotKey message loop, with
+# the tray (tray-icon pumps on the same thread) and the ganked.tv upload menu.
 [target.'cfg(target_os = "windows")'.dependencies]
 rewynd-capture.workspace = true
 rewynd-gpu.workspace = true
@@ -48,9 +48,18 @@ rewynd-clip.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 pollster.workspace = true
 notify-rust = "4"
+# System tray icon + menu (tauri's tray-icon; MIT/Apache). PNG decode for the icon.
+tray-icon = "0.24"
+image.workspace = true
+rewynd-upload.workspace = true
+jiff.workspace = true
 windows = { workspace = true, features = [
-    # MessageBeep lives here (the audible save confirmation).
+    # The in-game save badge (layered window, GDI-drawn) + chime (PlaySound).
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    # MessageBeep lives here (the audible failure fallback).
     "Win32_System_Diagnostics_Debug",
+    "Win32_System_LibraryLoader",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
