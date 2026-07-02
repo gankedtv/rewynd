@@ -395,7 +395,7 @@ mod uploads {
         use rewynd_upload::UploadError;
         match e {
             UploadError::Http(_) => {
-                "Could not reach ganked.tv — check your connection and the API server URL."
+                "Could not reach ganked.tv; check your connection and the API server URL."
                     .to_owned()
             }
             UploadError::Io(_) => "The clip file could not be read.".to_owned(),
