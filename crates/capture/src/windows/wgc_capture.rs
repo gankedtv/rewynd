@@ -21,8 +21,8 @@
 
 use std::ops::ControlFlow;
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D11::{
@@ -58,6 +58,10 @@ const SHARED_SLOTS: usize = 4;
 /// How often the watchdog polls the cooperative stop flag. WGC delivers no frames
 /// while the screen is static, so the flag must be observed off the frame path too.
 const STOP_POLL: Duration = Duration::from_millis(200);
+
+/// How often the game detector re-checks the foreground window while no game is
+/// running (or after a session ended). Cheap Win32 queries; sub-second pickup.
+const GAME_POLL: Duration = Duration::from_millis(500);
 
 /// Bound on the CPU-side wait for a slot copy to complete. A healthy copy finishes
 /// in well under a millisecond; hitting this means the device is lost or hung.
@@ -407,28 +411,125 @@ where
         None => Monitor::primary(),
     }
     .map_err(|e| CaptureError::Wgc(format!("monitor selection: {e}")))?;
-
-    // Cap delivery at the configured framerate when it's below the monitor's
-    // refresh rate; otherwise let WGC deliver at its native cadence.
+    tracing::info!(
+        monitor = monitor.name().unwrap_or_default(),
+        "starting WGC monitor capture"
+    );
     let refresh = monitor.refresh_rate().unwrap_or(0);
+    run_session(monitor, refresh, epoch, prefs, stop, on_frame)
+}
+
+/// Capture the active *game*, continuously: poll the foreground window until one
+/// looks like a running game (fullscreen/borderless — see
+/// [`super::game_window::fullscreen_game_window`]), capture it until it closes,
+/// then go back to watching for the next one. Desktop content between games is
+/// never captured.
+///
+/// Same callback/stop contract as [`capture_stream`]; a callback `Break` ends the
+/// whole loop, not just the current game's session. Blocks until `on_frame` breaks
+/// or the `stop` flag is set — while no game runs, it idles on the detector poll.
+pub fn capture_game_stream<F>(
+    epoch: Instant,
+    prefs: StreamPrefs,
+    stop: Option<Arc<AtomicBool>>,
+    on_frame: F,
+) -> Result<(), CaptureError>
+where
+    F: FnMut(CapturedD3d11Frame) -> ControlFlow<()> + Send + 'static,
+{
+    // The callback outlives any single game's session, so each session gets an
+    // adapter borrowing it through a mutex (sessions never overlap; the lock is
+    // uncontended). `finished` distinguishes the callback's own Break from a
+    // session that ended because the game closed.
+    let on_frame = Arc::new(Mutex::new(on_frame));
+    let finished = Arc::new(AtomicBool::new(false));
+    tracing::info!("game-only capture: watching for a fullscreen game");
+
+    loop {
+        if stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::Relaxed))
+            || finished.load(Ordering::Relaxed)
+        {
+            return Ok(());
+        }
+
+        let Some(window) = super::game_window::fullscreen_game_window() else {
+            std::thread::sleep(GAME_POLL);
+            continue;
+        };
+        tracing::info!(
+            title = window.title().unwrap_or_default(),
+            process = window.process_name().unwrap_or_default(),
+            "fullscreen game detected; capturing it"
+        );
+        let refresh = window
+            .monitor()
+            .and_then(|m| m.refresh_rate().ok())
+            .unwrap_or(0);
+
+        let session_cb = {
+            let on_frame = on_frame.clone();
+            let finished = finished.clone();
+            move |frame: CapturedD3d11Frame| {
+                let mut on_frame = on_frame.lock().unwrap_or_else(|p| p.into_inner());
+                match on_frame(frame) {
+                    ControlFlow::Break(()) => {
+                        finished.store(true, Ordering::Relaxed);
+                        ControlFlow::Break(())
+                    }
+                    action => action,
+                }
+            }
+        };
+        // Any session end that isn't ours (the game closed, its window died mid-
+        // setup, a device hiccup) just returns to the detector; the stop flag and
+        // the callback's Break remain the only exits.
+        match run_session(window, refresh, epoch, prefs, stop.clone(), session_cb) {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::info!(error = %e, "game capture session ended; watching for the next game");
+                std::thread::sleep(GAME_POLL);
+            }
+        }
+    }
+}
+
+/// One WGC session over `item` (a monitor or a window): the shared body of
+/// [`capture_stream`] and [`capture_game_stream`]. `refresh` is the source
+/// monitor's refresh rate (0 = unknown), used to decide whether `prefs.framerate`
+/// caps delivery via WGC's minimum update interval.
+fn run_session<T, F>(
+    item: T,
+    refresh: u32,
+    epoch: Instant,
+    prefs: StreamPrefs,
+    stop: Option<Arc<AtomicBool>>,
+    on_frame: F,
+) -> Result<(), CaptureError>
+where
+    T: TryInto<windows_capture::settings::GraphicsCaptureItemType> + Send + 'static,
+    F: FnMut(CapturedD3d11Frame) -> ControlFlow<()> + Send + 'static,
+{
+    // Cap delivery at the configured framerate when it's below the source's
+    // refresh rate; otherwise let WGC deliver at its native cadence.
     let min_interval = if prefs.framerate > 0 && (refresh == 0 || prefs.framerate < refresh) {
         MinimumUpdateIntervalSettings::Custom(Duration::from_secs(1) / prefs.framerate)
     } else {
         MinimumUpdateIntervalSettings::Default
     };
     tracing::info!(
-        monitor = monitor.name().unwrap_or_default(),
         refresh,
         framerate = prefs.framerate,
         capped = matches!(min_interval, MinimumUpdateIntervalSettings::Custom(_)),
-        "starting WGC capture"
+        "starting WGC session"
     );
 
     let success = Arc::new(AtomicBool::new(false));
     let stopped = Arc::new(AtomicBool::new(false));
 
     let settings = Settings::new(
-        monitor,
+        item,
         CursorCaptureSettings::WithCursor,
         DrawBorderSettings::WithoutBorder,
         SecondaryWindowSettings::Default,

@@ -316,7 +316,10 @@ enum Message {
     BrowseDir,
     DirPicked(Option<String>),
     HotkeyEdited(String),
+    #[cfg(target_os = "linux")]
     AlwaysPrompt(bool),
+    #[cfg(target_os = "windows")]
+    CaptureDesktop(bool),
     StartOnBoot(bool),
     UploadEnabled(bool),
     ApiKeyEdited(String),
@@ -444,8 +447,14 @@ impl App {
                 self.hotkey = s;
                 self.touch();
             }
+            #[cfg(target_os = "linux")]
             Message::AlwaysPrompt(on) => {
                 self.config.set_always_prompt(on);
+                self.touch();
+            }
+            #[cfg(target_os = "windows")]
+            Message::CaptureDesktop(on) => {
+                self.config.set_capture_desktop(on);
                 self.touch();
             }
             Message::StartOnBoot(on) => {
@@ -740,42 +749,63 @@ impl App {
             || "Leave empty for the system temp folder".to_owned(),
             |p| format!("Leave empty for {}", p.display()),
         );
-        let output = card(
-            "OUTPUT & CAPTURE",
+        let output_capture = column![
             column![
-                column![
-                    field_label("Save clips to"),
-                    row![
-                        text_input(&placeholder, &self.output_dir)
-                            .on_input(Message::OutputDirEdited)
-                            .style(arena_input),
-                        button(text("Browse").size(12).font(UI_SEMIBOLD))
-                            .on_press(Message::BrowseDir)
-                            .style(secondary_button)
-                            .padding([10, 16]),
-                    ]
-                    .spacing(8),
+                field_label("Save clips to"),
+                row![
+                    text_input(&placeholder, &self.output_dir)
+                        .on_input(Message::OutputDirEdited)
+                        .style(arena_input),
+                    button(text("Browse").size(12).font(UI_SEMIBOLD))
+                        .on_press(Message::BrowseDir)
+                        .style(secondary_button)
+                        .padding([10, 16]),
                 ]
                 .spacing(8),
-                field(
-                    "Hotkey",
-                    text_input("CTRL+ALT+R", &self.hotkey)
-                        .on_input(Message::HotkeyEdited)
-                        .style(arena_input),
-                )
-                .push(hint(
-                    "Your desktop may let you rebind this in its shortcut settings.",
-                )),
-                checkbox(self.config.always_prompt())
-                    .label("Ask which monitor to record every time rewynd starts")
-                    .on_toggle(Message::AlwaysPrompt)
+            ]
+            .spacing(8),
+            field(
+                "Hotkey",
+                text_input("CTRL+ALT+R", &self.hotkey)
+                    .on_input(Message::HotkeyEdited)
+                    .style(arena_input),
+            )
+            .push(hint(
+                "Your desktop may let you rebind this in its shortcut settings.",
+            )),
+        ]
+        .spacing(18);
+        // The monitor picker is the ScreenCast portal's (Linux); Windows records the
+        // active game by default, with the whole desktop as the opt-in.
+        #[cfg(target_os = "linux")]
+        let output_capture = output_capture.push(
+            checkbox(self.config.always_prompt())
+                .label("Ask which monitor to record every time rewynd starts")
+                .on_toggle(Message::AlwaysPrompt)
+                .style(arena_check),
+        );
+        #[cfg(target_os = "windows")]
+        let output_capture = output_capture.push(
+            column![
+                checkbox(self.config.capture_desktop())
+                    .label("Record the whole desktop, not just the active game")
+                    .on_toggle(Message::CaptureDesktop)
                     .style(arena_check),
+                hint(
+                    "Off records only the game you're playing (fullscreen or \
+                     borderless), keeping other windows out of your clips.",
+                ),
+            ]
+            .spacing(6),
+        );
+        let output = card(
+            "OUTPUT & CAPTURE",
+            output_capture.push(
                 checkbox(self.config.start_on_boot())
                     .label("Start rewynd when I log in")
                     .on_toggle(Message::StartOnBoot)
                     .style(arena_check),
-            ]
-            .spacing(18),
+            ),
         );
 
         // Account area: a one-click browser login (device grant); the key it mints is stored

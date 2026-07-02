@@ -93,6 +93,7 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Media_Audio",
     "Win32_System_Com",
     # IMMDevice::Activate's optional activation params are a PROPVARIANT, so the

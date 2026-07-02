@@ -1222,7 +1222,7 @@ mod windows {
 
     use anyhow::{Context, Result, anyhow};
     use rewynd_buffer::{AudioRingBuffer, EncodedChunk, RingBuffer};
-    use rewynd_capture::windows::{CapturedD3d11Frame, capture_stream};
+    use rewynd_capture::windows::{CapturedD3d11Frame, capture_game_stream, capture_stream};
     use rewynd_capture::{AudioSource, StreamPrefs};
     use rewynd_clip::{ClipSaver, SaveError, SharedAudioBuffer, SharedBuffer, lock_unpoisoned};
     use rewynd_config::{self as config};
@@ -1376,10 +1376,17 @@ mod windows {
         // GPU pipeline lives (and tears down) there.
         let capture_buffer = buffer.clone();
         let capture_stop = stop.clone();
+        let capture_desktop = config.capture_desktop();
         let capture = std::thread::Builder::new()
             .name("rewynd-capture".to_owned())
             .spawn(move || {
-                if let Err(e) = run_capture(params, epoch, &capture_buffer, &capture_stop) {
+                if let Err(e) = run_capture(
+                    params,
+                    epoch,
+                    &capture_buffer,
+                    &capture_stop,
+                    capture_desktop,
+                ) {
                     tracing::error!(error = %e, "capture loop stopped");
                     toast(
                         "Recording stopped",
@@ -1490,24 +1497,27 @@ mod windows {
     }
 
     /// Build the GPU pipeline and pump captured frames into `buffer` until the stream
-    /// ends. The encoder/converter/device are dropped in dependency order afterwards
-    /// (tearing the device down before the encoder it backs crashes the driver); by the
-    /// time `capture_stream` returns, the WGC thread is joined, so these Arcs are the
-    /// last owners.
+    /// ends. `desktop` picks the source: the whole primary monitor, or (the default)
+    /// only the active fullscreen game — between games nothing is captured, so the
+    /// desktop stays out of the ring. The encoder/converter/device are dropped in
+    /// dependency order afterwards (tearing the device down before the encoder it
+    /// backs crashes the driver); by the time the stream returns, the WGC thread is
+    /// joined, so these Arcs are the last owners.
     fn run_capture(
         params: EncodeParams,
         epoch: Instant,
         buffer: &SharedBuffer,
         stop: &Arc<AtomicBool>,
+        desktop: bool,
     ) -> Result<()> {
         let gpu = Arc::new(pollster::block_on(GpuContext::new())?);
         // Mutexes, not RefCell/Rc as on Linux: the per-frame callback runs on the WGC
         // capture thread, so everything it captures must be Send (+Sync via Arc).
         let conv = Arc::new(Mutex::new(Nv12Converter::new(&gpu)?));
         let enc = Arc::new(Mutex::new(GpuVideoEncoder::new(&gpu, params)?));
-        tracing::info!("capture pipeline ready; filling the ring buffer");
+        tracing::info!(desktop, "capture pipeline ready; filling the ring buffer");
 
-        // WGC captures the monitor at its native size; whatever arrives is scaled to the
+        // WGC captures the source at its native size; whatever arrives is scaled to the
         // encoder's dimensions in the NV12 pass. The framerate pref caps delivery.
         let prefs = StreamPrefs {
             width: params.width,
@@ -1518,7 +1528,7 @@ mod windows {
         // it still surfaces as this function's Err. (Mutex, not Cell: the callback runs on
         // the WGC capture thread.)
         let failure: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(None));
-        capture_stream(None, epoch, prefs, Some(stop.clone()), {
+        let on_frame = {
             let gpu = gpu.clone();
             let conv = conv.clone();
             let enc = enc.clone();
@@ -1561,7 +1571,12 @@ mod windows {
                     }
                 }
             }
-        })?;
+        };
+        if desktop {
+            capture_stream(None, epoch, prefs, Some(stop.clone()), on_frame)?;
+        } else {
+            capture_game_stream(epoch, prefs, Some(stop.clone()), on_frame)?;
+        }
 
         drop(enc);
         drop(conv);

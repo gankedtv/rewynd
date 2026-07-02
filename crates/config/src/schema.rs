@@ -174,6 +174,11 @@ struct CaptureConfig {
     /// Re-show the ScreenCast monitor picker each launch (ignore the saved restore token),
     /// so a different monitor can be chosen; `false` reuses the saved selection.
     always_prompt: bool,
+    /// Capture the whole desktop instead of only the active game. Off by default:
+    /// recording everything can catch private content, and game-only is what an
+    /// instant-replay tool is expected to do. (Windows honors this today; on Linux the
+    /// ScreenCast portal's picker governs what is shared.)
+    desktop: bool,
 }
 
 /// Desktop-session startup behaviour.
@@ -394,6 +399,12 @@ impl Config {
         self.capture.always_prompt
     }
 
+    /// Whether to capture the whole desktop instead of only the active game.
+    #[must_use]
+    pub fn capture_desktop(&self) -> bool {
+        self.capture.desktop
+    }
+
     /// Whether the recorder should start automatically at login.
     #[must_use]
     pub fn start_on_boot(&self) -> bool {
@@ -504,6 +515,11 @@ impl Config {
     /// Set whether to re-show the monitor picker each launch.
     pub fn set_always_prompt(&mut self, always_prompt: bool) {
         self.capture.always_prompt = always_prompt;
+    }
+
+    /// Set whether to capture the whole desktop instead of only the active game.
+    pub fn set_capture_desktop(&mut self, desktop: bool) {
+        self.capture.desktop = desktop;
     }
 
     /// Switch uploads on/off (takes effect only once a key is set — see [`upload`]).
@@ -717,6 +733,9 @@ trigger = \"CTRL+ALT+R\"
 [capture]
 # Re-show the monitor picker each launch (so you can pick a different screen).
 always_prompt = false
+# Record the whole desktop instead of only the active fullscreen game (Windows).
+# Off keeps private windows out of clips.
+desktop = false
 
 [startup]
 # Start rewynd automatically when you log in.
