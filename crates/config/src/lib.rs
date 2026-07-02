@@ -28,6 +28,7 @@ mod lock;
 mod paths;
 mod process;
 mod schema;
+pub mod upload_history;
 
 pub use clips::{
     ClipEntry, clip_output_path, clips_dir, ensure_private_dir, folder_name, list_clips,

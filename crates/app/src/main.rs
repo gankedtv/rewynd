@@ -1089,11 +1089,51 @@ mod linux {
 
     /// Upload `path` and toast the outcome, releasing `busy` when done. Runs as its own task so
     /// nothing else waits on it.
+    /// How often to poll ganked.tv processing status after a tray upload, and for how long
+    /// (≈5 minutes) — long enough to catch a server-side failure that only surfaces after
+    /// "processing", short enough not to poll forever.
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+    const POLL_MAX_READS: u32 = 60;
+
+    /// Remember a successful upload in the shared history file, so the library shows an "uploaded"
+    /// badge and the duplicate guard applies to clips sent from the tray too.
+    fn record_upload(
+        path: &std::path::Path,
+        destination: &str,
+        remote_id: String,
+        url: Option<String>,
+    ) {
+        use rewynd_config::upload_history::{ClipKey, UploadRecord, record};
+        let Ok(meta) = std::fs::metadata(path) else {
+            return;
+        };
+        let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        let Some(key) = ClipKey::new(path, meta.len(), modified) else {
+            return;
+        };
+        let entry = UploadRecord {
+            file_name: key.file_name,
+            size_bytes: key.size_bytes,
+            modified_millis: key.modified_millis,
+            destination: destination.to_owned(),
+            remote_id,
+            url,
+            uploaded_millis: ClipKey::now_millis(),
+        };
+        if let Err(e) = record(entry) {
+            tracing::warn!(error = %e, "could not record the upload");
+        }
+    }
+
     async fn upload_and_toast(up: Uploader, path: PathBuf, busy: Arc<AtomicBool>) {
-        let _busy = BusyGuard(busy);
+        use rewynd_config::upload_history::GANKED;
         let title = rewynd_upload::default_title();
         tray::toast("Uploading clip", "Sending to ganked.tv...").await;
-        match up.client.upload(&path, &title, up.visibility).await {
+
+        // Hold the one-upload-at-a-time flag only for the transfer; the status poll below is
+        // passive and must not block the next upload for minutes.
+        let busy_guard = BusyGuard(busy);
+        let clip_id = match up.client.upload(&path, &title, up.visibility).await {
             Ok(clip) if clip.failed() => {
                 tracing::error!(clip_id = %clip.id, "server rejected the clip after upload");
                 tray::toast(
@@ -1101,17 +1141,45 @@ mod linux {
                     "ganked.tv could not process the clip (check its length and format).",
                 )
                 .await;
+                None
             }
             Ok(clip) => {
-                let body = clip
-                    .share_url(&up.share_base)
-                    .unwrap_or_else(|| "Processing on ganked.tv".to_owned());
+                let link = clip.share_url(&up.share_base);
+                record_upload(&path, GANKED, clip.id.clone(), link.clone());
                 tracing::info!(clip_id = %clip.id, "clip uploaded");
-                tray::toast("Clip uploaded", &body).await;
+                tray::toast(
+                    "Clip uploaded",
+                    &link.unwrap_or_else(|| "Processing on ganked.tv".to_owned()),
+                )
+                .await;
+                Some(clip.id)
             }
             Err(e) => {
                 tracing::error!(error = %e, path = %path.display(), "upload failed");
                 tray::toast("Upload failed", &user_facing_upload_error(&e)).await;
+                None
+            }
+        };
+        drop(busy_guard);
+
+        // Watch server-side processing so a failure that appears after "processing" reaches the
+        // user (the fault this milestone's companion server fix + this poll close together).
+        if let Some(clip_id) = clip_id
+            && let Ok(report) = up
+                .client
+                .poll_status(&clip_id, POLL_INTERVAL, POLL_MAX_READS)
+                .await
+        {
+            if report.failed() {
+                tray::toast(
+                    "ganked.tv couldn't process the clip",
+                    &report.failure_message(),
+                )
+                .await;
+            } else if report.is_ready()
+                && let Some(url) = report.share_url(&up.share_base)
+            {
+                record_upload(&path, GANKED, clip_id, Some(url));
             }
         }
     }
@@ -1119,16 +1187,21 @@ mod linux {
     /// Upload `path` to YouTube and toast the outcome (the youtu.be link on success),
     /// releasing `busy` when done. Runs as its own task so nothing else waits on it.
     async fn upload_youtube_and_toast(up: YtUploader, path: PathBuf, busy: Arc<AtomicBool>) {
+        use rewynd_config::upload_history::YOUTUBE;
         let _busy = BusyGuard(busy);
         let title = rewynd_upload::default_title();
         tray::toast("Uploading clip", "Sending to YouTube...").await;
         match up.client.upload(&path, &title, up.visibility).await {
             Ok(video) => {
-                let body = video
-                    .watch_url()
-                    .unwrap_or_else(|| "Processing on YouTube".to_owned());
+                record_upload(&path, YOUTUBE, video.id.clone(), video.watch_url());
                 tracing::info!(video_id = %video.id, "clip uploaded to YouTube");
-                tray::toast("Clip uploaded to YouTube", &body).await;
+                tray::toast(
+                    "Clip uploaded to YouTube",
+                    &video
+                        .watch_url()
+                        .unwrap_or_else(|| "Processing on YouTube".to_owned()),
+                )
+                .await;
             }
             Err(e) => {
                 tracing::error!(error = %e, path = %path.display(), "YouTube upload failed");
