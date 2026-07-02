@@ -28,8 +28,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, w};
 
-/// How long the badge stays on screen.
-const BADGE_MS: u32 = 2600;
+/// How long the badge stays on screen: long enough to catch mid-fight in the
+/// corner of the eye, short enough to never feel like HUD clutter.
+const BADGE_MS: u32 = 4000;
 /// Whole-badge opacity (SourceConstantAlpha): solid enough to read, soft enough
 /// to feel like an overlay rather than a dialog.
 const BADGE_ALPHA: u8 = 242;
