@@ -19,7 +19,7 @@ use iced::{Background, Border, Element, Font, Length, Task, Theme, font};
 
 use rewynd_config::{self as config, Config};
 
-// The ganked.tv "Arena" design system (docs: the design handoff's DESIGN_SPEC): a near-black
+// The ganked.tv "Arena" design system (docs/design/arena.md): a near-black
 // surface ladder for depth (base → raised → high; the system forbids shadows), one mint accent
 // owning every interactive state (no red — errors are mint too), hairline borders.
 mod palette {
@@ -52,11 +52,6 @@ const DISPLAY_BLACK: Font = Font {
     ..Font::DEFAULT
 };
 /// UI face: Inter (Regular is the default font; these are the heavier cuts).
-const UI_MEDIUM: Font = Font {
-    family: font::Family::Name("Inter"),
-    weight: font::Weight::Medium,
-    ..Font::DEFAULT
-};
 const UI_SEMIBOLD: Font = Font {
     family: font::Family::Name("Inter"),
     weight: font::Weight::Semibold,
@@ -113,7 +108,6 @@ fn main() -> iced::Result {
         // Barlow Condensed (display) + Inter (UI); system fallbacks would break the look.
         .font(include_bytes!("../assets/fonts/BarlowCondensed-Black.ttf").as_slice())
         .font(include_bytes!("../assets/fonts/Inter-Regular.ttf").as_slice())
-        .font(include_bytes!("../assets/fonts/Inter-Medium.ttf").as_slice())
         .font(include_bytes!("../assets/fonts/Inter-SemiBold.ttf").as_slice())
         .font(include_bytes!("../assets/fonts/Inter-Bold.ttf").as_slice())
         .default_font(Font {
@@ -217,7 +211,9 @@ struct App {
 /// a non-empty API key.
 enum LoginState {
     Idle,
-    Starting,
+    Starting {
+        abort: iced::task::Handle,
+    },
     /// Waiting for browser approval: the user code plus the server's verification page (shown as
     /// the fallback when the browser did not open — it may not be ganked.tv when self-hosting),
     /// and the poll task's abort handle so Cancel actually stops the polling.
@@ -391,20 +387,22 @@ impl App {
                 self.touch();
             }
             Message::LoginPressed => {
-                self.login = LoginState::Starting;
                 let base = self.effective_api_url();
-                return Task::perform(
+                let (task, abort) = Task::perform(
                     async move {
                         rewynd_upload::device_login_start(&base, "rewynd")
                             .await
                             .map_err(|e| e.to_string())
                     },
                     Message::LoginStarted,
-                );
+                )
+                .abortable();
+                self.login = LoginState::Starting { abort };
+                return task;
             }
             Message::LoginStarted(Ok(login)) => {
                 // A cancelled/stale start must not begin polling.
-                if !matches!(self.login, LoginState::Starting) {
+                if !matches!(self.login, LoginState::Starting { .. }) {
                     return Task::none();
                 }
                 if let Err(e) = open::that_detached(&login.verification_uri_complete) {
@@ -430,7 +428,7 @@ impl App {
                 return task;
             }
             Message::LoginStarted(Err(e)) => {
-                if matches!(self.login, LoginState::Starting) {
+                if matches!(self.login, LoginState::Starting { .. }) {
                     self.login = LoginState::Failed(e);
                 }
             }
@@ -450,18 +448,12 @@ impl App {
                     Err(e) => self.login = LoginState::Failed(e),
                 }
             }
-            Message::LoginCancelled => {
-                if let LoginState::Waiting { abort, .. } =
-                    std::mem::replace(&mut self.login, LoginState::Idle)
-                {
-                    abort.abort();
-                }
-                self.login = LoginState::Idle;
-            }
+            Message::LoginCancelled => self.abort_login(),
             Message::LogoutPressed => {
                 self.api_key.clear();
                 self.config.set_upload_enabled(false);
-                self.login = LoginState::Idle;
+                // A pending device login must not keep polling after an explicit logout.
+                self.abort_login();
                 self.save();
             }
             Message::Save => self.save(),
@@ -487,9 +479,19 @@ impl App {
         Task::none()
     }
 
-    /// Mark the form as having unsaved edits.
+    /// Mark the form as having unsaved edits (a restart would no longer apply what's on screen).
     fn touch(&mut self) {
         self.status = Status::Editing;
+        self.last_save_ok = false;
+    }
+
+    /// Stop whichever login task is in flight (the handles are manual-abort, not
+    /// abort-on-drop) and return to Idle.
+    fn abort_login(&mut self) {
+        match std::mem::replace(&mut self.login, LoginState::Idle) {
+            LoginState::Starting { abort } | LoginState::Waiting { abort, .. } => abort.abort(),
+            _ => {}
+        }
     }
 
     /// Fold the free-text mirrors into the config and write it to disk.
@@ -658,7 +660,6 @@ impl App {
                     row![
                         text_input(&placeholder, &self.output_dir)
                             .on_input(Message::OutputDirEdited)
-                            .font(UI_MEDIUM)
                             .style(arena_input),
                         button(text("Browse").size(12).font(UI_SEMIBOLD))
                             .on_press(Message::BrowseDir)
@@ -672,7 +673,6 @@ impl App {
                     field_label("Hotkey"),
                     text_input("CTRL+ALT+R", &self.hotkey)
                         .on_input(Message::HotkeyEdited)
-                        .font(UI_MEDIUM)
                         .style(arena_input),
                     hint("Your desktop may let you rebind this in its shortcut settings."),
                 ]
@@ -727,7 +727,15 @@ impl App {
                 ]
                 .spacing(6)
                 .into(),
-                LoginState::Starting => text("Contacting ganked.tv...").size(14).into(),
+                LoginState::Starting { .. } => column![
+                    text("Contacting ganked.tv...").size(13),
+                    button(text("Cancel").size(11).font(UI_SEMIBOLD))
+                        .on_press(Message::LoginCancelled)
+                        .style(secondary_button)
+                        .padding([6, 14]),
+                ]
+                .spacing(7)
+                .into(),
                 LoginState::Waiting {
                     code,
                     verification_uri,
@@ -749,9 +757,7 @@ impl App {
                         .on_press(Message::LoginPressed)
                         .style(primary_button)
                         .padding([11, 20]),
-                    text(e.clone()).size(12).style(|_: &Theme| text::Style {
-                        color: Some(palette::ACCENT),
-                    }),
+                    text(e.clone()).size(12).style(tinted(palette::ACCENT)),
                 ]
                 .spacing(6)
                 .into(),
@@ -774,13 +780,13 @@ impl App {
                         Some(rewynd_upload::Visibility::parse(self.config.upload_visibility())),
                         Message::VisibilityPicked,
                     )
+                    .style(arena_pick)
                     .width(Length::Fill),
                 ),
                 column![
                     field_label("API server"),
                     text_input(config::DEFAULT_UPLOAD_API_URL, &self.api_url)
                         .on_input(Message::ApiUrlEdited)
-                        .font(UI_MEDIUM)
                         .style(arena_input),
                 ]
                 .spacing(6),
@@ -788,7 +794,6 @@ impl App {
                     field_label("Share links"),
                     text_input(config::DEFAULT_UPLOAD_SHARE_URL, &self.share_url)
                         .on_input(Message::ShareUrlEdited)
-                        .font(UI_MEDIUM)
                         .style(arena_input),
                     hint("Leave both empty for ganked.tv. Self-hosting? An API key can be pasted below."),
                 ]
@@ -798,7 +803,6 @@ impl App {
                     text_input("gtv_...", &self.api_key)
                         .secure(true)
                         .on_input(Message::ApiKeyEdited)
-                        .font(UI_MEDIUM)
                         .style(arena_input),
                 ]
                 .spacing(6),
@@ -888,9 +892,7 @@ fn card<'a>(title: &'a str, content: impl Into<Element<'a, Message>>) -> Element
         text(title)
             .size(10)
             .font(UI_BOLD)
-            .style(|_: &Theme| text::Style {
-                color: Some(palette::ACCENT),
-            }),
+            .style(tinted(palette::ACCENT)),
         content.into(),
     ]
     .spacing(14);
@@ -1056,18 +1058,19 @@ fn value_row<'a>(label: &'a str, value: String) -> Element<'a, Message> {
         text(label)
             .size(12)
             .font(UI_SEMIBOLD)
-            .style(|_: &Theme| text::Style {
-                color: Some(palette::TEXT_SECONDARY),
-            })
+            .style(tinted(palette::TEXT_SECONDARY))
             .width(Length::Fill),
         text(value)
             .size(12)
             .font(UI_SEMIBOLD)
-            .style(|_: &Theme| text::Style {
-                color: Some(palette::ACCENT),
-            }),
+            .style(tinted(palette::ACCENT)),
     ]
     .into()
+}
+
+/// A text style closure for one fixed color.
+fn tinted(color: iced::Color) -> impl Fn(&Theme) -> text::Style {
+    move |_| text::Style { color: Some(color) }
 }
 
 /// Arena field label: small, bold, uppercase, secondary.
@@ -1075,20 +1078,13 @@ fn field_label<'a>(s: &str) -> Element<'a, Message> {
     text(s.to_uppercase())
         .size(10)
         .font(UI_BOLD)
-        .style(|_: &Theme| text::Style {
-            color: Some(palette::TEXT_SECONDARY),
-        })
+        .style(tinted(palette::TEXT_SECONDARY))
         .into()
 }
 
 /// Muted hint text.
 fn hint<'a>(s: impl Into<String>) -> Element<'a, Message> {
-    text(s.into())
-        .size(11)
-        .style(|_: &Theme| text::Style {
-            color: Some(palette::MUTED),
-        })
-        .into()
+    text(s.into()).size(11).style(tinted(palette::MUTED)).into()
 }
 
 /// The save-status line under the Save button.
@@ -1106,10 +1102,7 @@ fn status_line(status: &Status) -> Element<'_, Message> {
         ),
         Status::Error(e) => (e.clone(), palette::ACCENT),
     };
-    text(msg)
-        .size(13)
-        .style(move |_: &Theme| text::Style { color: Some(color) })
-        .into()
+    text(msg).size(12).style(tinted(color)).into()
 }
 
 /// The recorder binary, expected as a sibling of this settings binary.

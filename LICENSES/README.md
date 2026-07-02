@@ -9,6 +9,8 @@ this directory is sufficient).
 | Dependency | License | Notice |
 | --- | --- | --- |
 | [`gpu-video`](https://github.com/software-mansion/smelter) (Software Mansion) | MIT | [gpu-video-MIT.txt](gpu-video-MIT.txt) |
+| [Barlow Condensed](https://github.com/jpt/barlow) (embedded font, settings app) | OFL-1.1 | [crates/settings/assets/fonts/OFL-BarlowCondensed.txt](../crates/settings/assets/fonts/OFL-BarlowCondensed.txt) |
+| [Inter](https://github.com/rsms/inter) (embedded font, settings app) | OFL-1.1 | [crates/settings/assets/fonts/OFL-Inter.txt](../crates/settings/assets/fonts/OFL-Inter.txt) |
 
 > Note: `gpu-video` the **crate** is MIT (per its own `LICENSE`); the broader *smelter*
 > product is under a separate source-available license that does **not** govern this
