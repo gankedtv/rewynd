@@ -379,22 +379,39 @@ impl GankedClient {
     }
 
     /// Poll [`clip_status`](Self::clip_status) until it reaches a terminal state (ready/failed) or
-    /// `max_reads` reads elapse, waiting `interval` between reads. Returns the last status seen,
-    /// which may still be non-terminal if processing outran the budget.
+    /// `max_reads` reads elapse, waiting `interval` between reads. A transient read error (a blip
+    /// or a 5xx) does not end the poll — it is kept and retried, so a single hiccup can't collapse
+    /// the whole multi-minute window. Returns the last status seen; only if no read ever succeeded
+    /// does it surface the last error.
     pub async fn poll_status(
         &self,
         clip_id: &str,
         interval: Duration,
         max_reads: u32,
     ) -> Result<ClipStatusReport, UploadError> {
-        let mut report = self.clip_status(clip_id).await?;
-        let mut reads = 1;
-        while !report.is_terminal() && reads < max_reads.max(1) {
-            tokio::time::sleep(interval).await;
-            report = self.clip_status(clip_id).await?;
-            reads += 1;
+        let mut last: Option<ClipStatusReport> = None;
+        let mut last_error: Option<UploadError> = None;
+        for read in 0..max_reads.max(1) {
+            if read > 0 {
+                tokio::time::sleep(interval).await;
+            }
+            match self.clip_status(clip_id).await {
+                Ok(report) if report.is_terminal() => return Ok(report),
+                Ok(report) => {
+                    last = Some(report);
+                    last_error = None;
+                }
+                Err(e) => last_error = Some(e),
+            }
         }
-        Ok(report)
+        // Budget spent without a terminal state: prefer the last status, else the last error.
+        last.ok_or_else(|| {
+            last_error.unwrap_or_else(|| UploadError::Api {
+                status: 0,
+                code: "no_status".to_owned(),
+                detail: "the clip status could not be read".to_owned(),
+            })
+        })
     }
 
     /// Whether the clip still exists server-side. A 404 (the clip was deleted) returns `Ok(false)`
@@ -1058,6 +1075,20 @@ mod tests {
             !report.is_terminal(),
             "still processing after the read budget"
         );
+    }
+
+    #[tokio::test]
+    async fn poll_status_keeps_reading_through_transient_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/clips/c/status"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(3) // a 5xx must not collapse the whole window after one read
+            .mount(&server)
+            .await;
+        let client = GankedClient::new(&server.uri(), "gtv_testkey").expect("client");
+        let result = client.poll_status("c", std::time::Duration::ZERO, 3).await;
+        assert!(result.is_err(), "no status ever read surfaces the error");
     }
 
     #[tokio::test]

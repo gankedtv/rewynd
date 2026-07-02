@@ -82,25 +82,67 @@ pub fn find(key: &ClipKey, destination: &str) -> Option<UploadRecord> {
     find_in(&load(), key, destination)
 }
 
-/// Remember a successful upload, replacing any prior record for the same clip + destination.
+/// Remember a successful upload, replacing any prior record for the same clip + destination. The
+/// read-modify-write runs under an exclusive file lock so a concurrent record from the recorder's
+/// tray and the settings GUI can't clobber each other's entries.
 pub fn record(entry: UploadRecord) -> std::io::Result<()> {
     let path = history_path().ok_or_else(no_path)?;
-    let mut records = load_at(&path);
-    upsert(&mut records, entry);
-    save_at(&path, &records)
+    with_history_lock(&path, || {
+        let mut records = load_at(&path);
+        upsert(&mut records, entry);
+        save_at(&path, &records)
+    })
 }
 
 /// Forget the record for `key` at `destination` (e.g. after the remote copy was deleted), so the
-/// duplicate guard lets the user upload again. A no-op when there's nothing to forget.
+/// duplicate guard lets the user upload again. A no-op when there's nothing to forget. Same
+/// exclusive lock as [`record`].
 pub fn forget(key: &ClipKey, destination: &str) -> std::io::Result<()> {
     let path = history_path().ok_or_else(no_path)?;
-    let mut records = load_at(&path);
-    let before = records.len();
-    records.retain(|r| !(key.matches(r) && r.destination == destination));
-    if records.len() == before {
-        return Ok(());
+    with_history_lock(&path, || {
+        let mut records = load_at(&path);
+        let before = records.len();
+        records.retain(|r| !(key.matches(r) && r.destination == destination));
+        if records.len() == before {
+            return Ok(());
+        }
+        save_at(&path, &records)
+    })
+}
+
+/// Run a read-modify-write against the history file while holding an exclusive advisory lock on a
+/// sidecar `.lock` file, so two processes can't interleave load/save and lose records. Blocking:
+/// the critical section is a couple of tiny file operations. Non-unix has no advisory lock here,
+/// so it just runs the body (the practical contention — tray + GUI — is a Linux desktop concern).
+#[cfg(unix)]
+fn with_history_lock<T>(
+    path: &Path,
+    body: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
-    save_at(&path, &records)
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path.with_extension("json.lock"))?;
+    // SAFETY: `file` owns a valid fd for the whole call; the lock releases when it drops (close).
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    body()
+}
+
+#[cfg(not(unix))]
+fn with_history_lock<T>(
+    _path: &Path,
+    body: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    body()
 }
 
 fn no_path() -> std::io::Error {
@@ -256,6 +298,21 @@ mod tests {
         let reloaded = load_at(&path);
         assert!(find_in(&reloaded, &k, GANKED).is_none());
         assert!(find_in(&reloaded, &k, YOUTUBE).is_some());
+    }
+
+    #[test]
+    fn with_history_lock_runs_the_body_under_a_lock_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("upload-history.json");
+        let out = with_history_lock(&path, || {
+            save_at(&path, &[record_of(&key("rewynd-1-0.mp4"), GANKED, "id")])?;
+            Ok::<_, std::io::Error>(11)
+        })
+        .expect("locked body");
+        assert_eq!(out, 11);
+        assert_eq!(load_at(&path).len(), 1);
+        #[cfg(unix)]
+        assert!(path.with_extension("json.lock").exists());
     }
 
     #[test]

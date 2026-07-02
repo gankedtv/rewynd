@@ -382,7 +382,7 @@ impl Library {
                 }
             }
             Message::UploadDone(result) => return self.upload_done(result, config),
-            Message::StatusPolled(path, result) => self.status_polled(&path, result),
+            Message::StatusPolled(path, result) => return self.status_polled(&path, result),
             Message::Verified(path, dest, result) => {
                 return self.verified(path, dest, result, config);
             }
@@ -561,21 +561,29 @@ impl Library {
     }
 
     /// Fold a ganked.tv status poll into a terminal state; ignore a poll for a clip the user has
-    /// since navigated away from.
-    fn status_polled(&mut self, path: &Path, result: Result<StatusOutcome, String>) {
+    /// since navigated away from. A share code usually only appears once processing finishes, so
+    /// this is where the link is copied to the clipboard for ganked.tv (it was still `processing`
+    /// at upload time).
+    fn status_polled(
+        &mut self,
+        path: &Path,
+        result: Result<StatusOutcome, String>,
+    ) -> Task<Message> {
         if !matches!(&self.upload, UploadState::Processing { path: p, .. } if p == path) {
-            return;
+            return Task::none();
         }
         let path = path.to_path_buf();
+        let mut task = Task::none();
         self.upload = match result {
             Ok(outcome) if outcome.failed => UploadState::Failed {
                 path,
                 error: outcome.message,
             },
             Ok(outcome) => {
-                // A share code may only appear once processing advances; keep the badge's link fresh.
                 if let Some(url) = &outcome.link {
+                    // Keep the badge's link fresh and put the now-available link on the clipboard.
                     self.update_history_link(&path, Dest::Ganked, url);
+                    task = iced::clipboard::write(url.clone());
                 }
                 UploadState::Done {
                     path,
@@ -586,6 +594,7 @@ impl Library {
             }
             Err(error) => UploadState::Failed { path, error },
         };
+        task
     }
 
     /// "Upload again" on an already-uploaded clip: verify the remote copy still exists before
