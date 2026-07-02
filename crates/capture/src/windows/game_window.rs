@@ -31,8 +31,12 @@ pub(crate) fn fullscreen_game_window() -> Option<Window> {
     if !window.is_valid() {
         return None;
     }
-    let process = window.process_name().ok()?.to_ascii_lowercase();
-    if EXCLUDED_PROCESSES.contains(&process.as_str()) {
+    // Anti-cheat-protected games (Vanguard, EAC, ...) refuse OpenProcess, so a
+    // failed name query must NOT disqualify — it is in fact a strong game signal.
+    // The shell processes this list guards against are always queryable.
+    if let Ok(process) = window.process_name()
+        && EXCLUDED_PROCESSES.contains(&process.to_ascii_lowercase().as_str())
+    {
         return None;
     }
     covers_its_monitor(&window).then_some(window)
@@ -60,6 +64,39 @@ fn covers_its_monitor(window: &Window) -> bool {
         && rect.top <= bounds.top
         && rect.right >= bounds.right
         && rect.bottom >= bounds.bottom
+}
+
+/// One-line diagnosis of the current foreground window against the game heuristic —
+/// the `game_probe` example prints this so "my game isn't detected" reports carry
+/// the failing step instead of guesswork. Deliberately excludes the window title.
+#[must_use]
+pub fn describe_foreground() -> String {
+    let window = match Window::foreground() {
+        Ok(w) => w,
+        Err(e) => return format!("no foreground window ({e})"),
+    };
+    if !window.is_valid() {
+        return "foreground window is not a valid capture target (invisible/tool/child)".to_owned();
+    }
+    let process = match window.process_name() {
+        Ok(p) => p,
+        // The anti-cheat case: unreadable process = still a game candidate.
+        Err(e) => format!("<unreadable: {e}>"),
+    };
+    let excluded = EXCLUDED_PROCESSES.contains(&process.to_ascii_lowercase().as_str());
+    let rect = window
+        .rect()
+        .map(|r| format!("{},{} → {},{}", r.left, r.top, r.right, r.bottom))
+        .unwrap_or_else(|e| format!("<unreadable: {e}>"));
+    let covers = covers_its_monitor(&window);
+    let verdict = if excluded {
+        "NO (shell process)"
+    } else if covers {
+        "YES"
+    } else {
+        "NO (not fullscreen: window does not cover its monitor)"
+    };
+    format!("process={process} rect={rect} covers_monitor={covers} → game: {verdict}")
 }
 
 /// Keep the compiler honest about the excluded list staying lowercase — the runtime

@@ -39,8 +39,8 @@ image.workspace = true
 rewynd-upload.workspace = true
 jiff.workspace = true
 
-# Windows MVP wiring (video-only): WGC capture + D3D11 import + a RegisterHotKey
-# message loop. Tray/upload/audio follow with later parity issues.
+# Windows wiring: WGC capture + D3D11 import + a RegisterHotKey message loop.
+# Tray/upload follow with later parity issues.
 [target.'cfg(target_os = "windows")'.dependencies]
 rewynd-capture.workspace = true
 rewynd-gpu.workspace = true
@@ -49,6 +49,9 @@ tokio = { workspace = true, features = ["signal"] }
 pollster.workspace = true
 notify-rust = "4"
 windows = { workspace = true, features = [
+    # MessageBeep lives here (the audible save confirmation).
+    "Win32_System_Diagnostics_Debug",
+    "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
