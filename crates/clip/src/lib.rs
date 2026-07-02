@@ -54,6 +54,9 @@ pub struct ClipSaver {
     /// Set to ask the mixer for an immediate drain before the audio cut; the mixer clears it.
     audio_drain_now: Option<Arc<AtomicBool>>,
     last_clip: Mutex<Option<PathBuf>>,
+    /// The per-game subfolder the next save lands in (ShadowPlay-style), when game
+    /// detection knows what the buffer holds. The platform wiring keeps it current.
+    game_folder: Mutex<Option<String>>,
 }
 
 impl ClipSaver {
@@ -76,7 +79,14 @@ impl ClipSaver {
             output_dir,
             audio_drain_now,
             last_clip: Mutex::new(None),
+            game_folder: Mutex::new(None),
         })
+    }
+
+    /// Set (or clear) the per-game subfolder for subsequent saves. The name is
+    /// sanitized here so callers can pass a raw game name.
+    pub fn set_game_folder(&self, game: Option<&str>) {
+        *lock_unpoisoned(&self.game_folder) = game.and_then(folder_name);
     }
 
     /// Cut the most recent window from both rings and write it to an MP4. Blocking: the mux +
@@ -103,7 +113,8 @@ impl ClipSaver {
         let clip_base = chunks.first().map_or(Duration::ZERO, |c| c.pts);
         let audio_chunks = lock_unpoisoned(&self.audio).flush_from(clip_base);
 
-        let path = clip_output_path(self.output_dir.as_deref());
+        let game_folder = lock_unpoisoned(&self.game_folder).clone();
+        let path = clip_output_path(self.output_dir.as_deref(), game_folder.as_deref());
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -167,31 +178,76 @@ impl ClipSaver {
     }
 }
 
-/// The newest `rewynd-*.mp4` in `dir` by file name (names embed a millisecond timestamp, so
-/// lexicographic max is newest; no metadata calls needed).
+/// The newest `rewynd-*.mp4` under `dir` by file name, looking one level into per-game
+/// subfolders too (names embed a millisecond timestamp, so lexicographic max of the file
+/// name is newest; no metadata calls needed).
 fn newest_clip_in(dir: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension().is_some_and(|ext| ext == "mp4")
-                && p.file_name()
+    fn clips_in(dir: &Path, recurse: bool) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut clips = Vec::new();
+        for path in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
+            if recurse && path.is_dir() {
+                clips.extend(clips_in(&path, false));
+            } else if path.extension().is_some_and(|ext| ext == "mp4")
+                && path
+                    .file_name()
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| n.starts_with("rewynd-"))
+            {
+                clips.push(path);
+            }
+        }
+        clips
+    }
+    clips_in(dir, true)
+        .into_iter()
+        .max_by(|a, b| a.file_name().cmp(&b.file_name()))
+}
+
+/// A filesystem-safe folder name derived from a game name: path separators and
+/// characters Windows forbids become spaces, whitespace collapses, and the result is
+/// length-capped. `None` when nothing usable remains.
+fn folder_name(raw: &str) -> Option<String> {
+    const MAX_LEN: usize = 80;
+    let mapped: String = raw
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => ' ',
+            c if c.is_control() => ' ',
+            c => c,
         })
-        .max()
+        .collect();
+    let mut collapsed = String::with_capacity(mapped.len());
+    for word in mapped.split_whitespace() {
+        if !collapsed.is_empty() {
+            collapsed.push(' ');
+        }
+        collapsed.push_str(word);
+    }
+    while collapsed.len() > MAX_LEN {
+        collapsed.pop();
+    }
+    // Windows refuses names ending in dots; reserved device names (CON, NUL, ...) are
+    // vanishingly unlikely as game titles and left to the OS to reject.
+    let trimmed = collapsed.trim_end_matches(['.', ' ']).to_owned();
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 /// Where to write a saved clip: `output_dir` if configured, else the user's Videos folder, else
-/// a private per-user temp directory — with a millisecond-stamped, per-process-sequenced name.
-/// The sequence number disambiguates two saves landing in the same millisecond.
-fn clip_output_path(output_dir: Option<&Path>) -> PathBuf {
+/// a private per-user temp directory — plus the per-game subfolder when one is set — with a
+/// millisecond-stamped, per-process-sequenced name. The sequence number disambiguates two
+/// saves landing in the same millisecond.
+fn clip_output_path(output_dir: Option<&Path>, game_folder: Option<&str>) -> PathBuf {
     static SEQ: AtomicU32 = AtomicU32::new(0);
-    let dir = output_dir
+    let mut dir = output_dir
         .map(Path::to_path_buf)
         .or_else(rewynd_config::default_output_dir)
         .unwrap_or_else(private_temp_dir);
+    if let Some(game) = game_folder {
+        dir.push(game);
+    }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
@@ -313,6 +369,56 @@ mod tests {
                 .is_some_and(|n| n.starts_with("rewynd-") && n.ends_with(".mp4"))
         );
         assert_eq!(saver.last_clip(), Some(path));
+    }
+
+    #[test]
+    fn saves_into_the_game_subfolder_and_finds_it_after_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (saver, buffer, _) = saver_with(dir.path(), 5);
+        saver.set_game_folder(Some("Half-Life 2: Episode Two"));
+        lock_unpoisoned(&buffer).push(EncodedChunk {
+            bytes: keyframe_bytes(),
+            is_keyframe: true,
+            pts: Duration::ZERO,
+        });
+
+        let path = saver.save().expect("saves");
+        assert_eq!(
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
+            Some("Half-Life 2 Episode Two"),
+            "clip lands in the sanitized per-game folder"
+        );
+
+        // A fresh saver (post-restart) must find the clip inside the subfolder.
+        let (fresh, _, _) = saver_with(dir.path(), 5);
+        assert_eq!(fresh.last_clip(), Some(path));
+
+        // Clearing the folder (or an unusable name) returns saves to the root.
+        saver.set_game_folder(Some("..."));
+        lock_unpoisoned(&buffer).push(EncodedChunk {
+            bytes: keyframe_bytes(),
+            is_keyframe: true,
+            pts: Duration::from_millis(32),
+        });
+        let root = saver.save().expect("saves");
+        assert_eq!(root.parent(), Some(dir.path()));
+    }
+
+    #[test]
+    fn folder_name_sanitizes() {
+        assert_eq!(folder_name("Elden Ring"), Some("Elden Ring".to_owned()));
+        assert_eq!(folder_name("a/b\\c"), Some("a b c".to_owned()));
+        assert_eq!(
+            folder_name("  spaced   out  "),
+            Some("spaced out".to_owned())
+        );
+        assert_eq!(folder_name("..."), None);
+        assert_eq!(folder_name("\u{0}\u{1}"), None);
+        assert_eq!(folder_name(""), None);
+        let long = "x".repeat(200);
+        assert!(folder_name(&long).unwrap().len() <= 80);
     }
 
     #[test]

@@ -12,6 +12,7 @@ use pw::spa::pod::serialize::PodSerializer;
 use pw::spa::pod::{Object, Value};
 
 pub mod audio;
+pub mod focus;
 pub mod pipewire_capture;
 pub mod portal;
 pub mod vulkan_modifiers;
@@ -26,6 +27,7 @@ pub(crate) fn serialize_object(obj: Object) -> Vec<u8> {
 }
 
 pub use audio::{AudioParams, AudioSource, capture_audio};
+pub use focus::{FocusError, FocusWatcher};
 pub use pipewire_capture::{CapturedDmabuf, DmabufFrame, StreamPrefs, capture_stream};
 // Diagnostic probe entry points, used by this crate's examples only.
 #[cfg(feature = "probes")]

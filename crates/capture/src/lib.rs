@@ -13,6 +13,8 @@
 
 use thiserror::Error;
 
+pub mod game;
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 
