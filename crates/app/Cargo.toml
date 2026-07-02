@@ -38,3 +38,17 @@ image.workspace = true
 # ganked.tv upload from the tray (docs/adr/0009); jiff stamps clip titles in local time.
 rewynd-upload.workspace = true
 jiff.workspace = true
+
+# Windows MVP wiring (video-only): WGC capture + D3D11 import + a RegisterHotKey
+# message loop. Tray/upload/audio follow with later parity issues.
+[target.'cfg(target_os = "windows")'.dependencies]
+rewynd-capture.workspace = true
+rewynd-gpu.workspace = true
+rewynd-clip.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+pollster.workspace = true
+notify-rust = "4"
+windows = { workspace = true, features = [
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
