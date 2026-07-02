@@ -1315,15 +1315,45 @@ mod windows {
             }
         }
 
-        // Park until Ctrl+C (there is no tray on Windows yet), then run the same
-        // stop-flag-then-join shutdown as the Linux recorder.
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        runtime
-            .block_on(tokio::signal::ctrl_c())
-            .context("waiting for Ctrl+C")?;
-        tracing::info!("Ctrl+C received; shutting down");
+        // Park until Ctrl+C or the named stop event (the settings app's restart request
+        // — the Windows SIGTERM stand-in), then run the same stop-flag-then-join
+        // shutdown as the Linux recorder. Both waiter threads are detached: they hold
+        // nothing that needs teardown and die with the process.
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<&'static str>();
+        match config::RecorderStopEvent::create() {
+            Ok(stop_event) => {
+                let tx = shutdown_tx.clone();
+                std::thread::Builder::new()
+                    .name("rewynd-stop-event".to_owned())
+                    .spawn(move || {
+                        stop_event.wait();
+                        let _ = tx.send("stop requested (settings restart)");
+                    })
+                    .context("spawning the stop-event thread")?;
+            }
+            // Without the event the settings restart falls back to terminating us.
+            Err(e) => tracing::warn!(error = %e, "could not create the stop event"),
+        }
+        {
+            let tx = shutdown_tx;
+            std::thread::Builder::new()
+                .name("rewynd-ctrl-c".to_owned())
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build();
+                    let ok = runtime.map(|rt| rt.block_on(tokio::signal::ctrl_c()));
+                    if matches!(ok, Ok(Ok(()))) {
+                        let _ = tx.send("Ctrl+C");
+                    }
+                    // A failed handler just leaves the stop event as the only trigger.
+                })
+                .context("spawning the Ctrl+C thread")?;
+        }
+        let reason = shutdown_rx
+            .recv()
+            .unwrap_or("all shutdown waiters died; shutting down");
+        tracing::info!(reason, "shutting down");
 
         stop.store(true, Ordering::Relaxed);
         let _ = capture.join();
