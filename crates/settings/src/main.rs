@@ -54,6 +54,10 @@ fn collapse_scroll() -> Task<Message> {
 /// write touches the `.part` file, the rename, and the directory) collapses into one rescan.
 const WATCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How long to wait before re-arming the clip-directory watch when the directory does not exist
+/// yet (a fresh machine that has never saved a clip).
+const WATCH_RETRY: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Watch `dir` recursively and yield a debounced [`Message::ClipsChanged`] whenever clips there
 /// appear or disappear. Recursive so a brand-new per-game subfolder (the first clip of a new
 /// game) is covered without re-binding. The `notify` watcher is owned by the async block and
@@ -79,8 +83,23 @@ fn clip_watch_stream(dir: std::path::PathBuf) -> impl iced::futures::Stream<Item
                     return;
                 }
             };
-            if let Err(e) = watcher.watch(&dir, RecursiveMode::Recursive) {
-                tracing::warn!(error = %e, dir = %dir.display(), "could not watch the clip directory");
+            // The clip directory may not exist yet on a fresh machine (no clip saved). Re-arm on
+            // a timer until it appears rather than giving up: the subscription is keyed by the
+            // resolved path, so a one-shot failure would leave auto-refresh dead until the app
+            // restarts. A dropped subscription cancels this future mid-sleep.
+            let mut rearmed = false;
+            loop {
+                match watcher.watch(&dir, RecursiveMode::Recursive) {
+                    Ok(()) => break,
+                    Err(e) => {
+                        tracing::debug!(error = %e, dir = %dir.display(), "clip directory not watchable yet; retrying");
+                        rearmed = true;
+                        tokio::time::sleep(WATCH_RETRY).await;
+                    }
+                }
+            }
+            // If the directory only just appeared, surface whatever it already holds.
+            if rearmed && output.send(Message::ClipsChanged).await.is_err() {
                 return;
             }
 

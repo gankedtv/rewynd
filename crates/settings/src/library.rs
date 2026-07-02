@@ -516,8 +516,15 @@ impl Library {
         let groups = self.grouped();
         let mut sections = column![].spacing(24);
         if groups.is_empty() {
+            // The empty result can come from the search box, the game chips, or both; word it
+            // for whichever the user actually touched.
+            let reason = if self.search.trim().is_empty() {
+                "No clips in this section."
+            } else {
+                "No clips match your search."
+            };
             sections = sections.push(
-                container(hint("No clips match your search."))
+                container(hint(reason))
                     .center_x(Length::Fill)
                     .padding([48, 0])
                     .width(Length::Fill),
