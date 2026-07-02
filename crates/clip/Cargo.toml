@@ -7,12 +7,19 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
-description = "The clip save path: cut both ring buffers, pick an output path, mux to MP4."
+description = "The clip save path and clip store: cut the rings, pick an output path, mux, list."
+
+[features]
+default = ["saver"]
+# The full save path (ring buffers + encoder param types + muxer). Off, the crate is just
+# the clip store — output-dir resolution, naming, listing — with no GPU-adjacent deps, so
+# the settings GUI can share the store without pulling the encode tree into its build.
+saver = ["dep:rewynd-buffer", "dep:rewynd-encode", "dep:rewynd-mux"]
 
 [dependencies]
-rewynd-buffer.workspace = true
-rewynd-mux.workspace = true
-rewynd-encode.workspace = true
+rewynd-buffer = { workspace = true, optional = true }
+rewynd-mux = { workspace = true, optional = true }
+rewynd-encode = { workspace = true, optional = true }
 rewynd-config.workspace = true
 thiserror.workspace = true
 # Home-dir fallback when the shared temp dir cannot be trusted.
