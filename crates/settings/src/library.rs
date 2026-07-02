@@ -12,6 +12,7 @@ use iced::widget::{
 };
 use iced::{Background, Border, Element, Length, Task, Theme};
 
+use rewynd_config::upload_history::{self, ClipKey, UploadRecord};
 use rewynd_config::{ClipEntry, Config};
 use rewynd_upload::youtube::{
     DEFAULT_CLIENT_ID, DEFAULT_CLIENT_SECRET, YouTubeClient, user_facing_youtube_error,
@@ -46,6 +47,14 @@ impl Dest {
         match self {
             Dest::Ganked => "ganked.tv",
             Dest::YouTube => "YouTube",
+        }
+    }
+
+    /// The stored history key for this destination.
+    fn history_key(self) -> &'static str {
+        match self {
+            Dest::Ganked => upload_history::GANKED,
+            Dest::YouTube => upload_history::YOUTUBE,
         }
     }
 }
@@ -85,8 +94,31 @@ enum UploadState {
         dest: Dest,
         abort: iced::task::Handle,
     },
+    /// ganked.tv accepted the clip; polling its processing status until ready/failed.
+    Processing {
+        path: PathBuf,
+        abort: iced::task::Handle,
+    },
+    /// Verifying whether an already-uploaded clip still exists remotely before re-uploading.
+    Checking {
+        path: PathBuf,
+        dest: Dest,
+    },
+    /// The remote copy is still there, so a re-upload is blocked (with an "upload anyway" escape).
+    Blocked {
+        path: PathBuf,
+        dest: Dest,
+        link: Option<String>,
+    },
+    /// The remote copy could not be verified (offline, or YouTube's scope can't check); offer to
+    /// upload anyway.
+    Unverifiable {
+        path: PathBuf,
+        reason: String,
+    },
     Done {
         path: PathBuf,
+        dest: Dest,
         link: Option<String>,
         note: String,
     },
@@ -96,12 +128,26 @@ enum UploadState {
     },
 }
 
-/// A finished upload: the share/watch link when the server issued one, else a note.
+/// A finished upload: the remote id (for history + later verification), the share/watch link
+/// when the server issued one, and a note.
 #[derive(Debug, Clone)]
 pub struct Uploaded {
+    remote_id: String,
     link: Option<String>,
     note: String,
 }
+
+/// The result of polling ganked.tv processing status.
+#[derive(Debug, Clone)]
+pub struct StatusOutcome {
+    failed: bool,
+    link: Option<String>,
+    message: String,
+}
+
+/// How often to poll ganked.tv processing status, and for how many reads (≈5 minutes total).
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+const POLL_MAX_READS: u32 = 60;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -122,8 +168,12 @@ pub enum Message {
     DestPicked(Dest),
     VisibilityPicked(Visibility),
     UploadPressed,
+    UploadAgain,
+    UploadAnyway,
     UploadCancelled,
     UploadDone(Result<Uploaded, String>),
+    StatusPolled(PathBuf, Result<StatusOutcome, String>),
+    Verified(PathBuf, Dest, Result<bool, String>),
     OpenLink(String),
     CopyLink(String),
 }
@@ -153,6 +203,9 @@ pub struct Library {
     dest: Dest,
     visibility: Visibility,
     upload: UploadState,
+    /// Remembered successful uploads (per clip, per destination), for badges + the duplicate
+    /// guard. Reloaded on each scan and after a record/forget.
+    history: Vec<UploadRecord>,
 }
 
 impl Library {
@@ -173,7 +226,27 @@ impl Library {
             dest: Dest::Ganked,
             visibility: Visibility::default(),
             upload: UploadState::Idle,
+            history: upload_history::load(),
         }
+    }
+
+    /// The upload record for `entry` at `dest`, if the clip was uploaded there.
+    fn record_for(&self, entry: &ClipEntry, dest: Dest) -> Option<&UploadRecord> {
+        let key = clip_key(entry)?;
+        self.history.iter().find(|r| {
+            key.file_name == r.file_name
+                && key.size_bytes == r.size_bytes
+                && key.modified_millis == r.modified_millis
+                && r.destination == dest.history_key()
+        })
+    }
+
+    /// The destinations `entry` has already been uploaded to (for the card badges).
+    fn uploaded_dests(&self, entry: &ClipEntry) -> Vec<Dest> {
+        [Dest::Ganked, Dest::YouTube]
+            .into_iter()
+            .filter(|d| self.record_for(entry, *d).is_some())
+            .collect()
     }
 
     /// Rescan the clip directory (the same resolution the recorder saves through) on a
@@ -223,6 +296,7 @@ impl Library {
                 self.open = Some(path);
                 self.confirm_delete = false;
                 self.action_error = None;
+                self.upload = UploadState::Idle;
                 self.title_hint = default_title();
                 self.title = self.title_hint.clone();
                 let (ganked, youtube) = dest_statuses(config);
@@ -296,28 +370,21 @@ impl Library {
                 }
             }
             Message::VisibilityPicked(v) => self.visibility = v,
-            Message::UploadPressed => return self.start_upload(config),
+            Message::UploadPressed | Message::UploadAnyway => return self.start_upload(config),
+            Message::UploadAgain => return self.recheck_before_reupload(config),
             Message::UploadCancelled => {
-                if let UploadState::Uploading { abort, .. } =
-                    std::mem::replace(&mut self.upload, UploadState::Idle)
-                {
-                    abort.abort();
+                match std::mem::replace(&mut self.upload, UploadState::Idle) {
+                    UploadState::Uploading { abort, .. }
+                    | UploadState::Processing { abort, .. } => {
+                        abort.abort();
+                    }
+                    _ => {}
                 }
             }
-            Message::UploadDone(result) => {
-                let UploadState::Uploading { path, .. } =
-                    std::mem::replace(&mut self.upload, UploadState::Idle)
-                else {
-                    return Task::none();
-                };
-                self.upload = match result {
-                    Ok(done) => UploadState::Done {
-                        path,
-                        link: done.link,
-                        note: done.note,
-                    },
-                    Err(error) => UploadState::Failed { path, error },
-                };
+            Message::UploadDone(result) => return self.upload_done(result, config),
+            Message::StatusPolled(path, result) => return self.status_polled(&path, result),
+            Message::Verified(path, dest, result) => {
+                return self.verified(path, dest, result, config);
             }
             Message::OpenLink(url) => {
                 if let Err(e) = open::that_detached(&url) {
@@ -352,6 +419,9 @@ impl Library {
                 .push_back((entry.path.clone(), modified));
         }
         self.entries = entries;
+        // Refresh the upload memory so badges + the duplicate guard reflect uploads made from the
+        // tray (or a prior run) without a restart.
+        self.history = upload_history::load();
         // Drop a game filter whose section vanished (its last clip was deleted or moved).
         let stale = self
             .game_filter
@@ -440,6 +510,215 @@ impl Library {
         let (task, abort) = Task::perform(upload, Message::UploadDone).abortable();
         self.upload = UploadState::Uploading { path, dest, abort };
         task
+    }
+
+    /// Handle a finished upload: remember it (so badges + the guard persist), copy the link to the
+    /// clipboard, then for ganked.tv start polling its processing status; YouTube has no further
+    /// server step to watch.
+    fn upload_done(&mut self, result: Result<Uploaded, String>, config: &Config) -> Task<Message> {
+        let UploadState::Uploading { path, dest, .. } =
+            std::mem::replace(&mut self.upload, UploadState::Idle)
+        else {
+            return Task::none();
+        };
+        let done = match result {
+            Ok(done) => done,
+            Err(error) => {
+                self.upload = UploadState::Failed { path, error };
+                return Task::none();
+            }
+        };
+
+        self.remember_upload(&path, dest, &done);
+        let mut tasks = Vec::new();
+        if let Some(url) = &done.link {
+            tasks.push(iced::clipboard::write(url.clone()));
+        }
+
+        match dest {
+            Dest::Ganked => {
+                let up = config.upload();
+                let clip_id = done.remote_id.clone();
+                let for_path = path.clone();
+                let (task, abort) = Task::perform(
+                    async move { poll_ganked(up, for_path, clip_id).await },
+                    |(path, result)| Message::StatusPolled(path, result),
+                )
+                .abortable();
+                self.upload = UploadState::Processing { path, abort };
+                tasks.push(task);
+            }
+            Dest::YouTube => {
+                self.upload = UploadState::Done {
+                    path,
+                    dest,
+                    link: done.link,
+                    note: done.note,
+                };
+            }
+        }
+        Task::batch(tasks)
+    }
+
+    /// Fold a ganked.tv status poll into a terminal state; ignore a poll for a clip the user has
+    /// since navigated away from. A share code usually only appears once processing finishes, so
+    /// this is where the link is copied to the clipboard for ganked.tv (it was still `processing`
+    /// at upload time).
+    fn status_polled(
+        &mut self,
+        path: &Path,
+        result: Result<StatusOutcome, String>,
+    ) -> Task<Message> {
+        if !matches!(&self.upload, UploadState::Processing { path: p, .. } if p == path) {
+            return Task::none();
+        }
+        let path = path.to_path_buf();
+        let mut task = Task::none();
+        self.upload = match result {
+            Ok(outcome) if outcome.failed => UploadState::Failed {
+                path,
+                error: outcome.message,
+            },
+            Ok(outcome) => {
+                if let Some(url) = &outcome.link {
+                    // Keep the badge's link fresh and put the now-available link on the clipboard.
+                    self.update_history_link(&path, Dest::Ganked, url);
+                    task = iced::clipboard::write(url.clone());
+                }
+                UploadState::Done {
+                    path,
+                    dest: Dest::Ganked,
+                    link: outcome.link,
+                    note: outcome.message,
+                }
+            }
+            Err(error) => UploadState::Failed { path, error },
+        };
+        task
+    }
+
+    /// "Upload again" on an already-uploaded clip: verify the remote copy still exists before
+    /// allowing a second upload. ganked.tv can be checked (a 404 means it was deleted); YouTube's
+    /// upload-only scope can't, so it goes straight to the "upload anyway" escape.
+    fn recheck_before_reupload(&mut self, config: &Config) -> Task<Message> {
+        let Some(path) = self.open.clone() else {
+            return Task::none();
+        };
+        let dest = self.dest;
+        let Some(record) = self
+            .open_entry()
+            .and_then(|e| self.record_for(e, dest))
+            .cloned()
+        else {
+            return self.start_upload(config);
+        };
+        match dest {
+            Dest::Ganked => {
+                self.upload = UploadState::Checking {
+                    path: path.clone(),
+                    dest,
+                };
+                let up = config.upload();
+                let remote_id = record.remote_id;
+                Task::perform(
+                    async move { verify_ganked(up, path.clone(), remote_id).await },
+                    move |(path, result)| Message::Verified(path, dest, result),
+                )
+            }
+            Dest::YouTube => {
+                self.upload = UploadState::Unverifiable {
+                    path,
+                    reason: "YouTube can't confirm whether the video is still up.".to_owned(),
+                };
+                Task::none()
+            }
+        }
+    }
+
+    /// Resolve a remote-existence check: gone → forget the record and upload; still there → block;
+    /// couldn't check → offer to upload anyway.
+    fn verified(
+        &mut self,
+        path: PathBuf,
+        dest: Dest,
+        result: Result<bool, String>,
+        config: &Config,
+    ) -> Task<Message> {
+        if !matches!(&self.upload, UploadState::Checking { path: p, .. } if *p == path) {
+            return Task::none();
+        }
+        match result {
+            Ok(false) => {
+                // The remote copy is gone; drop the stale record and upload afresh.
+                if let Some(key) = self.open_entry().and_then(clip_key) {
+                    let _ = upload_history::forget(&key, dest.history_key());
+                    self.history = upload_history::load();
+                }
+                self.start_upload(config)
+            }
+            Ok(true) => {
+                let link = self
+                    .open_entry()
+                    .and_then(|e| self.record_for(e, dest))
+                    .and_then(|r| r.url.clone());
+                self.upload = UploadState::Blocked { path, dest, link };
+                Task::none()
+            }
+            Err(reason) => {
+                self.upload = UploadState::Unverifiable { path, reason };
+                Task::none()
+            }
+        }
+    }
+
+    /// Persist a successful upload and refresh the in-memory history so the badge + guard update
+    /// without a rescan.
+    fn remember_upload(&mut self, path: &Path, dest: Dest, done: &Uploaded) {
+        let Some(entry) = self.entries.iter().find(|e| e.path == path) else {
+            return;
+        };
+        let Some(key) = clip_key(entry) else {
+            return;
+        };
+        let record = UploadRecord {
+            file_name: key.file_name,
+            size_bytes: key.size_bytes,
+            modified_millis: key.modified_millis,
+            destination: dest.history_key().to_owned(),
+            remote_id: done.remote_id.clone(),
+            url: done.link.clone(),
+            uploaded_millis: ClipKey::now_millis(),
+        };
+        if let Err(e) = upload_history::record(record) {
+            tracing::warn!(error = %e, "could not record the upload");
+        }
+        self.history = upload_history::load();
+    }
+
+    /// Update a stored record's link (e.g. once ganked.tv issues the share code after processing).
+    fn update_history_link(&mut self, path: &Path, dest: Dest, url: &str) {
+        let Some(entry) = self.entries.iter().find(|e| e.path == path) else {
+            return;
+        };
+        let Some(record) = self.record_for(entry, dest).cloned() else {
+            return;
+        };
+        if record.url.as_deref() == Some(url) {
+            return;
+        }
+        let updated = UploadRecord {
+            url: Some(url.to_owned()),
+            ..record
+        };
+        if upload_history::record(updated).is_ok() {
+            self.history = upload_history::load();
+        }
+    }
+
+    /// The `ClipEntry` for the open clip, if any.
+    fn open_entry(&self) -> Option<&ClipEntry> {
+        let path = self.open.as_ref()?;
+        self.entries.iter().find(|e| &e.path == path)
     }
 
     pub fn view(&self, config: &Config) -> Element<'_, Message> {
@@ -695,6 +974,9 @@ impl Library {
         if let Some(game) = &entry.game {
             line = line.push(accent_chip(game.clone()));
         }
+        for dest in self.uploaded_dests(entry) {
+            line = line.push(accent_chip(format!("On {}", dest.label())));
+        }
         line.push(text(meta).size(size).style(tinted(color))).into()
     }
 
@@ -794,7 +1076,12 @@ impl Library {
         ganked: DestStatus,
         youtube: DestStatus,
     ) -> Element<'a, Message> {
-        let uploading = matches!(self.upload, UploadState::Uploading { .. });
+        let busy = matches!(
+            self.upload,
+            UploadState::Uploading { .. }
+                | UploadState::Processing { .. }
+                | UploadState::Checking { .. }
+        );
 
         let title = column![
             field_label("Title"),
@@ -814,7 +1101,7 @@ impl Library {
             .style(move |theme: &Theme, status| segment_style(theme, status, active))
             .width(Length::Fill)
             .padding([5, 15]);
-            if ready && !uploading {
+            if ready && !busy {
                 b.on_press(Message::DestPicked(dest))
             } else {
                 b
@@ -867,15 +1154,26 @@ impl Library {
             Dest::Ganked => ganked.ready(),
             Dest::YouTube => youtube.ready(),
         };
+        // Once a clip is on a destination, the primary action becomes "Upload again", which
+        // verifies the remote copy still exists before it lets a duplicate through.
+        let already_uploaded = self.record_for(entry, self.dest).is_some();
         let mut send = button(
-            text(format!("Upload to {}", self.dest.label()))
-                .size(13)
-                .font(UI_BOLD),
+            text(if already_uploaded {
+                "Upload again".to_owned()
+            } else {
+                format!("Upload to {}", self.dest.label())
+            })
+            .size(13)
+            .font(UI_BOLD),
         )
         .style(primary_button)
         .padding([11, 24]);
-        if dest_ready && !uploading {
-            send = send.on_press(Message::UploadPressed);
+        if dest_ready && !busy {
+            send = send.on_press(if already_uploaded {
+                Message::UploadAgain
+            } else {
+                Message::UploadPressed
+            });
         }
 
         let mut panel = column![title, destination, visibility].spacing(16);
@@ -887,61 +1185,133 @@ impl Library {
     /// The status line under the upload button, for whatever upload concerns this clip.
     fn upload_status(&self, entry: &ClipEntry) -> Element<'_, Message> {
         match &self.upload {
-            UploadState::Uploading { path, dest, .. } if *path == entry.path => row![
-                text(format!("Uploading to {}...", dest.label()))
+            UploadState::Uploading { path, dest, .. } if *path == entry.path => {
+                cancellable(format!("Uploading to {}...", dest.label()))
+            }
+            UploadState::Processing { path, .. } if *path == entry.path => {
+                cancellable("Processing on ganked.tv...".to_owned())
+            }
+            UploadState::Checking { path, dest, .. } if *path == entry.path => hint(format!(
+                "Checking whether the clip is still on {}...",
+                dest.label()
+            )),
+            UploadState::Blocked { path, dest, link } if *path == entry.path => {
+                let mut col = column![
+                    text(format!("It's still on {}.", dest.label()))
+                        .size(12)
+                        .style(tinted(palette::TEXT_SECONDARY))
+                ]
+                .spacing(8);
+                if let Some(url) = link {
+                    col = col.push(link_actions(url));
+                }
+                col.push(anyway_button("Upload another copy")).into()
+            }
+            UploadState::Unverifiable { path, reason, .. } if *path == entry.path => column![
+                text(reason.clone())
                     .size(12)
                     .style(tinted(palette::TEXT_SECONDARY)),
-                button(text("Cancel").size(11).font(UI_SEMIBOLD))
-                    .on_press(Message::UploadCancelled)
-                    .style(secondary_button)
-                    .padding([6, 14]),
+                anyway_button("Upload anyway"),
             ]
-            .spacing(12)
-            .align_y(iced::Alignment::Center)
+            .spacing(8)
             .into(),
-            UploadState::Uploading { .. } => {
-                hint("Another clip is uploading; one upload runs at a time.")
-            }
-            UploadState::Done { path, link, note } if *path == entry.path => {
-                let mut line = row![text("Uploaded.").size(12).style(tinted(palette::ACCENT)),]
-                    .spacing(12)
-                    .align_y(iced::Alignment::Center);
-                if let Some(url) = link {
-                    line = line
-                        .push(
-                            text(url.clone())
-                                .size(12)
-                                .font(UI_SEMIBOLD)
-                                .style(tinted(palette::ACCENT)),
-                        )
-                        .push(
-                            button(text("Open").size(11).font(UI_SEMIBOLD))
-                                .on_press(Message::OpenLink(url.clone()))
-                                .style(secondary_button)
-                                .padding([6, 12]),
-                        )
-                        .push(
-                            button(text("Copy link").size(11).font(UI_SEMIBOLD))
-                                .on_press(Message::CopyLink(url.clone()))
-                                .style(secondary_button)
-                                .padding([6, 12]),
-                        );
-                } else {
-                    line = line.push(
+            UploadState::Done {
+                path,
+                dest,
+                link,
+                note,
+            } if *path == entry.path => {
+                let mut line = row![
+                    text(format!("Uploaded to {}.", dest.label()))
+                        .size(12)
+                        .style(tinted(palette::ACCENT))
+                ]
+                .spacing(12)
+                .align_y(iced::Alignment::Center);
+                line = match link {
+                    Some(url) => line.push(link_actions(url)),
+                    None => line.push(
                         text(note.clone())
                             .size(12)
                             .style(tinted(palette::TEXT_SECONDARY)),
-                    );
-                }
+                    ),
+                };
                 line.into()
             }
             UploadState::Failed { path, error } if *path == entry.path => text(error.clone())
                 .size(12)
                 .style(tinted(palette::DANGER))
                 .into(),
-            _ => Space::new().into(),
+            UploadState::Uploading { .. }
+            | UploadState::Processing { .. }
+            | UploadState::Checking { .. } => {
+                hint("Another clip is uploading; one upload runs at a time.")
+            }
+            // Idle for this clip: if it is already on the chosen destination, show where it landed.
+            _ => match self.record_for(entry, self.dest) {
+                Some(record) => {
+                    let mut line = row![
+                        text(format!("Already on {}.", self.dest.label()))
+                            .size(12)
+                            .style(tinted(palette::ACCENT))
+                    ]
+                    .spacing(12)
+                    .align_y(iced::Alignment::Center);
+                    if let Some(url) = &record.url {
+                        line = line.push(link_actions(url));
+                    }
+                    line.into()
+                }
+                None => Space::new().into(),
+            },
         }
     }
+}
+
+/// A share/watch link with Open + Copy-link buttons, shared by the upload status lines.
+fn link_actions(url: &str) -> Element<'static, Message> {
+    row![
+        text(url.to_owned())
+            .size(12)
+            .font(UI_SEMIBOLD)
+            .style(tinted(palette::ACCENT)),
+        button(text("Open").size(11).font(UI_SEMIBOLD))
+            .on_press(Message::OpenLink(url.to_owned()))
+            .style(secondary_button)
+            .padding([6, 12]),
+        button(text("Copy link").size(11).font(UI_SEMIBOLD))
+            .on_press(Message::CopyLink(url.to_owned()))
+            .style(secondary_button)
+            .padding([6, 12]),
+    ]
+    .spacing(12)
+    .align_y(iced::Alignment::Center)
+    .into()
+}
+
+/// A status line with a Cancel button, for the in-flight upload/processing states.
+fn cancellable(message: String) -> Element<'static, Message> {
+    row![
+        text(message)
+            .size(12)
+            .style(tinted(palette::TEXT_SECONDARY)),
+        button(text("Cancel").size(11).font(UI_SEMIBOLD))
+            .on_press(Message::UploadCancelled)
+            .style(secondary_button)
+            .padding([6, 14]),
+    ]
+    .spacing(12)
+    .align_y(iced::Alignment::Center)
+    .into()
+}
+
+/// The "upload anyway / another copy" escape for the duplicate guard.
+fn anyway_button(label: &'static str) -> Element<'static, Message> {
+    button(text(label).size(11).font(UI_SEMIBOLD))
+        .on_press(Message::UploadAnyway)
+        .style(secondary_button)
+        .padding([6, 14])
+        .into()
 }
 
 /// Whether one upload destination can actually receive a clip: logged in (key / refresh
@@ -1013,10 +1383,60 @@ async fn upload_ganked(
             "ganked.tv could not process the clip (check its length and format).".to_owned(),
         );
     }
+    let link = clip.share_url(&up.share_url);
     Ok(Uploaded {
-        link: clip.share_url(&up.share_url),
+        remote_id: clip.id,
+        link,
         note: "Processing on ganked.tv.".to_owned(),
     })
+}
+
+/// Poll ganked.tv processing status until it is ready or failed (or the budget runs out), so the
+/// user learns of a server-side failure that only surfaces after "processing".
+async fn poll_ganked(
+    up: rewynd_config::UploadSettings,
+    path: PathBuf,
+    clip_id: String,
+) -> (PathBuf, Result<StatusOutcome, String>) {
+    let outcome = async {
+        let client = GankedClient::new(&up.api_url, &up.api_key).map_err(|e| e.to_string())?;
+        let report = client
+            .poll_status(&clip_id, POLL_INTERVAL, POLL_MAX_READS)
+            .await
+            .map_err(|e| user_facing_upload_error(&e))?;
+        let message = if report.failed() {
+            report.failure_message()
+        } else if report.is_ready() {
+            "Live on ganked.tv.".to_owned()
+        } else {
+            "Still processing on ganked.tv.".to_owned()
+        };
+        Ok(StatusOutcome {
+            failed: report.failed(),
+            link: report.share_url(&up.share_url),
+            message,
+        })
+    }
+    .await;
+    (path, outcome)
+}
+
+/// Whether a ganked.tv clip still exists (for the duplicate guard). A 404 → gone (re-upload
+/// allowed); any other error is a verification failure the caller surfaces as "upload anyway".
+async fn verify_ganked(
+    up: rewynd_config::UploadSettings,
+    path: PathBuf,
+    clip_id: String,
+) -> (PathBuf, Result<bool, String>) {
+    let exists = async {
+        let client = GankedClient::new(&up.api_url, &up.api_key).map_err(|e| e.to_string())?;
+        client
+            .clip_exists(&clip_id)
+            .await
+            .map_err(|e| user_facing_upload_error(&e))
+    }
+    .await;
+    (path, exists)
 }
 
 /// Upload to YouTube with the same flow (and outcome wording) as the tray.
@@ -1040,8 +1460,9 @@ async fn upload_youtube(
             user_facing_youtube_error(&e)
         })?;
     Ok(Uploaded {
+        remote_id: video.id.clone(),
         link: video.watch_url(),
-        note: "Processing on YouTube.".to_owned(),
+        note: "Uploaded to YouTube.".to_owned(),
     })
 }
 
@@ -1079,6 +1500,11 @@ fn duration_label(d: Duration) -> String {
 /// The section label for a clip: its game subfolder, or [`ROOT_GROUP`] for a root clip.
 fn group_label(entry: &ClipEntry) -> &str {
     entry.game.as_deref().unwrap_or(ROOT_GROUP)
+}
+
+/// The upload-history identity key for a clip entry.
+fn clip_key(entry: &ClipEntry) -> Option<ClipKey> {
+    ClipKey::new(&entry.path, entry.size_bytes, entry.modified)
 }
 
 /// Case-insensitive subsequence match: every character of `needle` appears in `haystack` in

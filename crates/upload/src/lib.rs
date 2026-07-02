@@ -130,14 +130,7 @@ impl UploadedClip {
     /// outside the code alphabet yields `None` rather than an injectable string.
     #[must_use]
     pub fn share_url(&self, share_base: &str) -> Option<String> {
-        self.share_code
-            .as_ref()
-            .filter(|c| {
-                !c.is_empty()
-                    && c.bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-            })
-            .map(|code| format!("{}/c/{code}", share_base.trim_end_matches('/')))
+        share_url_from_code(self.share_code.as_deref(), share_base)
     }
 
     /// Whether the server already marked the clip failed (nothing shareable will come of it).
@@ -165,6 +158,77 @@ struct ClipStatus {
     share_code: Option<String>,
     #[serde(default)]
     status: String,
+    failure_reason: Option<String>,
+    duration_secs: Option<u32>,
+    max_clip_duration_secs: Option<u32>,
+}
+
+/// A clip's server-side processing state, read after upload: richer than [`UploadedClip`] because
+/// it carries the failure reason and duration facts the app surfaces when a clip fails to process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipStatusReport {
+    pub status: String,
+    pub share_code: Option<String>,
+    pub failure_reason: Option<String>,
+    pub duration_secs: Option<u32>,
+    pub max_clip_duration_secs: Option<u32>,
+}
+
+impl ClipStatusReport {
+    /// The clip finished processing and is playable.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.status == "ready"
+    }
+
+    /// The server gave up on the clip; `failure_message` explains why.
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        self.status == "failed"
+    }
+
+    /// No further state change is coming — polling can stop.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        self.is_ready() || self.failed()
+    }
+
+    /// The public watch URL, if a share code was issued (validated like [`UploadedClip::share_url`]).
+    #[must_use]
+    pub fn share_url(&self, share_base: &str) -> Option<String> {
+        share_url_from_code(self.share_code.as_deref(), share_base)
+    }
+
+    /// A human line explaining a failure, from the server's structured reason + duration facts.
+    #[must_use]
+    pub fn failure_message(&self) -> String {
+        match self.failure_reason.as_deref() {
+            Some("source_too_long") => match (self.duration_secs, self.max_clip_duration_secs) {
+                (Some(d), Some(m)) => {
+                    format!("Your clip is {d} seconds; ganked.tv's limit is {m} seconds.")
+                }
+                _ => "Your clip is too long for ganked.tv.".to_owned(),
+            },
+            Some("source_too_large") => "Your clip is too large for ganked.tv.".to_owned(),
+            Some("source_unavailable" | "fetch_failed") => {
+                "ganked.tv could not fetch the clip to process it.".to_owned()
+            }
+            _ => "ganked.tv could not process the clip.".to_owned(),
+        }
+    }
+}
+
+/// Validate a share code and build its watch URL under `share_base`. Shared by [`UploadedClip`]
+/// and [`ClipStatusReport`]: a code is server-provided text headed for a URL, so anything outside
+/// the code alphabet yields `None` rather than an injectable string.
+fn share_url_from_code(share_code: Option<&str>, share_base: &str) -> Option<String> {
+    share_code
+        .filter(|c| {
+            !c.is_empty()
+                && c.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+        .map(|code| format!("{}/c/{code}", share_base.trim_end_matches('/')))
 }
 
 /// Client for uploading finished clips to ganked.tv.
@@ -297,6 +361,68 @@ impl GankedClient {
             share_code: status.share_code,
             status: status.status,
         })
+    }
+
+    /// Read a clip's current processing status (a richer view than [`upload`](Self::upload)
+    /// returns, with the failure reason + duration facts).
+    pub async fn clip_status(&self, clip_id: &str) -> Result<ClipStatusReport, UploadError> {
+        let status: ClipStatus = self
+            .api_json(self.http.get(self.url(&format!("/clips/{clip_id}/status"))))
+            .await?;
+        Ok(ClipStatusReport {
+            status: status.status,
+            share_code: status.share_code,
+            failure_reason: status.failure_reason,
+            duration_secs: status.duration_secs,
+            max_clip_duration_secs: status.max_clip_duration_secs,
+        })
+    }
+
+    /// Poll [`clip_status`](Self::clip_status) until it reaches a terminal state (ready/failed) or
+    /// `max_reads` reads elapse, waiting `interval` between reads. A transient read error (a blip
+    /// or a 5xx) does not end the poll — it is kept and retried, so a single hiccup can't collapse
+    /// the whole multi-minute window. Returns the last status seen; only if no read ever succeeded
+    /// does it surface the last error.
+    pub async fn poll_status(
+        &self,
+        clip_id: &str,
+        interval: Duration,
+        max_reads: u32,
+    ) -> Result<ClipStatusReport, UploadError> {
+        let mut last: Option<ClipStatusReport> = None;
+        let mut last_error: Option<UploadError> = None;
+        for read in 0..max_reads.max(1) {
+            if read > 0 {
+                tokio::time::sleep(interval).await;
+            }
+            match self.clip_status(clip_id).await {
+                Ok(report) if report.is_terminal() => return Ok(report),
+                Ok(report) => {
+                    last = Some(report);
+                    last_error = None;
+                }
+                Err(e) => last_error = Some(e),
+            }
+        }
+        // Budget spent without a terminal state: prefer the last status, else the last error.
+        last.ok_or_else(|| {
+            last_error.unwrap_or_else(|| UploadError::Api {
+                status: 0,
+                code: "no_status".to_owned(),
+                detail: "the clip status could not be read".to_owned(),
+            })
+        })
+    }
+
+    /// Whether the clip still exists server-side. A 404 (the clip was deleted) returns `Ok(false)`
+    /// so a re-upload can be allowed; other errors propagate (an offline check must not read as
+    /// "gone" and green-light a duplicate).
+    pub async fn clip_exists(&self, clip_id: &str) -> Result<bool, UploadError> {
+        match self.clip_status(clip_id).await {
+            Ok(_) => Ok(true),
+            Err(UploadError::Api { status: 404, .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -879,6 +1005,112 @@ mod tests {
         assert!(clip.failed(), "failed status must surface to the caller");
         assert_eq!(clip.share_url("https://ganked.tv"), None);
         let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn clip_status_reads_rich_failure_fields() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/clips/c/status"))
+            .and(header("authorization", "Bearer gtv_testkey"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "failed",
+                "failureReason": "source_too_long",
+                "durationSecs": 75,
+                "maxClipDurationSecs": 60,
+            })))
+            .mount(&server)
+            .await;
+        let client = GankedClient::new(&server.uri(), "gtv_testkey").expect("client");
+        let report = client.clip_status("c").await.expect("status");
+        assert!(report.failed());
+        let message = report.failure_message();
+        assert!(
+            message.contains("75 seconds") && message.contains("60 seconds"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_status_returns_on_the_first_terminal_read() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/clips/c/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "ready",
+                "shareCode": "ab12",
+            })))
+            .expect(1) // terminal on the first read → no further polls
+            .mount(&server)
+            .await;
+        let client = GankedClient::new(&server.uri(), "gtv_testkey").expect("client");
+        let report = client
+            .poll_status("c", std::time::Duration::ZERO, 5)
+            .await
+            .expect("poll");
+        assert!(report.is_ready());
+        assert_eq!(
+            report.share_url("https://ganked.tv"),
+            Some("https://ganked.tv/c/ab12".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_status_gives_up_after_the_read_budget() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/clips/c/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "processing",
+            })))
+            .expect(3) // exactly max_reads, then give up while still non-terminal
+            .mount(&server)
+            .await;
+        let client = GankedClient::new(&server.uri(), "gtv_testkey").expect("client");
+        let report = client
+            .poll_status("c", std::time::Duration::ZERO, 3)
+            .await
+            .expect("poll");
+        assert!(
+            !report.is_terminal(),
+            "still processing after the read budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_status_keeps_reading_through_transient_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/clips/c/status"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(3) // a 5xx must not collapse the whole window after one read
+            .mount(&server)
+            .await;
+        let client = GankedClient::new(&server.uri(), "gtv_testkey").expect("client");
+        let result = client.poll_status("c", std::time::Duration::ZERO, 3).await;
+        assert!(result.is_err(), "no status ever read surfaces the error");
+    }
+
+    #[tokio::test]
+    async fn clip_exists_is_false_only_on_404() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/clips/gone/status"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(serde_json::json!({"code": "not_found"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/clips/live/status"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "ready"})),
+            )
+            .mount(&server)
+            .await;
+        let client = GankedClient::new(&server.uri(), "gtv_testkey").expect("client");
+        assert!(!client.clip_exists("gone").await.expect("gone check"));
+        assert!(client.clip_exists("live").await.expect("live check"));
     }
 
     #[tokio::test]
