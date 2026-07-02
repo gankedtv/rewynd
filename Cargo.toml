@@ -100,6 +100,8 @@ windows = { version = "0.62", features = [
     # method only generates with both of these on.
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
+    # IMMDevice::OpenPropertyStore (the endpoint friendly-name lookup).
+    "Win32_UI_Shell_PropertiesSystem",
 ] }
 
 # The settings window renders on the CPU (tiny-skia rasterizing, cosmic-text shaping), which
