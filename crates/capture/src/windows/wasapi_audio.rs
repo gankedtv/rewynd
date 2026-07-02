@@ -14,17 +14,27 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
     AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, IAudioCaptureClient, IAudioClient,
     IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX, eCapture, eConsole, eRender,
 };
+use windows::Win32::Media::Audio::{DEVICE_STATE_ACTIVE, IMMDevice, IMMDeviceCollection};
 use windows::Win32::System::Com::{
-    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize, STGM_READ,
 };
+use windows::core::GUID;
 
 use crate::{AudioParams, AudioSource, CaptureError};
+
+/// `PKEY_Device_FriendlyName` (functiondiscoverykeys_devpkey.h): the human-readable
+/// endpoint name ("Microphone (Elgato Wave:3)") shown in the sound settings.
+const PKEY_DEVICE_FRIENDLY_NAME: PROPERTYKEY = PROPERTYKEY {
+    fmtid: GUID::from_u128(0xa45c254e_df1c_4efd_8020_67d146a850e0),
+    pid: 14,
+};
 
 /// How often the capture client is polled. WASAPI's shared-mode engine period is 10 ms;
 /// polling at that cadence drains every packet without busy-waiting.
@@ -59,6 +69,58 @@ impl Drop for ComGuard {
     }
 }
 
+/// The endpoint's `PKEY_Device_FriendlyName` — the name the sound settings show.
+fn friendly_name(device: &IMMDevice) -> Result<String, CaptureError> {
+    // SAFETY: FFI; the property store lives independently of the device handle.
+    let store = unsafe { device.OpenPropertyStore(STGM_READ) }
+        .map_err(|e| CaptureError::Wasapi(format!("open property store: {e}")))?;
+    // SAFETY: FFI.
+    let value = unsafe { store.GetValue(&PKEY_DEVICE_FRIENDLY_NAME) }
+        .map_err(|e| CaptureError::Wasapi(format!("read friendly name: {e}")))?;
+    Ok(value.to_string())
+}
+
+/// Resolve the capture endpoint: the flow's default, or — when `name` is set — the
+/// active endpoint whose friendly name contains it (case-insensitive). No match is
+/// an error listing what exists, so a typo'd config names its fix.
+fn endpoint(
+    enumerator: &IMMDeviceEnumerator,
+    flow: windows::Win32::Media::Audio::EDataFlow,
+    name: Option<&str>,
+) -> Result<IMMDevice, CaptureError> {
+    let Some(name) = name else {
+        // SAFETY: FFI.
+        return unsafe { enumerator.GetDefaultAudioEndpoint(flow, eConsole) }
+            .map_err(|e| CaptureError::Wasapi(format!("no default endpoint: {e}")));
+    };
+
+    let wanted = name.to_lowercase();
+    // SAFETY: FFI.
+    let devices: IMMDeviceCollection =
+        unsafe { enumerator.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE) }
+            .map_err(|e| CaptureError::Wasapi(format!("enumerate endpoints: {e}")))?;
+    // SAFETY: FFI.
+    let count = unsafe { devices.GetCount() }
+        .map_err(|e| CaptureError::Wasapi(format!("count endpoints: {e}")))?;
+
+    let mut names = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        // SAFETY: FFI; `i` is within the collection.
+        let device = unsafe { devices.Item(i) }
+            .map_err(|e| CaptureError::Wasapi(format!("endpoint {i}: {e}")))?;
+        let friendly = friendly_name(&device)?;
+        if friendly.to_lowercase().contains(&wanted) {
+            tracing::info!(device = friendly, "using the configured audio endpoint");
+            return Ok(device);
+        }
+        names.push(friendly);
+    }
+    Err(CaptureError::Wasapi(format!(
+        "no active audio endpoint matches \"{name}\" (available: {})",
+        names.join(", ")
+    )))
+}
+
 /// Capture `source` as interleaved f32 PCM in the [`AudioParams`] format, delivering
 /// each drained packet to `on_samples` with a PTS measured from `epoch` (pass the video
 /// capture's epoch so the muxer can align the tracks).
@@ -74,6 +136,7 @@ impl Drop for ComGuard {
 pub fn capture_audio(
     params: AudioParams,
     source: AudioSource,
+    device: Option<&str>,
     idle_timeout: Option<Duration>,
     stop: Option<Arc<AtomicBool>>,
     epoch: Instant,
@@ -98,9 +161,7 @@ pub fn capture_audio(
         AudioSource::SinkMonitor => eRender,
         AudioSource::Microphone => eCapture,
     };
-    // SAFETY: FFI.
-    let device = unsafe { enumerator.GetDefaultAudioEndpoint(flow, eConsole) }
-        .map_err(|e| CaptureError::Wasapi(format!("no default endpoint: {e}")))?;
+    let device = endpoint(&enumerator, flow, device)?;
     // SAFETY: FFI.
     let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }
         .map_err(|e| CaptureError::Wasapi(format!("activate audio client: {e}")))?;
@@ -196,8 +257,14 @@ pub fn capture_audio(
             last_packet = Instant::now();
             let wall = epoch.elapsed();
             let discontinuity = flags & (AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32) != 0;
+            // Directional: only a *delivery gap* (wall far ahead of the stream clock)
+            // re-anchors. The clock running ahead of wall is the normal burst shape
+            // when the consumer briefly stalled — snapping those packets back to wall
+            // would recreate the very overlap this clock exists to prevent.
             let pts = match stream_clock {
-                Some(clock) if !discontinuity && clock.abs_diff(wall) < REANCHOR_DRIFT => clock,
+                Some(clock) if !discontinuity && wall.saturating_sub(clock) < REANCHOR_DRIFT => {
+                    clock
+                }
                 _ => wall,
             };
             stream_clock = Some(

@@ -121,6 +121,8 @@ const BITRATE_MIN_MBPS: u32 = 1;
 const BITRATE_MAX_MBPS: u32 = 50;
 /// Frame-rate options offered in the dropdown.
 const FPS_OPTIONS: [u32; 4] = [30, 60, 120, 144];
+/// The microphone picker's "use the system default" row (stored as an empty value).
+const MIC_DEFAULT: &str = "System default";
 const BITS_PER_MBIT: u32 = 1_000_000;
 
 fn main() -> iced::Result {
@@ -266,6 +268,9 @@ struct App {
     output_dir: String,
     /// Mirror of the hotkey trigger for the text box.
     hotkey: String,
+    /// Active input devices for the microphone picker (Windows enumerates them at
+    /// startup; empty elsewhere, where the control is a free-text node name).
+    mic_options: Vec<String>,
     /// Mirror of the ganked.tv API key.
     api_key: String,
     /// Mirror of the ganked.tv API base URL (empty = "use the default").
@@ -308,6 +313,7 @@ enum LoginState {
 enum Message {
     MicGain(f32),
     SystemGain(f32),
+    MicrophonePicked(String),
     BufferSeconds(u32),
     ResolutionPicked(Resolution),
     FpsPicked(u32),
@@ -346,9 +352,14 @@ impl App {
         // while the file keeps a different one). Resolution and the keyframe interval are left
         // alone — a custom resolution is shown verbatim, and the GOP is only retuned with the fps.
         normalize(&mut config);
+        #[cfg(target_os = "windows")]
+        let mic_options = config::list_audio_inputs();
+        #[cfg(not(target_os = "windows"))]
+        let mic_options = Vec::new();
         Self {
             output_dir: config.output_directory().unwrap_or_default().to_owned(),
             hotkey: config.hotkey_trigger().to_owned(),
+            mic_options,
             api_key: config.upload_api_key().to_owned(),
             api_url: config.upload_api_url().to_owned(),
             share_url: config.upload_share_url().to_owned(),
@@ -400,6 +411,15 @@ impl App {
             }
             Message::SystemGain(v) => {
                 self.config.set_system_gain(v);
+                self.touch();
+            }
+            Message::MicrophonePicked(mic) => {
+                // The picker's "System default" row maps to the empty stored value.
+                self.config.set_microphone(if mic == MIC_DEFAULT {
+                    String::new()
+                } else {
+                    mic
+                });
                 self.touch();
             }
             Message::BufferSeconds(s) => {
@@ -678,9 +698,46 @@ impl App {
             / 8;
         let est_mb = est_bytes.saturating_add(500_000) / 1_000_000;
 
+        // The microphone picker: a dropdown of the active input devices on Windows
+        // (also usable when the OS sound settings are locked), a free-text PipeWire
+        // node name elsewhere. Stored value empty = the system default.
+        let mic_value = self.config.microphone().unwrap_or_default().to_owned();
+        let microphone: Element<Message> = if self.mic_options.is_empty() {
+            column![
+                field_label("Microphone"),
+                text_input(MIC_DEFAULT, &mic_value)
+                    .on_input(Message::MicrophonePicked)
+                    .style(arena_input),
+                hint("Leave empty for the default; on Linux this is the PipeWire node name."),
+            ]
+            .spacing(8)
+            .into()
+        } else {
+            let mut options = vec![MIC_DEFAULT.to_owned()];
+            // Keep a configured-but-offline device visible instead of silently
+            // snapping the selection to the default.
+            if !mic_value.is_empty() && !self.mic_options.contains(&mic_value) {
+                options.push(mic_value.clone());
+            }
+            options.extend(self.mic_options.iter().cloned());
+            let selected = if mic_value.is_empty() {
+                MIC_DEFAULT.to_owned()
+            } else {
+                mic_value
+            };
+            column![
+                field_label("Microphone"),
+                pick_list(options, Some(selected), Message::MicrophonePicked)
+                    .style(arena_pick)
+                    .width(Length::Fill),
+            ]
+            .spacing(8)
+            .into()
+        };
         let audio = card(
             "AUDIO",
             column![
+                microphone,
                 setting(
                     "Microphone volume",
                     format!("{:.2}x", self.config.mic_gain()),

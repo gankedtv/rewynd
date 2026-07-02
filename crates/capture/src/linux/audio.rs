@@ -152,6 +152,7 @@ fn decode_f32le(raw: &[u8], offset: usize, size: usize, out: &mut Vec<f32>) {
 pub fn capture_audio(
     params: AudioParams,
     source: AudioSource,
+    device: Option<&str>,
     idle_timeout: Option<Duration>,
     stop: Option<Arc<AtomicBool>>,
     epoch: Instant,
@@ -183,6 +184,11 @@ pub fn capture_audio(
     // *source* — the microphone.
     if source == AudioSource::SinkMonitor {
         props.insert(*pw::keys::STREAM_CAPTURE_SINK, "true");
+    }
+    // A specific endpoint instead of the default: the session manager links the stream
+    // to the node matching this name (`pw-cli ls Node` lists them).
+    if let Some(name) = device {
+        props.insert(*pw::keys::TARGET_OBJECT, name);
     }
     let stream = pw::stream::StreamRc::new(core, source.stream_name(), props)
         .map_err(|e| CaptureError::PipeWire(format!("create stream: {e}")))?;
@@ -456,6 +462,7 @@ mod tests {
             AudioSource::SinkMonitor,
             None,
             None,
+            None,
             Instant::now(),
             |_, _| ControlFlow::Break(()),
         )
@@ -468,6 +475,7 @@ mod tests {
                 channels: 0,
             },
             AudioSource::SinkMonitor,
+            None,
             None,
             None,
             Instant::now(),
