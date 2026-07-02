@@ -311,6 +311,9 @@ fn checked_base(api_base: &str) -> Result<String, UploadError> {
         reason,
     };
     match reqwest::Url::parse(base) {
+        Ok(url) if url.query().is_some() || url.fragment().is_some() => Err(invalid(
+            "the base URL must not carry a query or fragment".to_owned(),
+        )),
         Ok(url) if url.scheme() == "http" && !is_loopback(&url) => {
             Err(invalid("http is only allowed for localhost".to_owned()))
         }

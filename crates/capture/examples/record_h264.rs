@@ -89,7 +89,11 @@ mod linux {
             portal.node_id,
             portal.take_fd(),
             wall_start,
-            rewynd_capture::linux::StreamPrefs::default(),
+            rewynd_capture::linux::StreamPrefs {
+                width: params.width,
+                height: params.height,
+                framerate: params.framerate,
+            },
             None,
             {
                 // The whole hot path runs inline on the PipeWire process thread — import +

@@ -55,7 +55,7 @@ pub struct AudioSettings {
 }
 
 /// Plain ganked.tv upload settings (the consumer maps these onto its client).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UploadSettings {
     /// Only true when uploads are switched on AND an API key is set.
     pub enabled: bool,
@@ -65,6 +65,19 @@ pub struct UploadSettings {
     /// `"public"` or `"unlisted"`. Consumers fail closed: anything else is treated as unlisted,
     /// so a typo can never widen a clip's visibility.
     pub visibility: String,
+}
+
+// Manual Debug: the API key must never reach logs through an innocent `{:?}`.
+impl std::fmt::Debug for UploadSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UploadSettings")
+            .field("enabled", &self.enabled)
+            .field("api_url", &self.api_url)
+            .field("share_url", &self.share_url)
+            .field("api_key", &"gtv_***")
+            .field("visibility", &self.visibility)
+            .finish()
+    }
 }
 
 /// Video encode settings as parsed from TOML, defaulting to the built-ins.
@@ -172,7 +185,7 @@ struct StartupConfig {
 }
 
 /// ganked.tv upload settings. `api_key` is a secret — `save_to` tightens the file mode for it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct UploadConfig {
     enabled: bool,
@@ -180,6 +193,19 @@ struct UploadConfig {
     share_url: String,
     api_key: String,
     visibility: String,
+}
+
+// Manual Debug (also covering Config's derived Debug): the key must never reach logs.
+impl std::fmt::Debug for UploadConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UploadConfig")
+            .field("enabled", &self.enabled)
+            .field("api_url", &self.api_url)
+            .field("share_url", &self.share_url)
+            .field("api_key", &"gtv_***")
+            .field("visibility", &self.visibility)
+            .finish()
+    }
 }
 
 impl Default for UploadConfig {
@@ -681,7 +707,7 @@ system_gain = 1.0
 seconds = 30
 
 [output]
-# Directory for saved clips. Unset = the system temp dir.
+# Directory for saved clips. Unset = your Videos folder (or a private temp dir).
 # directory = \"/home/you/Videos/rewynd\"
 
 [hotkey]

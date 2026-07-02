@@ -172,13 +172,14 @@ pub struct StreamPrefs {
     pub framerate: u32,
 }
 
-impl Default for StreamPrefs {
-    fn default() -> Self {
-        Self {
-            width: 1920,
-            height: 1080,
-            framerate: 60,
-        }
+/// Negotiation preference for the diagnostic probes only — the live pipeline always passes the
+/// configured values. Any sane numbers work; the compositor picks what it can deliver.
+#[cfg(feature = "probes")]
+fn probe_prefs() -> StreamPrefs {
+    StreamPrefs {
+        width: 1920,
+        height: 1080,
+        framerate: 60,
     }
 }
 
@@ -766,7 +767,7 @@ pub fn run_capture_probe(node_id: u32, fd: OwnedFd) -> Result<(), CaptureError> 
             stream_name: "rewynd-capture-probe",
             // The probe logs frames; its PTS isn't muxed, so any epoch works.
             epoch: Instant::now(),
-            prefs: StreamPrefs::default(),
+            prefs: probe_prefs(),
             stop: None,
             no_frame_error: PROBE_NO_FRAME_ERROR,
         },
@@ -843,7 +844,7 @@ pub fn capture_one_dmabuf(node_id: u32, fd: OwnedFd) -> Result<CapturedDmabuf, C
             stream_name: "rewynd-capture-import",
             // A single-frame readback; its PTS isn't muxed, so any epoch works.
             epoch: Instant::now(),
-            prefs: StreamPrefs::default(),
+            prefs: probe_prefs(),
             stop: None,
             no_frame_error: IMPORT_NO_FRAME_ERROR,
         },

@@ -208,14 +208,15 @@ fn private_temp_dir() -> PathBuf {
         return dir;
     }
     tracing::warn!(dir = %dir.display(), "temp clip dir is not safely ours; using a home dir");
-    match dirs::home_dir() {
-        Some(home) => {
-            let fallback = home.join(".rewynd-clips");
-            let _ = std::fs::create_dir_all(&fallback);
-            fallback
+    if let Some(home) = dirs::home_dir() {
+        let fallback = home.join(".rewynd-clips");
+        // Same bar as the temp path: clips only land in a directory that is verifiably ours.
+        if ensure_private_dir(&fallback) {
+            return fallback;
         }
-        None => dir,
+        tracing::error!(dir = %fallback.display(), "home clip dir is not safely ours either");
     }
+    dir
 }
 
 /// Create `dir` 0700 if missing and verify it is a real directory owned by us with no group or
