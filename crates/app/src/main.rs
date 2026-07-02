@@ -655,8 +655,10 @@ mod linux {
         let game_only = !capture_desktop;
         let game_folders = config.game_folders();
         // Read by the video frame callback and the audio mixer; written by the watcher
-        // reaction. True when nothing gates (desktop capture / no watcher).
-        let recording = Arc::new(AtomicBool::new(true));
+        // reaction. Starts closed in game-only mode BEFORE the watcher spawns — its
+        // initial burst may already report a fullscreen game, and a store after spawn
+        // could clobber that reaction.
+        let recording = Arc::new(AtomicBool::new(!game_only));
         let _focus_watcher = if game_only || game_folders {
             let reaction = crate::game_gate::reaction(
                 game_only,
@@ -667,23 +669,18 @@ mod linux {
                 audio_buffer.clone(),
             );
             match rewynd_capture::linux::FocusWatcher::spawn(Some(reaction)) {
-                Ok(watcher) => {
-                    if game_only {
-                        // Closed until the watcher reports a game; its initial burst
-                        // lands within milliseconds of the bind.
-                        recording.store(false, Ordering::Relaxed);
-                    }
-                    Some(watcher)
-                }
-                Err(e) if capture_desktop => {
-                    tracing::info!(error = %e, "no game detection; per-game folders unavailable");
-                    None
-                }
+                Ok(watcher) => Some(watcher),
                 Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "game detection unavailable on this compositor; recording the shared monitor continuously"
-                    );
+                    // No watcher, no gate: fall back to continuous capture.
+                    recording.store(true, Ordering::Relaxed);
+                    if capture_desktop {
+                        tracing::info!(error = %e, "no game detection; per-game folders unavailable");
+                    } else {
+                        tracing::warn!(
+                            error = %e,
+                            "game detection unavailable on this compositor; recording the shared monitor continuously"
+                        );
+                    }
                     None
                 }
             }

@@ -482,7 +482,7 @@ where
             let info = crate::game::GameInfo {
                 app_id: window.process_name().unwrap_or_default(),
                 title: window.title().unwrap_or_default(),
-                pid: None,
+                pid: window.process_id().ok().filter(|&pid| pid > 0),
             };
             on_game(Some(&info));
         }

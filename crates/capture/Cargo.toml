@@ -35,8 +35,9 @@ libc = "0.2"
 # KWin scripting fallback for game detection: recent KWin hides the plasma
 # window-management global from ordinary clients, so a tiny KWin script reports the
 # active window back over DBus. Same zbus that ashpd already pulls in; zbus runs on
-# tokio here (ashpd's choice), so the backend carries its own small runtime.
-zbus = "5"
+# tokio here (ashpd's choice, mirrored via the feature), so the backend carries its
+# own small runtime rather than dragging in zbus's default async-io stack.
+zbus = { version = "5", default-features = false, features = ["tokio", "blocking-api"] }
 tokio.workspace = true
 # Consumes the zbus NameOwnerChanged signal stream (KWin restart detection).
 futures-util.workspace = true
