@@ -303,8 +303,13 @@ fn place_badge(dc: HDC, pos: POINT, size: SIZE) -> windows::core::Result<HWND> {
             let _ = DestroyWindow(hwnd);
             return Err(e);
         }
+        // A badge with no working timer would stay on screen (and pump) forever.
+        if SetTimer(Some(hwnd), 1, BADGE_MS, None) == 0 {
+            let e = windows::core::Error::from_thread();
+            let _ = DestroyWindow(hwnd);
+            return Err(e);
+        }
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        SetTimer(Some(hwnd), 1, BADGE_MS, None);
         Ok(hwnd)
     }
 }
