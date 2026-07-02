@@ -63,6 +63,11 @@ const STOP_POLL: Duration = Duration::from_millis(200);
 /// running (or after a session ended). Cheap Win32 queries; sub-second pickup.
 const GAME_POLL: Duration = Duration::from_millis(500);
 
+/// Consecutive unexpected session failures tolerated before the game loop gives
+/// up — enough to absorb a window closing mid-setup, small enough that a broken
+/// capture backend surfaces instead of spinning silently.
+const SESSION_FAILURE_BUDGET: u32 = 3;
+
 /// Bound on the CPU-side wait for a slot copy to complete. A healthy copy finishes
 /// in well under a millisecond; hitting this means the device is lost or hung.
 const COPY_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -443,6 +448,7 @@ where
     // session that ended because the game closed.
     let on_frame = Arc::new(Mutex::new(on_frame));
     let finished = Arc::new(AtomicBool::new(false));
+    let mut failures: u32 = 0;
     tracing::info!("game-only capture: watching for a fullscreen game");
 
     loop {
@@ -458,8 +464,9 @@ where
             std::thread::sleep(GAME_POLL);
             continue;
         };
+        // Process name only — window titles carry documents/URLs/chat context, and
+        // leaking those into logs would undercut the point of game-only capture.
         tracing::info!(
-            title = window.title().unwrap_or_default(),
             process = window.process_name().unwrap_or_default(),
             "fullscreen game detected; capturing it"
         );
@@ -482,13 +489,26 @@ where
                 }
             }
         };
-        // Any session end that isn't ours (the game closed, its window died mid-
-        // setup, a device hiccup) just returns to the detector; the stop flag and
-        // the callback's Break remain the only exits.
+        // The expected end — the game closed (its item died, surfacing as the
+        // stream-end error) — returns to the detector. Anything else (setup or
+        // device failures) gets a small retry budget for races like a window
+        // closing mid-setup, then propagates so a broken backend can't spin
+        // silently forever.
         match run_session(window, refresh, epoch, prefs, stop.clone(), session_cb) {
-            Ok(()) => {}
+            Ok(()) => {
+                failures = 0;
+            }
+            Err(CaptureError::Wgc(ref msg)) if msg == STREAM_END_ERROR => {
+                failures = 0;
+                tracing::info!("game capture session ended; watching for the next game");
+                std::thread::sleep(GAME_POLL);
+            }
             Err(e) => {
-                tracing::info!(error = %e, "game capture session ended; watching for the next game");
+                failures += 1;
+                if failures >= SESSION_FAILURE_BUDGET {
+                    return Err(e);
+                }
+                tracing::warn!(error = %e, attempt = failures, "game capture session failed; retrying detection");
                 std::thread::sleep(GAME_POLL);
             }
         }
