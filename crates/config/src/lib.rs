@@ -36,6 +36,8 @@ pub use lock::{InstanceLock, acquire_recorder_lock, acquire_settings_lock};
 pub use paths::{
     APP_ID, config_path, default_output_dir, recorder_pid_path, settings_lock_path, sibling_binary,
 };
+#[cfg(windows)]
+pub use process::RecorderStopEvent;
 pub use process::{read_recorder_pid, stop_recorder};
 pub use schema::{
     AudioSettings, Config, DEFAULT_HOTKEY_TRIGGER, DEFAULT_TEMPLATE, DEFAULT_UPLOAD_API_URL,

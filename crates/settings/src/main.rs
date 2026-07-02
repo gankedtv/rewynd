@@ -930,8 +930,9 @@ impl App {
             status_line(&self.status),
         ];
         // Offer a one-click restart once a save actually landed (a failed save has nothing to
-        // apply; a failed restart may be retried). Hidden while a restart is in flight.
-        if self.last_save_ok && !matches!(self.status, Status::Restarting) {
+        // apply; a failed restart may be retried). Hidden while a restart is in flight and
+        // once it succeeded — it reappears on the next save.
+        if self.last_save_ok && !matches!(self.status, Status::Restarting | Status::Restarted) {
             save_items.push(
                 button(text("Restart rewynd now").size(12).font(UI_SEMIBOLD))
                     .on_press(Message::Restart)
