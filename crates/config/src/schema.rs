@@ -104,7 +104,7 @@ impl Default for VideoConfig {
 }
 
 /// Audio settings: the Opus encode params plus per-source linear mix gains.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct AudioConfig {
     sample_rate: u32,
@@ -114,6 +114,10 @@ struct AudioConfig {
     mic_gain: f32,
     /// Linear gain applied to system audio before mixing.
     system_gain: f32,
+    /// Capture this microphone instead of the system default. Empty = default. Matched
+    /// case-insensitively against the device's name (a substring is enough on Windows;
+    /// the PipeWire node name on Linux).
+    microphone: String,
 }
 
 impl Default for AudioConfig {
@@ -124,6 +128,7 @@ impl Default for AudioConfig {
             bitrate_bps: DEFAULT_AUDIO_BITRATE_BPS,
             mic_gain: 1.0,
             system_gain: 1.0,
+            microphone: String::new(),
         }
     }
 }
@@ -271,6 +276,9 @@ impl Config {
         if let Some(v) = u32_of("REWYND_AUDIO_BITRATE_BPS") {
             self.audio.bitrate_bps = v;
         }
+        if let Some(mic) = get("REWYND_MICROPHONE") {
+            self.audio.microphone = mic;
+        }
         if let Some(dir) = get("REWYND_OUTPUT_DIR").filter(|s| !s.is_empty()) {
             self.output.directory = Some(dir);
         }
@@ -368,6 +376,14 @@ impl Config {
     #[must_use]
     pub fn system_gain(&self) -> f32 {
         sanitize_gain(self.audio.system_gain)
+    }
+
+    /// The microphone to capture instead of the system default, if one is configured
+    /// (trimmed; empty = default).
+    #[must_use]
+    pub fn microphone(&self) -> Option<&str> {
+        let mic = self.audio.microphone.trim();
+        (!mic.is_empty()).then_some(mic)
     }
 
     /// Retention window, clamped to `[1, MAX_BUFFER_SECONDS]`: a zero window would keep
@@ -495,6 +511,11 @@ impl Config {
     /// Set the system-audio mix gain.
     pub fn set_system_gain(&mut self, gain: f32) {
         self.audio.system_gain = gain;
+    }
+
+    /// Set the microphone to capture (empty = the system default).
+    pub fn set_microphone(&mut self, microphone: String) {
+        self.audio.microphone = microphone;
     }
 
     /// Set the retention window in seconds (stored as-is; clamped on read by [`buffer_window`]).
@@ -717,6 +738,9 @@ bitrate_bps = 128000
 # microphone is quiet; the mix is clamped so it can't overflow.
 mic_gain = 1.0
 system_gain = 1.0
+# Capture a specific microphone instead of the system default. Case-insensitive; on
+# Windows a part of the device name is enough, on Linux use the PipeWire node name.
+microphone = \"\"
 
 [buffer]
 # How many seconds of footage to keep for a clip.

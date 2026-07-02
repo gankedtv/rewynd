@@ -68,6 +68,7 @@ mod probe {
         capture_audio(
             params,
             AudioSource::SinkMonitor,
+            None,
             Some(IDLE_TIMEOUT),
             None,
             std::time::Instant::now(),
