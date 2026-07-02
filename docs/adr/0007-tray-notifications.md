@@ -18,8 +18,9 @@ stack; no GTK. The tray runs as a background **task of the existing tokio runtim
 not a second event loop). It lives in `crates/app/src/tray.rs`; the recorder spawns it alongside —
 and leaves untouched — the proven GlobalShortcuts hotkey loop. Menu clicks arrive as a `TrayCmd`
 over an `mpsc` channel ("Save clip now" → the same `save_clip`, "Open settings" → launches the
-sibling `rewynd-settings`, "Quit" → exits). The clip-saved toast fires from `save_clip`'s success
-arm, so both the hotkey and the tray paths show it.
+sibling `rewynd-settings`, "Quit" → exits). The clip-saved toast fires from the
+callers' success paths (hotkey loop and tray; the toast is async so `save_clip` itself stays
+sync), so both triggers show it.
 
 The tray icon is the gankedtv logo mark (`assets/tray.png`, generated from `logo-mark.svg`),
 embedded via `include_bytes!` and decoded to ksni's ARGB32 with `image` (png feature only).

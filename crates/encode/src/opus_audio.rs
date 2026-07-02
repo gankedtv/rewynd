@@ -9,6 +9,7 @@
 //! packs packets contiguously and only reads the first PTS for the clip's start offset, so a
 //! mid-clip *gap* in capture isn't reconstructed downstream — see `rewynd_mux`.)
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use opus::{Application, Bitrate, Channels};
@@ -182,7 +183,7 @@ impl OpusAudioEncoder {
                 .encode_float(&self.pending[..self.frame_len], &mut self.packet)
                 .map_err(|e| AudioEncodeError::Encode(e.to_string()))?;
             on_packet(EncodedAudioChunk {
-                bytes: self.packet[..n].to_vec(),
+                bytes: Arc::from(&self.packet[..n]),
                 frames: self.samples_per_channel,
                 pts: self.pending_pts,
             });
@@ -207,7 +208,7 @@ impl OpusAudioEncoder {
             .encode_float(&self.pending[..self.frame_len], &mut self.packet)
             .map_err(|e| AudioEncodeError::Encode(e.to_string()))?;
         on_packet(EncodedAudioChunk {
-            bytes: self.packet[..n].to_vec(),
+            bytes: Arc::from(&self.packet[..n]),
             frames: self.samples_per_channel,
             pts: self.pending_pts,
         });
@@ -290,6 +291,24 @@ mod tests {
         let p = emitted.expect("one packet after the frame completes");
         assert_eq!(p.pts, Duration::ZERO);
         assert_eq!(p.frames, 960);
+    }
+
+    #[test]
+    fn push_re_anchors_pts_to_the_capture_clock() {
+        let mut enc = OpusAudioEncoder::new(AudioEncodeParams::default()).unwrap();
+        // Half a frame (480 samples/channel = 10 ms) at t=0 — buffered, no packet.
+        let half: Vec<f32> = vec![0.0; 960];
+        enc.push(&half, Duration::ZERO, |_| panic!("no whole frame yet"))
+            .unwrap();
+        // The next buffer arrives stamped 500 ms — a capture gap. The 10 ms already
+        // buffered precede it, so the completed frame re-anchors to 500 - 10 = 490 ms
+        // rather than free-running from 0.
+        let full: Vec<f32> = vec![0.0; 1920];
+        let mut packets = Vec::new();
+        enc.push(&full, Duration::from_millis(500), |p| packets.push(p))
+            .unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].pts, Duration::from_millis(490));
     }
 
     #[test]

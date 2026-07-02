@@ -38,6 +38,8 @@ static ICON: LazyLock<Vec<Icon>> = LazyLock::new(|| {
 
 pub struct RewyndTray {
     tx: UnboundedSender<TrayCmd>,
+    /// One-line pipeline status shown as the tooltip title; the recorder updates it on failures.
+    pub status: String,
 }
 
 impl Tray for RewyndTray {
@@ -64,7 +66,7 @@ impl Tray for RewyndTray {
 
     fn tool_tip(&self) -> ToolTip {
         ToolTip {
-            title: "rewynd is recording".to_owned(),
+            title: self.status.clone(),
             description: "Buffering recent gameplay. Press your hotkey to save a clip.".to_owned(),
             icon_name: String::new(),
             icon_pixmap: Vec::new(),
@@ -114,16 +116,26 @@ impl Tray for RewyndTray {
 /// `Handle` keeps the icon alive — hold it for as long as the tray should show.
 pub async fn spawn() -> anyhow::Result<(Handle<RewyndTray>, UnboundedReceiver<TrayCmd>)> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let handle = RewyndTray { tx }.spawn().await?;
+    let tray = RewyndTray {
+        tx,
+        status: "rewynd is recording".to_owned(),
+    };
+    let handle = tray.spawn().await?;
     Ok((handle, rx))
 }
 
 /// Best-effort desktop notification. Async: the zbus backend's blocking `show()` would panic if
 /// called inside our tokio runtime, so it is sent via `show_async`.
 pub async fn toast(summary: &str, body: &str) {
+    // Notification bodies are markup on many servers (KDE renders a HTML subset); escape so
+    // server-provided text (error details, share codes) can't inject tags.
+    let body = body
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
     if let Err(e) = notify_rust::Notification::new()
         .summary(summary)
-        .body(body)
+        .body(&body)
         .icon(rewynd_config::APP_ID)
         .appname("rewynd")
         .show_async()

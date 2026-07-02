@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
-description = "Lightweight instant-replay clip recorder: keeps the last 60s on the GPU, writes a clip on a hotkey."
+description = "Lightweight instant-replay clip recorder: keeps a configurable replay window on the GPU, writes a clip on a hotkey."
 
 [dependencies]
 anyhow.workspace = true
@@ -23,11 +23,13 @@ rewynd-config.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 rewynd-capture.workspace = true
 rewynd-gpu.workspace = true
-rewynd-mux.workspace = true
+rewynd-clip.workspace = true
 ashpd = { workspace = true, features = ["global_shortcuts"] }
-tokio.workspace = true
+# macros/sync drive the select!-based hotkey loop; signal funnels SIGTERM/SIGINT through the
+# same orderly shutdown as tray Quit.
+tokio = { workspace = true, features = ["macros", "signal", "sync", "time"] }
 pollster.workspace = true
-futures-util = "0.3"
+futures-util.workspace = true
 # Tray (StatusNotifierItem over D-Bus, no GTK — reuses our zbus stack) + desktop toast +
 # PNG decode for the tray icon. See docs/adr/0007.
 ksni = "0.3"

@@ -25,9 +25,10 @@ The file lives at `$XDG_CONFIG_HOME/rewynd/config.toml` (falling back to
 restore token (`$XDG_STATE_HOME`) and the desktop entry (`$XDG_DATA_HOME`). A commented default
 file is written on first run so the settings are discoverable.
 
-Lives in `crates/app/src/config.rs` (platform-agnostic and unit-tested on CI — the coverage gate
-covers it, unlike `app/src/main.rs`). The schema mirrors the encode/audio params plus app knobs:
-`[video]`, `[audio]` (incl. `mic_gain` / `system_gain`), `[buffer]`, `[output]`, `[hotkey]`,
+Lives in the `rewynd-config` crate (platform-agnostic and unit-tested on CI — the coverage gate
+covers it, unlike `app/src/main.rs`; *erratum:* an early draft said `crates/app/src/config.rs`).
+The schema mirrors the encode/audio params plus app knobs: `[video]`, `[audio]` (incl. `mic_gain`
+/ `system_gain`), `[buffer]`, `[output]`, `[hotkey]`, and later additions `[startup]`, `[upload]`,
 `[capture]`. Unknown keys are rejected (`deny_unknown_fields`) so typos surface rather than being
 silently ignored; a missing or malformed file degrades to defaults (logged) rather than blocking
 startup.

@@ -33,3 +33,6 @@ rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 rewynd-upload.workspace = true
 # Opens the approval page in the user's browser.
 open = "5"
+# One notification ("settings already open") from the refused second instance; shares the
+# zbus stack rfd already pulls.
+notify-rust = "4"

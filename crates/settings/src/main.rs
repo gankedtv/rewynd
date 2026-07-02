@@ -55,6 +55,14 @@ fn main() -> iced::Result {
         Ok(Some(lock)) => Some(lock),
         Ok(None) => {
             tracing::info!("rewynd settings is already open; not opening a second window");
+            // Blocking show is fine: no async runtime is live yet. Without this, the tray's
+            // "Open settings" appears to do nothing when a window is already open.
+            let _ = notify_rust::Notification::new()
+                .summary("rewynd settings is already open")
+                .body("Look for the existing settings window.")
+                .icon(config::APP_ID)
+                .appname("rewynd")
+                .show();
             return Ok(());
         }
         Err(e) => {
@@ -162,43 +170,6 @@ enum LoginState {
     Failed(String),
 }
 
-/// Upload visibility choices, mirroring what the ganked.tv API accepts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UploadVis {
-    Public,
-    Unlisted,
-}
-
-impl UploadVis {
-    const ALL: [UploadVis; 2] = [UploadVis::Public, UploadVis::Unlisted];
-
-    fn as_config(self) -> &'static str {
-        match self {
-            UploadVis::Public => "public",
-            UploadVis::Unlisted => "unlisted",
-        }
-    }
-
-    /// Fails closed like the uploader: only an explicit `public` maps to Public, so a hand-edited
-    /// typo can't be rewritten into a wider visibility on save.
-    fn from_config(s: &str) -> UploadVis {
-        if s.trim().eq_ignore_ascii_case("public") {
-            UploadVis::Public
-        } else {
-            UploadVis::Unlisted
-        }
-    }
-}
-
-impl fmt::Display for UploadVis {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            UploadVis::Public => "Public",
-            UploadVis::Unlisted => "Unlisted",
-        })
-    }
-}
-
 #[derive(Debug, Clone)]
 enum Message {
     MicGain(f32),
@@ -217,7 +188,7 @@ enum Message {
     ApiKeyEdited(String),
     ApiUrlEdited(String),
     ShareUrlEdited(String),
-    VisibilityPicked(UploadVis),
+    VisibilityPicked(rewynd_upload::Visibility),
     LoginPressed,
     LoginStarted(Result<rewynd_upload::DeviceLogin, String>),
     LoginDone(Result<String, String>),
@@ -290,14 +261,14 @@ impl App {
             }
             Message::ResolutionPicked(r) => {
                 let (width, height) = r.dims();
-                let mut v = self.config.video();
+                let mut v = self.config.video_stored();
                 v.width = width;
                 v.height = height;
                 self.config.set_video(v);
                 self.touch();
             }
             Message::FpsPicked(fps) => {
-                let mut v = self.config.video();
+                let mut v = self.config.video_stored();
                 v.framerate = fps;
                 // Keep ~1 keyframe per second so the ring buffer's cut granularity tracks the
                 // frame rate (the defaults couple these); the UI doesn't expose the GOP directly.
@@ -306,7 +277,7 @@ impl App {
                 self.touch();
             }
             Message::BitrateMbps(mbps) => {
-                let mut v = self.config.video();
+                let mut v = self.config.video_stored();
                 v.bitrate_bps = mbps.saturating_mul(BITS_PER_MBIT);
                 self.config.set_video(v);
                 self.touch();
@@ -354,7 +325,7 @@ impl App {
                 self.touch();
             }
             Message::VisibilityPicked(v) => {
-                self.config.set_upload_visibility(v.as_config().to_owned());
+                self.config.set_upload_visibility(v.as_str().to_owned());
                 self.touch();
             }
             Message::LoginPressed => {
@@ -498,8 +469,8 @@ impl App {
     fn view(&self) -> Element<'_, Message> {
         // `normalize` (on load) keeps these in range; clamp on the u64 before narrowing so a
         // pathological stored value can't wrap the cast.
-        let v = self.config.video();
-        let a = self.config.audio();
+        let v = self.config.video_stored();
+        let a = self.config.audio_stored();
         let mbps = v.bitrate_bps / BITS_PER_MBIT;
         let secs = self.config.buffer_seconds().min(u64::from(BUFFER_MAX_S)) as u32;
         // Rough clip size from the target bitrate (video + audio) over the replay window,
@@ -659,10 +630,10 @@ impl App {
                     .on_toggle(Message::UploadEnabled),
                 setting(
                     "Visibility",
-                    UploadVis::from_config(self.config.upload_visibility()).to_string(),
+                    rewynd_upload::Visibility::parse(self.config.upload_visibility()).to_string(),
                     pick_list(
-                        &UploadVis::ALL[..],
-                        Some(UploadVis::from_config(self.config.upload_visibility())),
+                        &rewynd_upload::Visibility::ALL[..],
+                        Some(rewynd_upload::Visibility::parse(self.config.upload_visibility())),
                         Message::VisibilityPicked,
                     )
                     .width(Length::Fill),
@@ -756,7 +727,7 @@ fn normalize(c: &mut Config) {
         c.buffer_seconds()
             .clamp(u64::from(BUFFER_MIN_S), u64::from(BUFFER_MAX_S)),
     );
-    let mut v = c.video();
+    let mut v = c.video_stored();
     let mbps = (v.bitrate_bps / BITS_PER_MBIT).clamp(BITRATE_MIN_MBPS, BITRATE_MAX_MBPS);
     v.bitrate_bps = mbps * BITS_PER_MBIT;
     c.set_video(v);
@@ -840,106 +811,40 @@ fn status_line(status: &Status) -> Element<'_, Message> {
         .into()
 }
 
-/// Recorder binary, expected next to this settings binary.
-const RECORDER_BIN: &str = if cfg!(windows) {
-    "rewynd.exe"
-} else {
-    "rewynd"
-};
-
 /// The recorder binary, expected as a sibling of this settings binary.
 fn recorder_path() -> Option<std::path::PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(RECORDER_BIN)))
+    config::sibling_binary("rewynd")
 }
 
 /// Stop the running recorder (if any), wait for it to exit, then launch a fresh one so it picks
 /// up the saved config. Blocking — runs on a `spawn_blocking` thread, not the UI thread.
+/// The stop half (pid verification, SIGTERM→SIGKILL escalation, start-time identity guard)
+/// lives in rewynd-config next to the pid file's writer.
 fn restart_recorder() -> Result<(), String> {
-    stop_running_recorder();
+    match config::stop_recorder(
+        std::time::Duration::from_secs(3),
+        std::time::Duration::from_secs(2),
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            // Spawning now would just bounce off the old process's single-instance lock.
+            return Err("the running recorder did not stop; try again".to_owned());
+        }
+        Err(e) => tracing::warn!(error = %e, "could not stop the running recorder"),
+    }
     let recorder =
         recorder_path().ok_or_else(|| "could not locate the recorder binary".to_owned())?;
     std::process::Command::new(&recorder)
         .spawn()
-        .map(|_| ())
+        .map(|mut child| {
+            // Reap in the background: an unreaped child stays a zombie whose /proc identity
+            // makes the NEXT restart's stop wait think the old recorder never exited.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        })
         .map_err(|e| format!("could not start {}: {e}", recorder.display()))
 }
-
-/// SIGTERM the running recorder (if its pid is still a rewynd process) and wait for it to exit, so
-/// it has dropped the global hotkey and ScreenCast portal before the replacement starts.
-#[cfg(unix)]
-fn stop_running_recorder() {
-    use std::time::Duration;
-    let Ok(contents) = std::fs::read_to_string(config::recorder_pid_path()) else {
-        return;
-    };
-    // The pid file is newline-framed; the first line is a clean pid even mid-rewrite.
-    let pid = contents.lines().next().unwrap_or("").trim();
-    if pid.is_empty() {
-        return;
-    }
-    // Guard against a stale/reused pid: only signal it if it's still a rewynd process, and pin its
-    // start-time identity so a pid reused mid-shutdown can't be mistaken for it (and SIGKILLed).
-    if !std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim() == "rewynd") {
-        return;
-    }
-    let identity = proc_start_time(pid);
-    let _ = std::process::Command::new("kill").arg(pid).status();
-    // The recorder releases the portal/hotkey (and the single-instance lock) as it dies; wait
-    // (bounded) for that before relaunch.
-    if wait_for_exit(pid, &identity, Duration::from_secs(3)) {
-        return;
-    }
-    // It outlived SIGTERM and is still the same process — escalate so the replacement isn't
-    // refused by the lock the old process still holds.
-    let _ = std::process::Command::new("kill")
-        .arg("-KILL")
-        .arg(pid)
-        .status();
-    wait_for_exit(pid, &identity, Duration::from_secs(2));
-}
-
-/// `/proc/<pid>/stat` field 22 (start time in clock ticks): with the pid, a stable identity that
-/// distinguishes the original process from a reused pid. `None` if unreadable.
-#[cfg(unix)]
-fn proc_start_time(pid: &str) -> Option<String> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // comm (field 2) is parenthesised and may itself contain spaces/parens, so resume after the
-    // last ')': the remaining tokens start at field 3, putting start time at index 19.
-    stat.rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .nth(19)
-        .map(str::to_owned)
-}
-
-/// Whether the original recorder (pid + start-time identity) is still running.
-#[cfg(unix)]
-fn still_running(pid: &str, identity: &Option<String>) -> bool {
-    match identity {
-        Some(start) => proc_start_time(pid).as_deref() == Some(start),
-        // No identity captured: fall back to bare pid existence.
-        None => std::path::Path::new(&format!("/proc/{pid}")).exists(),
-    }
-}
-
-/// Poll until the original recorder has exited (or its pid was reused) or the timeout elapses.
-#[cfg(unix)]
-fn wait_for_exit(pid: &str, identity: &Option<String>, timeout: std::time::Duration) -> bool {
-    use std::time::Instant;
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if !still_running(pid, identity) {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(30));
-    }
-    !still_running(pid, identity)
-}
-
-#[cfg(not(unix))]
-fn stop_running_recorder() {}
 
 #[cfg(test)]
 mod tests {
@@ -959,14 +864,5 @@ mod tests {
         // The view shows bps/1_000_000; a message multiplies back.
         assert_eq!(12_000_000 / BITS_PER_MBIT, 12);
         assert_eq!(25u32.saturating_mul(BITS_PER_MBIT), 25_000_000);
-    }
-
-    #[test]
-    fn upload_visibility_round_trips_and_fails_closed() {
-        for v in UploadVis::ALL {
-            assert_eq!(UploadVis::from_config(v.as_config()), v);
-        }
-        // A typo must never widen visibility.
-        assert_eq!(UploadVis::from_config("garbage"), UploadVis::Unlisted);
     }
 }

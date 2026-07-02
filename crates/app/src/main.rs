@@ -5,6 +5,9 @@
 //! is filled on a dedicated capture thread; the main thread drives the XDG portals
 //! (ScreenCast for capture, GlobalShortcuts for the hotkey) and cuts a clip on press.
 //!
+//! Every exit path — hotkey session end, tray Quit, SIGTERM/SIGINT — funnels through
+//! one orderly shutdown (stop flag → portal close → thread joins → audio flush).
+//!
 //! Linux-only at runtime; the binary compiles elsewhere via a stub `main`.
 
 #[cfg(target_os = "linux")]
@@ -12,14 +15,29 @@ mod tray;
 
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
-    linux::run()
+    let result = linux::run();
+    if let Err(e) = &result {
+        // The recorder is a windowless background app (often autostarted): without this, a
+        // fatal startup error is invisible. Blocking `show` is fine — no runtime is live here.
+        let body = format!("{e:#}")
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        let _ = notify_rust::Notification::new()
+            .summary("rewynd could not start")
+            .body(&body)
+            .icon(rewynd_config::APP_ID)
+            .appname("rewynd")
+            .show();
+    }
+    result
 }
 
 #[cfg(target_os = "linux")]
 mod linux {
     use std::cell::RefCell;
     use std::ops::ControlFlow;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -28,10 +46,11 @@ mod linux {
     use anyhow::{Context, Result, anyhow};
     use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
     use futures_util::StreamExt;
-    use rewynd_buffer::{AudioRingBuffer, EncodedChunk, RingBuffer};
     use rewynd_capture::linux::{
-        AudioParams, AudioSource, CapturedDmabuf, capture_audio, capture_stream, open_portal_with,
+        AudioParams, AudioSource, CapturedDmabuf, StreamPrefs, capture_audio, capture_stream,
+        open_portal_with,
     };
+    use rewynd_clip::{ClipSaver, SaveError, SharedAudioBuffer, SharedBuffer, lock_unpoisoned};
     use rewynd_encode::{
         AudioEncodeParams, AudioMixer, EncodeParams, Encoder, GpuVideoEncoder, Nv12Converter,
         OpusAudioEncoder, apply_gain, center_mono_into,
@@ -40,8 +59,8 @@ mod linux {
     use rewynd_config::{self as config, AudioSettings, VideoSettings};
 
     use crate::tray;
+    use rewynd_buffer::{AudioRingBuffer, EncodedChunk, RingBuffer};
     use rewynd_gpu::{DmabufImport, GpuContext};
-    use rewynd_mux::{AudioTrack, Mp4Muxer, Muxer};
 
     /// Application id, registered with the portal so the GlobalShortcuts backend (e.g.
     /// KWin) can attribute and persist our shortcut. Unsandboxed apps must register one.
@@ -49,14 +68,8 @@ mod linux {
     /// Stable id for our one shortcut; the compositor binds a trigger to it.
     const SHORTCUT_ID: &str = "save-clip";
 
-    /// Shared, mutable ring buffer: the capture thread pushes, the hotkey handler cuts.
-    type SharedBuffer = Arc<Mutex<RingBuffer>>;
-    /// Shared audio ring: the mixer thread pushes Opus packets, the hotkey handler cuts.
-    type SharedAudioBuffer = Arc<Mutex<AudioRingBuffer>>;
     /// Shared mixer: the system + mic capture threads sum into it, the mixer thread drains it.
     type SharedMixer = Arc<Mutex<AudioMixer>>;
-    /// The most recently saved clip, so the tray's "Upload last clip" knows what to send.
-    type SharedLastClip = Arc<Mutex<Option<PathBuf>>>;
 
     /// How far behind real time the mixer holds audio before encoding it, so the system and
     /// mic streams have both contributed. Latency is irrelevant for a replay buffer; this
@@ -64,6 +77,17 @@ mod linux {
     const AUDIO_SETTLE: Duration = Duration::from_millis(120);
     /// How often the mixer thread drains settled audio into the encoder.
     const AUDIO_DRAIN_INTERVAL: Duration = Duration::from_millis(20);
+    /// How long Quit waits for an in-flight upload before abandoning it.
+    const QUIT_UPLOAD_GRACE: Duration = Duration::from_secs(5);
+    /// Rebind attempts before the hotkey is declared gone (the recorder keeps running).
+    const HOTKEY_REBIND_ATTEMPTS: u32 = 3;
+
+    /// Pipeline failures surfaced to the user via the tray (tooltip + toast); the process
+    /// keeps running so already-buffered footage stays saveable.
+    enum RecorderEvent {
+        CaptureFailed(String),
+        SystemAudioFailed(String),
+    }
 
     /// Map the GPU-free [`VideoSettings`] from the config onto the encoder's [`EncodeParams`].
     /// A test guards that the config defaults stay in lockstep with [`EncodeParams::default`].
@@ -86,6 +110,48 @@ mod linux {
             ..Default::default()
         }
     }
+
+    /// The recorder's threads, joined in dependency order by [`Recorder::shutdown`]. Fields are
+    /// optional so a startup failure can tear down exactly what was already spawned.
+    struct Recorder {
+        stop: Arc<AtomicBool>,
+        captures_done: Arc<AtomicBool>,
+        system_audio: Option<std::thread::JoinHandle<()>>,
+        mic_audio: Option<std::thread::JoinHandle<()>>,
+        audio_mixer: Option<std::thread::JoinHandle<()>>,
+        capture: Option<std::thread::JoinHandle<()>>,
+        flush_hook: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Recorder {
+        /// Stop and join everything, in the order the pipeline requires: the capture loop's GPU
+        /// teardown must happen on its own thread; the audio captures must stop adding to the
+        /// mixer before `captures_done` releases the mixer's final drain + Opus flush.
+        fn shutdown(&mut self, runtime: &tokio::runtime::Runtime, portal: PortalHandle) {
+            self.stop.store(true, Ordering::Relaxed);
+            // Closing the portal removes the PipeWire node so the capture loop errors out even
+            // on an idle screen; the stop watchdog inside the stream is the belt to this brace.
+            let _ = runtime.block_on(portal.close());
+            if let Some(h) = self.capture.take() {
+                let _ = h.join();
+            }
+            if let Some(h) = self.system_audio.take() {
+                let _ = h.join();
+            }
+            if let Some(h) = self.mic_audio.take() {
+                let _ = h.join();
+            }
+            self.captures_done.store(true, Ordering::Relaxed);
+            if let Some(h) = self.audio_mixer.take() {
+                let _ = h.join();
+            }
+            if let Some(h) = self.flush_hook.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    type PortalHandle = rewynd_capture::linux::PortalSession;
 
     pub fn run() -> Result<()> {
         tracing_subscriber::fmt::init();
@@ -138,13 +204,23 @@ mod linux {
         let buffer: SharedBuffer = Arc::new(Mutex::new(RingBuffer::new(buffer_window)));
         let audio_buffer: SharedAudioBuffer =
             Arc::new(Mutex::new(AudioRingBuffer::new(buffer_window)));
-        let last_clip: SharedLastClip = Arc::new(Mutex::new(None));
         // The system + mic capture threads sum into this; the mixer thread drains + encodes it.
         let mixer: SharedMixer = Arc::new(Mutex::new(AudioMixer::new(
             audio_params.sample_rate,
             audio_params.channels,
             AUDIO_SETTLE,
         )));
+        // Raised by a clip save so the mixer drains its in-flight tail before the audio cut.
+        let audio_drain_now = Arc::new(AtomicBool::new(false));
+        let saver = ClipSaver::new(
+            buffer.clone(),
+            audio_buffer.clone(),
+            params,
+            audio_params,
+            buffer_window,
+            output_dir,
+            Some(audio_drain_now.clone()),
+        );
 
         // One monotonic epoch shared by all capture threads, so the video, system-audio and
         // mic PTS are on the same clock and the mixer/muxer can align them.
@@ -158,10 +234,14 @@ mod linux {
 
         // The portal Registry only accepts an app id that has an installed desktop entry,
         // so make sure one exists before registering. The login autostart entry is the settings
-        // app's business alone (it only touches the file when the toggle changes, so a
-        // desktop-managed entry is never clobbered by simply running the recorder).
-        if let Err(e) = ensure_desktop_entry() {
-            tracing::warn!(error = %e, "could not write a desktop entry; the hotkey may not bind");
+        // app's business alone.
+        match std::env::current_exe() {
+            Ok(exe) => {
+                if let Err(e) = config::install_launcher_entry(&exe) {
+                    tracing::warn!(error = %e, "could not write a desktop entry; the hotkey may not bind");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "could not locate our own binary"),
         }
 
         // Register our app id with the portal before any other portal call: ashpd shares
@@ -180,138 +260,198 @@ mod linux {
         tracing::info!(node_id, "screencast portal established");
 
         let stop = Arc::new(AtomicBool::new(false));
-
-        // Audio runs on three threads: the system (sink-monitor) and microphone captures each
-        // sum their PCM into the shared mixer; the mixer thread drains the aligned mix, Opus-
-        // encodes it, and fills the audio ring. No portal — PipeWire connects directly. The
-        // Opus encoder is built inside the mixer thread so it never crosses a thread boundary.
-        // These (and the mixer) are spawned BEFORE the GPU video thread so that a spawn
-        // failure here can't leave the video thread running and racing process exit.
-        let system_audio = spawn_audio_capture(
-            "rewynd-audio-system",
-            AudioSource::SinkMonitor,
-            audio_params,
-            config.system_gain(),
-            mixer.clone(),
-            &stop,
-            epoch,
-        )?;
-        // The mic is optional: with no input device the mixer simply never receives mic
-        // samples (the stream idles until shutdown), so clips are system-only.
-        let mic_audio = spawn_audio_capture(
-            "rewynd-audio-mic",
-            AudioSource::Microphone,
-            audio_params,
-            config.mic_gain(),
-            mixer.clone(),
-            &stop,
-            epoch,
-        )?;
-
-        // Set once the capture threads have stopped delivering (after their join), so the
-        // mixer's final drain catches every sample they added.
         let captures_done = Arc::new(AtomicBool::new(false));
-        let mixer_buffer = audio_buffer.clone();
-        let mixer_mixer = mixer.clone();
-        let mixer_done = captures_done.clone();
-        let audio_mixer = std::thread::Builder::new()
-            .name("rewynd-audio-mixer".to_owned())
-            .spawn(move || {
-                if let Err(e) =
-                    run_audio_mixer(epoch, audio_params, mixer_mixer, mixer_buffer, &mixer_done)
-                {
-                    tracing::error!(error = %e, "audio mixer loop stopped");
-                }
-            })
-            .context("spawning the audio mixer thread")?;
+        let mut recorder = Recorder {
+            stop: stop.clone(),
+            captures_done: captures_done.clone(),
+            system_audio: None,
+            mic_audio: None,
+            audio_mixer: None,
+            capture: None,
+            flush_hook: None,
+        };
+        // Pipeline failures flow to the tray task, which owns the user-visible state.
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<RecorderEvent>();
 
-        // Fill the video ring on its own thread: the PipeWire loop blocks, and the GPU
-        // pipeline lives there start to finish (so it also tears down there, in order).
-        // Spawned LAST — it's the only thread whose teardown must not race process exit, so
-        // nothing fallible runs after it; `stop` ends its loop and we join it before return.
-        let capture_buffer = buffer.clone();
-        let capture_stop = stop.clone();
-        let capture = std::thread::Builder::new()
-            .name("rewynd-capture".to_owned())
-            .spawn(move || {
-                if let Err(e) =
-                    run_capture(node_id, fd, params, epoch, capture_buffer, &capture_stop)
-                {
-                    tracing::error!(error = %e, "capture loop stopped");
-                }
-            })
-            .context("spawning the capture thread")?;
+        // From here on, any startup error must tear down the threads spawned so far — a
+        // detached PipeWire callback racing process exit is undefined behaviour.
+        let started = (|| -> Result<()> {
+            // Audio runs on three threads: the system (sink-monitor) and microphone captures
+            // each sum their PCM into the shared mixer; the mixer thread drains the aligned
+            // mix, Opus-encodes it, and fills the audio ring. No portal — PipeWire connects
+            // directly. Spawned BEFORE the GPU video thread so a spawn failure here can't
+            // leave the video thread running and racing process exit.
+            recorder.system_audio = Some(spawn_audio_capture(
+                "rewynd-audio-system",
+                AudioSource::SinkMonitor,
+                audio_params,
+                config.system_gain(),
+                mixer.clone(),
+                &stop,
+                epoch,
+                Some(events_tx.clone()),
+            )?);
+            // The mic is optional: with no input device the mixer simply never receives mic
+            // samples (the stream idles until shutdown), so clips are system-only.
+            recorder.mic_audio = Some(spawn_audio_capture(
+                "rewynd-audio-mic",
+                AudioSource::Microphone,
+                audio_params,
+                config.mic_gain(),
+                mixer.clone(),
+                &stop,
+                epoch,
+                None,
+            )?);
 
-        // Dev aid: flush once after N seconds without a keypress, so the pipeline can be
-        // exercised headlessly. The hotkey is the real trigger.
-        if let Ok(value) = std::env::var("REWYND_FLUSH_AFTER") {
-            match value.parse::<u64>() {
-                Ok(secs) => {
-                    let buffer = buffer.clone();
-                    let audio_buffer = audio_buffer.clone();
-                    let output_dir = output_dir.clone();
-                    let flush_last = last_clip.clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(Duration::from_secs(secs));
-                        if let Some(path) = save_clip(
-                            &buffer,
-                            &audio_buffer,
-                            params,
+            let mixer_buffer = audio_buffer.clone();
+            let mixer_mixer = mixer.clone();
+            let mixer_done = captures_done.clone();
+            let mixer_drain_now = audio_drain_now.clone();
+            recorder.audio_mixer = Some(
+                std::thread::Builder::new()
+                    .name("rewynd-audio-mixer".to_owned())
+                    .spawn(move || {
+                        if let Err(e) = run_audio_mixer(
+                            epoch,
                             audio_params,
-                            buffer_window,
-                            output_dir.as_deref(),
+                            mixer_mixer,
+                            mixer_buffer,
+                            &mixer_done,
+                            &mixer_drain_now,
                         ) {
-                            remember_clip(&flush_last, &path);
+                            tracing::error!(error = %e, "audio mixer loop stopped");
                         }
-                    });
+                    })
+                    .context("spawning the audio mixer thread")?,
+            );
+
+            // Fill the video ring on its own thread: the PipeWire loop blocks, and the GPU
+            // pipeline lives there start to finish (so it also tears down there, in order).
+            let capture_buffer = buffer.clone();
+            let capture_stop = stop.clone();
+            let capture_events = events_tx.clone();
+            recorder.capture = Some(
+                std::thread::Builder::new()
+                    .name("rewynd-capture".to_owned())
+                    .spawn(move || {
+                        if let Err(e) =
+                            run_capture(node_id, fd, params, epoch, capture_buffer, &capture_stop)
+                        {
+                            tracing::error!(error = %e, "capture loop stopped");
+                            let _ =
+                                capture_events.send(RecorderEvent::CaptureFailed(format!("{e:#}")));
+                        }
+                    })
+                    .context("spawning the capture thread")?,
+            );
+
+            // Dev aid: flush once after N seconds without a keypress, so the pipeline can be
+            // exercised headlessly. Stop-aware and joined at shutdown like every other thread.
+            if let Ok(value) = std::env::var("REWYND_FLUSH_AFTER") {
+                match value.parse::<u64>() {
+                    Ok(secs) => {
+                        let flush_saver = saver.clone();
+                        let flush_stop = stop.clone();
+                        recorder.flush_hook = Some(
+                            std::thread::Builder::new()
+                                .name("rewynd-flush-hook".to_owned())
+                                .spawn(move || {
+                                    let deadline = Instant::now() + Duration::from_secs(secs);
+                                    while Instant::now() < deadline {
+                                        if flush_stop.load(Ordering::Relaxed) {
+                                            return;
+                                        }
+                                        std::thread::sleep(Duration::from_millis(250));
+                                    }
+                                    if let Err(e) = flush_saver.save() {
+                                        tracing::warn!(error = %e, "dev flush produced no clip");
+                                    }
+                                })
+                                .context("spawning the flush hook thread")?,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(value, error = %e, "ignoring invalid REWYND_FLUSH_AFTER");
+                    }
                 }
-                Err(e) => tracing::warn!(value, error = %e, "ignoring invalid REWYND_FLUSH_AFTER"),
             }
+            Ok(())
+        })();
+        if let Err(e) = started {
+            recorder.shutdown(&runtime, portal);
+            return Err(e);
         }
 
-        // Tray icon + menu, on a background task of the same runtime (no GTK, no extra event
-        // loop). Menu clicks arrive as `TrayCmd`s; the hotkey loop below is left untouched.
-        {
-            let tray_buffer = buffer.clone();
-            let tray_audio = audio_buffer.clone();
-            let tray_output = output_dir.clone();
-            let tray_last = last_clip.clone();
-            let upload_busy = Arc::new(AtomicBool::new(false));
-            runtime.spawn(async move {
-                let (handle, mut rx) = match tray::spawn().await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "tray unavailable; continuing without it");
-                        return;
-                    }
-                };
-                let _handle = handle; // dropping it would remove the icon
-                while let Some(cmd) = rx.recv().await {
+        // Every exit path funnels through this signal: tray Quit sends it, SIGTERM/SIGINT
+        // trigger it, and the hotkey loop returning (session gone for good) implies it.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        // Tray icon + menu on a background task of the same runtime (no GTK, no extra event
+        // loop). It owns all user-visible state: menu commands, pipeline-failure tooltips,
+        // upload orchestration.
+        runtime.spawn(run_tray(saver.clone(), events_rx, shutdown_tx.clone()));
+
+        // Drive the hotkey until shutdown is requested (or the session is gone for good).
+        let result = runtime.block_on(run_hotkey_loop(
+            saver.clone(),
+            config.hotkey_trigger(),
+            shutdown_rx,
+        ));
+
+        recorder.shutdown(&runtime, portal);
+        // The pid file isn't removed on exit: the kernel releases the `flock` when the process
+        // dies, and unlinking it would race a relock by an incoming instance. A leftover pid is
+        // harmless — the settings app verifies it against `/proc` before signalling it.
+        result
+    }
+
+    /// The tray task: menu commands, upload orchestration, and pipeline-failure display.
+    async fn run_tray(
+        saver: Arc<ClipSaver>,
+        mut events: tokio::sync::mpsc::UnboundedReceiver<RecorderEvent>,
+        shutdown: tokio::sync::watch::Sender<bool>,
+    ) {
+        let (handle, mut rx) = match tray::spawn().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "tray unavailable; continuing without it");
+                return;
+            }
+        };
+        let upload_busy = Arc::new(AtomicBool::new(false));
+        loop {
+            tokio::select! {
+                event = events.recv() => {
+                    let Some(event) = event else { continue };
+                    let (title, body) = match event {
+                        RecorderEvent::CaptureFailed(e) => (
+                            "Recording stopped",
+                            format!("The screen capture failed: {e}. Already-buffered footage can still be saved."),
+                        ),
+                        RecorderEvent::SystemAudioFailed(e) => (
+                            "System audio lost",
+                            format!("Clips will have no system sound: {e}"),
+                        ),
+                    };
+                    handle
+                        .update(|tray: &mut tray::RewyndTray| tray.status = title.to_owned())
+                        .await;
+                    tray::toast(title, &body).await;
+                }
+                cmd = rx.recv() => {
+                    let Some(cmd) = cmd else { break };
                     match cmd {
                         tray::TrayCmd::SaveClip => {
-                            // The cut + mux is blocking; run it off the runtime worker, then toast.
-                            let (b, a, o) =
-                                (tray_buffer.clone(), tray_audio.clone(), tray_output.clone());
-                            let saved = tokio::task::spawn_blocking(move || {
-                                save_clip(&b, &a, params, audio_params, buffer_window, o.as_deref())
-                            })
-                            .await
-                            .ok()
-                            .flatten();
-                            if let Some(path) = saved {
-                                remember_clip(&tray_last, &path);
-                                tray::clip_saved_toast(&path).await;
-                            }
+                            let s = saver.clone();
+                            let saved = tokio::task::spawn_blocking(move || s.save()).await;
+                            toast_save_outcome(saved).await;
                         }
                         tray::TrayCmd::UploadClip => {
-                            let clip = tray_last
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .clone();
                             // Fresh config each click: enabling uploads or changing the key in
                             // the settings works without restarting the recorder.
-                            match (build_uploader(config::load().upload()), clip) {
-                                (Some(up), Some(path)) => {
+                            match (build_uploader(config::load().upload()), saver.last_clip()) {
+                                (UploaderStatus::Ready(up), Some(path)) => {
                                     if upload_busy.swap(true, Ordering::SeqCst) {
                                         tray::toast(
                                             "Upload already running",
@@ -320,87 +460,107 @@ mod linux {
                                         .await;
                                     } else {
                                         // Its own task so a slow upload never stalls the tray menu.
-                                        tokio::spawn(upload_and_toast(
-                                            up,
-                                            path,
-                                            upload_busy.clone(),
-                                        ));
+                                        tokio::spawn(upload_and_toast(up, path, upload_busy.clone()));
                                     }
                                 }
-                                (None, _) => {
+                                (UploaderStatus::BadUrl(e), _) => {
                                     tray::toast(
-                                        "Upload not configured",
-                                        "Enable uploads and add your ganked.tv API key in the settings.",
+                                        "Upload misconfigured",
+                                        &format!("The API server URL in the settings is invalid: {e}"),
                                     )
                                     .await;
                                 }
-                                (Some(_), None) => {
+                                (UploaderStatus::Disabled, _) => {
+                                    tray::toast(
+                                        "Upload not configured",
+                                        "Enable uploads and log in with ganked.tv in the settings.",
+                                    )
+                                    .await;
+                                }
+                                (UploaderStatus::Ready(_), None) => {
                                     tray::toast("No clip yet", "Save a clip first, then upload it.")
                                         .await;
                                 }
                             }
                         }
-                        tray::TrayCmd::OpenSettings => open_settings(),
+                        tray::TrayCmd::OpenSettings => open_settings().await,
                         tray::TrayCmd::Quit => {
                             tracing::info!("quit requested from the tray");
                             if upload_busy.load(Ordering::SeqCst) {
-                                tray::toast(
-                                    "Upload cancelled",
-                                    "rewynd quit while an upload was still running.",
-                                )
-                                .await;
+                                tray::toast("Finishing upload", "rewynd quits when it completes (a few seconds at most).").await;
+                                let waited = Instant::now();
+                                while upload_busy.load(Ordering::SeqCst)
+                                    && waited.elapsed() < QUIT_UPLOAD_GRACE
+                                {
+                                    tokio::time::sleep(Duration::from_millis(200)).await;
+                                }
+                                if upload_busy.load(Ordering::SeqCst) {
+                                    tray::toast(
+                                        "Upload abandoned",
+                                        "rewynd quit while an upload was still running.",
+                                    )
+                                    .await;
+                                }
                             }
-                            std::process::exit(0);
+                            let _ = shutdown.send(true);
+                            break;
                         }
                     }
                 }
-            });
+            }
         }
-
-        // Block on the hotkey loop until the shortcut session ends (or the process is
-        // killed). The capture threads keep filling the buffers in the background.
-        let result = runtime.block_on(run_hotkey_loop(
-            &buffer,
-            &audio_buffer,
-            params,
-            audio_params,
-            buffer_window,
-            output_dir.as_deref(),
-            config.hotkey_trigger(),
-            &last_clip,
-        ));
-
-        // Shut the capture loop down, then join it so the GPU pipeline tears down on its
-        // own thread rather than during process exit. The loop only observes `stop` when a
-        // frame arrives, so explicitly close the portal session first: that removes the
-        // PipeWire node, the stream errors out, and the loop quits even on an idle screen.
-        stop.store(true, Ordering::Relaxed);
-        let _ = runtime.block_on(portal.close());
-        let _ = capture.join();
-        // The audio capture loops poll `stop` via their watchdog timers (so they quit even if
-        // an endpoint is suspended). Join them first so they've stopped adding to the mixer,
-        // *then* signal `captures_done` so the mixer's final drain catches their last samples
-        // before it flushes and exits.
-        let _ = system_audio.join();
-        let _ = mic_audio.join();
-        captures_done.store(true, Ordering::Relaxed);
-        let _ = audio_mixer.join();
-        // The pid file isn't removed on exit: the kernel releases the `flock` when the process
-        // dies, and unlinking it would race a relock by an incoming instance. A leftover pid is
-        // harmless — the settings app verifies it against `/proc` before signalling it.
-        result
+        drop(handle); // removes the icon
     }
 
-    /// Launch the sibling settings binary (best-effort), for the tray's "Open settings".
-    fn open_settings() {
-        match std::env::current_exe() {
-            Ok(exe) => {
-                let settings = exe.with_file_name("rewynd-settings");
-                if let Err(e) = std::process::Command::new(&settings).spawn() {
-                    tracing::warn!(error = %e, path = %settings.display(), "could not open settings");
-                }
+    /// Toast a save outcome, including the failures a user can act on.
+    async fn toast_save_outcome(saved: Result<Result<PathBuf, SaveError>, tokio::task::JoinError>) {
+        match saved {
+            Ok(Ok(path)) => tray::clip_saved_toast(&path).await,
+            Ok(Err(SaveError::Empty(reason))) => {
+                tray::toast("Nothing to save yet", &reason).await;
             }
-            Err(e) => tracing::warn!(error = %e, "could not locate the settings binary"),
+            Ok(Err(e @ SaveError::Write { .. })) => {
+                tracing::error!(error = %e, "clip save failed");
+                tray::toast("Could not save the clip", &e.to_string()).await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "save task failed");
+                tray::toast(
+                    "Could not save the clip",
+                    "The save task crashed; see the logs.",
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Launch the sibling settings binary for the tray's "Open settings", reaping the child in
+    /// the background (an unwaited child stays a zombie for the recorder's whole lifetime).
+    async fn open_settings() {
+        let Some(settings) = config::sibling_binary("rewynd-settings") else {
+            tray::toast(
+                "Could not open settings",
+                "The settings binary was not found.",
+            )
+            .await;
+            return;
+        };
+        match std::process::Command::new(&settings).spawn() {
+            Ok(mut child) => {
+                // A plain thread, NOT spawn_blocking: dropping the runtime at shutdown waits
+                // for blocking tasks, and this one parks until the settings window closes.
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, path = %settings.display(), "could not open settings");
+                tray::toast(
+                    "Could not open settings",
+                    &format!("{}: {e}", settings.display()),
+                )
+                .await;
+            }
         }
     }
 
@@ -411,9 +571,17 @@ mod linux {
         share_base: String,
     }
 
-    fn build_uploader(settings: rewynd_config::UploadSettings) -> Option<Uploader> {
+    /// Why there is (or isn't) an uploader — the tray tells the user different things for
+    /// "switched off" versus "misconfigured".
+    enum UploaderStatus {
+        Ready(Uploader),
+        Disabled,
+        BadUrl(String),
+    }
+
+    fn build_uploader(settings: rewynd_config::UploadSettings) -> UploaderStatus {
         if !settings.enabled {
-            return None;
+            return UploaderStatus::Disabled;
         }
         let vis = settings.visibility.trim();
         if !vis.eq_ignore_ascii_case("public") && !vis.eq_ignore_ascii_case("unlisted") {
@@ -424,14 +592,14 @@ mod linux {
             );
         }
         match rewynd_upload::GankedClient::new(&settings.api_url, &settings.api_key) {
-            Ok(client) => Some(Uploader {
+            Ok(client) => UploaderStatus::Ready(Uploader {
                 client,
                 visibility: rewynd_upload::Visibility::parse(vis),
                 share_base: settings.share_url,
             }),
             Err(e) => {
                 tracing::warn!(error = %e, "uploads unavailable: could not build the ganked.tv client");
-                None
+                UploaderStatus::BadUrl(e.to_string())
             }
         }
     }
@@ -470,21 +638,29 @@ mod linux {
             }
             Err(e) => {
                 tracing::error!(error = %e, path = %path.display(), "upload failed");
-                tray::toast("Upload failed", &e.to_string()).await;
+                tray::toast("Upload failed", &user_facing_upload_error(&e)).await;
             }
         }
     }
 
-    fn remember_clip(last: &SharedLastClip, path: &Path) {
-        *last
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path.to_path_buf());
+    /// Upload errors in words a user can act on; the full error goes to the log.
+    fn user_facing_upload_error(e: &rewynd_upload::UploadError) -> String {
+        use rewynd_upload::UploadError;
+        match e {
+            UploadError::Http(_) => {
+                "Could not reach ganked.tv — check your connection and the API server URL."
+                    .to_owned()
+            }
+            UploadError::Io(_) => "The clip file could not be read.".to_owned(),
+            other => other.to_string(),
+        }
     }
 
     /// Spawn a thread that captures `source`, applies `gain`, and sums each buffer into the
     /// shared `mixer`, aligned by its capture-relative PTS. A capture error is logged at a
     /// severity matching the source (a missing mic is benign; a failed system sink loses the
-    /// primary audio) and the thread exits — the mixer simply never sees that source.
+    /// primary audio, so that one also raises a [`RecorderEvent`]).
+    #[allow(clippy::too_many_arguments)]
     fn spawn_audio_capture(
         name: &str,
         source: AudioSource,
@@ -493,6 +669,7 @@ mod linux {
         mixer: SharedMixer,
         stop: &Arc<AtomicBool>,
         epoch: Instant,
+        events: Option<tokio::sync::mpsc::UnboundedSender<RecorderEvent>>,
     ) -> Result<std::thread::JoinHandle<()>> {
         let stop = stop.clone();
         let capture_params = AudioParams {
@@ -508,8 +685,10 @@ mod linux {
                 // stuck in one ear, system audio keeps its stereo image, and the configured
                 // gain is applied to each.
                 let mut prep = Vec::new();
+                let panicked = std::rc::Rc::new(std::cell::Cell::new(false));
                 // No idle timeout (capture runs until shutdown); the stop flag drives the
                 // watchdog so the loop quits promptly even if the endpoint suspends.
+                let panicked_flag = panicked.clone();
                 let result = capture_audio(
                     capture_params,
                     source,
@@ -517,39 +696,59 @@ mod linux {
                     Some(stop.clone()),
                     epoch,
                     move |pcm, pts| {
-                        let prepared = match source {
-                            AudioSource::Microphone => {
-                                center_mono_into(pcm, channels, &mut prep);
-                                apply_gain(&mut prep, gain);
-                                prep.as_slice()
+                        // A panic must not unwind across the PipeWire C callback boundary (UB);
+                        // treat it as a stream failure instead.
+                        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let prepared = match source {
+                                AudioSource::Microphone => {
+                                    center_mono_into(pcm, channels, &mut prep);
+                                    apply_gain(&mut prep, gain);
+                                    prep.as_slice()
+                                }
+                                // Only copy to scale when the gain isn't (near) unity; the
+                                // common gain == 1.0 case passes the buffer through untouched.
+                                // The predicate matches `apply_gain`'s own no-op threshold.
+                                AudioSource::SinkMonitor
+                                    if (gain - 1.0).abs() >= f32::EPSILON =>
+                                {
+                                    prep.clear();
+                                    prep.extend_from_slice(pcm);
+                                    apply_gain(&mut prep, gain);
+                                    prep.as_slice()
+                                }
+                                AudioSource::SinkMonitor => pcm,
+                            };
+                            lock_unpoisoned(&mixer).add(prepared, pts);
+                        }));
+                        match outcome {
+                            Ok(()) => ControlFlow::Continue(()),
+                            Err(_) => {
+                                tracing::error!("audio callback panicked; stopping this capture");
+                                panicked_flag.set(true);
+                                ControlFlow::Break(())
                             }
-                            // Only copy to scale when the gain isn't (near) unity; the common
-                            // gain == 1.0 case passes the buffer through untouched. The predicate
-                            // matches `apply_gain`'s own no-op threshold.
-                            AudioSource::SinkMonitor if (gain - 1.0).abs() >= f32::EPSILON => {
-                                prep.clear();
-                                prep.extend_from_slice(pcm);
-                                apply_gain(&mut prep, gain);
-                                prep.as_slice()
-                            }
-                            AudioSource::SinkMonitor => pcm,
-                        };
-                        mixer
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .add(prepared, pts);
-                        ControlFlow::Continue(())
+                        }
                     },
                 );
+                // A panic Break reads as a clean stream end; surface it like a capture error.
+                let result = match result {
+                    Ok(()) if panicked.get() => Err(rewynd_capture::CaptureError::PipeWire(
+                        "the audio callback panicked".to_owned(),
+                    )),
+                    other => other,
+                };
                 if let Err(e) = result {
                     // A missing mic is expected; a failed system sink means the clip loses its
-                    // primary audio, so surface that louder.
+                    // primary audio, so surface that louder (and to the tray).
                     match source {
                         AudioSource::Microphone => {
                             tracing::info!(error = %e, "no microphone capture; clips use system audio only");
                         }
                         AudioSource::SinkMonitor => {
                             tracing::error!(error = %e, "system-audio capture failed; clips will have no system sound");
+                            if let Some(events) = events {
+                                let _ = events.send(RecorderEvent::SystemAudioFailed(e.to_string()));
+                            }
                         }
                     }
                 }
@@ -573,39 +772,57 @@ mod linux {
         let enc = Rc::new(RefCell::new(GpuVideoEncoder::new(&gpu, params)?));
         tracing::info!("capture pipeline ready; filling the ring buffer");
 
-        capture_stream(node_id, fd, epoch, {
+        // Ask the compositor for the configured size/rate; whatever it actually delivers is
+        // scaled to the encoder's dimensions in the NV12 pass.
+        let prefs = StreamPrefs {
+            width: params.width,
+            height: params.height,
+            framerate: params.framerate,
+        };
+        // A callback Break reads as a clean stop to the stream; record the real reason so it
+        // still surfaces as this function's Err (and from there as a RecorderEvent).
+        let failure: Rc<std::cell::Cell<Option<&'static str>>> =
+            Rc::new(std::cell::Cell::new(None));
+        capture_stream(node_id, fd, epoch, prefs, Some(stop.clone()), {
             let gpu = gpu.clone();
             let conv = conv.clone();
             let enc = enc.clone();
             let stop = stop.clone();
+            let failure = failure.clone();
             let mut frame_index: u64 = 0;
             move |captured: CapturedDmabuf| -> ControlFlow<()> {
                 if stop.load(Ordering::Relaxed) {
                     return ControlFlow::Break(());
                 }
                 // Force an IDR on the very first frame so the buffer always has an early
-                // keyframe to cut on; the encoder's GOP supplies the rest.
-                match encode_captured(
-                    &gpu,
-                    &conv,
-                    &mut enc.borrow_mut(),
-                    captured,
-                    frame_index == 0,
-                ) {
-                    Ok(chunk) => {
+                // keyframe to cut on; the encoder's GOP supplies the rest. A wgpu panic must
+                // not unwind into the PipeWire C callback (UB) — catch it and stop cleanly.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    encode_captured(
+                        &gpu,
+                        &conv,
+                        &mut enc.borrow_mut(),
+                        params,
+                        captured,
+                        frame_index == 0,
+                    )
+                }));
+                match outcome {
+                    Ok(Ok(chunk)) => {
                         // The chunk carries the frame's real capture timestamp, so the
                         // window evicts by wall-clock time regardless of the capture rate.
-                        // Recover from a poisoned lock rather than panicking across the
-                        // PipeWire C callback boundary (which would be undefined behaviour).
-                        buffer
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push(chunk);
+                        lock_unpoisoned(&buffer).push(chunk);
                         frame_index += 1;
                         ControlFlow::Continue(())
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::error!(error = %e, "frame failed; stopping capture");
+                        failure.set(Some("a frame failed to encode"));
+                        ControlFlow::Break(())
+                    }
+                    Err(_) => {
+                        tracing::error!("frame panicked (GPU error?); stopping capture");
+                        failure.set(Some("the GPU pipeline panicked"));
                         ControlFlow::Break(())
                     }
                 }
@@ -615,53 +832,60 @@ mod linux {
         drop(enc);
         drop(conv);
         drop(gpu);
-        Ok(())
+        match failure.get() {
+            Some(reason) => Err(anyhow!("{reason} (see the log for details)")),
+            None => Ok(()),
+        }
     }
 
     /// Drain settled mixed audio from `mixer`, Opus-encode it, and push packets into the
     /// audio ring. Runs until `captures_done` is set — which the shutdown path raises only
     /// *after* the capture threads are joined, so the final `drain_all` catches every sample
-    /// they added (a tail the steady-state settle window would still be holding). The encoder
-    /// is built here so it stays on this thread; `epoch` matches the mixer's alignment clock.
+    /// they added. `drain_now` (raised by a clip save) forces an immediate full drain so the
+    /// clip's audio reaches the cut instant. The encoder is built here so it stays on this
+    /// thread; `epoch` matches the mixer's alignment clock.
     fn run_audio_mixer(
         epoch: Instant,
         audio_params: AudioEncodeParams,
         mixer: SharedMixer,
         buffer: SharedAudioBuffer,
         captures_done: &Arc<AtomicBool>,
+        drain_now: &Arc<AtomicBool>,
     ) -> Result<()> {
         let mut encoder = OpusAudioEncoder::new(audio_params)?;
         tracing::info!("audio pipeline ready; mixing system + mic into the audio ring");
 
         let push_packet = |buffer: &SharedAudioBuffer, chunk| {
-            buffer
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(chunk);
+            lock_unpoisoned(buffer).push(chunk);
         };
 
         loop {
             std::thread::sleep(AUDIO_DRAIN_INTERVAL);
             let finalize = captures_done.load(Ordering::Relaxed);
+            let drain_all = finalize || drain_now.load(Ordering::SeqCst);
 
-            // Drain under the mixer lock, encode outside it. Once finalizing, take the whole
-            // tail (ignoring the settle delay) since no more samples will arrive.
+            // Drain under the mixer lock, encode outside it. A full drain ignores the settle
+            // delay: at shutdown no more samples arrive; at a clip cut the last ~140 ms matter
+            // more than a mic that hasn't contributed to them yet.
             let drained = {
-                let mut guard = mixer
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if finalize {
+                let mut guard = lock_unpoisoned(&mixer);
+                if drain_all {
                     guard.drain_all()
                 } else {
                     guard.drain_settled(epoch.elapsed())
                 }
             };
-            if let Some((pts, pcm)) = drained {
-                if let Err(e) = encoder.push(&pcm, pts, |chunk| push_packet(&buffer, chunk)) {
-                    // Drop this chunk but keep mixing: a transient encode error shouldn't kill
-                    // audio for the rest of the session (and would skip the shutdown flush).
-                    tracing::error!(error = %e, "audio encode failed; dropping this chunk");
-                }
+            if let Some((pts, pcm)) = drained
+                && let Err(e) = encoder.push(&pcm, pts, |chunk| push_packet(&buffer, chunk))
+            {
+                // Drop this chunk but keep mixing: a transient encode error shouldn't kill
+                // audio for the rest of the session (and would skip the shutdown flush).
+                tracing::error!(error = %e, "audio encode failed; dropping this chunk");
+            }
+            // Cleared only after the drained packets are in the ring: the saver waits on this
+            // (also on the finalize pass, so a save racing shutdown is not left waiting).
+            if drain_all {
+                drain_now.store(false, Ordering::SeqCst);
             }
 
             if finalize {
@@ -675,11 +899,12 @@ mod linux {
         Ok(())
     }
 
-    /// One frame of the hot path: import the DMA-BUF, convert to NV12, encode.
+    /// One frame of the hot path: import the DMA-BUF, convert (and scale) to NV12, encode.
     fn encode_captured(
         gpu: &GpuContext,
         conv: &Nv12Converter,
         enc: &mut GpuVideoEncoder,
+        params: EncodeParams,
         captured: CapturedDmabuf,
         force_keyframe: bool,
     ) -> Result<EncodedChunk> {
@@ -707,210 +932,197 @@ mod linux {
         // SAFETY: `captured` came straight from the PipeWire negotiation, so the fd is a
         // valid single-plane DMA-BUF whose format/modifier/stride/offset match `import`.
         let texture = unsafe { gpu.import_dmabuf(import)? };
-        let nv12 = conv.convert(gpu, &texture);
+        let nv12 = conv.convert(gpu, &texture, params.width, params.height);
         Ok(enc.encode(&nv12, force_keyframe, pts)?)
     }
 
-    /// Write a minimal desktop entry for [`APP_ID`] under `$XDG_DATA_HOME/applications`
-    /// if one isn't already present. The GlobalShortcuts portal rejects an app id with
-    /// no installed desktop entry ("app info not found"); a packaged install ships this
-    /// file, so this only matters when running the unpackaged binary.
-    fn ensure_desktop_entry() -> Result<()> {
-        let data_home = std::env::var_os("XDG_DATA_HOME")
-            .map(std::path::PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .or_else(|| {
-                std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".local/share"))
-            })
-            .ok_or_else(|| anyhow!("neither XDG_DATA_HOME nor HOME is set"))?;
-
-        let path = data_home
-            .join("applications")
-            .join(format!("{APP_ID}.desktop"));
-        if path.exists() {
-            return Ok(());
-        }
-
-        let exec = std::env::current_exe()?;
-        let entry = config::desktop_entry(&exec, "Categories=AudioVideo;Recorder;\n");
-        std::fs::create_dir_all(path.parent().expect("path has a parent"))?;
-        std::fs::write(&path, entry)?;
-        tracing::info!(path = %path.display(), "wrote desktop entry for the global shortcut");
-        Ok(())
-    }
-
-    /// Register the global shortcut and flush a clip whenever it fires.
-    #[allow(clippy::too_many_arguments)]
+    /// Drive the global shortcut until shutdown: bind it, save a clip on every activation, and
+    /// re-bind (with backoff) if the portal session drops. A hotkey that cannot be (re)bound
+    /// degrades to tray-only saving instead of killing the recorder.
     async fn run_hotkey_loop(
-        buffer: &SharedBuffer,
-        audio_buffer: &SharedAudioBuffer,
-        params: EncodeParams,
-        audio_params: AudioEncodeParams,
-        buffer_window: Duration,
-        output_dir: Option<&Path>,
+        saver: Arc<ClipSaver>,
         hotkey_trigger: &str,
-        last_clip: &SharedLastClip,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
-        let shortcuts = GlobalShortcuts::new().await?;
-        let session = shortcuts.create_session(Default::default()).await?;
-        // Subscribe before binding so no early activation is missed.
-        let mut activated = shortcuts.receive_activated().await?;
-        let save_description = format!("Save the last {} seconds", buffer_window.as_secs());
-        let bound = shortcuts
-            .bind_shortcuts(
-                &session,
-                &[NewShortcut::new(SHORTCUT_ID, &save_description)
-                    .preferred_trigger(hotkey_trigger)],
-                None,
-                Default::default(),
-            )
-            .await?
-            .response()?;
-        for shortcut in bound.shortcuts() {
-            tracing::info!(
-                id = shortcut.id(),
-                trigger = shortcut.trigger_description(),
-                "bound shortcut"
-            );
-        }
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .context("installing the SIGTERM handler")?;
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .context("installing the SIGINT handler")?;
 
-        // A freshly bound shortcut often has no trigger yet (the preferred trigger is only
-        // a hint). Open the portal's configuration dialog so the user can assign a key to
-        // *this* shortcut — assigning it elsewhere won't deliver the activation signal.
-        let needs_trigger = bound
-            .shortcuts()
-            .iter()
-            .all(|s| s.trigger_description().is_empty());
-        if needs_trigger && shortcuts.version() >= 2 {
-            tracing::info!(
-                shortcut = %save_description,
-                "no trigger bound yet — opening the shortcut configuration dialog; assign a key to this shortcut"
-            );
-            if let Err(e) = shortcuts
-                .configure_shortcuts(&session, None, Default::default())
-                .await
-            {
-                tracing::warn!(error = %e, "could not open the shortcut configuration dialog");
+        let mut attempts: u32 = 0;
+        loop {
+            if *shutdown.borrow() {
+                return Ok(());
             }
-        }
-
-        tracing::info!(
-            shortcut = SHORTCUT_ID,
-            "global shortcut ready; press the configured key to save a clip"
-        );
-
-        while let Some(activation) = activated.next().await {
-            tracing::info!(shortcut_id = activation.shortcut_id(), "shortcut activated");
-            if activation.shortcut_id() == SHORTCUT_ID {
-                if let Some(path) = save_clip(
-                    buffer,
-                    audio_buffer,
-                    params,
-                    audio_params,
-                    buffer_window,
-                    output_dir,
-                ) {
-                    remember_clip(last_clip, &path);
-                    tray::clip_saved_toast(&path).await;
+            match bind_and_listen(
+                &saver,
+                hotkey_trigger,
+                &mut shutdown,
+                &mut sigterm,
+                &mut sigint,
+            )
+            .await
+            {
+                Ok(HotkeyExit::Shutdown) => return Ok(()),
+                Ok(HotkeyExit::SessionEnded { lasted }) => {
+                    // A session that ran for a while resets the budget: the counter guards
+                    // against a rapid rebind loop, not a compositor restarting once a week.
+                    if lasted > Duration::from_secs(60) {
+                        attempts = 0;
+                    }
+                    attempts += 1;
+                    if attempts > HOTKEY_REBIND_ATTEMPTS {
+                        tracing::error!("hotkey session keeps ending; continuing tray-only");
+                        tray::toast(
+                            "Hotkey unavailable",
+                            "The shortcut stopped working; use the tray's Save clip now.",
+                        )
+                        .await;
+                        wait_for_shutdown(&mut shutdown, &mut sigterm, &mut sigint).await;
+                        return Ok(());
+                    }
+                    let backoff = Duration::from_secs(2u64.pow(attempts));
+                    tracing::warn!(
+                        attempt = attempts,
+                        ?backoff,
+                        "hotkey session ended; rebinding"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(e) => {
+                    // No hotkey portal at all: the recorder still records; only the shortcut
+                    // is gone. Tell the user and park until shutdown.
+                    tracing::error!(error = %e, "global shortcut unavailable; tray-only mode");
+                    tray::toast(
+                        "Hotkey unavailable",
+                        "Clips can still be saved from the tray menu (Save clip now).",
+                    )
+                    .await;
+                    wait_for_shutdown(&mut shutdown, &mut sigterm, &mut sigint).await;
+                    return Ok(());
                 }
             }
         }
+    }
+
+    enum HotkeyExit {
+        Shutdown,
+        /// The portal session ended; `lasted` distinguishes a healthy long-lived session (a
+        /// compositor restart — rebinding is fine indefinitely) from a rapid failure loop.
+        SessionEnded {
+            lasted: Duration,
+        },
+    }
+
+    /// One bind-and-listen session of the GlobalShortcuts portal.
+    async fn bind_and_listen(
+        saver: &Arc<ClipSaver>,
+        hotkey_trigger: &str,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+        sigterm: &mut tokio::signal::unix::Signal,
+        sigint: &mut tokio::signal::unix::Signal,
+    ) -> Result<HotkeyExit> {
+        let shortcuts = GlobalShortcuts::new().await?;
+        let session = shortcuts.create_session(Default::default()).await?;
+        // From here on the session must be closed on EVERY path (its Drop does not send Close,
+        // and the shared D-Bus connection lives as long as the process), so the fallible rest
+        // runs in a block whose result is awaited before the close.
+        let started = Instant::now();
+        let result = async {
+            // Subscribe before binding so no early activation is missed.
+            let mut activated = shortcuts.receive_activated().await?;
+            let save_description = format!("Save the last {} seconds", saver_window_secs(saver));
+            let bound = shortcuts
+                .bind_shortcuts(
+                    &session,
+                    &[NewShortcut::new(SHORTCUT_ID, &save_description)
+                        .preferred_trigger(hotkey_trigger)],
+                    None,
+                    Default::default(),
+                )
+                .await?
+                .response()?;
+            for shortcut in bound.shortcuts() {
+                tracing::info!(
+                    id = shortcut.id(),
+                    trigger = shortcut.trigger_description(),
+                    "bound shortcut"
+                );
+            }
+
+            // A freshly bound shortcut often has no trigger yet (the preferred trigger is only
+            // a hint). Open the portal's configuration dialog so the user can assign a key to
+            // *this* shortcut — assigning it elsewhere won't deliver the activation signal.
+            let needs_trigger = bound
+                .shortcuts()
+                .iter()
+                .all(|s| s.trigger_description().is_empty());
+            if needs_trigger && shortcuts.version() >= 2 {
+                tracing::info!(
+                    shortcut = %save_description,
+                    "no trigger bound yet — opening the shortcut configuration dialog; assign a key to this shortcut"
+                );
+                if let Err(e) = shortcuts
+                    .configure_shortcuts(&session, None, Default::default())
+                    .await
+                {
+                    tracing::warn!(error = %e, "could not open the shortcut configuration dialog");
+                }
+            }
+
+            tracing::info!(
+                shortcut = SHORTCUT_ID,
+                "global shortcut ready; press the configured key to save a clip"
+            );
+
+            let exit = loop {
+                tokio::select! {
+                    activation = activated.next() => {
+                        let Some(activation) = activation else {
+                            break HotkeyExit::SessionEnded { lasted: started.elapsed() };
+                        };
+                        tracing::info!(shortcut_id = activation.shortcut_id(), "shortcut activated");
+                        if activation.shortcut_id() == SHORTCUT_ID {
+                            // Blocking cut + mux off the runtime worker so activations keep flowing.
+                            let s = saver.clone();
+                            let saved = tokio::task::spawn_blocking(move || s.save()).await;
+                            toast_save_outcome(saved).await;
+                        }
+                    }
+                    _ = shutdown.changed() => break HotkeyExit::Shutdown,
+                    _ = sigterm.recv() => {
+                        tracing::info!("SIGTERM received; shutting down");
+                        break HotkeyExit::Shutdown;
+                    }
+                    _ = sigint.recv() => {
+                        tracing::info!("SIGINT received; shutting down");
+                        break HotkeyExit::Shutdown;
+                    }
+                }
+            };
+            Ok(exit)
+        }
+        .await;
 
         session.close().await.ok();
-        Ok(())
+        result
     }
 
-    /// Cut the most recent `buffer_window` from both rings and write it to an MP4 under
-    /// `output_dir` (or the temp dir when `None`). Returns the written path on success so the
-    /// caller can show a notification (the toast is async, so it can't fire from here).
-    fn save_clip(
-        buffer: &SharedBuffer,
-        audio_buffer: &SharedAudioBuffer,
-        params: EncodeParams,
-        audio_params: AudioEncodeParams,
-        buffer_window: Duration,
-        output_dir: Option<&Path>,
-    ) -> Option<PathBuf> {
-        // Hold the lock only for the cut (which clones the clip's chunks), then release it
-        // so the capture thread keeps filling the buffer while we write the file.
-        let clip = buffer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .flush_last(buffer_window);
-        let chunks = match clip {
-            Ok(chunks) => chunks,
-            Err(e) => {
-                tracing::warn!(error = %e, "nothing to save yet");
-                return None;
-            }
-        };
-
-        // The clip starts at its first (keyframe) chunk; take the audio from that instant on
-        // — both PTS share the capture epoch, so this keeps the tracks aligned.
-        let clip_base = chunks.first().map_or(Duration::ZERO, |c| c.pts);
-        let audio_chunks = audio_buffer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .flush_from(clip_base);
-
-        let path = clip_output_path(output_dir);
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        let mut muxer = Mp4Muxer::new(params.width, params.height, params.framerate);
-        let result = if audio_chunks.is_empty() {
-            muxer.write_mp4(&chunks, &path)
-        } else {
-            let audio = AudioTrack {
-                chunks: &audio_chunks,
-                channels: audio_params.channels as u8,
-                sample_rate: audio_params.sample_rate,
-                // Mid-stream cut: the encoder startup priming isn't present at the clip's
-                // first packet, so don't trim (ADR 0004).
-                pre_skip: 0,
-            };
-            muxer.write_mp4_with_audio(&chunks, &audio, &path)
-        };
-
-        match result {
-            Ok(()) => {
-                let span = match (chunks.first(), chunks.last()) {
-                    (Some(first), Some(last)) => last.pts.saturating_sub(first.pts),
-                    _ => Duration::ZERO,
-                };
-                tracing::info!(
-                    path = %path.display(),
-                    frames = chunks.len(),
-                    audio_packets = audio_chunks.len(),
-                    span_s = span.as_secs_f64(),
-                    "saved clip"
-                );
-                Some(path)
-            }
-            Err(e) => {
-                tracing::error!(error = %e, path = %path.display(), "failed to write clip");
-                None
-            }
+    /// Park until shutdown is requested by the tray or a signal (degraded, tray-only mode).
+    async fn wait_for_shutdown(
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+        sigterm: &mut tokio::signal::unix::Signal,
+        sigint: &mut tokio::signal::unix::Signal,
+    ) {
+        tokio::select! {
+            _ = shutdown.changed() => {}
+            _ = sigterm.recv() => {}
+            _ = sigint.recv() => {}
         }
     }
 
-    /// Where to write a saved clip: `output_dir` if configured, else the user's Videos folder,
-    /// else the temp dir — with a millisecond-stamped, per-process-sequenced name. The sequence
-    /// number disambiguates two saves landing in the same millisecond (e.g. the dev-hook flush
-    /// racing a hotkey press), which a bare timestamp would collide on.
-    fn clip_output_path(output_dir: Option<&Path>) -> PathBuf {
-        use std::sync::atomic::AtomicU32;
-        static SEQ: AtomicU32 = AtomicU32::new(0);
-        let dir = output_dir
-            .map(Path::to_path_buf)
-            .or_else(config::default_output_dir)
-            .unwrap_or_else(std::env::temp_dir);
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis());
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        dir.join(format!("rewynd-{stamp}-{seq}.mp4"))
+    fn saver_window_secs(saver: &Arc<ClipSaver>) -> u64 {
+        saver.window().as_secs()
     }
 
     #[cfg(test)]
