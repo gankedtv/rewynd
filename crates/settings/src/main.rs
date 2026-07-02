@@ -15,23 +15,53 @@ use iced::theme::Palette;
 use iced::widget::{
     button, checkbox, column, container, pick_list, row, scrollable, slider, text, text_input,
 };
-use iced::{Background, Border, Element, Length, Task, Theme};
+use iced::{Background, Border, Element, Font, Length, Task, Theme, font};
 
 use rewynd_config::{self as config, Config};
 
-// Theme colours, kept in one place so restyling (or a future ganked.tv house style) is one edit.
+// The ganked.tv "Arena" design system (docs/design/arena.md): a near-black
+// surface ladder for depth (base → raised → high; the system forbids shadows), one mint accent
+// owning every interactive state (no red — errors are mint too), hairline borders.
 mod palette {
     use iced::Color;
-    pub const BACKGROUND: Color = Color::from_rgb8(0x0d, 0x11, 0x17);
-    pub const TEXT: Color = Color::from_rgb8(0xe6, 0xed, 0xf3);
-    pub const ACCENT: Color = Color::from_rgb8(0x22, 0xd3, 0xee);
-    pub const PANEL: Color = Color::from_rgb8(0x16, 0x1b, 0x22);
-    pub const BORDER: Color = Color::from_rgb8(0x2d, 0x33, 0x3b);
-    pub const SUCCESS: Color = Color::from_rgb8(0x3f, 0xb9, 0x50);
-    pub const WARNING: Color = Color::from_rgb8(0xf0, 0xb4, 0x29);
-    pub const DANGER: Color = Color::from_rgb8(0xf8, 0x51, 0x49);
-    pub const MUTED: Color = Color::from_rgb8(0x8b, 0x94, 0x9e);
+    /// Window background (surface-base).
+    pub const BACKGROUND: Color = Color::from_rgb8(0x0b, 0x0b, 0x0f);
+    /// Cards and panels (surface-raised).
+    pub const PANEL: Color = Color::from_rgb8(0x11, 0x11, 0x16);
+    /// Inputs, wells, control tracks (surface-high).
+    pub const HIGH: Color = Color::from_rgb8(0x18, 0x18, 0x1f);
+    pub const TEXT: Color = Color::from_rgb8(0xf0, 0xf0, 0xf4);
+    pub const TEXT_SECONDARY: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.50);
+    pub const MUTED: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.28);
+    pub const BORDER: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.07);
+    pub const BORDER_STRONG: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.12);
+    /// THE accent: mint. Primary buttons, active/focus states, values, links.
+    pub const ACCENT: Color = Color::from_rgb8(0x00, 0xe5, 0xa0);
+    /// Primary-button hover (brightness(1.06) over the accent).
+    pub const ACCENT_HOVER: Color = Color::from_rgb8(0x0d, 0xf3, 0xab);
+    pub const ACCENT_BG: Color = Color::from_rgba(0.0, 0.898, 0.627, 0.08);
+    pub const ACCENT_BORDER: Color = Color::from_rgba(0.0, 0.898, 0.627, 0.25);
+    /// Text/icon color on mint-filled surfaces.
+    pub const INK_ON_ACCENT: Color = Color::from_rgb8(0x08, 0x12, 0x0e);
 }
+
+/// Display face for headings: Barlow Condensed, always uppercase per the design.
+const DISPLAY_BLACK: Font = Font {
+    family: font::Family::Name("Barlow Condensed"),
+    weight: font::Weight::Black,
+    ..Font::DEFAULT
+};
+/// UI face: Inter (Regular is the default font; these are the heavier cuts).
+const UI_SEMIBOLD: Font = Font {
+    family: font::Family::Name("Inter"),
+    weight: font::Weight::Semibold,
+    ..Font::DEFAULT
+};
+const UI_BOLD: Font = Font {
+    family: font::Family::Name("Inter"),
+    weight: font::Weight::Bold,
+    ..Font::DEFAULT
+};
 
 /// Slider bounds (kept generous but sane).
 const GAIN_MAX: f32 = 4.0;
@@ -74,7 +104,26 @@ fn main() -> iced::Result {
     iced::application(App::load, App::update, App::view)
         .title("rewynd settings")
         .theme(App::theme)
-        .window_size((900.0, 900.0))
+        // Bundled faces (both OFL, licenses beside the files): the Arena design is set in
+        // Barlow Condensed (display) + Inter (UI); system fallbacks would break the look.
+        .font(include_bytes!("../assets/fonts/BarlowCondensed-Black.ttf").as_slice())
+        .font(include_bytes!("../assets/fonts/Inter-Regular.ttf").as_slice())
+        .font(include_bytes!("../assets/fonts/Inter-SemiBold.ttf").as_slice())
+        .font(include_bytes!("../assets/fonts/Inter-Bold.ttf").as_slice())
+        .default_font(Font {
+            family: font::Family::Name("Inter"),
+            ..Font::DEFAULT
+        })
+        .window(iced::window::Settings {
+            size: iced::Size::new(960.0, 780.0),
+            min_size: Some(iced::Size::new(720.0, 560.0)),
+            platform_specific: iced::window::settings::PlatformSpecific {
+                // Wayland app_id, so the compositor can match the window to our identity.
+                application_id: config::APP_ID.to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
         .centered()
         .run()
 }
@@ -151,21 +200,27 @@ struct App {
     /// entry when the toggle moved away from this, so an entry the user manages through their
     /// desktop environment is never clobbered by unrelated saves.
     applied_on_boot: bool,
+    /// Whether the last Save wrote the file — the Restart button only appears when restarting
+    /// would actually apply something.
+    last_save_ok: bool,
     login: LoginState,
     status: Status,
 }
 
 /// Where the ganked.tv device login stands. "Connected" is not a state here — it is derived from
 /// a non-empty API key.
-#[derive(Debug, Clone)]
 enum LoginState {
     Idle,
-    Starting,
+    Starting {
+        abort: iced::task::Handle,
+    },
     /// Waiting for browser approval: the user code plus the server's verification page (shown as
-    /// the fallback when the browser did not open — it may not be ganked.tv when self-hosting).
+    /// the fallback when the browser did not open — it may not be ganked.tv when self-hosting),
+    /// and the poll task's abort handle so Cancel actually stops the polling.
     Waiting {
         code: String,
         verification_uri: String,
+        abort: iced::task::Handle,
     },
     Failed(String),
 }
@@ -192,6 +247,7 @@ enum Message {
     LoginPressed,
     LoginStarted(Result<rewynd_upload::DeviceLogin, String>),
     LoginDone(Result<String, String>),
+    LoginCancelled,
     LogoutPressed,
     Save,
     Restart,
@@ -217,6 +273,7 @@ impl App {
             config,
             login: LoginState::Idle,
             status: Status::Editing,
+            last_save_ok: false,
         }
     }
 
@@ -237,9 +294,10 @@ impl App {
                 background: palette::BACKGROUND,
                 text: palette::TEXT,
                 primary: palette::ACCENT,
-                success: palette::SUCCESS,
-                warning: palette::WARNING,
-                danger: palette::DANGER,
+                // One-accent rule: the design has no green/amber/red; mint owns every state.
+                success: palette::ACCENT,
+                warning: palette::ACCENT,
+                danger: palette::ACCENT,
             },
         )
     }
@@ -329,48 +387,73 @@ impl App {
                 self.touch();
             }
             Message::LoginPressed => {
-                self.login = LoginState::Starting;
                 let base = self.effective_api_url();
-                return Task::perform(
+                let (task, abort) = Task::perform(
                     async move {
                         rewynd_upload::device_login_start(&base, "rewynd")
                             .await
                             .map_err(|e| e.to_string())
                     },
                     Message::LoginStarted,
-                );
+                )
+                .abortable();
+                self.login = LoginState::Starting { abort };
+                return task;
             }
             Message::LoginStarted(Ok(login)) => {
+                // A cancelled/stale start must not begin polling.
+                if !matches!(self.login, LoginState::Starting { .. }) {
+                    return Task::none();
+                }
                 if let Err(e) = open::that_detached(&login.verification_uri_complete) {
                     tracing::warn!(error = %e, "could not open the browser for approval");
                 }
-                self.login = LoginState::Waiting {
-                    code: login.user_code.clone(),
-                    verification_uri: login.verification_uri.clone(),
-                };
+                let code = login.user_code.clone();
+                let verification_uri = login.verification_uri.clone();
                 // The login itself remembers which server issued it; no base to recompute.
-                return Task::perform(
+                let (task, abort) = Task::perform(
                     async move {
                         rewynd_upload::device_login_wait(&login)
                             .await
                             .map_err(|e| e.to_string())
                     },
                     Message::LoginDone,
-                );
+                )
+                .abortable();
+                self.login = LoginState::Waiting {
+                    code,
+                    verification_uri,
+                    abort,
+                };
+                return task;
             }
-            Message::LoginStarted(Err(e)) => self.login = LoginState::Failed(e),
-            Message::LoginDone(Ok(key)) => {
-                // Logging in states intent: switch uploads on and persist right away.
-                self.api_key = key;
-                self.config.set_upload_enabled(true);
-                self.login = LoginState::Idle;
-                self.save();
+            Message::LoginStarted(Err(e)) => {
+                if matches!(self.login, LoginState::Starting { .. }) {
+                    self.login = LoginState::Failed(e);
+                }
             }
-            Message::LoginDone(Err(e)) => self.login = LoginState::Failed(e),
+            Message::LoginDone(result) => {
+                // Ignore a result that arrives after Cancel/Logout switched the state away.
+                if !matches!(self.login, LoginState::Waiting { .. }) {
+                    return Task::none();
+                }
+                match result {
+                    Ok(key) => {
+                        // Logging in states intent: switch uploads on and persist right away.
+                        self.api_key = key;
+                        self.config.set_upload_enabled(true);
+                        self.login = LoginState::Idle;
+                        self.save();
+                    }
+                    Err(e) => self.login = LoginState::Failed(e),
+                }
+            }
+            Message::LoginCancelled => self.abort_login(),
             Message::LogoutPressed => {
                 self.api_key.clear();
                 self.config.set_upload_enabled(false);
-                self.login = LoginState::Idle;
+                // A pending device login must not keep polling after an explicit logout.
+                self.abort_login();
                 self.save();
             }
             Message::Save => self.save(),
@@ -396,9 +479,19 @@ impl App {
         Task::none()
     }
 
-    /// Mark the form as having unsaved edits.
+    /// Mark the form as having unsaved edits (a restart would no longer apply what's on screen).
     fn touch(&mut self) {
         self.status = Status::Editing;
+        self.last_save_ok = false;
+    }
+
+    /// Stop whichever login task is in flight (the handles are manual-abort, not
+    /// abort-on-drop) and return to Idle.
+    fn abort_login(&mut self) {
+        match std::mem::replace(&mut self.login, LoginState::Idle) {
+            LoginState::Starting { abort } | LoginState::Waiting { abort, .. } => abort.abort(),
+            _ => {}
+        }
     }
 
     /// Fold the free-text mirrors into the config and write it to disk.
@@ -427,11 +520,18 @@ impl App {
             Some(path) => match self.config.save_to(&path) {
                 Ok(()) => {
                     tracing::info!(path = %path.display(), "saved config");
+                    self.last_save_ok = true;
                     self.apply_autostart()
                 }
-                Err(e) => Status::Error(format!("could not write {}: {e}", path.display())),
+                Err(e) => {
+                    self.last_save_ok = false;
+                    Status::Error(format!("could not write {}: {e}", path.display()))
+                }
             },
-            None => Status::Error("no config path (set $HOME or $XDG_CONFIG_HOME)".to_owned()),
+            None => {
+                self.last_save_ok = false;
+                Status::Error("no config path (set $HOME or $XDG_CONFIG_HOME)".to_owned())
+            }
         };
     }
 
@@ -487,7 +587,9 @@ impl App {
                 setting(
                     "Microphone volume",
                     format!("{:.2}x", self.config.mic_gain()),
-                    slider(0.0..=GAIN_MAX, self.config.mic_gain(), Message::MicGain).step(0.05),
+                    slider(0.0..=GAIN_MAX, self.config.mic_gain(), Message::MicGain)
+                        .step(0.05)
+                        .style(arena_slider),
                 ),
                 setting(
                     "System volume",
@@ -497,7 +599,8 @@ impl App {
                         self.config.system_gain(),
                         Message::SystemGain
                     )
-                    .step(0.05),
+                    .step(0.05)
+                    .style(arena_slider),
                 ),
             ]
             .spacing(18),
@@ -509,7 +612,8 @@ impl App {
                 setting(
                     "Replay length",
                     format!("{secs} s"),
-                    slider(BUFFER_MIN_S..=BUFFER_MAX_S, secs, Message::BufferSeconds),
+                    slider(BUFFER_MIN_S..=BUFFER_MAX_S, secs, Message::BufferSeconds)
+                        .style(arena_slider),
                 ),
                 setting(
                     "Resolution",
@@ -519,12 +623,14 @@ impl App {
                         Resolution::from_dims(v.width, v.height),
                         Message::ResolutionPicked,
                     )
+                    .style(arena_pick)
                     .width(Length::Fill),
                 ),
                 setting(
                     "Frame rate",
                     format!("{} fps", v.framerate),
                     pick_list(&FPS_OPTIONS[..], Some(v.framerate), Message::FpsPicked)
+                        .style(arena_pick)
                         .width(Length::Fill),
                 ),
                 setting(
@@ -534,7 +640,8 @@ impl App {
                         BITRATE_MIN_MBPS..=BITRATE_MAX_MBPS,
                         mbps,
                         Message::BitrateMbps
-                    ),
+                    )
+                    .style(arena_slider),
                 ),
                 value_row("Estimated clip size", format!("about {est_mb} MB")),
             ]
@@ -549,27 +656,35 @@ impl App {
             "OUTPUT & CAPTURE",
             column![
                 column![
-                    text("Save clips to").size(14),
+                    field_label("Save clips to"),
                     row![
                         text_input(&placeholder, &self.output_dir)
-                            .on_input(Message::OutputDirEdited),
-                        button("Browse").on_press(Message::BrowseDir),
+                            .on_input(Message::OutputDirEdited)
+                            .style(arena_input),
+                        button(text("Browse").size(12).font(UI_SEMIBOLD))
+                            .on_press(Message::BrowseDir)
+                            .style(secondary_button)
+                            .padding([10, 16]),
                     ]
                     .spacing(8),
                 ]
                 .spacing(8),
                 column![
-                    text("Hotkey").size(14),
-                    text_input("CTRL+ALT+R", &self.hotkey).on_input(Message::HotkeyEdited),
+                    field_label("Hotkey"),
+                    text_input("CTRL+ALT+R", &self.hotkey)
+                        .on_input(Message::HotkeyEdited)
+                        .style(arena_input),
                     hint("Your desktop may let you rebind this in its shortcut settings."),
                 ]
                 .spacing(6),
                 checkbox(self.config.always_prompt())
-                    .label("Re-pick the monitor on next launch")
-                    .on_toggle(Message::AlwaysPrompt),
+                    .label("Ask which monitor to record every time rewynd starts")
+                    .on_toggle(Message::AlwaysPrompt)
+                    .style(arena_check),
                 checkbox(self.config.start_on_boot())
                     .label("Start rewynd when I log in")
-                    .on_toggle(Message::StartOnBoot),
+                    .on_toggle(Message::StartOnBoot)
+                    .style(arena_check),
             ]
             .spacing(18),
         );
@@ -578,43 +693,71 @@ impl App {
         // invisibly. Connectedness is simply "a key is present".
         let account: Element<Message> = if !self.api_key.trim().is_empty() {
             row![
-                text("Connected to ganked.tv").size(14).width(Length::Fill),
-                button(text("Log out").size(13))
+                container(text("CONNECTED TO GANKED.TV").size(10).font(UI_BOLD).style(
+                    |_: &Theme| text::Style {
+                        color: Some(palette::ACCENT),
+                    }
+                ),)
+                .padding([5, 10])
+                .style(|_: &Theme| container::Style {
+                    background: Some(Background::Color(palette::ACCENT_BG)),
+                    border: Border {
+                        color: palette::ACCENT_BORDER,
+                        width: 1.0,
+                        radius: 5.0.into(),
+                    },
+                    ..container::Style::default()
+                }),
+                iced::widget::Space::new().width(Length::Fill),
+                button(text("Log out").size(11).font(UI_SEMIBOLD))
                     .on_press(Message::LogoutPressed)
-                    .style(button::secondary)
-                    .padding([6, 14]),
+                    .style(secondary_button)
+                    .padding([7, 14]),
             ]
             .align_y(iced::Alignment::Center)
             .into()
         } else {
             match &self.login {
                 LoginState::Idle => column![
-                    button(text("Log in with ganked.tv").size(14))
+                    button(text("Log in with ganked.tv").size(13).font(UI_BOLD))
                         .on_press(Message::LoginPressed)
-                        .padding([10, 20]),
+                        .style(primary_button)
+                        .padding([11, 20]),
                     hint("Approve rewynd in your browser; no password is stored on this device."),
                 ]
                 .spacing(6)
                 .into(),
-                LoginState::Starting => text("Contacting ganked.tv...").size(14).into(),
+                LoginState::Starting { .. } => column![
+                    text("Contacting ganked.tv...").size(13),
+                    button(text("Cancel").size(11).font(UI_SEMIBOLD))
+                        .on_press(Message::LoginCancelled)
+                        .style(secondary_button)
+                        .padding([6, 14]),
+                ]
+                .spacing(7)
+                .into(),
                 LoginState::Waiting {
                     code,
                     verification_uri,
+                    ..
                 } => column![
-                    text(format!("Approve in your browser with code {code}")).size(14),
+                    text(format!("Approve in your browser with code {code}")).size(13),
                     hint(format!(
                         "Browser did not open? Go to {verification_uri} and enter the code."
                     )),
+                    button(text("Cancel").size(11).font(UI_SEMIBOLD))
+                        .on_press(Message::LoginCancelled)
+                        .style(secondary_button)
+                        .padding([6, 14]),
                 ]
-                .spacing(6)
+                .spacing(7)
                 .into(),
                 LoginState::Failed(e) => column![
-                    button(text("Log in with ganked.tv").size(14))
+                    button(text("Log in with ganked.tv").size(13).font(UI_BOLD))
                         .on_press(Message::LoginPressed)
-                        .padding([10, 20]),
-                    text(e.clone()).size(12).style(|_: &Theme| text::Style {
-                        color: Some(palette::DANGER),
-                    }),
+                        .style(primary_button)
+                        .padding([11, 20]),
+                    text(e.clone()).size(12).style(tinted(palette::ACCENT)),
                 ]
                 .spacing(6)
                 .into(),
@@ -627,7 +770,8 @@ impl App {
                 account,
                 checkbox(self.config.upload_enabled())
                     .label("Enable uploads (tray: Upload last clip)")
-                    .on_toggle(Message::UploadEnabled),
+                    .on_toggle(Message::UploadEnabled)
+                    .style(arena_check),
                 setting(
                     "Visibility",
                     rewynd_upload::Visibility::parse(self.config.upload_visibility()).to_string(),
@@ -636,26 +780,30 @@ impl App {
                         Some(rewynd_upload::Visibility::parse(self.config.upload_visibility())),
                         Message::VisibilityPicked,
                     )
+                    .style(arena_pick)
                     .width(Length::Fill),
                 ),
                 column![
-                    text("API server").size(14),
+                    field_label("API server"),
                     text_input(config::DEFAULT_UPLOAD_API_URL, &self.api_url)
-                        .on_input(Message::ApiUrlEdited),
+                        .on_input(Message::ApiUrlEdited)
+                        .style(arena_input),
                 ]
                 .spacing(6),
                 column![
-                    text("Share links").size(14),
+                    field_label("Share links"),
                     text_input(config::DEFAULT_UPLOAD_SHARE_URL, &self.share_url)
-                        .on_input(Message::ShareUrlEdited),
+                        .on_input(Message::ShareUrlEdited)
+                        .style(arena_input),
                     hint("Leave both empty for ganked.tv. Self-hosting? An API key can be pasted below."),
                 ]
                 .spacing(6),
                 column![
-                    text("API key (advanced)").size(14),
+                    field_label("API key (advanced)"),
                     text_input("gtv_...", &self.api_key)
                         .secure(true)
-                        .on_input(Message::ApiKeyEdited),
+                        .on_input(Message::ApiKeyEdited)
+                        .style(arena_input),
                 ]
                 .spacing(6),
             ]
@@ -663,26 +811,30 @@ impl App {
         );
 
         let header = column![
-            text("rewynd settings").size(28),
-            hint("Tune how clips are captured and where they are saved. Changes take effect the next time you clip."),
+            text("SETTINGS").size(32).font(DISPLAY_BLACK),
+            hint(
+                "Most changes apply after Save + Restart rewynd now; the ganked.tv upload \
+                 settings apply immediately.",
+            ),
         ]
         .spacing(6);
 
         let mut save_items: Vec<Element<Message>> = vec![
-            button(text("Save settings").size(15))
+            button(text("Save settings").size(13).font(UI_BOLD))
                 .on_press(Message::Save)
-                .padding([12, 28])
+                .style(primary_button)
+                .padding([13, 28])
                 .into(),
             status_line(&self.status),
         ];
-        // Offer a one-click restart once the file is saved (and let it retry after a failed one),
-        // since changes only apply on restart. Hidden while a restart is in flight.
-        if matches!(self.status, Status::Saved | Status::Error(_)) {
+        // Offer a one-click restart once a save actually landed (a failed save has nothing to
+        // apply; a failed restart may be retried). Hidden while a restart is in flight.
+        if self.last_save_ok && !matches!(self.status, Status::Restarting) {
             save_items.push(
-                button(text("Restart rewynd now").size(14))
+                button(text("Restart rewynd now").size(12).font(UI_SEMIBOLD))
                     .on_press(Message::Restart)
-                    .padding([8, 22])
-                    .style(button::secondary)
+                    .padding([9, 22])
+                    .style(secondary_button)
                     .into(),
             );
         }
@@ -733,28 +885,159 @@ fn normalize(c: &mut Config) {
     c.set_video(v);
 }
 
-/// A grouped settings card: an accent title over its content, on a raised rounded panel.
+/// A grouped settings card, Arena style: raised panel, hairline border, 8px radius, with the
+/// title as a small uppercase eyebrow (accent, like the design's active wizard cards).
 fn card<'a>(title: &'a str, content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     let inner = column![
-        text(title).size(13).style(|_: &Theme| text::Style {
-            color: Some(palette::ACCENT),
-        }),
+        text(title)
+            .size(10)
+            .font(UI_BOLD)
+            .style(tinted(palette::ACCENT)),
         content.into(),
     ]
-    .spacing(16);
+    .spacing(14);
     container(inner)
         .width(Length::Fill)
-        .padding(20)
+        .padding(18)
         .style(|_: &Theme| container::Style {
             background: Some(Background::Color(palette::PANEL)),
             border: Border {
                 color: palette::BORDER,
                 width: 1.0,
-                radius: 14.0.into(),
+                radius: 8.0.into(),
             },
             ..container::Style::default()
         })
         .into()
+}
+
+/// Primary (mint) button per the Arena spec: filled accent, ink text, 8px radius.
+fn primary_button(_theme: &Theme, status: button::Status) -> button::Style {
+    let background = match status {
+        button::Status::Hovered | button::Status::Pressed => palette::ACCENT_HOVER,
+        _ => palette::ACCENT,
+    };
+    button::Style {
+        background: Some(Background::Color(background)),
+        text_color: palette::INK_ON_ACCENT,
+        border: Border {
+            radius: 8.0.into(),
+            ..Border::default()
+        },
+        ..button::Style::default()
+    }
+}
+
+/// Secondary (outline) button: transparent, strong hairline; hover turns mint.
+fn secondary_button(_theme: &Theme, status: button::Status) -> button::Style {
+    let (border_color, text_color) = match status {
+        button::Status::Hovered | button::Status::Pressed => (palette::ACCENT, palette::ACCENT),
+        _ => (palette::BORDER_STRONG, palette::TEXT_SECONDARY),
+    };
+    button::Style {
+        background: None,
+        text_color,
+        border: Border {
+            color: border_color,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        ..button::Style::default()
+    }
+}
+
+/// Text-input shell: surface-high well, 6px radius, mint border when focused.
+fn arena_input(_theme: &Theme, status: text_input::Status) -> text_input::Style {
+    let border_color = match status {
+        text_input::Status::Focused { .. } => palette::ACCENT,
+        text_input::Status::Hovered => palette::BORDER_STRONG,
+        _ => palette::BORDER,
+    };
+    text_input::Style {
+        background: Background::Color(palette::HIGH),
+        border: Border {
+            color: border_color,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        icon: palette::TEXT_SECONDARY,
+        placeholder: palette::MUTED,
+        value: palette::TEXT,
+        selection: palette::ACCENT_BORDER,
+    }
+}
+
+/// Dropdown shell, styled like an input.
+fn arena_pick(_theme: &Theme, status: pick_list::Status) -> pick_list::Style {
+    let border_color = match status {
+        pick_list::Status::Hovered | pick_list::Status::Opened { .. } => palette::BORDER_STRONG,
+        _ => palette::BORDER,
+    };
+    pick_list::Style {
+        text_color: palette::TEXT,
+        placeholder_color: palette::MUTED,
+        handle_color: palette::TEXT_SECONDARY,
+        background: Background::Color(palette::HIGH),
+        border: Border {
+            color: border_color,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+    }
+}
+
+/// Checkbox: surface-high box, mint fill + ink check when on.
+fn arena_check(_theme: &Theme, status: checkbox::Status) -> checkbox::Style {
+    let checked = matches!(
+        status,
+        checkbox::Status::Active { is_checked: true }
+            | checkbox::Status::Hovered { is_checked: true }
+            | checkbox::Status::Disabled { is_checked: true }
+    );
+    let hovered = matches!(status, checkbox::Status::Hovered { .. });
+    checkbox::Style {
+        background: Background::Color(if checked {
+            palette::ACCENT
+        } else {
+            palette::HIGH
+        }),
+        icon_color: palette::INK_ON_ACCENT,
+        border: Border {
+            color: if checked {
+                palette::ACCENT
+            } else if hovered {
+                palette::BORDER_STRONG
+            } else {
+                palette::BORDER
+            },
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        text_color: Some(palette::TEXT),
+    }
+}
+
+/// Slider: thin surface-high rail with a mint filled side and a mint round handle.
+fn arena_slider(_theme: &Theme, _status: slider::Status) -> slider::Style {
+    slider::Style {
+        rail: slider::Rail {
+            backgrounds: (
+                Background::Color(palette::ACCENT),
+                Background::Color(palette::HIGH),
+            ),
+            width: 6.0,
+            border: Border {
+                radius: 3.0.into(),
+                ..Border::default()
+            },
+        },
+        handle: slider::Handle {
+            shape: slider::HandleShape::Circle { radius: 8.0 },
+            background: Background::Color(palette::ACCENT),
+            border_width: 0.0,
+            border_color: palette::ACCENT,
+        },
+    }
 }
 
 /// One setting: the label on the left, its current value on the right (accent), and the control
@@ -765,29 +1048,43 @@ fn setting<'a>(
     control: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
     column![value_row(label, value), control.into()]
-        .spacing(8)
+        .spacing(7)
         .into()
 }
 
 /// A label (left) and a value (right, accent) on one row — also used for read-only readouts.
 fn value_row<'a>(label: &'a str, value: String) -> Element<'a, Message> {
     row![
-        text(label).size(14).width(Length::Fill),
-        text(value).size(14).style(|_: &Theme| text::Style {
-            color: Some(palette::ACCENT),
-        }),
+        text(label)
+            .size(12)
+            .font(UI_SEMIBOLD)
+            .style(tinted(palette::TEXT_SECONDARY))
+            .width(Length::Fill),
+        text(value)
+            .size(12)
+            .font(UI_SEMIBOLD)
+            .style(tinted(palette::ACCENT)),
     ]
     .into()
 }
 
+/// A text style closure for one fixed color.
+fn tinted(color: iced::Color) -> impl Fn(&Theme) -> text::Style {
+    move |_| text::Style { color: Some(color) }
+}
+
+/// Arena field label: small, bold, uppercase, secondary.
+fn field_label<'a>(s: &str) -> Element<'a, Message> {
+    text(s.to_uppercase())
+        .size(10)
+        .font(UI_BOLD)
+        .style(tinted(palette::TEXT_SECONDARY))
+        .into()
+}
+
 /// Muted hint text.
 fn hint<'a>(s: impl Into<String>) -> Element<'a, Message> {
-    text(s.into())
-        .size(12)
-        .style(|_: &Theme| text::Style {
-            color: Some(palette::MUTED),
-        })
-        .into()
+    text(s.into()).size(11).style(tinted(palette::MUTED)).into()
 }
 
 /// The save-status line under the Save button.
@@ -796,19 +1093,16 @@ fn status_line(status: &Status) -> Element<'_, Message> {
         Status::Editing => (String::new(), palette::MUTED),
         Status::Saved => (
             "Saved. Restart rewynd to apply the changes.".to_owned(),
-            palette::SUCCESS,
+            palette::ACCENT,
         ),
         Status::Restarting => ("Restarting rewynd...".to_owned(), palette::MUTED),
         Status::Restarted => (
             "Restarted rewynd with the new settings.".to_owned(),
-            palette::SUCCESS,
+            palette::ACCENT,
         ),
-        Status::Error(e) => (e.clone(), palette::DANGER),
+        Status::Error(e) => (e.clone(), palette::ACCENT),
     };
-    text(msg)
-        .size(13)
-        .style(move |_: &Theme| text::Style { color: Some(color) })
-        .into()
+    text(msg).size(12).style(tinted(color)).into()
 }
 
 /// The recorder binary, expected as a sibling of this settings binary.
