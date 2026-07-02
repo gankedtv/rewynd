@@ -11,9 +11,9 @@ use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
     CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection, CreateFontW, DEFAULT_CHARSET,
     DIB_RGB_COLORS, DT_CALCRECT, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DeleteDC,
-    DeleteObject, DrawTextW, FF_DONTCARE, FW_SEMIBOLD, GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY,
-    MONITORINFO, MonitorFromWindow, OUT_DEFAULT_PRECIS, PROOF_QUALITY, SelectObject, SetBkMode,
-    SetTextColor, TRANSPARENT, VARIABLE_PITCH,
+    DeleteObject, DrawTextW, FF_DONTCARE, FW_SEMIBOLD, GetMonitorInfoW, HDC,
+    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromWindow, OUT_DEFAULT_PRECIS, PROOF_QUALITY,
+    SelectObject, SetBkMode, SetTextColor, TRANSPARENT, VARIABLE_PITCH,
 };
 use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
@@ -90,17 +90,16 @@ pub fn show(accent: Accent, text: &str) {
 fn show_badge(accent: Accent, text: &str) -> windows::core::Result<()> {
     // SAFETY: trivially safe FFI (module handle of our own process).
     let instance = unsafe { GetModuleHandleW(None)? };
-    let class = w!("rewynd.overlay");
     static REGISTER: std::sync::Once = std::sync::Once::new();
     REGISTER.call_once(|| {
         let wc = WNDCLASSW {
             lpfnWndProc: Some(badge_proc),
             hInstance: instance.into(),
-            lpszClassName: class,
+            lpszClassName: badge_class(),
             ..Default::default()
         };
-        // SAFETY: trivially safe FFI; 0 (already registered / failure) surfaces
-        // as a CreateWindowExW error below.
+        // SAFETY: trivially safe FFI; 0 (failure) surfaces as a CreateWindowExW
+        // error below.
         let _ = unsafe { RegisterClassW(&wc) };
     });
 
@@ -116,12 +115,33 @@ fn show_badge(accent: Accent, text: &str) -> windows::core::Result<()> {
     let (mut dpi_x, mut dpi_y) = (96_u32, 96_u32);
     // SAFETY: valid monitor handle and out-pointers.
     let _ = unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
-    let scale = |px: i32| px * dpi_x as i32 / 96;
 
-    // Measure the text, then size the badge: accent bar + padded single line.
-    // SAFETY: GDI resource creation/selection with paired cleanup below.
+    let hwnd = build_badge(accent, text, info.rcMonitor, dpi_x)?;
+
+    // Pump until the WM_TIMER -> DestroyWindow -> PostQuitMessage chain ends us.
+    let mut msg = MSG::default();
+    // SAFETY: FFI; drains this thread's own queue.
+    while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
+        // SAFETY: FFI on a message this thread owns.
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    let _ = hwnd; // destroyed by badge_proc
+    Ok(())
+}
+
+/// Measure the text and paint + place the badge window. Split into layers so every
+/// early error return still unwinds the GDI objects created before it.
+fn build_badge(accent: Accent, text: &str, monitor: RECT, dpi: u32) -> windows::core::Result<HWND> {
+    let scale = |px: i32| px * dpi as i32 / 96;
+    // SAFETY: GDI resource creation with paired cleanup before every return.
     unsafe {
         let dc = CreateCompatibleDC(None);
+        if dc.is_invalid() {
+            return Err(windows::core::Error::from_thread());
+        }
         let font = CreateFontW(
             -scale(16),
             0,
@@ -141,7 +161,25 @@ fn show_badge(accent: Accent, text: &str) -> windows::core::Result<()> {
             w!("Segoe UI"),
         );
         let old_font = SelectObject(dc, font.into());
+        let placed = paint_badge(dc, accent, text, monitor, scale);
+        SelectObject(dc, old_font);
+        let _ = DeleteObject(font.into());
+        let _ = DeleteDC(dc);
+        placed
+    }
+}
 
+/// Inner layer of [`build_badge`]: the DIB the badge is drawn into. The caller owns
+/// the DC and the font already selected into it.
+fn paint_badge(
+    dc: HDC,
+    accent: Accent,
+    text: &str,
+    monitor: RECT,
+    scale: impl Fn(i32) -> i32,
+) -> windows::core::Result<HWND> {
+    // SAFETY: GDI painting into a DIB owned (and cleaned up) by this function.
+    unsafe {
         let mut wide: Vec<u16> = text.encode_utf16().collect();
         let mut measure = RECT::default();
         DrawTextW(
@@ -152,12 +190,11 @@ fn show_badge(accent: Accent, text: &str) -> windows::core::Result<()> {
         );
         let bar = scale(4);
         let (pad_x, pad_y) = (scale(14), scale(12));
-        let max_text = scale(560);
-        let text_w = (measure.right - measure.left).min(max_text);
+        let text_w = (measure.right - measure.left).min(scale(560));
         let text_h = measure.bottom - measure.top;
         let (w, h) = (bar + pad_x + text_w + pad_x, text_h + 2 * pad_y);
 
-        // 32-bit top-down DIB the badge is drawn into.
+        // 32-bit top-down DIB.
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -201,64 +238,65 @@ fn show_badge(accent: Accent, text: &str) -> windows::core::Result<()> {
         }
 
         let pos = POINT {
-            x: info.rcMonitor.right - w - scale(24),
-            y: info.rcMonitor.top + scale(24),
+            x: monitor.right - w - scale(24),
+            y: monitor.top + scale(24),
         };
+        let shown = place_badge(dc, pos, SIZE { cx: w, cy: h });
+
+        // The layered surface owns a copy of the pixels now; the GDI sources can go.
+        SelectObject(dc, old_bitmap);
+        let _ = DeleteObject(bitmap.into());
+        shown
+    }
+}
+
+/// Innermost layer: the layered window itself, fed from the painted DC. A window
+/// that fails to take the surface is destroyed on the spot, not leaked.
+fn place_badge(dc: HDC, pos: POINT, size: SIZE) -> windows::core::Result<HWND> {
+    // SAFETY: window creation on this thread, destroyed by badge_proc (or here on error).
+    unsafe {
         let hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-            class,
+            badge_class(),
             PCWSTR::null(),
             WS_POPUP,
             pos.x,
             pos.y,
-            w,
-            h,
+            size.cx,
+            size.cy,
             None,
             None,
-            Some(instance.into()),
+            GetModuleHandleW(None).ok().map(|m| m.into()),
             None,
-        );
-
-        let shown = hwnd.and_then(|hwnd| {
-            let blend = BLENDFUNCTION {
-                BlendOp: AC_SRC_OVER as u8,
-                SourceConstantAlpha: BADGE_ALPHA,
-                AlphaFormat: AC_SRC_ALPHA as u8,
-                ..Default::default()
-            };
-            UpdateLayeredWindow(
-                hwnd,
-                None,
-                Some(&pos),
-                Some(&SIZE { cx: w, cy: h }),
-                Some(dc),
-                Some(&POINT::default()),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            )?;
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            SetTimer(Some(hwnd), 1, BADGE_MS, None);
-            Ok(hwnd)
-        });
-
-        // The layered surface owns a copy of the pixels now; the GDI sources can go.
-        SelectObject(dc, old_bitmap);
-        SelectObject(dc, old_font);
-        let _ = DeleteObject(bitmap.into());
-        let _ = DeleteObject(font.into());
-        let _ = DeleteDC(dc);
-        let hwnd = shown?;
-
-        // Pump until the WM_TIMER -> DestroyWindow -> PostQuitMessage chain ends us.
-        let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        )?;
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            SourceConstantAlpha: BADGE_ALPHA,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+            ..Default::default()
+        };
+        if let Err(e) = UpdateLayeredWindow(
+            hwnd,
+            None,
+            Some(&pos),
+            Some(&size),
+            Some(dc),
+            Some(&POINT::default()),
+            COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        ) {
+            let _ = DestroyWindow(hwnd);
+            return Err(e);
         }
-        let _ = hwnd; // destroyed by badge_proc
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        SetTimer(Some(hwnd), 1, BADGE_MS, None);
+        Ok(hwnd)
     }
-    Ok(())
+}
+
+fn badge_class() -> PCWSTR {
+    w!("rewynd.overlay")
 }
 
 unsafe extern "system" fn badge_proc(
