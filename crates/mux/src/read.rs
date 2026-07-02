@@ -118,7 +118,9 @@ fn avcc_to_annexb(sample: &[u8], out: &mut Vec<u8>) -> Result<(), ReadError> {
     while !rest.is_empty() {
         let (prefix, tail) = rest.split_at_checked(4).ok_or(ReadError::MalformedSample)?;
         let len = u32::from_be_bytes(prefix.try_into().expect("split_at gave 4 bytes")) as usize;
-        let (nal, tail) = tail.split_at_checked(len).ok_or(ReadError::MalformedSample)?;
+        let (nal, tail) = tail
+            .split_at_checked(len)
+            .ok_or(ReadError::MalformedSample)?;
         if nal.is_empty() {
             return Err(ReadError::MalformedSample);
         }
@@ -227,7 +229,10 @@ mod tests {
     fn garbage_file_is_an_mp4_error() {
         let out = TempMp4::new();
         std::fs::write(&out.0, b"this is not an mp4 at all").expect("write");
-        assert!(matches!(clip_summary(&out.0).unwrap_err(), ReadError::Mp4(_)));
+        assert!(matches!(
+            clip_summary(&out.0).unwrap_err(),
+            ReadError::Mp4(_)
+        ));
         assert!(matches!(
             first_keyframe_annexb(&out.0).unwrap_err(),
             ReadError::Mp4(_)

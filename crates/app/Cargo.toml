@@ -23,7 +23,7 @@ rewynd-config.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 rewynd-capture.workspace = true
 rewynd-gpu.workspace = true
-rewynd-clip.workspace = true
+rewynd-clip = { workspace = true, features = ["saver"] }
 ashpd = { workspace = true, features = ["global_shortcuts"] }
 # macros/sync drive the select!-based hotkey loop; signal funnels SIGTERM/SIGINT through the
 # same orderly shutdown as tray Quit.
@@ -44,7 +44,7 @@ jiff.workspace = true
 [target.'cfg(target_os = "windows")'.dependencies]
 rewynd-capture.workspace = true
 rewynd-gpu.workspace = true
-rewynd-clip.workspace = true
+rewynd-clip = { workspace = true, features = ["saver"] }
 tokio = { workspace = true, features = ["signal"] }
 pollster.workspace = true
 notify-rust = "4"

@@ -37,7 +37,9 @@ rewynd-buffer = { path = "crates/buffer" }
 rewynd-mux = { path = "crates/mux" }
 rewynd-upload = { path = "crates/upload" }
 rewynd-config = { path = "crates/config" }
-rewynd-clip = { path = "crates/clip" }
+# No default features at the workspace level: the settings GUI takes the clip *store* only,
+# while the recorder opts back into the full saver (ring buffers + encoder + muxer).
+rewynd-clip = { path = "crates/clip", default-features = false }
 
 # GPU stack — pinned in lockstep per docs/adr/0001-wgpu-rev.md.
 # Both crates resolve to the SAME wgpu source so wgpu::Texture types unify across

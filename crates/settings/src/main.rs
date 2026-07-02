@@ -1,16 +1,19 @@
-//! rewynd settings — a small, modern iced GUI to view and edit the config file
-//! (`$XDG_CONFIG_HOME/rewynd/config.toml`).
+//! rewynd — the app window: the clip LIBRARY (default view) and the settings editor for the
+//! config file (`$XDG_CONFIG_HOME/rewynd/config.toml`).
 //!
-//! It edits the same file the recorder reads (the file is the single source of truth, so no
-//! IPC). Changes apply on the recorder's next clip / restart — the window says so after saving;
-//! live-reload is a future refinement.
+//! Settings edits the same file the recorder reads (the file is the single source of truth, so
+//! no IPC). Changes apply on the recorder's next clip / restart — the window says so after
+//! saving; live-reload is a future refinement.
 //!
-//! Rendered with iced's tiny-skia software backend (no GPU) and a custom dark theme. The window
-//! needs a display to run, so there is no headless test of `run`; the pure mapping helpers are
-//! unit-tested.
+//! Rendered with iced's tiny-skia software backend (no GPU) and the Arena theme (`theme`).
+//! The window needs a display to run, so there is no headless test of `run`; the pure mapping
+//! helpers are unit-tested.
+
+mod library;
+mod theme;
+mod thumbs;
 
 use std::fmt;
-use std::sync::LazyLock;
 
 use iced::theme::Palette;
 use iced::widget::{
@@ -20,51 +23,10 @@ use iced::{Background, Border, Element, Font, Length, Task, Theme, font};
 
 use rewynd_config::{self as config, Config};
 
-// The ganked.tv "Arena" design system (docs/design/arena.md): a near-black
-// surface ladder for depth (base → raised → high; the system forbids shadows), one mint accent
-// owning every interactive state (no red — errors are mint too), hairline borders.
-mod palette {
-    use iced::Color;
-    /// Window background (surface-base).
-    pub const BACKGROUND: Color = Color::from_rgb8(0x0b, 0x0b, 0x0f);
-    /// Cards and panels (surface-raised).
-    pub const PANEL: Color = Color::from_rgb8(0x11, 0x11, 0x16);
-    /// Inputs, wells, control tracks (surface-high).
-    pub const HIGH: Color = Color::from_rgb8(0x18, 0x18, 0x1f);
-    pub const TEXT: Color = Color::from_rgb8(0xf0, 0xf0, 0xf4);
-    pub const TEXT_SECONDARY: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.50);
-    pub const MUTED: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.28);
-    pub const BORDER: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.07);
-    pub const BORDER_STRONG: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.12);
-    /// THE accent: mint. Primary buttons, active/focus states, values, links.
-    pub const ACCENT: Color = Color::from_rgb8(0x00, 0xe5, 0xa0);
-    /// Error text — the one deviation from the one-accent rule: a failure must
-    /// never read as success-mint.
-    pub const DANGER: Color = Color::from_rgb8(0xff, 0x5a, 0x5f);
-    /// Primary-button hover (brightness(1.06) over the accent).
-    pub const ACCENT_HOVER: Color = Color::from_rgb8(0x0d, 0xf3, 0xab);
-    pub const ACCENT_BG: Color = Color::from_rgba(0.0, 0.898, 0.627, 0.08);
-    pub const ACCENT_BORDER: Color = Color::from_rgba(0.0, 0.898, 0.627, 0.25);
-    /// Text/icon color on mint-filled surfaces.
-    pub const INK_ON_ACCENT: Color = Color::from_rgb8(0x08, 0x12, 0x0e);
-}
-
-/// Display face for headings: Barlow Condensed, always uppercase per the design.
-const DISPLAY_BLACK: Font = Font {
-    family: font::Family::Name("Barlow Condensed"),
-    weight: font::Weight::Black,
-    ..Font::DEFAULT
-};
-/// UI face: Inter (Regular is the default font; these are the heavier cuts).
-const UI_SEMIBOLD: Font = Font {
-    family: font::Family::Name("Inter"),
-    weight: font::Weight::Semibold,
-    ..Font::DEFAULT
-};
-const UI_BOLD: Font = Font {
-    family: font::Family::Name("Inter"),
-    weight: font::Weight::Bold,
-    ..Font::DEFAULT
+use crate::theme::{
+    DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, arena_check, arena_input, arena_pick, arena_slider, card,
+    field, field_label, hint, link_button, logo, oauth_button, palette, primary_button,
+    secondary_button, setting, tinted, value_row, window_icon,
 };
 
 /// Whether a stored URL points somewhere other than the shipped default (empty means "use the
@@ -72,42 +34,6 @@ const UI_BOLD: Font = Font {
 fn is_custom_url(stored: &str, default: &str) -> bool {
     let stored = stored.trim();
     !stored.is_empty() && stored != default
-}
-
-/// The shipped brand-mark PNG nearest at or above `size` pixels (falling back to the largest),
-/// from the ladder the config crate owns.
-fn brand_png(size: u32) -> &'static [u8] {
-    config::BRAND_ICONS
-        .iter()
-        .find(|(s, _)| *s >= size)
-        .or(config::BRAND_ICONS.last())
-        .map(|(_, bytes)| *bytes)
-        .expect("BRAND_ICONS is non-empty")
-}
-
-// The brand mark, decoded once per displayed size: a fresh handle every `view` call would miss
-// the renderer's raster cache and re-decode each frame.
-static LOGO_LARGE: LazyLock<iced::widget::image::Handle> =
-    LazyLock::new(|| iced::widget::image::Handle::from_bytes(brand_png(64)));
-static LOGO_SMALL: LazyLock<iced::widget::image::Handle> =
-    LazyLock::new(|| iced::widget::image::Handle::from_bytes(brand_png(32)));
-
-/// The brand mark at `size` logical pixels, from the PNG render nearest above it.
-fn logo(size: f32) -> Element<'static, Message> {
-    let handle = if size <= 24.0 {
-        LOGO_SMALL.clone()
-    } else {
-        LOGO_LARGE.clone()
-    };
-    iced::widget::image(handle).width(size).height(size).into()
-}
-
-/// The window icon, decoded from the shipped PNG render of the mark (X11/Windows; see the
-/// `window::Settings` note for Wayland).
-fn window_icon() -> Option<iced::window::Icon> {
-    let img = image::load_from_memory_with_format(brand_png(64), image::ImageFormat::Png).ok()?;
-    let (width, height) = (img.width(), img.height());
-    iced::window::icon::from_rgba(img.into_rgba8().into_vec(), width, height).ok()
 }
 
 /// Slider bounds (kept generous but sane).
@@ -175,7 +101,7 @@ fn main() -> iced::Result {
     }
 
     iced::application(App::load, App::update, App::view)
-        .title("rewynd settings")
+        .title("rewynd")
         .theme(App::theme)
         // Bundled faces (both OFL, licenses beside the files): the Arena design is set in
         // Barlow Condensed (display) + Inter (UI); system fallbacks would break the look.
@@ -261,8 +187,19 @@ enum Status {
     Error(String),
 }
 
+/// The window's top-level pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum View {
+    /// Saved clips with thumbnails — what a gamer opens rewynd for.
+    #[default]
+    Library,
+    Settings,
+}
+
 /// Editable application state: the loaded config plus text mirrors for the free-text fields.
 struct App {
+    view: View,
+    library: library::Library,
     config: Config,
     /// Mirror of the output directory for the text box (empty = "use the default").
     output_dir: String,
@@ -342,6 +279,8 @@ struct YtStarted {
 
 #[derive(Debug, Clone)]
 enum Message {
+    Tab(View),
+    Library(library::Message),
     MicGain(f32),
     SystemGain(f32),
     MicrophonePicked(String),
@@ -385,7 +324,14 @@ enum Message {
 }
 
 impl App {
-    fn load() -> Self {
+    /// Build the initial state and the boot task (the library scan: it is the default view).
+    fn load() -> (Self, Task<Message>) {
+        let mut app = Self::new();
+        let scan = app.library.refresh(&app.config).map(Message::Library);
+        (app, scan)
+    }
+
+    fn new() -> Self {
         // Edit the file's own values (no env overrides — those are a runtime concern).
         let mut config = config::load_file();
         // Snap the stored values into the ranges the controls can represent, so what the window
@@ -398,6 +344,8 @@ impl App {
         #[cfg(not(target_os = "windows"))]
         let mic_options = Vec::new();
         Self {
+            view: View::default(),
+            library: library::Library::new(),
             output_dir: config.output_directory().unwrap_or_default().to_owned(),
             hotkey: config.hotkey_trigger().to_owned(),
             mic_options,
@@ -470,6 +418,20 @@ impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         // Any edit invalidates a prior "Saved" state.
         match message {
+            Message::Tab(view) => {
+                let entered_library = view == View::Library && self.view != View::Library;
+                self.view = view;
+                // Refresh on view-enter, so clips saved while the user was in Settings appear.
+                if entered_library {
+                    return self.library.refresh(&self.config).map(Message::Library);
+                }
+            }
+            Message::Library(message) => {
+                return self
+                    .library
+                    .update(message, &self.config)
+                    .map(Message::Library);
+            }
             Message::MicGain(v) => {
                 self.config.set_mic_gain(v);
                 self.touch();
@@ -872,6 +834,14 @@ impl App {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        let body: Element<Message> = match self.view {
+            View::Library => self.library.view(&self.config).map(Message::Library),
+            View::Settings => self.settings_view(),
+        };
+        column![nav_bar(self.view), body].into()
+    }
+
+    fn settings_view(&self) -> Element<'_, Message> {
         // `normalize` (on load) keeps these in range; clamp on the u64 before narrowing so a
         // pathological stored value can't wrap the cast.
         let v = self.config.video_stored();
@@ -1403,43 +1373,57 @@ fn normalize(c: &mut Config) {
     c.set_video(v);
 }
 
-/// A grouped settings card, Arena style: raised panel, hairline border, 8px radius, with the
-/// title as a small uppercase eyebrow (accent, like the design's active wizard cards).
-fn card<'a>(title: &'a str, content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    let inner = column![
-        text(title)
-            .size(10)
-            .font(UI_BOLD)
-            .style(tinted(palette::ACCENT)),
-        content.into(),
-    ]
-    .spacing(14);
-    container(inner)
+/// The top navigation, Arena style: the brand on the left, then the Library/Settings links
+/// (accent-on-tint pill when active), on a raised bar over a hairline divider.
+fn nav_bar(active: View) -> Element<'static, Message> {
+    let tab = |label: &'static str, view: View| {
+        let is_active = view == active;
+        button(text(label).size(12).font(UI_SEMIBOLD))
+            .on_press(Message::Tab(view))
+            .style(move |_: &Theme, status| nav_link(is_active, status))
+            .padding([6, 10])
+    };
+    let bar = container(
+        row![
+            logo(23.0),
+            text("REWYND").size(17).font(DISPLAY_BLACK),
+            iced::widget::Space::new().width(8),
+            tab("Library", View::Library),
+            tab("Settings", View::Settings),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding([12, 22])
+    .style(|_: &Theme| container::Style {
+        background: Some(Background::Color(palette::PANEL)),
+        ..container::Style::default()
+    });
+    let divider = container(iced::widget::Space::new().height(1))
         .width(Length::Fill)
-        .padding(18)
         .style(|_: &Theme| container::Style {
-            background: Some(Background::Color(palette::PANEL)),
-            border: Border {
-                color: palette::BORDER,
-                width: 1.0,
-                radius: 8.0.into(),
-            },
+            background: Some(Background::Color(palette::BORDER)),
             ..container::Style::default()
-        })
-        .into()
+        });
+    column![bar, divider].into()
 }
 
-/// Primary (mint) button per the Arena spec: filled accent, ink text, 8px radius.
-fn primary_button(_theme: &Theme, status: button::Status) -> button::Style {
-    let background = match status {
-        button::Status::Hovered | button::Status::Pressed => palette::ACCENT_HOVER,
-        _ => palette::ACCENT,
+/// A nav link: mint text on the mint tint when active, quiet otherwise, 7px pill.
+fn nav_link(active: bool, status: button::Status) -> button::Style {
+    let (background, text_color) = if active {
+        (Some(Background::Color(palette::ACCENT_BG)), palette::ACCENT)
+    } else {
+        match status {
+            button::Status::Hovered | button::Status::Pressed => (None, palette::ACCENT),
+            _ => (None, palette::TEXT_SECONDARY),
+        }
     };
     button::Style {
-        background: Some(Background::Color(background)),
-        text_color: palette::INK_ON_ACCENT,
+        background,
+        text_color,
         border: Border {
-            radius: 8.0.into(),
+            radius: 7.0.into(),
             ..Border::default()
         },
         ..button::Style::default()
@@ -1471,207 +1455,6 @@ fn yt_login_button<'a>() -> Element<'a, Message> {
         .style(oauth_button)
         .padding([10, 22])
         .into()
-}
-
-/// OAuth sign-in shell: unlike `primary_button` the fill stays a dark well so the gradient
-/// mark carries the brand; hover tints it mint.
-fn oauth_button(_theme: &Theme, status: button::Status) -> button::Style {
-    let (background, border_color) = match status {
-        button::Status::Hovered | button::Status::Pressed => {
-            (palette::ACCENT_BG, palette::ACCENT_BORDER)
-        }
-        _ => (palette::HIGH, palette::BORDER_STRONG),
-    };
-    button::Style {
-        background: Some(Background::Color(background)),
-        text_color: palette::TEXT,
-        border: Border {
-            color: border_color,
-            width: 1.0,
-            radius: 8.0.into(),
-        },
-        ..button::Style::default()
-    }
-}
-
-/// Quiet link-style button (the Advanced disclosure): bare text, mint on hover.
-fn link_button(_theme: &Theme, status: button::Status) -> button::Style {
-    button::Style {
-        background: None,
-        text_color: match status {
-            button::Status::Hovered | button::Status::Pressed => palette::ACCENT,
-            _ => palette::TEXT_SECONDARY,
-        },
-        ..button::Style::default()
-    }
-}
-
-/// Secondary (outline) button: transparent, strong hairline; hover turns mint.
-fn secondary_button(_theme: &Theme, status: button::Status) -> button::Style {
-    let (border_color, text_color) = match status {
-        button::Status::Hovered | button::Status::Pressed => (palette::ACCENT, palette::ACCENT),
-        _ => (palette::BORDER_STRONG, palette::TEXT_SECONDARY),
-    };
-    button::Style {
-        background: None,
-        text_color,
-        border: Border {
-            color: border_color,
-            width: 1.0,
-            radius: 8.0.into(),
-        },
-        ..button::Style::default()
-    }
-}
-
-/// Text-input shell: surface-high well, 6px radius, mint border when focused.
-fn arena_input(_theme: &Theme, status: text_input::Status) -> text_input::Style {
-    let border_color = match status {
-        text_input::Status::Focused { .. } => palette::ACCENT,
-        text_input::Status::Hovered => palette::BORDER_STRONG,
-        _ => palette::BORDER,
-    };
-    text_input::Style {
-        background: Background::Color(palette::HIGH),
-        border: Border {
-            color: border_color,
-            width: 1.0,
-            radius: 6.0.into(),
-        },
-        icon: palette::TEXT_SECONDARY,
-        placeholder: palette::MUTED,
-        value: palette::TEXT,
-        selection: palette::ACCENT_BORDER,
-    }
-}
-
-/// Dropdown shell, styled like an input.
-fn arena_pick(_theme: &Theme, status: pick_list::Status) -> pick_list::Style {
-    let border_color = match status {
-        pick_list::Status::Hovered | pick_list::Status::Opened { .. } => palette::BORDER_STRONG,
-        _ => palette::BORDER,
-    };
-    pick_list::Style {
-        text_color: palette::TEXT,
-        placeholder_color: palette::MUTED,
-        handle_color: palette::TEXT_SECONDARY,
-        background: Background::Color(palette::HIGH),
-        border: Border {
-            color: border_color,
-            width: 1.0,
-            radius: 6.0.into(),
-        },
-    }
-}
-
-/// Checkbox: surface-high box, mint fill + ink check when on.
-fn arena_check(_theme: &Theme, status: checkbox::Status) -> checkbox::Style {
-    let checked = matches!(
-        status,
-        checkbox::Status::Active { is_checked: true }
-            | checkbox::Status::Hovered { is_checked: true }
-            | checkbox::Status::Disabled { is_checked: true }
-    );
-    let hovered = matches!(status, checkbox::Status::Hovered { .. });
-    checkbox::Style {
-        background: Background::Color(if checked {
-            palette::ACCENT
-        } else {
-            palette::HIGH
-        }),
-        icon_color: palette::INK_ON_ACCENT,
-        border: Border {
-            color: if checked {
-                palette::ACCENT
-            } else if hovered {
-                palette::BORDER_STRONG
-            } else {
-                palette::BORDER
-            },
-            width: 1.0,
-            radius: 4.0.into(),
-        },
-        text_color: Some(palette::TEXT),
-    }
-}
-
-/// Slider: thin surface-high rail with a mint filled side and a mint round handle.
-fn arena_slider(_theme: &Theme, _status: slider::Status) -> slider::Style {
-    slider::Style {
-        rail: slider::Rail {
-            backgrounds: (
-                Background::Color(palette::ACCENT),
-                Background::Color(palette::HIGH),
-            ),
-            width: 6.0,
-            border: Border {
-                radius: 3.0.into(),
-                ..Border::default()
-            },
-        },
-        handle: slider::Handle {
-            shape: slider::HandleShape::Circle { radius: 8.0 },
-            background: Background::Color(palette::ACCENT),
-            border_width: 0.0,
-            border_color: palette::ACCENT,
-        },
-    }
-}
-
-/// One setting: the label on the left, its current value on the right (accent), and the control
-/// directly beneath spanning the full width.
-fn setting<'a>(
-    label: &'a str,
-    value: String,
-    control: impl Into<Element<'a, Message>>,
-) -> Element<'a, Message> {
-    column![value_row(label, value), control.into()]
-        .spacing(7)
-        .into()
-}
-
-/// A label (left) and a value (right, accent) on one row — also used for read-only readouts.
-fn value_row<'a>(label: &'a str, value: String) -> Element<'a, Message> {
-    row![
-        text(label)
-            .size(12)
-            .font(UI_SEMIBOLD)
-            .style(tinted(palette::TEXT_SECONDARY))
-            .width(Length::Fill),
-        text(value)
-            .size(12)
-            .font(UI_SEMIBOLD)
-            .style(tinted(palette::ACCENT)),
-    ]
-    .into()
-}
-
-/// A text style closure for one fixed color.
-fn tinted(color: iced::Color) -> impl Fn(&Theme) -> text::Style {
-    move |_| text::Style { color: Some(color) }
-}
-
-/// A labelled form field: [`field_label`] over the control. Returns the column so a caller can
-/// `.push` a trailing [`hint`].
-fn field<'a>(
-    label: &'a str,
-    control: impl Into<Element<'a, Message>>,
-) -> iced::widget::Column<'a, Message> {
-    column![field_label(label), control.into()].spacing(6)
-}
-
-/// Arena field label: small, bold, uppercase, secondary.
-fn field_label<'a>(s: &str) -> Element<'a, Message> {
-    text(s.to_uppercase())
-        .size(10)
-        .font(UI_BOLD)
-        .style(tinted(palette::TEXT_SECONDARY))
-        .into()
-}
-
-/// Muted hint text.
-fn hint<'a>(s: impl Into<String>) -> Element<'a, Message> {
-    text(s.into()).size(11).style(tinted(palette::MUTED)).into()
 }
 
 /// The save-status line under the Save button.

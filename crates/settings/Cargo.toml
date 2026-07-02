@@ -7,10 +7,15 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
-description = "rewynd settings: a small iced GUI to view and edit the config file."
+description = "The rewynd app window: the clip library plus the settings editor (iced GUI)."
 
 [dependencies]
 rewynd-config.workspace = true
+# The clip store only (listing + output-dir resolution); the default saver feature would drag
+# the ring-buffer/encoder (wgpu) tree into this deliberately GPU-free build (docs/adr/0006).
+rewynd-clip = { workspace = true, default-features = false }
+# The MP4 read side: clip summary + first keyframe for thumbnails (docs/adr/0013).
+rewynd-mux.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 # Runs the stop-and-relaunch off the UI thread (spawn_blocking) so the window never freezes.
@@ -41,3 +46,10 @@ open = "5"
 # One notification ("settings already open") from the refused second instance; shares the
 # zbus stack rfd already pulls.
 notify-rust = "4"
+# CPU H.264 decode for library thumbnails (docs/adr/0013). BSD-2-Clause; the default `source`
+# feature compiles Cisco's openh264 from vendored source (decode-only use here).
+openh264 = "0.9"
+# The thumbnail disk cache lives under the user cache dir.
+dirs = "6"
+# Default upload titles ("rewynd <date time>"), matching the tray's.
+jiff.workspace = true

@@ -233,7 +233,10 @@ mod tests {
 
     #[test]
     fn clip_stamp_parses_only_well_formed_names() {
-        assert_eq!(clip_stamp_millis("rewynd-1700000000123-0.mp4"), Some(1_700_000_000_123));
+        assert_eq!(
+            clip_stamp_millis("rewynd-1700000000123-0.mp4"),
+            Some(1_700_000_000_123)
+        );
         assert_eq!(clip_stamp_millis("rewynd-5-17.mp4"), Some(5));
         assert_eq!(clip_stamp_millis("rewynd-abc-0.mp4"), None);
         assert_eq!(clip_stamp_millis("rewynd-123-x.mp4"), None);
@@ -289,7 +292,10 @@ mod tests {
         std::fs::write(&path, b"x").expect("write");
         let clips = list_clips(dir.path());
         assert_eq!(clips.len(), 1);
-        let mtime = std::fs::metadata(&path).expect("stat").modified().expect("mtime");
+        let mtime = std::fs::metadata(&path)
+            .expect("stat")
+            .modified()
+            .expect("mtime");
         assert_eq!(clips[0].saved_at, mtime);
         assert_eq!(clips[0].modified, mtime);
     }
