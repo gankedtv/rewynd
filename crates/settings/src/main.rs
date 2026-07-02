@@ -38,6 +38,9 @@ mod palette {
     pub const BORDER_STRONG: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.12);
     /// THE accent: mint. Primary buttons, active/focus states, values, links.
     pub const ACCENT: Color = Color::from_rgb8(0x00, 0xe5, 0xa0);
+    /// Error text — the one deviation from the one-accent rule: a failure must
+    /// never read as success-mint.
+    pub const DANGER: Color = Color::from_rgb8(0xff, 0x5a, 0x5f);
     /// Primary-button hover (brightness(1.06) over the accent).
     pub const ACCENT_HOVER: Color = Color::from_rgb8(0x0d, 0xf3, 0xab);
     pub const ACCENT_BG: Color = Color::from_rgba(0.0, 0.898, 0.627, 0.08);
@@ -370,10 +373,11 @@ impl App {
                 background: palette::BACKGROUND,
                 text: palette::TEXT,
                 primary: palette::ACCENT,
-                // One-accent rule: the design has no green/amber/red; mint owns every state.
+                // One-accent rule for the happy states (no green/amber split; mint owns
+                // them) — but errors get the palette's one red so they can't be misread.
                 success: palette::ACCENT,
                 warning: palette::ACCENT,
-                danger: palette::ACCENT,
+                danger: palette::DANGER,
             },
         )
     }
@@ -608,7 +612,7 @@ impl App {
             },
             None => {
                 self.last_save_ok = false;
-                Status::Error("no config path (set $HOME or $XDG_CONFIG_HOME)".to_owned())
+                Status::Error("no config path could be resolved on this system".to_owned())
             }
         };
     }
@@ -830,7 +834,7 @@ impl App {
                 .into(),
                 LoginState::Failed(e) => column![
                     oauth_login_button(),
-                    text(e.clone()).size(12).style(tinted(palette::ACCENT)),
+                    text(e.clone()).size(12).style(tinted(palette::DANGER)),
                 ]
                 .spacing(6)
                 .into(),
@@ -1259,7 +1263,7 @@ fn status_line(status: &Status) -> Element<'_, Message> {
             "Restarted rewynd with the new settings.".to_owned(),
             palette::ACCENT,
         ),
-        Status::Error(e) => (e.clone(), palette::ACCENT),
+        Status::Error(e) => (e.clone(), palette::DANGER),
     };
     text(msg).size(12).style(tinted(color)).into()
 }
