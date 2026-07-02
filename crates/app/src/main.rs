@@ -366,6 +366,71 @@ mod uploads {
     }
 }
 
+/// The shared reaction to game-focus changes (both platforms): mirror the gate into
+/// the `recording` flag, keep the saver's per-game folder current, and start each
+/// recorded stretch with cleared rings so a clip never spans a gated-off gap (the
+/// muxer writes audio packets back-to-back; a mid-clip gap would desynchronize the
+/// tracks). Runs on the detector's thread, never inside a capture FFI callback, so
+/// the (steamlocate) name lookup may block briefly.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod game_gate {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use rewynd_capture::game::GameInfo;
+    use rewynd_clip::{ClipSaver, SharedAudioBuffer, SharedBuffer, lock_unpoisoned};
+
+    /// Invoked with `Some` on game focus/switch, `None` on unfocus or detector death.
+    pub(crate) type GameReaction = Box<dyn Fn(Option<&GameInfo>) + Send + Sync>;
+
+    pub(crate) fn reaction(
+        game_only: bool,
+        game_folders: bool,
+        recording: Arc<AtomicBool>,
+        saver: Arc<ClipSaver>,
+        buffer: SharedBuffer,
+        audio: SharedAudioBuffer,
+    ) -> GameReaction {
+        // The app id whose footage the rings currently hold (while recording).
+        let held = Mutex::new(None::<String>);
+        Box::new(move |game| {
+            if game_folders {
+                match game {
+                    Some(game) => saver.set_game_folder(Some(&game.display_name())),
+                    // Game-only capture keeps the folder on unfocus: the paused buffer
+                    // still holds the last game. Desktop capture holds whatever was on
+                    // screen, so those clips return to the output root.
+                    None if !game_only => saver.set_game_folder(None),
+                    None => {}
+                }
+            }
+            if !game_only {
+                return;
+            }
+            match game {
+                Some(game) => {
+                    {
+                        let mut held = lock_unpoisoned(&held);
+                        if held.as_deref() != Some(game.app_id.as_str()) {
+                            // A fresh recorded stretch: drop older footage so a saved
+                            // clip is one contiguous session. Cleared before the gate
+                            // opens, so no frame lands in between.
+                            lock_unpoisoned(&buffer).clear();
+                            lock_unpoisoned(&audio).clear();
+                            *held = Some(game.app_id.clone());
+                        }
+                    }
+                    recording.store(true, Ordering::Relaxed);
+                }
+                None => {
+                    recording.store(false, Ordering::Relaxed);
+                    *lock_unpoisoned(&held) = None;
+                }
+            }
+        })
+    }
+}
+
 /// Config → encoder parameter mapping, shared by the platform recorders.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod params {
@@ -580,28 +645,51 @@ mod linux {
             Some(audio_drain_now.clone()),
         );
 
-        // Game detection: the focus watcher gates the buffer on a focused fullscreen
-        // game (unless the user opted into whole-desktop capture) and names per-game
-        // clip folders. GNOME exposes no window-management protocol; there the recorder
-        // falls back to continuous capture of the shared monitor.
+        // Game detection (ADR 0012): the focus watcher gates the buffer on a focused
+        // fullscreen game (unless the user opted into whole-desktop capture) and names
+        // per-game clip folders. Everything reacts to the watcher's change events, so
+        // gating never depends on the (damage-driven) capture stream delivering frames.
+        // GNOME exposes no window-management path; there the recorder falls back to
+        // continuous capture of the shared monitor.
         let capture_desktop = config.capture_desktop();
-        let focus = match rewynd_capture::linux::FocusWatcher::spawn() {
-            Ok(watcher) => Some(Arc::new(watcher)),
-            Err(e) if capture_desktop => {
-                tracing::info!(error = %e, "no game detection; per-game folders unavailable");
-                None
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "game detection unavailable on this compositor; recording the shared monitor continuously"
-                );
-                None
-            }
-        };
-        // The video gate mirrors itself here for the audio side: while false, the mixer
-        // drops its packets so paused stretches hold no desktop sound either.
+        let game_only = !capture_desktop;
+        let game_folders = config.game_folders();
+        // Read by the video frame callback and the audio mixer; written by the watcher
+        // reaction. True when nothing gates (desktop capture / no watcher).
         let recording = Arc::new(AtomicBool::new(true));
+        let _focus_watcher = if game_only || game_folders {
+            let reaction = crate::game_gate::reaction(
+                game_only,
+                game_folders,
+                recording.clone(),
+                saver.clone(),
+                buffer.clone(),
+                audio_buffer.clone(),
+            );
+            match rewynd_capture::linux::FocusWatcher::spawn(Some(reaction)) {
+                Ok(watcher) => {
+                    if game_only {
+                        // Closed until the watcher reports a game; its initial burst
+                        // lands within milliseconds of the bind.
+                        recording.store(false, Ordering::Relaxed);
+                    }
+                    Some(watcher)
+                }
+                Err(e) if capture_desktop => {
+                    tracing::info!(error = %e, "no game detection; per-game folders unavailable");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "game detection unavailable on this compositor; recording the shared monitor continuously"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // One monotonic epoch shared by all capture threads, so the video, system-audio and
         // mic PTS are on the same clock and the mixer/muxer can align them.
@@ -726,14 +814,7 @@ mod linux {
             let capture_buffer = buffer.clone();
             let capture_stop = stop.clone();
             let capture_events = events_tx.clone();
-            let gate = CaptureGate {
-                focus: focus.clone(),
-                game_only: !capture_desktop,
-                game_folders: config.game_folders(),
-                recording: recording.clone(),
-                saver: saver.clone(),
-                labeled_app_id: None,
-            };
+            let capture_recording = recording.clone();
             recorder.capture = Some(
                 std::thread::Builder::new()
                     .name("rewynd-capture".to_owned())
@@ -745,7 +826,7 @@ mod linux {
                             epoch,
                             capture_buffer,
                             &capture_stop,
-                            gate,
+                            capture_recording,
                         ) {
                             tracing::error!(error = %e, "capture loop stopped");
                             let _ =
@@ -982,57 +1063,10 @@ mod linux {
         }
     }
 
-    /// Frame admission: game-only capture and per-game clip folders, fed by the focus
-    /// watcher. The portal's monitor stream keeps running either way; what "game-only"
-    /// means here is that frames only reach the encoder/ring while a fullscreen game
-    /// is focused, so the desktop never enters the buffer.
-    struct CaptureGate {
-        focus: Option<Arc<rewynd_capture::linux::FocusWatcher>>,
-        /// Gate frames on a focused fullscreen game (the `[capture] desktop = false` default).
-        game_only: bool,
-        /// Name per-game clip subfolders (`[output] game_folders`).
-        game_folders: bool,
-        /// Mirrors the gate for the audio side: the mixer drops packets while this is false.
-        recording: Arc<AtomicBool>,
-        saver: Arc<ClipSaver>,
-        /// The app id the saver's folder currently reflects, so the (steamlocate) name
-        /// lookup runs once per game switch, not per frame.
-        labeled_app_id: Option<String>,
-    }
-
-    impl CaptureGate {
-        /// Whether this frame records. Also keeps the audio flag and the saver's
-        /// per-game folder current; called once per captured frame.
-        fn admit_frame(&mut self) -> bool {
-            let Some(watcher) = &self.focus else {
-                return true;
-            };
-            let current = watcher.current_game();
-            let record = !self.game_only || current.is_some();
-            self.recording.store(record, Ordering::Relaxed);
-            if self.game_folders {
-                // Game-only capture: a paused buffer still holds the *last* game, so a
-                // save right after alt-tab files under it. Desktop capture: the buffer
-                // holds whatever is on screen, so only a *currently* fullscreen game
-                // earns a folder.
-                let labeled = if self.game_only {
-                    watcher.last_game()
-                } else {
-                    current
-                };
-                let app_id = labeled.as_ref().map(|g| g.app_id.clone());
-                if app_id != self.labeled_app_id {
-                    let name = labeled.map(|g| g.display_name());
-                    self.saver.set_game_folder(name.as_deref());
-                    self.labeled_app_id = app_id;
-                }
-            }
-            record
-        }
-    }
-
     /// Build the GPU pipeline and pump captured frames into `buffer` until the stream
-    /// ends. The encoder/converter/device are dropped in dependency order afterwards
+    /// ends. `recording` is the game gate (kept current by the focus watcher): while
+    /// false, frames are dropped before the GPU so the desktop never enters the ring.
+    /// The encoder/converter/device are dropped in dependency order afterwards
     /// (tearing the device down before the encoder it backs crashes the driver).
     fn run_capture(
         node_id: u32,
@@ -1041,7 +1075,7 @@ mod linux {
         epoch: Instant,
         buffer: SharedBuffer,
         stop: &Arc<AtomicBool>,
-        mut gate: CaptureGate,
+        recording: Arc<AtomicBool>,
     ) -> Result<()> {
         let gpu = Rc::new(pollster::block_on(GpuContext::new())?);
         let conv = Rc::new(Nv12Converter::new(&gpu)?);
@@ -1073,13 +1107,16 @@ mod linux {
                 if stop.load(Ordering::Relaxed) {
                     return ControlFlow::Break(());
                 }
-                if !gate.admit_frame() {
+                if !recording.load(Ordering::Relaxed) {
                     resume_keyframe = true;
                     return ControlFlow::Continue(());
                 }
-                // Force an IDR on the very first frame so the buffer always has an early
-                // keyframe to cut on; the encoder's GOP supplies the rest. A wgpu panic must
-                // not unwind into the PipeWire C callback (UB) — catch it and stop cleanly.
+                // Force an IDR on the very first frame — and whenever the ring is empty
+                // (a game switch starts with cleared rings) — so the buffer always has an
+                // early keyframe to cut on; the encoder's GOP supplies the rest. A wgpu
+                // panic must not unwind into the PipeWire C callback (UB) — catch it and
+                // stop cleanly.
+                let fresh_ring = lock_unpoisoned(&buffer).is_empty();
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     encode_captured(
                         &gpu,
@@ -1087,7 +1124,7 @@ mod linux {
                         &mut enc.borrow_mut(),
                         params,
                         captured,
-                        frame_index == 0 || resume_keyframe,
+                        frame_index == 0 || resume_keyframe || fresh_ring,
                     )
                 }));
                 match outcome {
@@ -1471,6 +1508,25 @@ mod windows {
             Some(audio_drain_now.clone()),
         );
 
+        // Game gating (mirrors Linux, ADR 0012): in game-only mode the WGC session
+        // callbacks flip this flag so audio only rings while a game session records,
+        // per-game clip folders stay current, and each new session starts with cleared
+        // rings so a clip never spans an between-games gap.
+        let capture_desktop = config.capture_desktop();
+        let recording = Arc::new(AtomicBool::new(capture_desktop));
+        let on_game: Option<rewynd_capture::windows::GameCallback> = if capture_desktop {
+            None
+        } else {
+            Some(crate::game_gate::reaction(
+                true,
+                config.game_folders(),
+                recording.clone(),
+                saver.clone(),
+                buffer.clone(),
+                audio_buffer.clone(),
+            ))
+        };
+
         // One monotonic epoch shared by all capture threads, so the video, system-audio
         // and mic PTS are on the same clock and the mixer/muxer can align them.
         let epoch = Instant::now();
@@ -1513,11 +1569,10 @@ mod windows {
         let mixer_mixer = mixer.clone();
         let mixer_done = captures_done.clone();
         let mixer_drain_now = audio_drain_now.clone();
+        let mixer_recording = recording.clone();
         let audio_mixer = std::thread::Builder::new()
             .name("rewynd-audio-mixer".to_owned())
             .spawn(move || {
-                // No gate on Windows yet: between games the WGC stream stops on its own,
-                // but audio keeps ringing (known gap; the video cut governs the clip).
                 if let Err(e) = run_audio_mixer(
                     epoch,
                     audio_params,
@@ -1525,7 +1580,7 @@ mod windows {
                     mixer_buffer,
                     &mixer_done,
                     &mixer_drain_now,
-                    None,
+                    Some(mixer_recording),
                 ) {
                     tracing::error!(error = %e, "audio mixer loop stopped");
                 }
@@ -1536,7 +1591,6 @@ mod windows {
         // GPU pipeline lives (and tears down) there.
         let capture_buffer = buffer.clone();
         let capture_stop = stop.clone();
-        let capture_desktop = config.capture_desktop();
         let capture = std::thread::Builder::new()
             .name("rewynd-capture".to_owned())
             .spawn(move || {
@@ -1546,6 +1600,7 @@ mod windows {
                     &capture_buffer,
                     &capture_stop,
                     capture_desktop,
+                    on_game,
                 ) {
                     tracing::error!(error = %e, "capture loop stopped");
                     toast(
@@ -1698,6 +1753,7 @@ mod windows {
         buffer: &SharedBuffer,
         stop: &Arc<AtomicBool>,
         desktop: bool,
+        on_game: Option<rewynd_capture::windows::GameCallback>,
     ) -> Result<()> {
         let gpu = Arc::new(pollster::block_on(GpuContext::new())?);
         // Mutexes, not RefCell/Rc as on Linux: the per-frame callback runs on the WGC
@@ -1729,9 +1785,11 @@ mod windows {
                 if stop.load(Ordering::Relaxed) {
                     return ControlFlow::Break(());
                 }
-                // Force an IDR on the very first frame so the buffer always has an early
-                // keyframe to cut on. A wgpu panic must not unwind into the WGC callback
-                // (an FFI boundary) — catch it and stop cleanly.
+                // Force an IDR on the very first frame — and whenever the ring is empty
+                // (a new game session starts with cleared rings) — so the buffer always
+                // has an early keyframe to cut on. A wgpu panic must not unwind into the
+                // WGC callback (an FFI boundary) — catch it and stop cleanly.
+                let fresh_ring = lock_unpoisoned(&buffer).is_empty();
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     encode_captured(
                         &gpu,
@@ -1739,7 +1797,7 @@ mod windows {
                         &mut lock_unpoisoned(&enc),
                         params,
                         &captured,
-                        frame_index == 0,
+                        frame_index == 0 || fresh_ring,
                     )
                 }));
                 match outcome {
@@ -1764,7 +1822,7 @@ mod windows {
         if desktop {
             capture_stream(None, epoch, prefs, Some(stop.clone()), on_frame)?;
         } else {
-            capture_game_stream(epoch, prefs, Some(stop.clone()), on_frame)?;
+            capture_game_stream(epoch, prefs, Some(stop.clone()), on_frame, on_game)?;
         }
 
         drop(enc);

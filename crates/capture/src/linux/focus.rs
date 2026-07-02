@@ -1,8 +1,8 @@
 //! Focused-window watcher: is a fullscreen game active right now, and which one?
 //!
 //! The XDG ScreenCast portal deliberately hides the window list, so game detection
-//! rides the compositor's window-management protocols on a dedicated Wayland
-//! connection instead (independent of the portal/PipeWire capture path):
+//! rides the compositor's window-management interfaces on dedicated connections
+//! instead (independent of the portal/PipeWire capture path):
 //!
 //! - KDE: `org_kde_plasma_window_management` — active + fullscreen + app id + pid,
 //!   event-driven. Recent KWin (observed on Plasma 6.7) no longer advertises it to
@@ -18,12 +18,19 @@
 //!
 //! A window counts as "the game" when it is active (focused) and fullscreen and its
 //! app id isn't a desktop-shell id — the same conservative heuristic as the Windows
-//! detector (`windows::game_window`): capture too little rather than too much.
+//! detector (`windows::game_window`): capture too little rather than too much. The
+//! KWin-script backend also treats an undecorated window covering its whole output
+//! as fullscreen (borderless-windowed games).
+//!
+//! Every state transition funnels through [`Shared::publish`], which also drives the
+//! caller's change callback — event-driven, so gating never depends on the capture
+//! stream delivering frames. If a watcher backend dies mid-session it publishes
+//! `None` (fail closed): recording pauses rather than silently capturing the desktop.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use thiserror::Error;
 use wayland_client::backend::ObjectId;
@@ -48,6 +55,11 @@ use crate::game::{GameInfo, is_shell_app_id};
 /// How long the watcher thread sleeps in poll(2) between stop-flag checks.
 const POLL_TIMEOUT_MS: i32 = 200;
 
+/// Runs on the watcher's own thread whenever the focused fullscreen game changes
+/// (`Some` on focus/switch, `None` on unfocus or watcher death). Never invoked from
+/// an FFI callback, so it may block briefly (name lookups, ring maintenance).
+pub type FocusCallback = Box<dyn Fn(Option<&GameInfo>) + Send + Sync>;
+
 /// Why the watcher could not start.
 #[derive(Debug, Error)]
 pub enum FocusError {
@@ -64,14 +76,66 @@ pub enum FocusError {
     Spawn(std::io::Error),
 }
 
-/// State shared between the watcher thread and its readers.
-#[derive(Default)]
+/// Lock a mutex, recovering a poisoned one — the watcher state must stay readable
+/// even if some holder panicked.
+fn lock_unpoisoned<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// State shared between the watcher backend and its readers. All transitions go
+/// through [`publish`](Self::publish).
 struct Shared {
     /// The focused fullscreen game right now, if any.
     current: Mutex<Option<GameInfo>>,
     /// The most recent game that was current — what the (paused) buffer still holds
     /// after an alt-tab or a game exit.
     last: Mutex<Option<GameInfo>>,
+    /// Serializes whole publishes (state change + callback) so two backend threads
+    /// (e.g. the KWin DBus handler and its restart watcher) can't deliver callbacks
+    /// out of order.
+    publish_gate: Mutex<()>,
+    on_change: Option<FocusCallback>,
+}
+
+impl Shared {
+    fn new(on_change: Option<FocusCallback>) -> Self {
+        Self {
+            current: Mutex::new(None),
+            last: Mutex::new(None),
+            publish_gate: Mutex::new(()),
+            on_change,
+        }
+    }
+
+    /// Record a new focused-game observation; on change, update `last` and run the
+    /// caller's callback. The callback runs outside the state locks (readers never
+    /// wait on it) but inside the publish gate (transitions stay ordered).
+    fn publish(&self, game: Option<GameInfo>) {
+        let _ordered = lock_unpoisoned(&self.publish_gate);
+        {
+            let mut current = lock_unpoisoned(&self.current);
+            if *current == game {
+                return;
+            }
+            if let Some(game) = &game {
+                // Never log the title (documents/URLs/chat); the app id is generic.
+                tracing::info!(app_id = %game.app_id, "fullscreen game focused; recording");
+                *lock_unpoisoned(&self.last) = Some(game.clone());
+            } else {
+                tracing::info!("no fullscreen game focused; replay buffer paused");
+            }
+            *current = game.clone();
+        }
+        if let Some(on_change) = &self.on_change {
+            // A callback panic must not kill the watcher (stale state fails open).
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                on_change(game.as_ref());
+            }));
+            if outcome.is_err() {
+                tracing::error!("focus change callback panicked; continuing to watch");
+            }
+        }
+    }
 }
 
 /// Watches the compositor for the focused fullscreen game on a background thread.
@@ -96,11 +160,12 @@ enum Guts {
 }
 
 impl FocusWatcher {
-    /// Connect, pick a backend, and start watching. Fails fast (before anything
-    /// spawns) when no usable path exists, so the caller can log and fall back to
-    /// ungated capture.
-    pub fn spawn() -> Result<Self, FocusError> {
-        let shared = Arc::new(Shared::default());
+    /// Connect, pick a backend, and start watching. `on_change` fires on the
+    /// watcher's own thread for every focused-game transition. Fails fast (before
+    /// anything spawns) when no usable path exists, so the caller can log and fall
+    /// back to ungated capture.
+    pub fn spawn(on_change: Option<FocusCallback>) -> Result<Self, FocusError> {
+        let shared = Arc::new(Shared::new(on_change));
         match Self::spawn_wayland(shared.clone()) {
             Err(FocusError::NoBackend) => {}
             other => return other,
@@ -126,20 +191,21 @@ impl FocusWatcher {
 
         let mut tracker = Tracker {
             windows: HashMap::new(),
-            plasma_ids: HashSet::new(),
             plasma_mgmt: None,
+            dead: false,
             shared: shared.clone(),
         };
 
         // Plasma first (gives pid too); wlroots second. Binding also subscribes us to
-        // the initial burst of window announcements.
+        // the initial burst of window announcements. The wlr bind floor is 2: the
+        // fullscreen state entry is "since 2", and without it the gate could never open.
         let backend = if let Ok(mgmt) =
             globals.bind::<OrgKdePlasmaWindowManagement, _, _>(&qh, 17..=18, ())
         {
             tracker.plasma_mgmt = Some(mgmt);
             "plasma-window-management"
         } else if globals
-            .bind::<ZwlrForeignToplevelManagerV1, _, _>(&qh, 1..=3, ())
+            .bind::<ZwlrForeignToplevelManagerV1, _, _>(&qh, 2..=3, ())
             .is_ok()
         {
             "wlr-foreign-toplevel-management"
@@ -149,11 +215,18 @@ impl FocusWatcher {
 
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
+        let thread_shared = shared.clone();
         let thread = std::thread::Builder::new()
             .name("rewynd-focus".to_owned())
             .spawn(move || {
                 if let Err(e) = watch_loop(&conn, &mut queue, &mut tracker, &thread_stop) {
-                    tracing::warn!(error = %e, "focus watcher stopped; game detection is stale");
+                    tracing::warn!(error = %e, "focus watcher stopped");
+                }
+                // Fail closed on unexpected death (not on a requested stop): without a
+                // live watcher, "a game is focused" can't be trusted, and a stale Some
+                // would record the desktop indefinitely.
+                if !thread_stop.load(Ordering::Relaxed) {
+                    thread_shared.publish(None);
                 }
             })
             .map_err(FocusError::Spawn)?;
@@ -172,22 +245,14 @@ impl FocusWatcher {
     /// The focused fullscreen game right now, if any.
     #[must_use]
     pub fn current_game(&self) -> Option<GameInfo> {
-        self.shared
-            .current
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
+        lock_unpoisoned(&self.shared.current).clone()
     }
 
     /// The most recent game that was focused fullscreen — the one the paused buffer
     /// still holds right after an alt-tab or a game exit.
     #[must_use]
     pub fn last_game(&self) -> Option<GameInfo> {
-        self.shared
-            .last
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
+        lock_unpoisoned(&self.shared.last).clone()
     }
 
     /// Which protocol backs this watcher (for logs/diagnostics).
@@ -212,15 +277,16 @@ impl Drop for FocusWatcher {
     }
 }
 
-/// Dispatch Wayland events until `stop`: poll the connection fd with a timeout so the
-/// stop flag is honored within [`POLL_TIMEOUT_MS`] even when the compositor is silent.
+/// Dispatch Wayland events until `stop` (or the server finishes the manager): poll
+/// the connection fd with a timeout so the stop flag is honored within
+/// [`POLL_TIMEOUT_MS`] even when the compositor is silent.
 fn watch_loop(
     conn: &Connection,
     queue: &mut wayland_client::EventQueue<Tracker>,
     tracker: &mut Tracker,
     stop: &AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    while !stop.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::Relaxed) && !tracker.dead {
         queue.dispatch_pending(tracker)?;
         tracker.publish();
         queue.flush()?;
@@ -261,10 +327,10 @@ struct Win {
 
 struct Tracker {
     windows: HashMap<ObjectId, Win>,
-    /// Plasma announces windows by numeric id, once via `window` and once via
-    /// `window_with_uuid`; remember which we already materialized.
-    plasma_ids: HashSet<u32>,
     plasma_mgmt: Option<OrgKdePlasmaWindowManagement>,
+    /// Set when the server ends the session (wlr `finished`); the loop then exits
+    /// and the thread publishes `None`.
+    dead: bool,
     shared: Arc<Shared>,
 }
 
@@ -280,27 +346,10 @@ impl Tracker {
                 title: w.title.clone(),
                 pid: w.pid,
             });
-        let mut current = self
-            .shared
-            .current
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        if *current != game {
-            if let Some(game) = &game {
-                // Never log the title (documents/URLs/chat); the app id is generic.
-                tracing::info!(app_id = %game.app_id, "fullscreen game focused; recording");
-                *self.shared.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(game.clone());
-            } else {
-                tracing::info!("no fullscreen game focused; replay buffer paused");
-            }
-            *current = game;
-        }
+        self.shared.publish(game);
     }
 
     fn plasma_window(&mut self, qh: &QueueHandle<Self>, id: u32) {
-        if !self.plasma_ids.insert(id) {
-            return;
-        }
         if let Some(mgmt) = &self.plasma_mgmt {
             let window = mgmt.get_window(id, qh, ());
             self.windows.insert(window.id(), Win::default());
@@ -331,6 +380,8 @@ impl Dispatch<OrgKdePlasmaWindowManagement, ()> for Tracker {
     ) {
         use org_kde_plasma_window_management::Event;
         match event {
+            // At our bound version KWin announces each window through exactly one of
+            // these (window_with_uuid since v13); no dedupe needed.
             Event::Window { id } => state.plasma_window(qh, id),
             Event::WindowWithUuid { id, .. } => state.plasma_window(qh, id),
             _ => {}
@@ -393,188 +444,19 @@ impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for Tracker {
         _: &QueueHandle<Self>,
     ) {
         use zwlr_foreign_toplevel_manager_v1::Event;
-        if let Event::Toplevel { toplevel } = event {
-            state.windows.insert(toplevel.id(), Win::default());
+        match event {
+            Event::Toplevel { toplevel } => {
+                state.windows.insert(toplevel.id(), Win::default());
+            }
+            // The server is done with us; treat it like a watcher death (fail closed).
+            Event::Finished => state.dead = true,
+            _ => {}
         }
     }
 
     event_created_child!(Tracker, ZwlrForeignToplevelManagerV1, [
         zwlr_foreign_toplevel_manager_v1::EVT_TOPLEVEL_OPCODE => (ZwlrForeignToplevelHandleV1, ()),
     ]);
-}
-
-/// The KWin fallback: load a small script into the compositor (over
-/// `org.kde.kwin.Scripting`) that reports the active window's app id / title / pid /
-/// fullscreen state back to us over DBus whenever focus or fullscreen changes.
-/// This is how kdotool and GPU Screen Recorder read KWin's window state.
-mod kwin_script {
-    use std::sync::Arc;
-
-    use super::{FocusError, Shared};
-    use crate::game::{GameInfo, is_shell_app_id};
-
-    /// Our callback bus name + interface; the script calls back into this.
-    const BUS_NAME: &str = "tv.ganked.rewynd.Focus";
-    const OBJECT_PATH: &str = "/tv/ganked/rewynd/Focus";
-    /// The plugin name the script loads/unloads under (stable, so a crashed previous
-    /// instance's script is replaced, not duplicated).
-    const PLUGIN_NAME: &str = "rewynd-focus";
-
-    /// All values ride as strings: KWin's `callDBus` marshals JS numbers as doubles,
-    /// which would not match an integer parameter, so the script stringifies.
-    const SCRIPT: &str = r#"
-function rewyndPush(w) {
-    var appId = "", title = "", pid = "0", full = "0";
-    if (w) {
-        appId = String(w.resourceClass);
-        title = String(w.caption);
-        pid = String(w.pid);
-        full = w.fullScreen === true ? "1" : "0";
-    }
-    callDBus("tv.ganked.rewynd.Focus", "/tv/ganked/rewynd/Focus",
-             "tv.ganked.rewynd.Focus", "Update", appId, title, pid, full);
-}
-function rewyndHook(w) {
-    if (!w || w.rewyndHooked === true) { return; }
-    w.rewyndHooked = true;
-    w.fullScreenChanged.connect(function () {
-        if (workspace.activeWindow === w) { rewyndPush(w); }
-    });
-}
-workspace.windowActivated.connect(function (w) { rewyndHook(w); rewyndPush(w); });
-rewyndHook(workspace.activeWindow);
-rewyndPush(workspace.activeWindow);
-"#;
-
-    /// Keeps the DBus connection (serving the callback object) and the loaded script
-    /// alive; Drop unloads the script and removes the temp file. The runtime hosts
-    /// zbus's background tasks (zbus is built on tokio in this tree, via ashpd) and
-    /// must outlive the connection.
-    pub(super) struct ScriptHandle {
-        conn: zbus::blocking::Connection,
-        script_file: std::path::PathBuf,
-        _runtime: tokio::runtime::Runtime,
-    }
-
-    impl Drop for ScriptHandle {
-        fn drop(&mut self) {
-            let _guard = self._runtime.enter();
-            if let Ok(scripting) = scripting_proxy(&self.conn) {
-                let _ = scripting.call_method("unloadScript", &(PLUGIN_NAME,));
-            }
-            let _ = std::fs::remove_file(&self.script_file);
-        }
-    }
-
-    /// The DBus object the KWin script calls back into.
-    struct FocusService {
-        shared: Arc<Shared>,
-    }
-
-    #[zbus::interface(name = "tv.ganked.rewynd.Focus")]
-    impl FocusService {
-        fn update(&self, app_id: String, title: String, pid: String, fullscreen: String) {
-            let game = (fullscreen == "1" && !is_shell_app_id(&app_id)).then(|| GameInfo {
-                pid: pid.parse().ok().filter(|&p: &u32| p > 0),
-                app_id,
-                title,
-            });
-            let mut current = self
-                .shared
-                .current
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            if *current != game {
-                if let Some(game) = &game {
-                    tracing::info!(app_id = %game.app_id, "fullscreen game focused; recording");
-                    *self.shared.last.lock().unwrap_or_else(|p| p.into_inner()) =
-                        Some(game.clone());
-                } else {
-                    tracing::info!("no fullscreen game focused; replay buffer paused");
-                }
-                *current = game;
-            }
-        }
-    }
-
-    fn scripting_proxy(
-        conn: &zbus::blocking::Connection,
-    ) -> zbus::Result<zbus::blocking::Proxy<'static>> {
-        zbus::blocking::Proxy::new(conn, "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting")
-    }
-
-    /// Serve the callback object, write the script, and load + run it in KWin.
-    /// "KWin isn't on the bus" maps to [`FocusError::NoBackend`] (a non-KDE desktop);
-    /// anything else is a real [`FocusError::Kwin`] failure.
-    pub(super) fn start(shared: Arc<Shared>) -> Result<ScriptHandle, FocusError> {
-        let kwin_err = |e: zbus::Error| match &e {
-            zbus::Error::MethodError(name, _, _) if name.as_str().ends_with("ServiceUnknown") => {
-                FocusError::NoBackend
-            }
-            _ => FocusError::Kwin(e.to_string()),
-        };
-
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("rewynd-focus-dbus")
-            .enable_all()
-            .build()
-            .map_err(|e| FocusError::Kwin(e.to_string()))?;
-        let guard = runtime.enter();
-
-        let conn = zbus::blocking::Connection::session()
-            .map_err(|e| FocusError::Connect(e.to_string()))?;
-        conn.object_server()
-            .at(OBJECT_PATH, FocusService { shared })
-            .map_err(|e| FocusError::Kwin(e.to_string()))?;
-        conn.request_name(BUS_NAME)
-            .map_err(|e| FocusError::Kwin(e.to_string()))?;
-
-        let script_file = write_script().map_err(|e| FocusError::Kwin(e.to_string()))?;
-        let scripting = scripting_proxy(&conn).map_err(kwin_err)?;
-        // Replace any script a crashed previous instance left behind.
-        let _ = scripting.call_method("unloadScript", &(PLUGIN_NAME,));
-        let script_path = script_file.to_string_lossy().into_owned();
-        let id: i32 = scripting
-            .call("loadScript", &(script_path, PLUGIN_NAME))
-            .map_err(kwin_err)?;
-        let script: zbus::blocking::Proxy<'_> = zbus::blocking::Proxy::new(
-            &conn,
-            "org.kde.KWin",
-            format!("/Scripting/Script{id}"),
-            "org.kde.kwin.Script",
-        )
-        .map_err(kwin_err)?;
-        script.call::<_, _, ()>("run", &()).map_err(kwin_err)?;
-
-        drop(guard);
-        Ok(ScriptHandle {
-            conn,
-            script_file,
-            _runtime: runtime,
-        })
-    }
-
-    /// Write the script where only we can touch it: the user-private XDG runtime dir
-    /// when available, else a 0600 file in the temp dir (replaced, never reused, so a
-    /// squatter can't feed KWin someone else's code).
-    fn write_script() -> std::io::Result<std::path::PathBuf> {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let dir = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        // SAFETY: geteuid is infallible and takes no arguments.
-        let path = dir.join(format!("rewynd-focus-{}.js", unsafe { libc::geteuid() }));
-        let _ = std::fs::remove_file(&path);
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)?;
-        file.write_all(SCRIPT.as_bytes())?;
-        Ok(path)
-    }
 }
 
 impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Tracker {
@@ -624,5 +506,252 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Tracker {
             }
             _ => {}
         }
+    }
+}
+
+/// The KWin fallback: load a small script into the compositor (over
+/// `org.kde.kwin.Scripting`) that reports the active window's app id / title / pid /
+/// fullscreen state back to us over DBus whenever focus or fullscreen changes.
+/// This is how kdotool and GPU Screen Recorder read KWin's window state.
+mod kwin_script {
+    use std::sync::Arc;
+
+    use futures_util::StreamExt;
+
+    use super::{FocusError, Shared};
+    use crate::game::{GameInfo, is_shell_app_id};
+
+    /// Our callback bus name + interface; the script calls back into this.
+    const BUS_NAME: &str = "tv.ganked.rewynd.Focus";
+    const OBJECT_PATH: &str = "/tv/ganked/rewynd/Focus";
+    /// The plugin name the script loads/unloads under (stable, so a crashed previous
+    /// instance's script is replaced, not duplicated).
+    const PLUGIN_NAME: &str = "rewynd-focus";
+    /// How long to give a restarted KWin before reloading the script into it.
+    const KWIN_RESTART_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// All values ride as strings: KWin's `callDBus` marshals JS numbers as doubles,
+    /// which would not match an integer parameter, so the script stringifies.
+    ///
+    /// Window hooks are attached once per window via `windowAdded` (plus a sweep of
+    /// pre-existing windows at load), so no per-window dedupe state is needed. A
+    /// window also counts as fullscreen when its frame covers its whole output —
+    /// borderless-windowed games never set the compositor fullscreen state. Pushes
+    /// dedupe against the last sent payload, so geometry churn (window drags) does
+    /// not flood DBus.
+    const SCRIPT: &str = r#"
+var rewyndLast = null;
+function rewyndFullish(w) {
+    if (w.fullScreen === true) { return true; }
+    try {
+        var g = w.frameGeometry;
+        var s = w.output.geometry;
+        return g.x <= s.x && g.y <= s.y &&
+               g.x + g.width >= s.x + s.width && g.y + g.height >= s.y + s.height;
+    } catch (e) {
+        return false;
+    }
+}
+function rewyndPush(w) {
+    var appId = "", title = "", pid = "0", full = "0";
+    if (w) {
+        appId = String(w.resourceClass);
+        title = String(w.caption);
+        pid = String(w.pid);
+        full = rewyndFullish(w) ? "1" : "0";
+    }
+    var key = appId + " " + pid + " " + full;
+    if (key === rewyndLast) { return; }
+    rewyndLast = key;
+    callDBus("tv.ganked.rewynd.Focus", "/tv/ganked/rewynd/Focus",
+             "tv.ganked.rewynd.Focus", "Update", appId, title, pid, full);
+}
+function rewyndHook(w) {
+    if (!w) { return; }
+    w.fullScreenChanged.connect(function () {
+        if (workspace.activeWindow === w) { rewyndPush(w); }
+    });
+    w.frameGeometryChanged.connect(function () {
+        if (workspace.activeWindow === w) { rewyndPush(w); }
+    });
+}
+workspace.windowAdded.connect(rewyndHook);
+workspace.windowList().forEach(rewyndHook);
+workspace.windowActivated.connect(rewyndPush);
+rewyndPush(workspace.activeWindow);
+"#;
+
+    /// Keeps the DBus connection (serving the callback object) and the loaded script
+    /// alive; Drop unloads the script and removes the temp file. The runtime hosts
+    /// zbus's background tasks (zbus is built on tokio in this tree, via ashpd) and
+    /// must outlive the connection.
+    pub(super) struct ScriptHandle {
+        conn: zbus::blocking::Connection,
+        script_file: std::path::PathBuf,
+        restart_watch: tokio::task::JoinHandle<()>,
+        _runtime: tokio::runtime::Runtime,
+    }
+
+    impl Drop for ScriptHandle {
+        fn drop(&mut self) {
+            self.restart_watch.abort();
+            let _guard = self._runtime.enter();
+            let _ = self
+                ._runtime
+                .block_on(unload_script(self.conn.inner(), PLUGIN_NAME));
+            let _ = std::fs::remove_file(&self.script_file);
+        }
+    }
+
+    /// The DBus object the KWin script calls back into.
+    struct FocusService {
+        shared: Arc<Shared>,
+    }
+
+    #[zbus::interface(name = "tv.ganked.rewynd.Focus")]
+    impl FocusService {
+        fn update(&self, app_id: String, title: String, pid: String, fullscreen: String) {
+            let game = (fullscreen == "1" && !is_shell_app_id(&app_id)).then(|| GameInfo {
+                pid: pid.parse().ok().filter(|&p: &u32| p > 0),
+                app_id,
+                title,
+            });
+            self.shared.publish(game);
+        }
+    }
+
+    async fn scripting_proxy(conn: &zbus::Connection) -> zbus::Result<zbus::Proxy<'static>> {
+        zbus::Proxy::new(conn, "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting").await
+    }
+
+    async fn unload_script(conn: &zbus::Connection, name: &str) -> zbus::Result<()> {
+        let scripting = scripting_proxy(conn).await?;
+        scripting.call_method("unloadScript", &(name,)).await?;
+        Ok(())
+    }
+
+    /// Replace-load the script and run it.
+    async fn load_and_run(conn: &zbus::Connection, script_path: &str) -> zbus::Result<()> {
+        let scripting = scripting_proxy(conn).await?;
+        // Replace any script a previous (or crashed) instance left behind.
+        let _ = scripting.call_method("unloadScript", &(PLUGIN_NAME,)).await;
+        let id: i32 = scripting
+            .call("loadScript", &(script_path, PLUGIN_NAME))
+            .await?;
+        let script = zbus::Proxy::new(
+            conn,
+            "org.kde.KWin",
+            format!("/Scripting/Script{id}"),
+            "org.kde.kwin.Script",
+        )
+        .await?;
+        script.call::<_, _, ()>("run", &()).await?;
+        Ok(())
+    }
+
+    /// Follow org.kde.KWin's bus ownership: a restart discards our loaded script, so
+    /// publish `None` (fail closed) when KWin drops off and reload the script when it
+    /// returns.
+    async fn watch_kwin_restarts(conn: zbus::Connection, shared: Arc<Shared>, script_path: String) {
+        let Ok(dbus) = zbus::fdo::DBusProxy::new(&conn).await else {
+            return;
+        };
+        let Ok(mut owner_changes) = dbus
+            .receive_name_owner_changed_with_args(&[(0, "org.kde.KWin")])
+            .await
+        else {
+            return;
+        };
+        while let Some(change) = owner_changes.next().await {
+            let Ok(args) = change.args() else { continue };
+            if args.new_owner().is_none() {
+                tracing::warn!("KWin left the bus; pausing recording until it returns");
+                shared.publish(None);
+            } else {
+                tokio::time::sleep(KWIN_RESTART_GRACE).await;
+                match load_and_run(&conn, &script_path).await {
+                    Ok(()) => tracing::info!("KWin restarted; focus script reloaded"),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "KWin restarted but the focus script could not be reloaded; \
+                         game detection stays off"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Serve the callback object, write the script, and load + run it in KWin.
+    /// "KWin isn't on the bus" maps to [`FocusError::NoBackend`] (a non-KDE desktop);
+    /// anything else is a real [`FocusError::Kwin`] failure.
+    pub(super) fn start(shared: Arc<Shared>) -> Result<ScriptHandle, FocusError> {
+        let kwin_err = |e: zbus::Error| match &e {
+            zbus::Error::MethodError(name, _, _) if name.as_str().ends_with("ServiceUnknown") => {
+                FocusError::NoBackend
+            }
+            _ => FocusError::Kwin(e.to_string()),
+        };
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("rewynd-focus-dbus")
+            .enable_all()
+            .build()
+            .map_err(|e| FocusError::Kwin(e.to_string()))?;
+        let guard = runtime.enter();
+
+        let conn = zbus::blocking::Connection::session()
+            .map_err(|e| FocusError::Connect(e.to_string()))?;
+        conn.object_server()
+            .at(
+                OBJECT_PATH,
+                FocusService {
+                    shared: shared.clone(),
+                },
+            )
+            .map_err(|e| FocusError::Kwin(e.to_string()))?;
+        conn.request_name(BUS_NAME)
+            .map_err(|e| FocusError::Kwin(e.to_string()))?;
+
+        let script_file = write_script().map_err(|e| FocusError::Kwin(e.to_string()))?;
+        let script_path = script_file.to_string_lossy().into_owned();
+        runtime
+            .block_on(load_and_run(conn.inner(), &script_path))
+            .map_err(kwin_err)?;
+
+        let restart_watch = runtime.spawn(watch_kwin_restarts(
+            conn.inner().clone(),
+            shared,
+            script_path,
+        ));
+
+        drop(guard);
+        Ok(ScriptHandle {
+            conn,
+            script_file,
+            restart_watch,
+            _runtime: runtime,
+        })
+    }
+
+    /// Write the script where only we can touch it: the user-private XDG runtime dir
+    /// when available, else a 0600 file in the temp dir (replaced, never reused, so a
+    /// squatter can't feed KWin someone else's code).
+    fn write_script() -> std::io::Result<std::path::PathBuf> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        // SAFETY: geteuid is infallible and takes no arguments.
+        let path = dir.join(format!("rewynd-focus-{}.js", unsafe { libc::geteuid() }));
+        let _ = std::fs::remove_file(&path);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.write_all(SCRIPT.as_bytes())?;
+        Ok(path)
     }
 }

@@ -38,6 +38,8 @@ libc = "0.2"
 # tokio here (ashpd's choice), so the backend carries its own small runtime.
 zbus = "5"
 tokio.workspace = true
+# Consumes the zbus NameOwnerChanged signal stream (KWin restart detection).
+futures-util.workspace = true
 
 # Windows capture (PLAN §3.5): Windows Graphics Capture → D3D11 shared NT handles.
 [target.'cfg(target_os = "windows")'.dependencies]

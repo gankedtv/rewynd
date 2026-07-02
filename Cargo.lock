@@ -4111,6 +4111,7 @@ dependencies = [
  "ash",
  "ashpd",
  "drm-fourcc",
+ "futures-util",
  "libc",
  "pipewire",
  "png",

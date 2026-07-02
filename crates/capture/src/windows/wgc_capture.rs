@@ -424,11 +424,16 @@ where
     run_session(monitor, refresh, epoch, prefs, stop, on_frame)
 }
 
+/// Runs on the capture thread when game capture starts (`Some`, with what the
+/// detector knows about the window) and when its session ends (`None`).
+pub type GameCallback = Box<dyn Fn(Option<&crate::game::GameInfo>) + Send + Sync>;
+
 /// Capture the active *game*, continuously: poll the foreground window until one
 /// looks like a running game (fullscreen/borderless — see
 /// [`super::game_window::fullscreen_game_window`]), capture it until it closes,
 /// then go back to watching for the next one. Desktop content between games is
-/// never captured.
+/// never captured. `on_game` reports each session's game (and its end) so the
+/// caller can gate audio and label clip folders.
 ///
 /// Same callback/stop contract as [`capture_stream`]; a callback `Break` ends the
 /// whole loop, not just the current game's session. Blocks until `on_frame` breaks
@@ -438,6 +443,7 @@ pub fn capture_game_stream<F>(
     prefs: StreamPrefs,
     stop: Option<Arc<AtomicBool>>,
     on_frame: F,
+    on_game: Option<GameCallback>,
 ) -> Result<(), CaptureError>
 where
     F: FnMut(CapturedD3d11Frame) -> ControlFlow<()> + Send + 'static,
@@ -470,6 +476,16 @@ where
             process = window.process_name().unwrap_or_default(),
             "fullscreen game detected; capturing it"
         );
+        if let Some(on_game) = &on_game {
+            // An anti-cheat-shielded process refuses the name query; the empty app id
+            // falls back to the window title for naming.
+            let info = crate::game::GameInfo {
+                app_id: window.process_name().unwrap_or_default(),
+                title: window.title().unwrap_or_default(),
+                pid: None,
+            };
+            on_game(Some(&info));
+        }
         let refresh = window
             .monitor()
             .and_then(|m| m.refresh_rate().ok())
@@ -494,7 +510,11 @@ where
         // device failures) gets a small retry budget for races like a window
         // closing mid-setup, then propagates so a broken backend can't spin
         // silently forever.
-        match run_session(window, refresh, epoch, prefs, stop.clone(), session_cb) {
+        let session = run_session(window, refresh, epoch, prefs, stop.clone(), session_cb);
+        if let Some(on_game) = &on_game {
+            on_game(None);
+        }
+        match session {
             Ok(()) => {
                 failures = 0;
             }

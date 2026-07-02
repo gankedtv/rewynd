@@ -4,7 +4,7 @@
 #[cfg(target_os = "linux")]
 fn main() {
     tracing_subscriber::fmt::init();
-    let watcher = match rewynd_capture::linux::FocusWatcher::spawn() {
+    let watcher = match rewynd_capture::linux::FocusWatcher::spawn(None) {
         Ok(w) => w,
         Err(e) => {
             eprintln!("focus watcher unavailable: {e}");

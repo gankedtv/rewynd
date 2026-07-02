@@ -180,30 +180,24 @@ impl ClipSaver {
 
 /// The newest `rewynd-*.mp4` under `dir` by file name, looking one level into per-game
 /// subfolders too (names embed a millisecond timestamp, so lexicographic max of the file
-/// name is newest; no metadata calls needed).
+/// name is newest — dir entry types come from readdir, so no per-file metadata calls).
 fn newest_clip_in(dir: &Path) -> Option<PathBuf> {
-    fn clips_in(dir: &Path, recurse: bool) -> Vec<PathBuf> {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return Vec::new();
-        };
-        let mut clips = Vec::new();
-        for path in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
-            if recurse && path.is_dir() {
-                clips.extend(clips_in(&path, false));
-            } else if path.extension().is_some_and(|ext| ext == "mp4")
-                && path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("rewynd-"))
-            {
-                clips.push(path);
-            }
-        }
-        clips
+    fn newest_in(dir: &Path, recurse: bool) -> Option<PathBuf> {
+        let entries = std::fs::read_dir(dir).ok()?;
+        entries
+            .filter_map(|e| e.ok())
+            .filter_map(|entry| {
+                let kind = entry.file_type().ok()?;
+                if kind.is_dir() {
+                    return recurse.then(|| newest_in(&entry.path(), false)).flatten();
+                }
+                let name = entry.file_name();
+                let name = name.to_str()?;
+                (name.starts_with("rewynd-") && name.ends_with(".mp4")).then(|| entry.path())
+            })
+            .max_by(|a, b| a.file_name().cmp(&b.file_name()))
     }
-    clips_in(dir, true)
-        .into_iter()
-        .max_by(|a, b| a.file_name().cmp(&b.file_name()))
+    newest_in(dir, true)
 }
 
 /// A filesystem-safe folder name derived from a game name: path separators and

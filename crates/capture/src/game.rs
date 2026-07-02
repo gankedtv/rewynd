@@ -26,8 +26,14 @@ impl GameInfo {
     /// otherwise a cleaned-up app id, otherwise the window title.
     #[must_use]
     pub fn display_name(&self) -> String {
+        self.display_name_via(steam_app_name)
+    }
+
+    /// [`display_name`](Self::display_name) with the Steam lookup injected, so the
+    /// resolution order is testable without a Steam install.
+    fn display_name_via(&self, steam_lookup: impl Fn(u32) -> Option<String>) -> String {
         if let Some(appid) = self.steam_appid()
-            && let Some(name) = steam_app_name(appid)
+            && let Some(name) = steam_lookup(appid)
         {
             return name;
         }
@@ -127,18 +133,33 @@ mod tests {
 
     #[test]
     fn display_name_falls_back_from_app_id_to_title() {
+        let no_steam = |_: u32| None;
         // No Steam appid involved: the cleaned app id wins over the title.
         assert_eq!(
-            info("eldenring.exe", "ELDEN RING").display_name(),
+            info("eldenring.exe", "ELDEN RING").display_name_via(no_steam),
             "eldenring"
         );
         assert_eq!(
-            info("net.lutris.dishonored", "Dishonored").display_name(),
+            info("net.lutris.dishonored", "Dishonored").display_name_via(no_steam),
             "dishonored"
         );
         assert_eq!(
-            info("", "Some Window Title").display_name(),
+            info("", "Some Window Title").display_name_via(no_steam),
             "Some Window Title"
+        );
+    }
+
+    #[test]
+    fn display_name_prefers_the_steam_title() {
+        let lookup = |appid: u32| (appid == 1245620).then(|| "ELDEN RING".to_owned());
+        assert_eq!(
+            info("steam_app_1245620", "er.exe").display_name_via(lookup),
+            "ELDEN RING"
+        );
+        // Unresolvable appid falls back to the cleaned app id.
+        assert_eq!(
+            info("steam_app_999", "t").display_name_via(lookup),
+            "steam_app_999"
         );
     }
 }
