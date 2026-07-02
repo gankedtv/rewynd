@@ -98,14 +98,28 @@ pub fn first_keyframe_annexb(path: &Path) -> Result<Vec<u8>, ReadError> {
     })
 }
 
-/// Everything a preview needs from a single open + parse: the summary and the first keyframe
-/// (as [`clip_summary`] and [`first_keyframe_annexb`] would return, at half the file reads).
+/// Everything a preview needs from a single open + parse: the summary and a representative
+/// keyframe, at half the file reads. The keyframe is taken from around [`PREVIEW_POSITION`] of
+/// the clip, so previews skip the intro (a resume IDR's first frames are often a loading screen,
+/// and pre-gating clips can open on the desktop); see [`clip_preview_at`].
 pub fn clip_preview(path: &Path) -> Result<(ClipSummary, Vec<u8>), ReadError> {
+    clip_preview_at(path, PREVIEW_POSITION)
+}
+
+/// Fraction of the clip duration to prefer for a thumbnail. Past the intro, before anything a
+/// mid-clip resume would cut short.
+const PREVIEW_POSITION: f32 = 0.4;
+
+/// Like [`clip_preview`] but with an explicit position hint (`0.0..=1.0`) into the clip. The
+/// keyframe returned is the sync sample nearest `position` of the duration, falling back to the
+/// first keyframe when the track declares no sync-sample table.
+pub fn clip_preview_at(path: &Path, position: f32) -> Result<(ClipSummary, Vec<u8>), ReadError> {
     catch_reader_panics(|| {
         let mut reader = open(path)?;
         let track_id = video_track(&reader)?;
         let summary = summary_of(&reader, track_id);
-        let keyframe = keyframe_of(&mut reader, track_id)?;
+        let sample_id = keyframe_sample_near(&reader, track_id, position);
+        let keyframe = keyframe_at(&mut reader, track_id, sample_id)?;
         Ok((summary, keyframe))
     })
 }
@@ -141,6 +155,57 @@ fn keyframe_of(reader: &mut Reader, track_id: u32) -> Result<Vec<u8>, ReadError>
         }
     }
     Err(ReadError::NoKeyframe)
+}
+
+/// The sync-sample id whose decode time sits nearest `position` (`0.0..=1.0`) of the clip's
+/// duration. Metadata only, no sample bytes read. Falls back to sample 1 when the track has no
+/// sync table (then every sample is nominally a keyframe, but only the first is self-contained).
+fn keyframe_sample_near(reader: &Reader, track_id: u32, position: f32) -> u32 {
+    let track = &reader.tracks()[&track_id];
+    let Some(syncs) = track.sync_sample_ids() else {
+        return 1;
+    };
+    let Some(&first) = syncs.first() else {
+        return 1;
+    };
+    let position = f64::from(position.clamp(0.0, 1.0));
+    let timescale = f64::from(track.timescale().max(1));
+    let target = track.duration().as_secs_f64() * position;
+    let mut best = first;
+    let mut best_dist = f64::INFINITY;
+    for &id in syncs {
+        let Ok((start, _)) = track.sample_time(id) else {
+            continue;
+        };
+        let dist = (start as f64 / timescale - target).abs();
+        if dist < best_dist {
+            best = id;
+            best_dist = dist;
+        }
+    }
+    best
+}
+
+/// The keyframe at `sample_id` as a self-contained Annex-B buffer (`avcC` SPS/PPS, then the
+/// sample's NALs). The caller picks a sync sample; a non-sync id would not decode alone, so it
+/// is reported as [`ReadError::NoKeyframe`].
+fn keyframe_at(reader: &mut Reader, track_id: u32, sample_id: u32) -> Result<Vec<u8>, ReadError> {
+    let track = &reader.tracks()[&track_id];
+    let (sps, pps) = (
+        track.sequence_parameter_set()?.to_vec(),
+        track.picture_parameter_set()?.to_vec(),
+    );
+    let prefix_size = nal_length_size(track)?;
+    let mut out = Vec::new();
+    append_nal(&mut out, &sps);
+    append_nal(&mut out, &pps);
+    match reader.read_sample(track_id, sample_id)? {
+        Some(sample) if sample.is_sync => {
+            avcc_to_annexb(&sample.bytes, prefix_size, &mut out)?;
+            Ok(out)
+        }
+        _ => Err(ReadError::NoKeyframe),
+    }
 }
 
 /// The sample NAL length-prefix size the track's `avcC` declares: 1, 2, or 4 bytes (our write
@@ -233,6 +298,80 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
+    }
+
+    /// Whether `haystack` contains the byte sequence `needle`.
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// A clip with keyframes at samples 1, 5, 9 (0%, 40%, 80% of a ten-frame span), each IDR
+    /// tagged with its frame index so the selected keyframe is identifiable.
+    fn multi_keyframe_clip() -> TempMp4 {
+        let chunks: Vec<_> = (0..10u64)
+            .map(|i| {
+                let tag = i as u8;
+                if i % 4 == 0 {
+                    chunk(annexb(&[&SPS, &PPS, &[0x65, 0x88, tag]]), true, i * 16_667)
+                } else {
+                    chunk(annexb(&[&[0x41, 0x9a, tag]]), false, i * 16_667)
+                }
+            })
+            .collect();
+        let out = TempMp4::new();
+        Mp4Muxer::new(1920, 1080, 60)
+            .write_mp4(&chunks, &out.0)
+            .expect("write_mp4");
+        out
+    }
+
+    #[test]
+    fn keyframe_sample_near_picks_the_nearest_sync_sample() {
+        let clip = multi_keyframe_clip();
+        let reader = open(&clip.0).expect("open");
+        let track_id = video_track(&reader).expect("track");
+        assert_eq!(keyframe_sample_near(&reader, track_id, 0.0), 1);
+        assert_eq!(keyframe_sample_near(&reader, track_id, 0.4), 5);
+        assert_eq!(keyframe_sample_near(&reader, track_id, 1.0), 9);
+        // Out-of-range positions clamp rather than misbehave.
+        assert_eq!(keyframe_sample_near(&reader, track_id, -1.0), 1);
+        assert_eq!(keyframe_sample_near(&reader, track_id, 5.0), 9);
+    }
+
+    #[test]
+    fn preview_at_returns_a_mid_clip_keyframe() {
+        let clip = multi_keyframe_clip();
+        let (_summary, frame) = clip_preview_at(&clip.0, 0.4).expect("preview");
+        assert!(contains(&frame, &[0x65, 0x88, 4]), "the 40% keyframe");
+        assert!(
+            !contains(&frame, &[0x65, 0x88, 0]),
+            "not the first keyframe"
+        );
+        // The default preview position lands on the mid keyframe, not the very first frame.
+        let (_s, dflt) = clip_preview(&clip.0).expect("preview");
+        assert!(contains(&dflt, &[0x65, 0x88, 4]));
+    }
+
+    #[test]
+    fn keyframe_at_rejects_a_non_sync_sample() {
+        let clip = multi_keyframe_clip();
+        let mut reader = open(&clip.0).expect("open");
+        let track_id = video_track(&reader).expect("track");
+        // Sample 2 is a delta frame; it cannot stand alone as a keyframe.
+        assert!(matches!(
+            keyframe_at(&mut reader, track_id, 2),
+            Err(ReadError::NoKeyframe)
+        ));
+    }
+
+    #[test]
+    fn preview_falls_back_to_first_frame_without_a_sync_table() {
+        // A track with no samples declares no stss, so selection falls back to sample 1.
+        let out = raw_video_mp4(&[]);
+        let reader = open(&out.0).expect("open");
+        let track_id = video_track(&reader).expect("track");
+        assert!(reader.tracks()[&track_id].sync_sample_ids().is_none());
+        assert_eq!(keyframe_sample_near(&reader, track_id, 0.4), 1);
     }
 
     /// Mux a tiny keyframe + delta clip and return its path holder.

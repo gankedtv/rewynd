@@ -51,6 +51,9 @@ notify-rust = "4"
 openh264 = "0.9"
 # The thumbnail disk cache lives under the user cache dir.
 dirs = "6"
+# Auto-refresh: watch the clips directory (and its per-game subfolders) so a clip saved with the
+# hotkey while the library is open appears without a manual refresh.
+notify = "8"
 # Local-time "saved at" labels on the library cards.
 jiff.workspace = true
 

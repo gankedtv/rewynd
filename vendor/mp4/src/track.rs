@@ -492,7 +492,20 @@ impl Mp4Track {
         }
     }
 
-    fn sample_time(&self, sample_id: u32) -> Result<(u64, u32)> {
+    /// The sync-sample table (`stss`) entries: the 1-based ids of the track's keyframes, in
+    /// order. `None` when the track declares no `stss` (every sample is then a sync sample).
+    pub fn sync_sample_ids(&self) -> Option<&[u32]> {
+        self.trak
+            .mdia
+            .minf
+            .stbl
+            .stss
+            .as_ref()
+            .map(|stss| stss.entries.as_slice())
+    }
+
+    /// The decode start time and duration of `sample_id`, in the media timescale.
+    pub fn sample_time(&self, sample_id: u32) -> Result<(u64, u32)> {
         let stts = &self.trak.mdia.minf.stbl.stts;
 
         let mut sample_count: u32 = 1;

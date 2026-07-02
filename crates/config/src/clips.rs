@@ -200,16 +200,27 @@ fn private_temp_dir() -> PathBuf {
     dir
 }
 
-/// Create `dir` 0700 if missing and verify it is a real directory owned by us with no group or
-/// world access (never following a planted symlink). Shared by the clip fallback dir and the
-/// settings app's thumbnail cache, which holds frames of the same recordings.
+/// Create `dir` 0700 if missing and verify it is a real directory owned by us. A dir we own but
+/// left group/world-accessible by an older release is tightened to 0700 in place, not refused:
+/// failing closed would disable the private store forever (mirrors the single-instance dir's
+/// upgrade path). Only a symlink, a foreign owner, or a non-directory is refused. Shared by the
+/// clip fallback dir and the settings app's thumbnail cache, which holds frames of the same
+/// recordings.
 #[cfg(unix)]
 #[must_use]
 pub fn ensure_private_dir(dir: &Path) -> bool {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     let _ = std::fs::DirBuilder::new().mode(0o700).create(dir);
-    std::fs::symlink_metadata(dir)
-        .is_ok_and(|meta| meta.is_dir() && meta.uid() == euid() && meta.mode() & 0o077 == 0)
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    if !meta.is_dir() || meta.uid() != euid() {
+        return false;
+    }
+    if meta.mode() & 0o077 != 0 {
+        return std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).is_ok();
+    }
+    true
 }
 
 #[cfg(not(unix))]
@@ -385,13 +396,29 @@ mod tests {
         assert!(ensure_private_dir(&private), "fresh 0700 dir is ours");
         assert!(ensure_private_dir(&private), "idempotent");
 
+        // A dir we own but left too open by an older release is tightened in place, not refused.
         let loose = dir.path().join("loose");
         std::fs::create_dir(&loose).expect("mkdir");
         std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        assert!(!ensure_private_dir(&loose), "group/world access is refused");
+        assert!(
+            ensure_private_dir(&loose),
+            "a loose dir we own is tightened"
+        );
+        let mode = std::fs::metadata(&loose)
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "tightened to owner-only");
 
         let file = dir.path().join("file");
         std::fs::write(&file, b"x").expect("write");
         assert!(!ensure_private_dir(&file), "a non-directory is refused");
+
+        // A symlink (even to a dir we own) is refused: it could be planted to redirect the store.
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).expect("mkdir");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert!(!ensure_private_dir(&link), "a symlink is refused");
     }
 }
