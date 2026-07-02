@@ -65,13 +65,17 @@ toml = "1"
 # `flock` for the single-instance guard (docs/adr/0008). Unix-only, MIT/Apache.
 libc = "0.2"
 # ganked.tv upload client (docs/adr/0009): HTTP over rustls (no system TLS dep). MIT/Apache.
-reqwest = { version = "0.13", features = ["json", "stream"] }
+reqwest = { version = "0.13", features = ["json", "stream", "form"] }
 serde_json = "1"
 futures-util = "0.3"
 # Bridges tokio::fs::File to a reqwest streaming body (clips upload without buffering in RAM).
 tokio-util = { version = "0.7", features = ["io"] }
 # Local-time clip titles for uploads. Unlicense/MIT.
 jiff = "0.2"
+# YouTube OAuth loopback login (docs/adr/0011): PKCE S256 challenge + CSPRNG state/verifier.
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = "0.3"
 # HTTP mock server for the upload client's tests (dev-only). MIT/Apache.
 wiremock = "0.6"
 # RAII temp files/dirs for filesystem tests (dev-only). MIT/Apache.

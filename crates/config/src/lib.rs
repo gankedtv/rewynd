@@ -47,6 +47,6 @@ pub use process::RecorderStopEvent;
 pub use process::{read_recorder_pid, stop_recorder};
 pub use schema::{
     AudioSettings, Config, DEFAULT_HOTKEY_TRIGGER, DEFAULT_TEMPLATE, DEFAULT_UPLOAD_API_URL,
-    DEFAULT_UPLOAD_SHARE_URL, MAX_BUFFER_SECONDS, UploadSettings, VideoSettings,
+    DEFAULT_UPLOAD_SHARE_URL, MAX_BUFFER_SECONDS, UploadSettings, VideoSettings, YouTubeSettings,
     ensure_default_file, load, load_file, non_empty_or,
 };

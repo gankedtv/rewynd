@@ -12,6 +12,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 pub enum TrayCmd {
     SaveClip,
     UploadClip,
+    UploadYouTube,
     OpenSettings,
     Quit,
 }
@@ -89,6 +90,14 @@ impl Tray for RewyndTray {
                 label: "Upload last clip".to_owned(),
                 activate: Box::new(|t: &mut Self| {
                     let _ = t.tx.send(TrayCmd::UploadClip);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "Upload last clip to YouTube".to_owned(),
+                activate: Box::new(|t: &mut Self| {
+                    let _ = t.tx.send(TrayCmd::UploadYouTube);
                 }),
                 ..Default::default()
             }

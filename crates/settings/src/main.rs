@@ -288,6 +288,13 @@ struct App {
     /// key). UI-only state; collapsed by default because login covers the common case.
     advanced_open: bool,
     login: LoginState,
+    /// Mirror of the YouTube OAuth client id override (empty = the compiled-in default).
+    yt_client_id: String,
+    /// Mirror of the YouTube OAuth client secret override.
+    yt_client_secret: String,
+    /// Whether the YouTube card shows its OAuth-client override fields.
+    yt_advanced_open: bool,
+    yt_login: YtLoginState,
     status: Status,
 }
 
@@ -307,6 +314,30 @@ enum LoginState {
         abort: iced::task::Handle,
     },
     Failed(String),
+}
+
+/// Where the YouTube loopback login stands. "Connected" is derived from a stored refresh token.
+enum YtLoginState {
+    Idle,
+    Starting {
+        abort: iced::task::Handle,
+    },
+    /// Waiting for the browser redirect: the consent URL (for a manual reopen) and the wait
+    /// task's abort handle so Cancel actually stops the loopback listener.
+    Waiting {
+        auth_url: String,
+        abort: iced::task::Handle,
+    },
+    Failed(String),
+}
+
+/// A started YouTube login headed through the message loop: the consent URL to open, plus the
+/// login handed to the wait task. `YouTubeLogin` owns a socket so it cannot be cloned; the
+/// message must be, hence the shared slot the wait task takes it from.
+#[derive(Debug, Clone)]
+struct YtStarted {
+    auth_url: String,
+    login: std::sync::Arc<std::sync::Mutex<Option<rewynd_upload::youtube::YouTubeLogin>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -338,6 +369,16 @@ enum Message {
     LoginDone(Result<String, String>),
     LoginCancelled,
     LogoutPressed,
+    YouTubeEnabled(bool),
+    YtClientIdEdited(String),
+    YtClientSecretEdited(String),
+    YtAdvancedToggled,
+    YtLoginPressed,
+    YtLoginStarted(Result<YtStarted, String>),
+    YtLoginDone(Result<String, String>),
+    YtLoginCancelled,
+    YtOpenAuthUrl,
+    YtLogoutPressed,
     Save,
     Restart,
     Restarted(Result<(), String>),
@@ -369,11 +410,35 @@ impl App {
             // the ganked.tv defaults, spelled out, are not a custom setup.
             advanced_open: is_custom_url(config.upload_api_url(), config::DEFAULT_UPLOAD_API_URL)
                 || is_custom_url(config.upload_share_url(), config::DEFAULT_UPLOAD_SHARE_URL),
+            yt_client_id: config.youtube_client_id().to_owned(),
+            yt_client_secret: config.youtube_client_secret().to_owned(),
+            // A stored OAuth-client override stays visible instead of hiding behind the
+            // disclosure.
+            yt_advanced_open: !config.youtube_client_id().trim().is_empty()
+                || !config.youtube_client_secret().trim().is_empty(),
             config,
             login: LoginState::Idle,
+            yt_login: YtLoginState::Idle,
             status: Status::Editing,
             last_save_ok: false,
         }
+    }
+
+    /// The OAuth client the YouTube login should use: the (unsaved) field values, or the
+    /// compiled-in defaults.
+    fn effective_yt_client(&self) -> (String, String) {
+        (
+            config::non_empty_or(
+                &self.yt_client_id,
+                rewynd_upload::youtube::DEFAULT_CLIENT_ID,
+            )
+            .to_owned(),
+            config::non_empty_or(
+                &self.yt_client_secret,
+                rewynd_upload::youtube::DEFAULT_CLIENT_SECRET,
+            )
+            .to_owned(),
+        )
     }
 
     /// The API base the login flow should talk to: the (unsaved) field value, or the default.
@@ -576,6 +641,111 @@ impl App {
                 self.abort_login();
                 self.save();
             }
+            Message::YouTubeEnabled(on) => {
+                self.config.set_youtube_enabled(on);
+                self.touch();
+            }
+            Message::YtClientIdEdited(s) => {
+                self.yt_client_id = s;
+                self.touch();
+            }
+            Message::YtClientSecretEdited(s) => {
+                self.yt_client_secret = s;
+                self.touch();
+            }
+            // No touch(): opening the disclosure edits nothing.
+            Message::YtAdvancedToggled => self.yt_advanced_open = !self.yt_advanced_open,
+            Message::YtLoginPressed => {
+                let (client_id, client_secret) = self.effective_yt_client();
+                // Google's installed-app token exchange needs both halves; catching a
+                // missing secret here beats a cryptic failure after the consent screen.
+                if client_id.is_empty() || client_secret.is_empty() {
+                    self.yt_login = YtLoginState::Failed(
+                        "No Google OAuth client is configured; add its id and secret under \
+                         Advanced options."
+                            .to_owned(),
+                    );
+                    return Task::none();
+                }
+                let (task, abort) = Task::perform(
+                    async move {
+                        rewynd_upload::youtube::youtube_login_start(&client_id, &client_secret)
+                            .await
+                            .map(|login| YtStarted {
+                                auth_url: login.auth_url.clone(),
+                                login: std::sync::Arc::new(std::sync::Mutex::new(Some(login))),
+                            })
+                            .map_err(|e| e.to_string())
+                    },
+                    Message::YtLoginStarted,
+                )
+                .abortable();
+                self.yt_login = YtLoginState::Starting { abort };
+                return task;
+            }
+            Message::YtLoginStarted(Ok(started)) => {
+                // A cancelled/stale start must not begin listening.
+                if !matches!(self.yt_login, YtLoginState::Starting { .. }) {
+                    return Task::none();
+                }
+                if let Err(e) = open::that_detached(&started.auth_url) {
+                    tracing::warn!(error = %e, "could not open the browser for Google consent");
+                }
+                let auth_url = started.auth_url.clone();
+                let (task, abort) = Task::perform(
+                    async move {
+                        let login = started
+                            .login
+                            .lock()
+                            .map_err(|_| "the login state was poisoned".to_owned())?
+                            .take()
+                            .ok_or_else(|| "the login was already consumed".to_owned())?;
+                        rewynd_upload::youtube::youtube_login_wait(login)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    Message::YtLoginDone,
+                )
+                .abortable();
+                self.yt_login = YtLoginState::Waiting { auth_url, abort };
+                return task;
+            }
+            Message::YtLoginStarted(Err(e)) => {
+                if matches!(self.yt_login, YtLoginState::Starting { .. }) {
+                    self.yt_login = YtLoginState::Failed(e);
+                }
+            }
+            Message::YtLoginDone(result) => {
+                // Ignore a result that arrives after Cancel/Logout switched the state away.
+                if !matches!(self.yt_login, YtLoginState::Waiting { .. }) {
+                    return Task::none();
+                }
+                match result {
+                    Ok(refresh_token) => {
+                        // Logging in states intent: switch YouTube uploads on and persist.
+                        self.config.set_youtube_refresh_token(refresh_token);
+                        self.config.set_youtube_enabled(true);
+                        self.yt_login = YtLoginState::Idle;
+                        self.save();
+                    }
+                    Err(e) => self.yt_login = YtLoginState::Failed(e),
+                }
+            }
+            Message::YtLoginCancelled => self.abort_yt_login(),
+            Message::YtOpenAuthUrl => {
+                if let YtLoginState::Waiting { auth_url, .. } = &self.yt_login
+                    && let Err(e) = open::that_detached(auth_url)
+                {
+                    tracing::warn!(error = %e, "could not reopen the Google consent page");
+                }
+            }
+            Message::YtLogoutPressed => {
+                self.config.set_youtube_refresh_token(String::new());
+                self.config.set_youtube_enabled(false);
+                // A pending login must not keep listening after an explicit logout.
+                self.abort_yt_login();
+                self.save();
+            }
             Message::Save => self.save(),
             Message::Restart => {
                 self.status = Status::Restarting;
@@ -614,6 +784,15 @@ impl App {
         }
     }
 
+    /// [`abort_login`](Self::abort_login)'s YouTube twin (aborting the wait task drops the
+    /// loopback listener, closing the port).
+    fn abort_yt_login(&mut self) {
+        match std::mem::replace(&mut self.yt_login, YtLoginState::Idle) {
+            YtLoginState::Starting { abort } | YtLoginState::Waiting { abort, .. } => abort.abort(),
+            _ => {}
+        }
+    }
+
     /// Fold the free-text mirrors into the config and write it to disk.
     fn save(&mut self) {
         let dir = self.output_dir.trim();
@@ -635,6 +814,12 @@ impl App {
             .set_upload_api_url(self.api_url.trim().to_owned());
         self.config
             .set_upload_share_url(self.share_url.trim().to_owned());
+        // Empty fields are stored empty: "use the compiled-in OAuth client" lives in one place
+        // (the consumers), so a rebuilt default reaches everyone who didn't override it.
+        self.config
+            .set_youtube_client_id(self.yt_client_id.trim().to_owned());
+        self.config
+            .set_youtube_client_secret(self.yt_client_secret.trim().to_owned());
 
         self.status = match config::config_path() {
             Some(path) => match self.config.save_to(&path) {
@@ -1014,6 +1199,126 @@ impl App {
         }
         let upload = card("GANKED.TV", column(upload_items).spacing(18));
 
+        // YouTube account area, mirroring the ganked.tv login. Google grants no username with
+        // the upload-only scope, so connectedness is simply "a refresh token is stored".
+        let yt_account: Element<Message> = if !self.config.youtube_refresh_token().trim().is_empty()
+        {
+            row![
+                container(text("CONNECTED TO YOUTUBE").size(10).font(UI_BOLD).style(
+                    |_: &Theme| text::Style {
+                        color: Some(palette::ACCENT),
+                    }
+                ),)
+                .padding([5, 10])
+                .style(|_: &Theme| container::Style {
+                    background: Some(Background::Color(palette::ACCENT_BG)),
+                    border: Border {
+                        color: palette::ACCENT_BORDER,
+                        width: 1.0,
+                        radius: 5.0.into(),
+                    },
+                    ..container::Style::default()
+                }),
+                iced::widget::Space::new().width(Length::Fill),
+                button(text("Log out").size(11).font(UI_SEMIBOLD))
+                    .on_press(Message::YtLogoutPressed)
+                    .style(secondary_button)
+                    .padding([7, 14]),
+            ]
+            .align_y(iced::Alignment::Center)
+            .into()
+        } else {
+            match &self.yt_login {
+                YtLoginState::Idle => column![
+                    yt_login_button(),
+                    hint("Approve rewynd in your browser; only permission to upload is asked."),
+                ]
+                .spacing(6)
+                .into(),
+                YtLoginState::Starting { .. } => column![
+                    text("Preparing the Google login...").size(13),
+                    button(text("Cancel").size(11).font(UI_SEMIBOLD))
+                        .on_press(Message::YtLoginCancelled)
+                        .style(secondary_button)
+                        .padding([6, 14]),
+                ]
+                .spacing(7)
+                .into(),
+                YtLoginState::Waiting { .. } => column![
+                    text("Approve rewynd in the browser tab that just opened.").size(13),
+                    row![
+                        button(text("Open the page again").size(11).font(UI_SEMIBOLD))
+                            .on_press(Message::YtOpenAuthUrl)
+                            .style(link_button)
+                            .padding(0),
+                        button(text("Cancel").size(11).font(UI_SEMIBOLD))
+                            .on_press(Message::YtLoginCancelled)
+                            .style(secondary_button)
+                            .padding([6, 14]),
+                    ]
+                    .spacing(14)
+                    .align_y(iced::Alignment::Center),
+                ]
+                .spacing(7)
+                .into(),
+                YtLoginState::Failed(e) => column![
+                    yt_login_button(),
+                    text(e.clone()).size(12).style(tinted(palette::DANGER)),
+                ]
+                .spacing(6)
+                .into(),
+            }
+        };
+        let mut youtube_items: Vec<Element<Message>> = vec![
+            yt_account,
+            checkbox(self.config.youtube_enabled())
+                .label("Enable YouTube uploads (tray: Upload last clip to YouTube)")
+                .on_toggle(Message::YouTubeEnabled)
+                .style(arena_check)
+                .into(),
+            hint(
+                "Clips use the visibility chosen above. YouTube's built-in quota allows \
+                 only a handful of uploads per day.",
+            ),
+            button(
+                text(if self.yt_advanced_open {
+                    "Hide advanced options"
+                } else {
+                    "Advanced options"
+                })
+                .size(11)
+                .font(UI_SEMIBOLD),
+            )
+            .on_press(Message::YtAdvancedToggled)
+            .style(link_button)
+            .padding(0)
+            .into(),
+        ];
+        if self.yt_advanced_open {
+            youtube_items.extend([
+                field(
+                    "OAuth client ID",
+                    text_input("...apps.googleusercontent.com", &self.yt_client_id)
+                        .on_input(Message::YtClientIdEdited)
+                        .style(arena_input),
+                )
+                .into(),
+                field(
+                    "OAuth client secret",
+                    text_input("GOCSPX-...", &self.yt_client_secret)
+                        .secure(true)
+                        .on_input(Message::YtClientSecretEdited)
+                        .style(arena_input),
+                )
+                .push(hint(
+                    "Leave both empty for the built-in client. Bring your own Google Cloud \
+                     OAuth client (Desktop app) for a private upload quota.",
+                ))
+                .into(),
+            ]);
+        }
+        let youtube = card("YOUTUBE", column(youtube_items).spacing(18));
+
         let header = column![
             logo(46.0),
             text("SETTINGS").size(32).font(DISPLAY_BLACK),
@@ -1058,7 +1363,9 @@ impl App {
         // Audio on the left, Output and Upload on the right.
         let columns = row![
             column![recording, audio].spacing(20).width(Length::Fill),
-            column![output, upload].spacing(20).width(Length::Fill),
+            column![output, upload, youtube]
+                .spacing(20)
+                .width(Length::Fill),
         ]
         .spacing(20);
 
@@ -1154,6 +1461,16 @@ fn oauth_login_button<'a>() -> Element<'a, Message> {
     .style(oauth_button)
     .padding([10, 22])
     .into()
+}
+
+/// The "Log in with YouTube" button: same OAuth sign-in shell, label only (no third-party
+/// logo asset is shipped).
+fn yt_login_button<'a>() -> Element<'a, Message> {
+    button(text("Log in with YouTube").size(13).font(UI_SEMIBOLD))
+        .on_press(Message::YtLoginPressed)
+        .style(oauth_button)
+        .padding([10, 22])
+        .into()
 }
 
 /// OAuth sign-in shell: unlike `primary_button` the fill stays a dark well so the gradient

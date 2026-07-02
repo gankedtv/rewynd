@@ -21,7 +21,7 @@ See [`PLAN.md`](PLAN.md) for the full design and rationale, and
 | [`rewynd-encode`](crates/encode) | Thin wrapper over `gpu-video` (NV12 `wgpu::Texture` → H.264) + RGBA→NV12. |
 | [`rewynd-buffer`](crates/buffer) | Keyframe-aware ring buffer — the pure-Rust core, no GPU dependency. |
 | [`rewynd-mux`](crates/mux) | H.264 Annex-B → MP4 with real PTS. |
-| [`rewynd-upload`](crates/upload) | ganked.tv upload client (later feature). |
+| [`rewynd-upload`](crates/upload) | Upload clients: ganked.tv (API key) and YouTube (OAuth). |
 | [`rewynd`](crates/app) | The binary: wires the pipeline, hotkey, config. |
 
 ## Building

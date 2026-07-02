@@ -80,6 +80,36 @@ impl std::fmt::Debug for UploadSettings {
     }
 }
 
+/// Plain YouTube upload settings (the consumer maps these onto its client).
+#[derive(Clone, PartialEq, Eq)]
+pub struct YouTubeSettings {
+    /// Only true when YouTube uploads are switched on AND a refresh token is stored.
+    pub enabled: bool,
+    /// OAuth client id override; empty = the compiled-in default.
+    pub client_id: String,
+    /// OAuth client secret override; empty = the compiled-in default.
+    pub client_secret: String,
+    pub refresh_token: String,
+    /// `"public"`, `"unlisted"` or `"private"`; empty falls back to the `[upload]` visibility.
+    /// Consumers fail closed: anything unrecognized is treated as private, so a typo can
+    /// never widen a clip's visibility.
+    pub visibility: String,
+}
+
+// Manual Debug: the refresh token (and the nominally-secret client secret) must never reach
+// logs through an innocent `{:?}`.
+impl std::fmt::Debug for YouTubeSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("YouTubeSettings")
+            .field("enabled", &self.enabled)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"***")
+            .field("refresh_token", &"***")
+            .field("visibility", &self.visibility)
+            .finish()
+    }
+}
+
 /// Video encode settings as parsed from TOML, defaulting to the built-ins.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -243,6 +273,31 @@ impl Default for UploadConfig {
     }
 }
 
+/// YouTube upload settings. `refresh_token` and `client_secret` are secrets — `save_to`
+/// tightens the file mode for them (as it already does for the ganked.tv key).
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct YouTubeConfig {
+    enabled: bool,
+    client_id: String,
+    client_secret: String,
+    refresh_token: String,
+    visibility: String,
+}
+
+// Manual Debug (also covering Config's derived Debug): the secrets must never reach logs.
+impl std::fmt::Debug for YouTubeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("YouTubeConfig")
+            .field("enabled", &self.enabled)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"***")
+            .field("refresh_token", &"***")
+            .field("visibility", &self.visibility)
+            .finish()
+    }
+}
+
 /// The parsed, layered configuration. Build it with [`load`]; read it through the accessors.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -255,6 +310,7 @@ pub struct Config {
     capture: CaptureConfig,
     startup: StartupConfig,
     upload: UploadConfig,
+    youtube: YouTubeConfig,
 }
 
 impl Config {
@@ -459,6 +515,20 @@ impl Config {
         }
     }
 
+    /// The validated YouTube settings: `enabled` requires a refresh token (fail closed), and an
+    /// empty visibility falls back to the shared `[upload]` default.
+    #[must_use]
+    pub fn youtube(&self) -> YouTubeSettings {
+        let token = self.youtube.refresh_token.trim();
+        YouTubeSettings {
+            enabled: self.youtube.enabled && !token.is_empty(),
+            client_id: self.youtube.client_id.trim().to_owned(),
+            client_secret: self.youtube.client_secret.trim().to_owned(),
+            refresh_token: token.to_owned(),
+            visibility: non_empty_or(&self.youtube.visibility, &self.upload.visibility).to_owned(),
+        }
+    }
+
     // --- Raw getters + setters for an editor (the settings UI). The getters return the
     // configured value as stored (unclamped/unfiltered) so a round-trip through the editor
     // doesn't silently rewrite it; the daemon should keep using the validating accessors above.
@@ -509,6 +579,36 @@ impl Config {
     #[must_use]
     pub fn upload_visibility(&self) -> &str {
         &self.upload.visibility
+    }
+
+    /// The YouTube toggle as stored (before [`youtube`](Self::youtube)'s has-a-token requirement).
+    #[must_use]
+    pub fn youtube_enabled(&self) -> bool {
+        self.youtube.enabled
+    }
+
+    /// The YouTube OAuth client id as stored (before the trim; empty = compiled-in default).
+    #[must_use]
+    pub fn youtube_client_id(&self) -> &str {
+        &self.youtube.client_id
+    }
+
+    /// The YouTube OAuth client secret as stored.
+    #[must_use]
+    pub fn youtube_client_secret(&self) -> &str {
+        &self.youtube.client_secret
+    }
+
+    /// The YouTube refresh token as stored.
+    #[must_use]
+    pub fn youtube_refresh_token(&self) -> &str {
+        &self.youtube.refresh_token
+    }
+
+    /// The YouTube visibility string as stored (before the `[upload]` fallback).
+    #[must_use]
+    pub fn youtube_visibility(&self) -> &str {
+        &self.youtube.visibility
     }
 
     /// Replace the video settings.
@@ -590,6 +690,31 @@ impl Config {
     /// Set the upload visibility string.
     pub fn set_upload_visibility(&mut self, visibility: String) {
         self.upload.visibility = visibility;
+    }
+
+    /// Switch YouTube uploads on/off (takes effect only once a refresh token is stored).
+    pub fn set_youtube_enabled(&mut self, enabled: bool) {
+        self.youtube.enabled = enabled;
+    }
+
+    /// Set the YouTube OAuth client id; an empty string means "use the compiled-in default".
+    pub fn set_youtube_client_id(&mut self, id: String) {
+        self.youtube.client_id = id;
+    }
+
+    /// Set the YouTube OAuth client secret; an empty string means "use the compiled-in default".
+    pub fn set_youtube_client_secret(&mut self, secret: String) {
+        self.youtube.client_secret = secret;
+    }
+
+    /// Set the YouTube refresh token; an empty string logs out.
+    pub fn set_youtube_refresh_token(&mut self, token: String) {
+        self.youtube.refresh_token = token;
+    }
+
+    /// Set the YouTube visibility string; empty falls back to the `[upload]` visibility.
+    pub fn set_youtube_visibility(&mut self, visibility: String) {
+        self.youtube.visibility = visibility;
     }
 
     /// Serialize to a TOML string (the editor writes this back to the config file).
@@ -713,6 +838,7 @@ fn salvage_sections(text: &str) -> Config {
             "capture" => value.try_into().map(|s| config.capture = s),
             "startup" => value.try_into().map(|s| config.startup = s),
             "upload" => value.try_into().map(|s| config.upload = s),
+            "youtube" => value.try_into().map(|s| config.youtube = s),
             _ => {
                 tracing::warn!(section = %name, "unknown config section ignored");
                 continue;
@@ -800,6 +926,17 @@ share_url = \"https://ganked.tv\"
 api_key = \"\"
 # \"public\" (in feeds), \"unlisted\" (link only) or \"private\" (only you)
 visibility = \"unlisted\"
+
+[youtube]
+# Upload saved clips to YouTube from the tray (\"Upload last clip to YouTube\"). The easy way
+# is the settings window's \"Log in with YouTube\", which fills refresh_token for you.
+enabled = false
+# Override the built-in Google OAuth client (advanced; e.g. your own Google Cloud project).
+client_id = \"\"
+client_secret = \"\"
+refresh_token = \"\"
+# \"public\", \"unlisted\" or \"private\"; empty uses the [upload] visibility above.
+visibility = \"\"
 ";
 
 /// Write [`DEFAULT_TEMPLATE`] to `path`, creating parent directories (0700 on unix). The file is
@@ -997,6 +1134,64 @@ mod tests {
         assert_eq!(u.api_key, "gtv_k", "key is trimmed");
         assert_eq!(u.api_url, "http://localhost:5050/");
         assert_eq!(u.visibility, "unlisted");
+    }
+
+    #[test]
+    fn youtube_defaults_token_requirement_and_visibility_fallback() {
+        let c = Config::from_toml_str("").expect("parses");
+        let y = c.youtube();
+        assert!(!y.enabled);
+        assert_eq!(y.visibility, "unlisted", "empty falls back to [upload]");
+
+        // Enabled without a refresh token stays disabled.
+        let c = Config::from_toml_str("[youtube]\nenabled = true\n").expect("parses");
+        assert!(!c.youtube().enabled, "no token means not enabled");
+
+        let c = Config::from_toml_str(
+            "[upload]\nvisibility = \"unlisted\"\n\
+             [youtube]\nenabled = true\nrefresh_token = \" rt_x \"\nclient_id = \" my.id \"\n",
+        )
+        .expect("parses");
+        let y = c.youtube();
+        assert!(y.enabled);
+        assert_eq!(y.refresh_token, "rt_x", "token is trimmed");
+        assert_eq!(y.client_id, "my.id", "client id is trimmed");
+        assert_eq!(y.visibility, "unlisted", "falls back to the [upload] value");
+
+        let own = Config::from_toml_str(
+            "[upload]\nvisibility = \"unlisted\"\n[youtube]\nvisibility = \"public\"\n",
+        )
+        .expect("parses");
+        assert_eq!(own.youtube().visibility, "public", "own value wins");
+    }
+
+    #[test]
+    fn youtube_setters_round_trip() {
+        let mut c = Config::default();
+        c.set_youtube_enabled(true);
+        c.set_youtube_client_id("id.apps.googleusercontent.com".to_owned());
+        c.set_youtube_client_secret("cs".to_owned());
+        c.set_youtube_refresh_token("rt".to_owned());
+        c.set_youtube_visibility("unlisted".to_owned());
+        let back = Config::from_toml_str(&c.to_toml_string().expect("serialize")).expect("reparse");
+        assert_eq!(back, c);
+        assert!(back.youtube_enabled());
+        assert_eq!(back.youtube_client_id(), "id.apps.googleusercontent.com");
+        assert_eq!(back.youtube_client_secret(), "cs");
+        assert_eq!(back.youtube_refresh_token(), "rt");
+        assert_eq!(back.youtube_visibility(), "unlisted");
+    }
+
+    #[test]
+    fn youtube_secrets_are_redacted_in_debug() {
+        let mut c = Config::default();
+        c.set_youtube_client_secret("hushhush".to_owned());
+        c.set_youtube_refresh_token("rt_hidden".to_owned());
+        let dump = format!("{c:?} {:?}", c.youtube());
+        assert!(
+            !dump.contains("hushhush") && !dump.contains("rt_hidden"),
+            "{dump}"
+        );
     }
 
     #[test]
