@@ -1014,28 +1014,29 @@ impl App {
         .align_x(iced::Alignment::Center)
         .width(Length::Fill);
 
-        let mut save_items: Vec<Element<Message>> = vec![
+        // Save and Restart side by side: stacked below the fold, the restart button fell
+        // outside small windows' viewport and went unseen — with stale settings running on.
+        let mut save_row = row![
             button(text("Save settings").size(13).font(UI_BOLD))
                 .on_press(Message::Save)
                 .style(primary_button)
-                .padding([13, 28])
-                .into(),
-            status_line(&self.status),
-        ];
+                .padding([13, 28]),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
         // Offer a one-click restart once a save actually landed (a failed save has nothing to
         // apply; a failed restart may be retried). Hidden while a restart is in flight and
         // once it succeeded — it reappears on the next save.
         if self.last_save_ok && !matches!(self.status, Status::Restarting | Status::Restarted) {
-            save_items.push(
+            save_row = save_row.push(
                 button(text("Restart rewynd now").size(12).font(UI_SEMIBOLD))
                     .on_press(Message::Restart)
-                    .padding([9, 22])
-                    .style(secondary_button)
-                    .into(),
+                    .padding([13, 22])
+                    .style(secondary_button),
             );
         }
         let save = container(
-            column(save_items)
+            column![save_row, status_line(&self.status)]
                 .spacing(10)
                 .align_x(iced::Alignment::Center),
         )

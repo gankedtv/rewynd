@@ -49,13 +49,22 @@ mod probe {
             .and_then(|v| v.parse().ok())
             .filter(|&v| v > 0)
             .unwrap_or(DEFAULT_BUFFERS);
+        // AUDIO_PROBE_SOURCE=mic probes the microphone instead of the system mix;
+        // AUDIO_PROBE_DEVICE selects a specific endpoint (as the config value would).
+        let source = match std::env::var("AUDIO_PROBE_SOURCE").as_deref() {
+            Ok("mic") => AudioSource::Microphone,
+            _ => AudioSource::SinkMonitor,
+        };
+        let device = std::env::var("AUDIO_PROBE_DEVICE").ok();
 
         let params = AudioParams::default();
         tracing::info!(
+            ?source,
+            device = device.as_deref().unwrap_or("<default>"),
             sample_rate = params.sample_rate,
             channels = params.channels,
             max_buffers,
-            "starting system-audio capture probe (play audio to see non-zero levels)"
+            "starting audio capture probe (make noise to see non-zero levels)"
         );
 
         // The callback is `'static`, so it can't borrow these locals; share them through
@@ -67,8 +76,8 @@ mod probe {
 
         capture_audio(
             params,
-            AudioSource::SinkMonitor,
-            None,
+            source,
+            device.as_deref(),
             Some(IDLE_TIMEOUT),
             None,
             std::time::Instant::now(),
