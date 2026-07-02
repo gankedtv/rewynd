@@ -9,12 +9,14 @@ ignore = [
     "RUSTSEC-2026-0150", # audiopus_sys unmaintained — we link SYSTEM libopus via pkg-config, the bundled-CMake path never runs
     "RUSTSEC-2026-0192", # ttf-parser unmaintained — transitive via iced/winit; upstream migration (skrifa) is theirs
     "RUSTSEC-2024-0388", # derivative unmaintained — inside the ADR-0001-pinned gpu-video rev
-    # quick-xml quadratic-runtime DoS on attacker-supplied start tags; patched only in >= 0.41
-    # while both our copies are semver-pinned upstream. Not reachable here: 0.39 sits in
+    # quick-xml quadratic-runtime DoS on attacker-supplied start tags (0194) and unbounded
+    # namespace-declaration allocation in NsReader (0195); both patched only in >= 0.41 while
+    # both our copies are semver-pinned upstream. Not reachable here: 0.39 sits in
     # wayland-scanner, a proc-macro parsing the BUNDLED protocol XML at compile time, and 0.37
     # sits in notify-rust's Windows-only backend serializing our own toast XML. Drop when
     # winit/wayland-rs and notify-rust move to a patched quick-xml.
     "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
 
 [licenses]
