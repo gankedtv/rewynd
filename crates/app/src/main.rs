@@ -281,10 +281,7 @@ mod uploads {
             return UploaderStatus::Disabled;
         }
         let vis = settings.visibility.trim();
-        if !vis.eq_ignore_ascii_case("public")
-            && !vis.eq_ignore_ascii_case("unlisted")
-            && !vis.eq_ignore_ascii_case("private")
-        {
+        if !rewynd_upload::Visibility::is_recognized(vis) {
             // parse() fails closed to private; still tell the user their config has a typo.
             tracing::warn!(visibility = vis, "unknown upload visibility; using private");
         }

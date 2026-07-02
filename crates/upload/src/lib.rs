@@ -51,6 +51,13 @@ impl Visibility {
         }
     }
 
+    /// Whether `s` names a recognized level, i.e. [`Self::parse`] won't fall back.
+    #[must_use]
+    pub fn is_recognized(s: &str) -> bool {
+        let s = s.trim();
+        Self::ALL.iter().any(|v| s.eq_ignore_ascii_case(v.as_str()))
+    }
+
     /// Parse a config value. Fails closed: only an explicit, recognized level is honored;
     /// anything unrecognized (a typo, say) becomes private rather than widening visibility.
     #[must_use]
