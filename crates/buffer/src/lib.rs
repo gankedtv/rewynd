@@ -101,6 +101,10 @@ impl<T: HasPts> TimeRing<T> {
     fn window(&self) -> Duration {
         self.window
     }
+
+    fn clear(&mut self) {
+        self.chunks.clear();
+    }
 }
 
 /// A time-bounded ring of encoded chunks with a keyframe-aware cut
@@ -169,6 +173,14 @@ impl RingBuffer {
     pub fn window(&self) -> Duration {
         self.ring.window()
     }
+
+    /// Drop everything buffered. Game-only capture calls this when a (new) game
+    /// starts recording, so a clip can never span a gated-off stretch: the muxer
+    /// writes audio packets back-to-back and a mid-clip gap would desynchronize
+    /// the tracks.
+    pub fn clear(&mut self) {
+        self.ring.clear();
+    }
 }
 
 /// A time-bounded ring of encoded audio packets, parallel to [`RingBuffer`].
@@ -226,6 +238,11 @@ impl AudioRingBuffer {
     #[must_use]
     pub fn window(&self) -> Duration {
         self.ring.window()
+    }
+
+    /// Drop everything buffered (see [`RingBuffer::clear`]).
+    pub fn clear(&mut self) {
+        self.ring.clear();
     }
 }
 

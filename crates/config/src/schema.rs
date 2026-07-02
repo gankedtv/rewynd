@@ -149,12 +149,24 @@ impl Default for BufferConfig {
 }
 
 /// Where saved clips are written (`None` → the caller's default, e.g. the temp dir).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct OutputConfig {
     // Omitted from the serialized file when unset (TOML has no null).
     #[serde(skip_serializing_if = "Option::is_none")]
     directory: Option<String>,
+    /// Sort clips into a per-game subfolder (ShadowPlay-style) when game detection
+    /// knows which game the buffer holds.
+    game_folders: bool,
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self {
+            directory: None,
+            game_folders: true,
+        }
+    }
 }
 
 /// Global-shortcut preference.
@@ -181,8 +193,9 @@ struct CaptureConfig {
     always_prompt: bool,
     /// Capture the whole desktop instead of only the active game. Off by default:
     /// recording everything can catch private content, and game-only is what an
-    /// instant-replay tool is expected to do. (Windows honors this today; on Linux the
-    /// ScreenCast portal's picker governs what is shared.)
+    /// instant-replay tool is expected to do. Windows targets the game window itself;
+    /// Linux keeps the portal's monitor stream but only fills the buffer while a
+    /// fullscreen game is focused.
     desktop: bool,
 }
 
@@ -462,6 +475,12 @@ impl Config {
         self.output.directory.as_deref()
     }
 
+    /// Whether clips sort into per-game subfolders when the running game is known.
+    #[must_use]
+    pub fn game_folders(&self) -> bool {
+        self.output.game_folders
+    }
+
     /// The upload toggle as stored (before [`upload`]'s has-a-key requirement).
     #[must_use]
     pub fn upload_enabled(&self) -> bool {
@@ -526,6 +545,11 @@ impl Config {
     /// Set the output directory; an empty string clears it (back to the caller's default).
     pub fn set_output_directory(&mut self, dir: Option<String>) {
         self.output.directory = dir.filter(|s| !s.is_empty());
+    }
+
+    /// Set whether clips sort into per-game subfolders.
+    pub fn set_game_folders(&mut self, on: bool) {
+        self.output.game_folders = on;
     }
 
     /// Set the preferred global-shortcut trigger.
@@ -749,6 +773,8 @@ seconds = 30
 [output]
 # Directory for saved clips. Unset = your Videos folder (or a private temp dir).
 # directory = \"/home/you/Videos/rewynd\"
+# Sort clips into a folder per game (like ShadowPlay) when the game is known.
+game_folders = true
 
 [hotkey]
 # Preferred trigger; the desktop may let you rebind it in its shortcut settings.
@@ -757,7 +783,7 @@ trigger = \"CTRL+ALT+R\"
 [capture]
 # Re-show the monitor picker each launch (so you can pick a different screen).
 always_prompt = false
-# Record the whole desktop instead of only the active fullscreen game (Windows).
+# Record the whole desktop instead of only the active fullscreen game.
 # Off keeps private windows out of clips.
 desktop = false
 
@@ -872,6 +898,15 @@ mod tests {
         assert!(c.always_prompt());
         assert_eq!(c.hotkey_trigger(), "CTRL+ALT+K");
         assert_eq!(c.buffer_window(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn game_folders_defaults_on_and_round_trips() {
+        let mut c = Config::default();
+        assert!(c.game_folders(), "per-game folders default on");
+        c.set_game_folders(false);
+        let back = Config::from_toml_str(&c.to_toml_string().expect("serialize")).expect("reparse");
+        assert!(!back.game_folders());
     }
 
     #[test]

@@ -12,6 +12,8 @@ publish = false
 wgpu.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# Maps a running Steam appid to the installed game's human name (per-game clip folders).
+steamlocate = "2.1"
 
 # Linux capture (PLAN §3.5): XDG ScreenCast portal + PipeWire. Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -23,6 +25,22 @@ pipewire.workspace = true
 ash = "0.38"
 # Type-safe DRM fourcc codes and the DRM_FORMAT_MOD_INVALID sentinel.
 drm-fourcc.workspace = true
+# Focused-window watcher (game detection): the plasma-window-management and
+# wlr-foreign-toplevel protocols, spoken over a dedicated Wayland connection.
+wayland-client = "0.31"
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+# poll(2) on the Wayland fd so the watcher thread can notice the stop flag.
+libc = "0.2"
+# KWin scripting fallback for game detection: recent KWin hides the plasma
+# window-management global from ordinary clients, so a tiny KWin script reports the
+# active window back over DBus. Same zbus that ashpd already pulls in; zbus runs on
+# tokio here (ashpd's choice, mirrored via the feature), so the backend carries its
+# own small runtime rather than dragging in zbus's default async-io stack.
+zbus = { version = "5", default-features = false, features = ["tokio", "blocking-api"] }
+tokio.workspace = true
+# Consumes the zbus NameOwnerChanged signal stream (KWin restart detection).
+futures-util.workspace = true
 
 # Windows capture (PLAN §3.5): Windows Graphics Capture → D3D11 shared NT handles.
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -73,6 +91,12 @@ required-features = ["probes"]
 # compiles everywhere via a `#[cfg(not(target_os = "linux"))]` stub `main`.
 [[example]]
 name = "record_h264"
+
+# Focus-watcher probe: print the focused fullscreen game as it changes, proving the
+# compositor's window-management backend works. Linux-only at runtime; compiles
+# everywhere via a stub `main`.
+[[example]]
+name = "focus_probe"
 
 # System-audio capture probe: capture the default sink monitor as PCM and log each
 # buffer's peak/RMS level + PTS, proving non-silent capture. Linux-only at runtime;

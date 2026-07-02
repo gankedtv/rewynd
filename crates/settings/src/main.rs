@@ -324,8 +324,8 @@ enum Message {
     HotkeyEdited(String),
     #[cfg(target_os = "linux")]
     AlwaysPrompt(bool),
-    #[cfg(target_os = "windows")]
     CaptureDesktop(bool),
+    GameFolders(bool),
     StartOnBoot(bool),
     UploadEnabled(bool),
     ApiKeyEdited(String),
@@ -472,9 +472,12 @@ impl App {
                 self.config.set_always_prompt(on);
                 self.touch();
             }
-            #[cfg(target_os = "windows")]
             Message::CaptureDesktop(on) => {
                 self.config.set_capture_desktop(on);
+                self.touch();
+            }
+            Message::GameFolders(on) => {
+                self.config.set_game_folders(on);
                 self.touch();
             }
             Message::StartOnBoot(on) => {
@@ -841,7 +844,6 @@ impl App {
                 .on_toggle(Message::AlwaysPrompt)
                 .style(arena_check),
         );
-        #[cfg(target_os = "windows")]
         let output_capture = output_capture.push(
             column![
                 checkbox(self.config.capture_desktop())
@@ -852,6 +854,16 @@ impl App {
                     "Off records only the game you're playing (fullscreen or \
                      borderless), keeping other windows out of your clips.",
                 ),
+            ]
+            .spacing(6),
+        );
+        let output_capture = output_capture.push(
+            column![
+                checkbox(self.config.game_folders())
+                    .label("Sort clips into a folder per game")
+                    .on_toggle(Message::GameFolders)
+                    .style(arena_check),
+                hint("Saved clips land in a subfolder named after the game, when known."),
             ]
             .spacing(6),
         );
