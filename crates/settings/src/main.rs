@@ -36,6 +36,66 @@ fn is_custom_url(stored: &str, default: &str) -> bool {
     !stored.is_empty() && stored != default
 }
 
+/// The settings scrollable's id, so a disclosure collapse can snap it back to the top.
+fn settings_scroll_id() -> iced::widget::Id {
+    iced::widget::Id::new("settings-scroll")
+}
+
+/// Snap the settings form back to the top: used when a disclosure collapses, so the shorter form
+/// is shown rather than a stale scroll offset that hides the change.
+fn collapse_scroll() -> Task<Message> {
+    iced::widget::operation::snap_to(
+        settings_scroll_id(),
+        iced::widget::scrollable::RelativeOffset::START,
+    )
+}
+
+/// How long to wait after the first filesystem event before refreshing, so a burst (one clip
+/// write touches the `.part` file, the rename, and the directory) collapses into one rescan.
+const WATCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Watch `dir` recursively and yield a debounced [`Message::ClipsChanged`] whenever clips there
+/// appear or disappear. Recursive so a brand-new per-game subfolder (the first clip of a new
+/// game) is covered without re-binding. The `notify` watcher is owned by the async block and
+/// lives until the subscription is dropped.
+fn clip_watch_stream(dir: std::path::PathBuf) -> impl iced::futures::Stream<Item = Message> {
+    iced::stream::channel(
+        4,
+        move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+            use iced::futures::SinkExt;
+            use notify::{RecursiveMode, Watcher};
+
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let mut watcher = match notify::recommended_watcher(
+                move |res: notify::Result<notify::Event>| {
+                    if res.is_ok() {
+                        let _ = tx.send(());
+                    }
+                },
+            ) {
+                Ok(watcher) => watcher,
+                Err(e) => {
+                    tracing::warn!(error = %e, "clip-directory watcher unavailable; refresh is manual");
+                    return;
+                }
+            };
+            if let Err(e) = watcher.watch(&dir, RecursiveMode::Recursive) {
+                tracing::warn!(error = %e, dir = %dir.display(), "could not watch the clip directory");
+                return;
+            }
+
+            while rx.recv().await.is_some() {
+                // Collapse the rest of the burst before refreshing once.
+                tokio::time::sleep(WATCH_DEBOUNCE).await;
+                while rx.try_recv().is_ok() {}
+                if output.send(Message::ClipsChanged).await.is_err() {
+                    break;
+                }
+            }
+        },
+    )
+}
+
 /// Slider bounds (kept generous but sane).
 const GAIN_MAX: f32 = 4.0;
 const BUFFER_MIN_S: u32 = 5;
@@ -103,6 +163,7 @@ fn main() -> iced::Result {
     iced::application(App::load, App::update, App::view)
         .title("rewynd")
         .theme(App::theme)
+        .subscription(App::subscription)
         // Bundled faces (both OFL, licenses beside the files): the Arena design is set in
         // Barlow Condensed (display) + Inter (UI); system fallbacks would break the look.
         .font(include_bytes!("../assets/fonts/BarlowCondensed-Black.ttf").as_slice())
@@ -321,6 +382,10 @@ enum Message {
     Save,
     Restart,
     Restarted(Result<(), String>),
+    /// The window regained focus; refresh the library so clips saved meanwhile show up.
+    WindowFocused,
+    /// The clip-directory watcher fired (debounced); refresh the library.
+    ClipsChanged,
 }
 
 impl App {
@@ -531,8 +596,14 @@ impl App {
                 self.config.set_upload_visibility(v.as_str().to_owned());
                 self.touch();
             }
-            // No touch(): opening the disclosure edits nothing.
-            Message::AdvancedToggled => self.advanced_open = !self.advanced_open,
+            // No touch(): opening the disclosure edits nothing. Collapsing snaps the (now
+            // shorter) form back to the top so the change is visible even when scrolled down.
+            Message::AdvancedToggled => {
+                self.advanced_open = !self.advanced_open;
+                if !self.advanced_open {
+                    return collapse_scroll();
+                }
+            }
             Message::LoginPressed => {
                 let base = self.effective_api_url();
                 let (task, abort) = Task::perform(
@@ -616,7 +687,12 @@ impl App {
                 self.touch();
             }
             // No touch(): opening the disclosure edits nothing.
-            Message::YtAdvancedToggled => self.yt_advanced_open = !self.yt_advanced_open,
+            Message::YtAdvancedToggled => {
+                self.yt_advanced_open = !self.yt_advanced_open;
+                if !self.yt_advanced_open {
+                    return collapse_scroll();
+                }
+            }
             Message::YtLoginPressed => {
                 let (client_id, client_secret) = self.effective_yt_client();
                 // Google's installed-app token exchange needs both halves; catching a
@@ -726,6 +802,13 @@ impl App {
                     Ok(()) => Status::Restarted,
                     Err(e) => Status::Error(e),
                 };
+            }
+            // Auto-refresh only matters while the library is on screen; entering it already
+            // rescans, so a Settings-side event has nothing to do.
+            Message::WindowFocused | Message::ClipsChanged => {
+                if self.view == View::Library {
+                    return self.library.refresh(&self.config).map(Message::Library);
+                }
             }
         }
         Task::none()
@@ -839,6 +922,24 @@ impl App {
             View::Settings => self.settings_view(),
         };
         column![nav_bar(self.view), body].into()
+    }
+
+    /// Live events that keep the library in step with what the recorder writes: the OS window
+    /// regaining focus, and a debounced watch on the clip directory (and its per-game
+    /// subfolders). The watch is keyed by the resolved directory, so it re-binds if the output
+    /// directory changes.
+    fn subscription(&self) -> iced::Subscription<Message> {
+        let focus = iced::event::listen_with(|event, _status, _id| match event {
+            iced::Event::Window(iced::window::Event::Focused) => Some(Message::WindowFocused),
+            _ => None,
+        });
+        let dir = config::clips_dir(self.config.output_dir().as_deref())
+            .to_string_lossy()
+            .into_owned();
+        let clips = iced::Subscription::run_with(dir, |dir| {
+            clip_watch_stream(std::path::PathBuf::from(dir))
+        });
+        iced::Subscription::batch([focus, clips])
     }
 
     fn settings_view(&self) -> Element<'_, Message> {
@@ -1347,8 +1448,9 @@ impl App {
         // The scrollable is a safety net for small windows and the opened Advanced disclosure;
         // the default window size is chosen (by eye — iced has no pre-layout measure) so the
         // collapsed form fits without it. The body caps at 880, so on a wider window center it
-        // rather than leaving the slack on one side.
-        container(scrollable(container(body).center_x(Length::Fill)))
+        // rather than leaving the slack on one side. The id lets a disclosure collapse snap the
+        // view back to the top, so the shorter form is never stranded below a stale scroll offset.
+        container(scrollable(container(body).center_x(Length::Fill)).id(settings_scroll_id()))
             .width(Length::Fill)
             .height(Length::Fill)
             .into()

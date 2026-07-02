@@ -9,6 +9,8 @@
 //! thumbnails stay in-memory only for the run.
 
 use std::path::{Path, PathBuf};
+use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use iced::widget::image::Handle;
@@ -149,20 +151,54 @@ fn cache_file(path: &Path, modified: SystemTime) -> Option<PathBuf> {
 }
 
 /// The private thumbnail cache dir, (re-)verified on every use like the clip store's fallback
-/// dir: created 0700 when missing, and only trusted while it is a real directory owned by us
-/// with no group/world access.
+/// dir: created 0700 when missing, and trusted once it is a real directory owned by us. A dir an
+/// older build left group/world-readable is tightened in place by `ensure_private_dir` (not
+/// refused), so the on-disk cache survives the upgrade instead of falling back to memory forever.
+/// The warning is logged at most once per run, not once per decode.
 fn thumbs_dir() -> Option<PathBuf> {
     let base = dirs::cache_dir()?.join("rewynd");
     let dir = base.join("thumbs");
     if rewynd_config::ensure_private_dir(&base) && rewynd_config::ensure_private_dir(&dir) {
+        tighten_existing_pngs(&dir);
         return Some(dir);
     }
-    tracing::warn!(
-        dir = %dir.display(),
-        "thumbnail cache dir is not safely ours; keeping thumbnails in memory only"
-    );
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            dir = %dir.display(),
+            "thumbnail cache dir is not safely ours; keeping thumbnails in memory only"
+        );
+    }
     None
 }
+
+/// One-time sweep tightening any PNGs an older build wrote group/world-readable (before the 0600
+/// atomic writer landed) down to owner-only. The dir itself is already 0700, so this only closes
+/// the residual file bits; new writes are 0600 from the start.
+#[cfg(unix)]
+fn tighten_existing_pngs(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "png") {
+                continue;
+            }
+            if std::fs::symlink_metadata(&path)
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o077 != 0)
+            {
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn tighten_existing_pngs(_dir: &Path) {}
 
 /// A stable 64-bit key over (path, mtime) — FNV-1a, so the cache file names survive restarts
 /// (std's hasher is seeded per process) and a rewritten clip gets a fresh entry.

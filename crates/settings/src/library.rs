@@ -27,6 +27,9 @@ use crate::thumbs;
 /// Cards per grid row (the body column is width-capped, so a fixed count stays balanced).
 const GRID_COLUMNS: usize = 3;
 
+/// Section label for clips saved outside a per-game subfolder (desktop / no game detected).
+const ROOT_GROUP: &str = "Desktop";
+
 /// Thumbnail decodes running at once. Each holds a full decoded frame briefly, so a big
 /// library must stream through a small pool instead of decoding every stale clip at once.
 const MAX_DECODES: usize = 4;
@@ -103,6 +106,8 @@ pub struct Uploaded {
 #[derive(Debug, Clone)]
 pub enum Message {
     Refresh,
+    SearchEdited(String),
+    GameFilterPicked(Option<String>),
     Scanned(Vec<ClipEntry>),
     ThumbDone(PathBuf, SystemTime, Result<thumbs::Loaded, String>),
     Open(PathBuf),
@@ -132,6 +137,10 @@ pub struct Library {
     /// decode was started for). Its size is the in-flight count, capped at [`MAX_DECODES`].
     decoding: HashMap<PathBuf, SystemTime>,
     scanning: bool,
+    /// Fuzzy filter over game name / date / file name; empty shows everything.
+    search: String,
+    /// The game section the chip row has narrowed to, if any (`None` shows all).
+    game_filter: Option<String>,
     /// The clip whose detail page is open, if any.
     open: Option<PathBuf>,
     confirm_delete: bool,
@@ -154,6 +163,8 @@ impl Library {
             pending_thumbs: VecDeque::new(),
             decoding: HashMap::new(),
             scanning: false,
+            search: String::new(),
+            game_filter: None,
             open: None,
             confirm_delete: false,
             action_error: None,
@@ -183,6 +194,8 @@ impl Library {
     pub fn update(&mut self, message: Message, config: &Config) -> Task<Message> {
         match message {
             Message::Refresh => return self.refresh(config),
+            Message::SearchEdited(q) => self.search = q,
+            Message::GameFilterPicked(game) => self.game_filter = game,
             Message::Scanned(entries) => return self.scanned(entries),
             Message::ThumbDone(path, modified, result) => {
                 // Free the decode slot, unless a newer decode for the same path superseded it.
@@ -339,6 +352,14 @@ impl Library {
                 .push_back((entry.path.clone(), modified));
         }
         self.entries = entries;
+        // Drop a game filter whose section vanished (its last clip was deleted or moved).
+        let stale = self
+            .game_filter
+            .as_ref()
+            .is_some_and(|game| !self.entries.iter().any(|e| group_label(e) == game));
+        if stale {
+            self.game_filter = None;
+        }
         self.start_pending_decodes()
     }
 
@@ -444,10 +465,18 @@ impl Library {
         self.entries.iter().find(|e| e.path == path)
     }
 
-    /// The default page: header + the clip cards, newest first.
+    /// The default page: header + the clip cards, grouped by game, newest first.
     fn grid(&self) -> Element<'_, Message> {
-        let header = row![
+        let title = column![
             text("LIBRARY").size(32).font(DISPLAY_BLACK),
+            text(self.library_stats())
+                .size(12)
+                .font(UI_SEMIBOLD)
+                .style(tinted(palette::TEXT_SECONDARY)),
+        ]
+        .spacing(4);
+        let header = row![
+            title,
             Space::new().width(Length::Fill),
             if self.scanning {
                 hint("Refreshing...")
@@ -484,19 +513,139 @@ impl Library {
             .into();
         }
 
+        let groups = self.grouped();
+        let mut sections = column![].spacing(24);
+        if groups.is_empty() {
+            sections = sections.push(
+                container(hint("No clips match your search."))
+                    .center_x(Length::Fill)
+                    .padding([48, 0])
+                    .width(Length::Fill),
+            );
+        }
+        for (label, clips) in &groups {
+            sections = sections.push(self.section(label, clips));
+        }
+        column![header, self.controls(), sections]
+            .spacing(20)
+            .into()
+    }
+
+    /// The "N clips · X.X GB" line under the title, over the whole library (unfiltered).
+    fn library_stats(&self) -> String {
+        let count = self.entries.len();
+        let bytes: u64 = self.entries.iter().map(|e| e.size_bytes).sum();
+        let clips = if count == 1 { "clip" } else { "clips" };
+        format!("{count} {clips} · {} on disk", disk_label(bytes))
+    }
+
+    /// Search field plus a chip per game section (and an "All" chip), shown only when there is
+    /// more than one section to move between.
+    fn controls(&self) -> Element<'_, Message> {
+        let search = text_input("Search clips", &self.search)
+            .on_input(Message::SearchEdited)
+            .style(theme::arena_input)
+            .width(Length::Fixed(260.0));
+
+        let labels = self.game_labels();
+        let mut chips = row![chip(
+            "All",
+            self.game_filter.is_none(),
+            Message::GameFilterPicked(None)
+        )]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+        if labels.len() > 1 {
+            for label in labels {
+                let active = self.game_filter.as_deref() == Some(label.as_str());
+                chips = chips.push(chip(
+                    &label,
+                    active,
+                    Message::GameFilterPicked(Some(label.clone())),
+                ));
+            }
+        }
+
+        row![search, Space::new().width(Length::Fill), chips]
+            .spacing(12)
+            .align_y(iced::Alignment::Center)
+            .into()
+    }
+
+    /// One game section: a header (label + clip count) over that group's grid. `label`'s
+    /// lifetime is independent of the returned element (its text is owned), so the caller's
+    /// grouping scratch does not have to outlive the view.
+    fn section<'a>(&'a self, label: &str, clips: &[&'a ClipEntry]) -> Element<'a, Message> {
+        let head = row![
+            text(label.to_uppercase()).size(15).font(UI_BOLD),
+            text(format!("{}", clips.len()))
+                .size(11)
+                .font(UI_SEMIBOLD)
+                .style(tinted(palette::MUTED)),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
+
         let mut rows = column![].spacing(14);
-        for chunk in self.entries.chunks(GRID_COLUMNS) {
+        for chunk in clips.chunks(GRID_COLUMNS) {
             let mut r = row![].spacing(14);
             for entry in chunk {
                 r = r.push(self.clip_card(entry));
             }
-            // Pad the last row so its cards keep the grid's card width.
             for _ in chunk.len()..GRID_COLUMNS {
                 r = r.push(Space::new().width(Length::Fill));
             }
             rows = rows.push(r);
         }
-        column![header, rows].spacing(20).into()
+        column![head, rows].spacing(12).into()
+    }
+
+    /// The filtered entries grouped by game, each group newest-first, groups ordered by most
+    /// recent activity (entries arrive newest-first, so first sighting fixes group order).
+    fn grouped(&self) -> Vec<(String, Vec<&ClipEntry>)> {
+        let mut groups: Vec<(String, Vec<&ClipEntry>)> = Vec::new();
+        for entry in self.entries.iter().filter(|e| self.matches(e)) {
+            let label = group_label(entry);
+            if let Some(group) = groups.iter_mut().find(|(l, _)| l == label) {
+                group.1.push(entry);
+            } else {
+                groups.push((label.to_owned(), vec![entry]));
+            }
+        }
+        groups
+    }
+
+    /// Distinct game section labels present, ordered by most recent activity (for the chip row).
+    fn game_labels(&self) -> Vec<String> {
+        let mut labels: Vec<String> = Vec::new();
+        for entry in &self.entries {
+            let label = group_label(entry);
+            if !labels.iter().any(|l| l == label) {
+                labels.push(label.to_owned());
+            }
+        }
+        labels
+    }
+
+    /// Whether `entry` passes the active game filter and the search query.
+    fn matches(&self, entry: &ClipEntry) -> bool {
+        if let Some(filter) = &self.game_filter
+            && group_label(entry) != filter
+        {
+            return false;
+        }
+        let query = self.search.trim();
+        if query.is_empty() {
+            return true;
+        }
+        let name = entry
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        fuzzy_match(query, group_label(entry))
+            || fuzzy_match(query, &saved_at_label(entry.saved_at))
+            || fuzzy_match(query, name)
     }
 
     fn clip_card<'a>(&'a self, entry: &'a ClipEntry) -> Element<'a, Message> {
@@ -905,9 +1054,75 @@ fn size_label(bytes: u64) -> String {
     format!("{:.1} MB", bytes as f64 / 1e6)
 }
 
+/// A whole-library size in whichever of MB / GB reads cleanest.
+fn disk_label(bytes: u64) -> String {
+    let gb = bytes as f64 / 1e9;
+    if gb >= 1.0 {
+        format!("{gb:.1} GB")
+    } else {
+        format!("{:.0} MB", bytes as f64 / 1e6)
+    }
+}
+
 fn duration_label(d: Duration) -> String {
     let s = d.as_secs();
     format!("{}:{:02}", s / 60, s % 60)
+}
+
+/// The section label for a clip: its game subfolder, or [`ROOT_GROUP`] for a root clip.
+fn group_label(entry: &ClipEntry) -> &str {
+    entry.game.as_deref().unwrap_or(ROOT_GROUP)
+}
+
+/// Case-insensitive subsequence match: every character of `needle` appears in `haystack` in
+/// order (so "eldn" matches "Elden Ring"). An empty needle matches everything.
+fn fuzzy_match(needle: &str, haystack: &str) -> bool {
+    let mut hay = haystack.chars().flat_map(char::to_lowercase);
+    'needle: for nc in needle.chars().flat_map(char::to_lowercase) {
+        for hc in hay.by_ref() {
+            if hc == nc {
+                continue 'needle;
+            }
+        }
+        return false;
+    }
+    true
+}
+
+/// A filter chip: mint fill when active, a quiet outline otherwise. The label text is owned, so
+/// the chip does not borrow the caller's string.
+fn chip(label: &str, active: bool, msg: Message) -> Element<'static, Message> {
+    button(text(label.to_uppercase()).size(10).font(UI_BOLD))
+        .on_press(msg)
+        .style(move |_: &Theme, status| chip_style(status, active))
+        .padding([5, 11])
+        .into()
+}
+
+fn chip_style(status: iced::widget::button::Status, active: bool) -> iced::widget::button::Style {
+    use iced::widget::button::{Status, Style};
+    let (background, text_color, border_color) = if active {
+        (
+            Some(Background::Color(palette::ACCENT)),
+            palette::INK_ON_ACCENT,
+            palette::ACCENT,
+        )
+    } else {
+        match status {
+            Status::Hovered | Status::Pressed => (None, palette::ACCENT, palette::ACCENT_BORDER),
+            _ => (None, palette::TEXT_SECONDARY, palette::BORDER),
+        }
+    };
+    Style {
+        background,
+        text_color,
+        border: Border {
+            color: border_color,
+            width: 1.0,
+            radius: 12.0.into(),
+        },
+        ..Style::default()
+    }
 }
 
 /// The clip card shell: a raised panel that is also a button (hover lifts the border to the
@@ -1012,6 +1227,44 @@ mod tests {
         assert!(!disabled.ready());
         let blocker = disabled.blocker(Dest::Ganked).expect("blocked");
         assert!(blocker.contains("switched off"), "{blocker}");
+    }
+
+    #[test]
+    fn fuzzy_match_is_a_case_insensitive_subsequence() {
+        assert!(fuzzy_match("eldn", "Elden Ring"));
+        assert!(fuzzy_match("OW", "Overwatch"));
+        assert!(fuzzy_match("", "anything"));
+        assert!(fuzzy_match("desktop", "Desktop"));
+        assert!(!fuzzy_match("zzz", "Overwatch"));
+        assert!(
+            !fuzzy_match("ringx", "Elden Ring"),
+            "extra char past the end"
+        );
+    }
+
+    #[test]
+    fn disk_label_scales_mb_to_gb() {
+        assert_eq!(disk_label(500_000_000), "500 MB");
+        assert_eq!(disk_label(0), "0 MB");
+        assert_eq!(disk_label(1_500_000_000), "1.5 GB");
+        assert_eq!(disk_label(12_300_000_000), "12.3 GB");
+    }
+
+    #[test]
+    fn group_label_falls_back_to_the_root_section() {
+        let with_game = ClipEntry {
+            path: PathBuf::from("/c/Elden Ring/rewynd-1-0.mp4"),
+            game: Some("Elden Ring".to_owned()),
+            saved_at: SystemTime::UNIX_EPOCH,
+            modified: SystemTime::UNIX_EPOCH,
+            size_bytes: 1,
+        };
+        let rootless = ClipEntry {
+            game: None,
+            ..with_game.clone()
+        };
+        assert_eq!(group_label(&with_game), "Elden Ring");
+        assert_eq!(group_label(&rootless), ROOT_GROUP);
     }
 
     #[test]
