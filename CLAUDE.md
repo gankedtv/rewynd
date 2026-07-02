@@ -20,7 +20,7 @@
 
 ## Workflow
 - Issue-driven: branch `N-slug` off `main` per issue → implement → `/code-review` (+ apply) → push → PR → CodeRabbit review (address findings) → merge. The repo squash-merges, so stacked PRs need a rebase after the base lands.
-- **Always run the `/code-review` skill before pushing a PR** — the actual skill, not a few ad-hoc review agents. Apply its findings first.
+- **Always run the `/review` skill before pushing a PR** — the actual skill, not a few ad-hoc review agents. Apply its findings first.
 - **Read CodeRabbit's review properly before merging.** Its author login is `coderabbitai[bot]`, so match case-insensitively. The verdict (`Actionable comments posted: N`) lives in the PR *reviews*, and the findings are *inline review comments*, not issue comments: `gh api repos/<owner>/<repo>/pulls/<n>/comments --paginate`. Only treat it as "no findings" after checking that endpoint. If it says rate-limited / "Review limit reached", skip it and merge once CI is green (per the user's standing permission).
 - CI installs the Linux capture system deps (`libpipewire-0.3-dev`, `clang`); keep that in `.github/workflows/ci.yml`.
 

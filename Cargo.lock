@@ -3625,6 +3625,7 @@ dependencies = [
  "drm-fourcc",
  "pipewire",
  "png",
+ "pollster",
  "rewynd-encode",
  "rewynd-gpu",
  "thiserror 2.0.18",
@@ -3686,6 +3687,7 @@ dependencies = [
  "gpu-video",
  "thiserror 2.0.18",
  "wgpu 29.0.0",
+ "windows 0.62.2",
 ]
 
 [[package]]
