@@ -36,10 +36,10 @@ entirely on the user's machine.
   stays on googleapis.com and **does** carry the bearer (encoded in the tests). Interruption
   resume (308 + `Content-Range`) is deferred: clips are small and the recorder retriggers a
   whole upload cheaply; the session init already speaks the resumable protocol if that changes.
-- **Visibility** maps 1:1 onto `privacyStatus` (`Visibility::as_str` values are Google's own);
-  `[youtube] visibility` falls back to the shared `[upload]` default and fails closed to
-  unlisted on anything unrecognized. `private` stays unsupported until the shared selector
-  grows it.
+- **Visibility** maps 1:1 onto `privacyStatus` (`Visibility::as_str` values are Google's own —
+  public, unlisted and private alike); `[youtube] visibility` falls back to the shared
+  `[upload]` default and fails closed to **private** on anything unrecognized, so a typo can
+  only ever narrow who sees a clip.
 - **OAuth client = embedded desktop-app client** (`option_env!("REWYND_YT_CLIENT_ID")` /
   `REWYND_YT_CLIENT_SECRET` at build time, currently empty), overridable at runtime via
   `[youtube] client_id/client_secret` and the settings' Advanced fields. Google's installed-app

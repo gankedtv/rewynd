@@ -427,19 +427,17 @@ impl App {
     /// The OAuth client the YouTube login should use: the (unsaved) field values, or the
     /// compiled-in defaults.
     fn effective_yt_client(&self) -> (String, String) {
-        let or_default = |field: &str, default: &str| {
-            let v = field.trim();
-            if v.is_empty() { default } else { v }.to_owned()
-        };
         (
-            or_default(
+            config::non_empty_or(
                 &self.yt_client_id,
                 rewynd_upload::youtube::DEFAULT_CLIENT_ID,
-            ),
-            or_default(
+            )
+            .to_owned(),
+            config::non_empty_or(
                 &self.yt_client_secret,
                 rewynd_upload::youtube::DEFAULT_CLIENT_SECRET,
-            ),
+            )
+            .to_owned(),
         )
     }
 
@@ -659,9 +657,12 @@ impl App {
             Message::YtAdvancedToggled => self.yt_advanced_open = !self.yt_advanced_open,
             Message::YtLoginPressed => {
                 let (client_id, client_secret) = self.effective_yt_client();
-                if client_id.is_empty() {
+                // Google's installed-app token exchange needs both halves; catching a
+                // missing secret here beats a cryptic failure after the consent screen.
+                if client_id.is_empty() || client_secret.is_empty() {
                     self.yt_login = YtLoginState::Failed(
-                        "No Google OAuth client is configured; add one under Advanced options."
+                        "No Google OAuth client is configured; add its id and secret under \
+                         Advanced options."
                             .to_owned(),
                     );
                     return Task::none();

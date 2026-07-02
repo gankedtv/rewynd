@@ -334,10 +334,12 @@ mod uploads {
         let client_id = rewynd_config::non_empty_or(&settings.client_id, DEFAULT_CLIENT_ID);
         let client_secret =
             rewynd_config::non_empty_or(&settings.client_secret, DEFAULT_CLIENT_SECRET);
-        if client_id.is_empty() {
+        // The token exchange needs both halves of the OAuth client.
+        if client_id.is_empty() || client_secret.is_empty() {
             return Err((
                 "YouTube upload unavailable",
-                "No Google OAuth client is configured; set one in the settings (Advanced options)."
+                "No Google OAuth client is configured; set its id and secret in the settings \
+                 (Advanced options)."
                     .to_owned(),
             ));
         }

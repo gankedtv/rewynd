@@ -90,8 +90,9 @@ pub struct YouTubeSettings {
     /// OAuth client secret override; empty = the compiled-in default.
     pub client_secret: String,
     pub refresh_token: String,
-    /// `"public"` or `"unlisted"`; empty falls back to the `[upload]` visibility. Consumers
-    /// fail closed: anything unrecognized is treated as unlisted.
+    /// `"public"`, `"unlisted"` or `"private"`; empty falls back to the `[upload]` visibility.
+    /// Consumers fail closed: anything unrecognized is treated as private, so a typo can
+    /// never widen a clip's visibility.
     pub visibility: String,
 }
 

@@ -33,12 +33,8 @@ const UPLOAD_URL: &str = "https://www.googleapis.com/upload/youtube/v3/videos";
 /// The minimal scope for `videos.insert`.
 const SCOPE: &str = "https://www.googleapis.com/auth/youtube.upload";
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const API_TIMEOUT: Duration = Duration::from_secs(30);
-/// Base allowance for the video PUT, extended per byte below.
-const PUT_BASE_TIMEOUT: Duration = Duration::from_secs(60);
-/// Slowest tolerated sustained upload rate (~1 Mbit/s), matching the ganked.tv client.
-const PUT_MIN_RATE_BYTES_PER_SEC: u64 = 125_000;
+// Timeout discipline is shared with the ganked.tv client so the destinations can't drift.
+use crate::{API_TIMEOUT, CONNECT_TIMEOUT, PUT_BASE_TIMEOUT, PUT_MIN_RATE_BYTES_PER_SEC};
 /// How long the loopback listener waits for the browser redirect before giving up.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 /// Refresh the access token when it has less than this left, so it can't expire mid-upload
@@ -250,11 +246,10 @@ impl YouTubeClient {
             .await?;
         let status = resp.status();
         if !status.is_success() {
-            let body = crate::bounded_text(resp).await;
-            if oauth_error(&body) == Some("invalid_grant") {
-                return Err(YouTubeError::NeedsReauth);
-            }
-            return Err(map_api_error(status.as_u16(), &body));
+            return Err(map_token_error(
+                status.as_u16(),
+                &crate::bounded_text(resp).await,
+            ));
         }
         let token: TokenResponse = resp.json().await?;
         let ttl = Duration::from_secs(token.expires_in).saturating_sub(TOKEN_EXPIRY_MARGIN);
@@ -365,7 +360,7 @@ pub async fn youtube_login_wait(login: YouTubeLogin) -> Result<String, YouTubeEr
         .await?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(map_api_error(
+        return Err(map_token_error(
             status.as_u16(),
             &crate::bounded_text(resp).await,
         ));
@@ -379,21 +374,27 @@ pub async fn youtube_login_wait(login: YouTubeLogin) -> Result<String, YouTubeEr
 }
 
 /// Serve loopback connections until one carries a redirect with our state; return its code.
-/// Connections that aren't the redirect (favicon probes, other local traffic) get a 404 and the
-/// loop continues; a mismatched state or an OAuth error terminates the login.
+/// Connections that aren't the redirect — favicon probes, other local traffic, and
+/// query-bearing GETs whose state doesn't match (any process can poke a loopback port; a
+/// stray hit must not kill the pending login) — get a 404 and the loop continues. Only a
+/// state-matching redirect ends the flow.
 async fn await_redirect(login: &YouTubeLogin) -> Result<String, YouTubeError> {
     loop {
         let (mut stream, _) = login.listener.accept().await?;
         match read_redirect(&mut stream).await {
-            Ok(Some(params)) => {
-                let outcome = redirect_outcome(&params, &login.state);
-                let page = match &outcome {
-                    Ok(_) => success_page(),
-                    Err(e) => failure_page(&e.to_string()),
-                };
-                let _ = respond(&mut stream, "200 OK", &page).await;
-                return outcome;
-            }
+            Ok(Some(params)) => match redirect_outcome(&params, &login.state) {
+                Some(outcome) => {
+                    let (status, page) = match &outcome {
+                        Ok(_) => ("200 OK", pending_page()),
+                        Err(e) => ("400 Bad Request", failure_page(&e.to_string())),
+                    };
+                    let _ = respond(&mut stream, status, &page).await;
+                    return outcome;
+                }
+                None => {
+                    let _ = respond(&mut stream, "404 Not Found", "Not found").await;
+                }
+            },
             Ok(None) => {
                 let _ = respond(&mut stream, "404 Not Found", "Not found").await;
             }
@@ -402,34 +403,37 @@ async fn await_redirect(login: &YouTubeLogin) -> Result<String, YouTubeError> {
     }
 }
 
-/// Decide what a parsed redirect query means. Split from the IO for testability.
+/// Decide what a parsed redirect query means: `None` for a stray request (state missing or
+/// mismatched — not ours to act on), `Some` for this login's terminal outcome. Split from the
+/// IO for testability.
 fn redirect_outcome(
     params: &[(String, String)],
     expected_state: &str,
-) -> Result<String, YouTubeError> {
+) -> Option<Result<String, YouTubeError>> {
     let get = |k: &str| {
         params
             .iter()
             .find(|(key, _)| key == k)
             .map(|(_, v)| v.as_str())
     };
+    // Constant-time comparison is unnecessary: the state is single-use and the listener only
+    // accepts loopback connections, but it must match to bind this request (including an OAuth
+    // error response, which Google sends with our state) to OUR login attempt.
+    if get("state") != Some(expected_state) {
+        return None;
+    }
     if let Some(err) = get("error") {
-        return Err(YouTubeError::LoginFailed(match err {
+        return Some(Err(YouTubeError::LoginFailed(match err {
             "access_denied" => "you declined the request in the browser".to_owned(),
             other => format!("Google reported {other:?}"),
-        }));
+        })));
     }
-    // Constant-time comparison is unnecessary: the state is single-use and the listener only
-    // accepts loopback connections, but it must still match to bind the code to OUR request.
-    if get("state") != Some(expected_state) {
-        return Err(YouTubeError::LoginFailed(
-            "the browser redirect did not match this login attempt".to_owned(),
-        ));
-    }
-    get("code")
-        .filter(|c| !c.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| YouTubeError::LoginFailed("the redirect carried no code".to_owned()))
+    Some(
+        get("code")
+            .filter(|c| !c.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| YouTubeError::LoginFailed("the redirect carried no code".to_owned())),
+    )
 }
 
 /// Read one HTTP request line from `stream`; `Some(query pairs)` for `GET /?...`, `None` for
@@ -491,10 +495,13 @@ async fn respond(
 }
 
 /// The Arena-toned "you're logged in" page: self-contained, no external assets.
-fn success_page() -> String {
+// The code exchange still runs after this page is served, so it must not claim success yet;
+// the settings window shows the real outcome.
+fn pending_page() -> String {
     login_page(
-        "You're logged in",
-        "rewynd is now connected to YouTube. You can close this tab.",
+        "Approval received",
+        "You can close this tab. rewynd is finishing the connection; \
+         the settings window confirms when it is done.",
     )
 }
 
@@ -569,12 +576,33 @@ fn map_api_error(status: u16, body: &str) -> YouTubeError {
     }
 }
 
-/// The `error` field of an OAuth token-endpoint failure (`{"error": "invalid_grant", ...}`).
-fn oauth_error(body: &str) -> Option<&'static str> {
-    let json: serde_json::Value = serde_json::from_str(body).ok()?;
-    match json.get("error")?.as_str()? {
-        "invalid_grant" => Some("invalid_grant"),
-        _ => None,
+/// Map an OAuth *token endpoint* failure. Unlike the Data API's nested error shape, these are
+/// flat (`{"error": "invalid_grant", "error_description": "..."}`), and a 401 here means the
+/// OAuth *client* was rejected, not that the user's login expired — so this must not reuse
+/// [`map_api_error`], whose 401 arm would tell the user to log in again forever.
+fn map_token_error(status: u16, body: &str) -> YouTubeError {
+    let json: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let code = json
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let description = json
+        .get("error_description")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    match code {
+        // The refresh token is revoked/expired: a fresh login fixes it.
+        "invalid_grant" => YouTubeError::NeedsReauth,
+        // The OAuth client itself was rejected: logging in again cannot help.
+        "invalid_client" | "unauthorized_client" => YouTubeError::LoginFailed(format!(
+            "Google rejected the OAuth client ({code}); check the client id and secret \
+             under Advanced options"
+        )),
+        _ => YouTubeError::LoginFailed(format!(
+            "Google reported {code} (HTTP {status}){}{}",
+            if description.is_empty() { "" } else { ": " },
+            description
+        )),
     }
 }
 
@@ -724,20 +752,22 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            redirect_outcome(&pairs(&[("state", "s1"), ("code", "c1")]), "s1").expect("ok"),
+            redirect_outcome(&pairs(&[("state", "s1"), ("code", "c1")]), "s1")
+                .expect("ours")
+                .expect("ok"),
             "c1"
         );
+        // A stray query-bearing GET (wrong or missing state) must not end the login.
+        assert!(redirect_outcome(&pairs(&[("state", "WRONG"), ("code", "c1")]), "s1").is_none());
+        assert!(redirect_outcome(&pairs(&[("error", "access_denied")]), "s1").is_none());
+        // Google's own error redirect carries our state and is terminal.
         assert!(matches!(
-            redirect_outcome(&pairs(&[("state", "WRONG"), ("code", "c1")]), "s1"),
-            Err(YouTubeError::LoginFailed(_))
-        ));
-        assert!(matches!(
-            redirect_outcome(&pairs(&[("error", "access_denied")]), "s1"),
-            Err(YouTubeError::LoginFailed(_))
+            redirect_outcome(&pairs(&[("state", "s1"), ("error", "access_denied")]), "s1"),
+            Some(Err(YouTubeError::LoginFailed(_)))
         ));
         assert!(matches!(
             redirect_outcome(&pairs(&[("state", "s1")]), "s1"),
-            Err(YouTubeError::LoginFailed(_))
+            Some(Err(YouTubeError::LoginFailed(_)))
         ));
     }
 
