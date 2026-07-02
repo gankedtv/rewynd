@@ -25,7 +25,12 @@ iced = { version = "0.14", default-features = false, features = [
     "tokio",
     "wayland",
     "x11",
+    # Raster brand mark. Deliberately NOT `svg`: iced's svg path (resvg) scans every system
+    # font on the first draw, and NOT `image`: that turns on every codec in the image crate.
+    "image-without-codecs",
 ] }
+# PNG decode for the brand mark and window icon (codec choice stays ours: png only).
+image.workspace = true
 # Folder picker via the XDG Desktop Portal (no GTK build dep), matching our portal-based capture.
 # The async dialog future is executor-agnostic — iced's tokio executor drives it.
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }

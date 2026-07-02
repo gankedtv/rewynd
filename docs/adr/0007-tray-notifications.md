@@ -22,8 +22,10 @@ sibling `rewynd-settings`, "Quit" → exits). The clip-saved toast fires from th
 callers' success paths (hotkey loop and tray; the toast is async so `save_clip` itself stays
 sync), so both triggers show it.
 
-The tray icon is the gankedtv logo mark (`assets/tray.png`, generated from `logo-mark.svg`),
-embedded via `include_bytes!` and decoded to ksni's ARGB32 with `image` (png feature only).
+The tray icon is the gankedtv logo mark (*erratum:* originally a single `assets/tray.png`; since
+the Arena brand refresh the PNG ladder lives in `rewynd-config` as `BRAND_ICONS`, master vector
+`docs/design/logo.svg`), embedded via `include_bytes!` and decoded to ksni's ARGB32 with `image`
+(png feature only) in every shipped size, letting the host pick the closest.
 
 ## Options evaluated
 

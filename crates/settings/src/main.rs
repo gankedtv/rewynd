@@ -10,6 +10,7 @@
 //! unit-tested.
 
 use std::fmt;
+use std::sync::LazyLock;
 
 use iced::theme::Palette;
 use iced::widget::{
@@ -63,6 +64,49 @@ const UI_BOLD: Font = Font {
     ..Font::DEFAULT
 };
 
+/// Whether a stored URL points somewhere other than the shipped default (empty means "use the
+/// default" and an explicitly spelled-out default is still the default).
+fn is_custom_url(stored: &str, default: &str) -> bool {
+    let stored = stored.trim();
+    !stored.is_empty() && stored != default
+}
+
+/// The shipped brand-mark PNG nearest at or above `size` pixels (falling back to the largest),
+/// from the ladder the config crate owns.
+fn brand_png(size: u32) -> &'static [u8] {
+    config::BRAND_ICONS
+        .iter()
+        .find(|(s, _)| *s >= size)
+        .or(config::BRAND_ICONS.last())
+        .map(|(_, bytes)| *bytes)
+        .expect("BRAND_ICONS is non-empty")
+}
+
+// The brand mark, decoded once per displayed size: a fresh handle every `view` call would miss
+// the renderer's raster cache and re-decode each frame.
+static LOGO_LARGE: LazyLock<iced::widget::image::Handle> =
+    LazyLock::new(|| iced::widget::image::Handle::from_bytes(brand_png(64)));
+static LOGO_SMALL: LazyLock<iced::widget::image::Handle> =
+    LazyLock::new(|| iced::widget::image::Handle::from_bytes(brand_png(32)));
+
+/// The brand mark at `size` logical pixels, from the PNG render nearest above it.
+fn logo(size: f32) -> Element<'static, Message> {
+    let handle = if size <= 24.0 {
+        LOGO_SMALL.clone()
+    } else {
+        LOGO_LARGE.clone()
+    };
+    iced::widget::image(handle).width(size).height(size).into()
+}
+
+/// The window icon, decoded from the shipped PNG render of the mark (X11/Windows; see the
+/// `window::Settings` note for Wayland).
+fn window_icon() -> Option<iced::window::Icon> {
+    let img = image::load_from_memory_with_format(brand_png(64), image::ImageFormat::Png).ok()?;
+    let (width, height) = (img.width(), img.height());
+    iced::window::icon::from_rgba(img.into_rgba8().into_vec(), width, height).ok()
+}
+
 /// Slider bounds (kept generous but sane).
 const GAIN_MAX: f32 = 4.0;
 const BUFFER_MIN_S: u32 = 5;
@@ -101,6 +145,22 @@ fn main() -> iced::Result {
         }
     };
 
+    // Best-effort desktop integration, so the taskbar and notification icons resolve even when
+    // the settings window is the first rewynd binary this machine ever runs. The recorder does
+    // the same at startup; both paths are cheap and idempotent.
+    if let Err(e) = config::install_icons() {
+        tracing::warn!(error = %e, "could not install app icons");
+    }
+    if let Some(recorder) = recorder_path().filter(|p| p.is_file()) {
+        if let Err(e) = config::install_launcher_entry(&recorder) {
+            tracing::warn!(error = %e, "could not write a desktop entry");
+        }
+        // Migrate a pre-icon autostart entry so it picks up the icon too.
+        if let Err(e) = config::refresh_autostart(&recorder) {
+            tracing::warn!(error = %e, "could not refresh the autostart entry");
+        }
+    }
+
     iced::application(App::load, App::update, App::view)
         .title("rewynd settings")
         .theme(App::theme)
@@ -115,8 +175,12 @@ fn main() -> iced::Result {
             ..Font::DEFAULT
         })
         .window(iced::window::Settings {
-            size: iced::Size::new(960.0, 780.0),
+            // Tall enough that the whole form (advanced collapsed) fits without scrolling.
+            size: iced::Size::new(960.0, 900.0),
             min_size: Some(iced::Size::new(720.0, 560.0)),
+            // On Wayland this is a no-op until winit speaks xdg-toplevel-icon; there the
+            // taskbar icon resolves through the app id's desktop entry + hicolor icons.
+            icon: window_icon(),
             platform_specific: iced::window::settings::PlatformSpecific {
                 // Wayland app_id, so the compositor can match the window to our identity.
                 application_id: config::APP_ID.to_owned(),
@@ -203,6 +267,9 @@ struct App {
     /// Whether the last Save wrote the file — the Restart button only appears when restarting
     /// would actually apply something.
     last_save_ok: bool,
+    /// Whether the ganked.tv card shows its self-hosting fields (API server, share links, API
+    /// key). UI-only state; collapsed by default because login covers the common case.
+    advanced_open: bool,
     login: LoginState,
     status: Status,
 }
@@ -244,6 +311,7 @@ enum Message {
     ApiUrlEdited(String),
     ShareUrlEdited(String),
     VisibilityPicked(rewynd_upload::Visibility),
+    AdvancedToggled,
     LoginPressed,
     LoginStarted(Result<rewynd_upload::DeviceLogin, String>),
     LoginDone(Result<String, String>),
@@ -270,6 +338,11 @@ impl App {
             api_url: config.upload_api_url().to_owned(),
             share_url: config.upload_share_url().to_owned(),
             applied_on_boot: config.start_on_boot(),
+            // A saved self-hosting setup stays visible instead of hiding behind the disclosure
+            // (a key alone is just "logged in" — the badge already shows that). URLs stored as
+            // the ganked.tv defaults, spelled out, are not a custom setup.
+            advanced_open: is_custom_url(config.upload_api_url(), config::DEFAULT_UPLOAD_API_URL)
+                || is_custom_url(config.upload_share_url(), config::DEFAULT_UPLOAD_SHARE_URL),
             config,
             login: LoginState::Idle,
             status: Status::Editing,
@@ -386,6 +459,8 @@ impl App {
                 self.config.set_upload_visibility(v.as_str().to_owned());
                 self.touch();
             }
+            // No touch(): opening the disclosure edits nothing.
+            Message::AdvancedToggled => self.advanced_open = !self.advanced_open,
             Message::LoginPressed => {
                 let base = self.effective_api_url();
                 let (task, abort) = Task::perform(
@@ -669,14 +744,15 @@ impl App {
                     .spacing(8),
                 ]
                 .spacing(8),
-                column![
-                    field_label("Hotkey"),
+                field(
+                    "Hotkey",
                     text_input("CTRL+ALT+R", &self.hotkey)
                         .on_input(Message::HotkeyEdited)
                         .style(arena_input),
-                    hint("Your desktop may let you rebind this in its shortcut settings."),
-                ]
-                .spacing(6),
+                )
+                .push(hint(
+                    "Your desktop may let you rebind this in its shortcut settings.",
+                )),
                 checkbox(self.config.always_prompt())
                     .label("Ask which monitor to record every time rewynd starts")
                     .on_toggle(Message::AlwaysPrompt)
@@ -719,10 +795,7 @@ impl App {
         } else {
             match &self.login {
                 LoginState::Idle => column![
-                    button(text("Log in with ganked.tv").size(13).font(UI_BOLD))
-                        .on_press(Message::LoginPressed)
-                        .style(primary_button)
-                        .padding([11, 20]),
+                    oauth_login_button(),
                     hint("Approve rewynd in your browser; no password is stored on this device."),
                 ]
                 .spacing(6)
@@ -753,10 +826,7 @@ impl App {
                 .spacing(7)
                 .into(),
                 LoginState::Failed(e) => column![
-                    button(text("Log in with ganked.tv").size(13).font(UI_BOLD))
-                        .on_press(Message::LoginPressed)
-                        .style(primary_button)
-                        .padding([11, 20]),
+                    oauth_login_button(),
                     text(e.clone()).size(12).style(tinted(palette::ACCENT)),
                 ]
                 .spacing(6)
@@ -764,60 +834,85 @@ impl App {
             }
         };
 
-        let upload = card(
-            "GANKED.TV",
-            column![
-                account,
-                checkbox(self.config.upload_enabled())
-                    .label("Enable uploads (tray: Upload last clip)")
-                    .on_toggle(Message::UploadEnabled)
-                    .style(arena_check),
-                setting(
-                    "Visibility",
-                    rewynd_upload::Visibility::parse(self.config.upload_visibility()).to_string(),
-                    pick_list(
-                        &rewynd_upload::Visibility::ALL[..],
-                        Some(rewynd_upload::Visibility::parse(self.config.upload_visibility())),
-                        Message::VisibilityPicked,
-                    )
-                    .style(arena_pick)
-                    .width(Length::Fill),
-                ),
-                column![
-                    field_label("API server"),
+        // The self-hosting fields hide behind a disclosure: with the browser login covering the
+        // common case, "API server" and "share links" only confuse an average user.
+        let mut upload_items: Vec<Element<Message>> = vec![
+            account,
+            checkbox(self.config.upload_enabled())
+                .label("Enable uploads (tray: Upload last clip)")
+                .on_toggle(Message::UploadEnabled)
+                .style(arena_check)
+                .into(),
+            setting(
+                "Visibility",
+                rewynd_upload::Visibility::parse(self.config.upload_visibility()).to_string(),
+                pick_list(
+                    &rewynd_upload::Visibility::ALL[..],
+                    Some(rewynd_upload::Visibility::parse(
+                        self.config.upload_visibility(),
+                    )),
+                    Message::VisibilityPicked,
+                )
+                .style(arena_pick)
+                .width(Length::Fill),
+            ),
+            button(
+                text(if self.advanced_open {
+                    "Hide advanced options"
+                } else {
+                    "Advanced options"
+                })
+                .size(11)
+                .font(UI_SEMIBOLD),
+            )
+            .on_press(Message::AdvancedToggled)
+            .style(link_button)
+            .padding(0)
+            .into(),
+        ];
+        if self.advanced_open {
+            upload_items.extend([
+                field(
+                    "API server",
                     text_input(config::DEFAULT_UPLOAD_API_URL, &self.api_url)
                         .on_input(Message::ApiUrlEdited)
                         .style(arena_input),
-                ]
-                .spacing(6),
-                column![
-                    field_label("Share links"),
+                )
+                .into(),
+                field(
+                    "Share links",
                     text_input(config::DEFAULT_UPLOAD_SHARE_URL, &self.share_url)
                         .on_input(Message::ShareUrlEdited)
                         .style(arena_input),
-                    hint("Leave both empty for ganked.tv. Self-hosting? An API key can be pasted below."),
-                ]
-                .spacing(6),
-                column![
-                    field_label("API key (advanced)"),
+                )
+                .push(hint(
+                    "Leave both empty for ganked.tv. Self-hosting? An API key can be \
+                     pasted below.",
+                ))
+                .into(),
+                field(
+                    "API key",
                     text_input("gtv_...", &self.api_key)
                         .secure(true)
                         .on_input(Message::ApiKeyEdited)
                         .style(arena_input),
-                ]
-                .spacing(6),
-            ]
-            .spacing(18),
-        );
+                )
+                .into(),
+            ]);
+        }
+        let upload = card("GANKED.TV", column(upload_items).spacing(18));
 
         let header = column![
+            logo(46.0),
             text("SETTINGS").size(32).font(DISPLAY_BLACK),
             hint(
                 "Most changes apply after Save + Restart rewynd now; the ganked.tv upload \
                  settings apply immediately.",
             ),
         ]
-        .spacing(6);
+        .spacing(6)
+        .align_x(iced::Alignment::Center)
+        .width(Length::Fill);
 
         let mut save_items: Vec<Element<Message>> = vec![
             button(text("Save settings").size(13).font(UI_BOLD))
@@ -858,8 +953,9 @@ impl App {
             .padding(28)
             .max_width(880);
 
-        // The scrollable is a safety net for very small windows; at the default size the content
-        // fits, so it never actually scrolls (which keeps the software renderer smooth).
+        // The scrollable is a safety net for small windows and the opened Advanced disclosure;
+        // the default window size is chosen (by eye — iced has no pre-layout measure) so the
+        // collapsed form fits without it.
         container(scrollable(body))
             .width(Length::Fill)
             .height(Length::Fill)
@@ -923,6 +1019,56 @@ fn primary_button(_theme: &Theme, status: button::Status) -> button::Style {
         border: Border {
             radius: 8.0.into(),
             ..Border::default()
+        },
+        ..button::Style::default()
+    }
+}
+
+/// The "Log in with ganked.tv" button: the brand mark plus label, shaped like a familiar
+/// third-party sign-in button.
+fn oauth_login_button<'a>() -> Element<'a, Message> {
+    button(
+        row![
+            logo(18.0),
+            text("Log in with ganked.tv").size(13).font(UI_SEMIBOLD),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center),
+    )
+    .on_press(Message::LoginPressed)
+    .style(oauth_button)
+    .padding([10, 22])
+    .into()
+}
+
+/// OAuth sign-in shell: unlike `primary_button` the fill stays a dark well so the gradient
+/// mark carries the brand; hover tints it mint.
+fn oauth_button(_theme: &Theme, status: button::Status) -> button::Style {
+    let (background, border_color) = match status {
+        button::Status::Hovered | button::Status::Pressed => {
+            (palette::ACCENT_BG, palette::ACCENT_BORDER)
+        }
+        _ => (palette::HIGH, palette::BORDER_STRONG),
+    };
+    button::Style {
+        background: Some(Background::Color(background)),
+        text_color: palette::TEXT,
+        border: Border {
+            color: border_color,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        ..button::Style::default()
+    }
+}
+
+/// Quiet link-style button (the Advanced disclosure): bare text, mint on hover.
+fn link_button(_theme: &Theme, status: button::Status) -> button::Style {
+    button::Style {
+        background: None,
+        text_color: match status {
+            button::Status::Hovered | button::Status::Pressed => palette::ACCENT,
+            _ => palette::TEXT_SECONDARY,
         },
         ..button::Style::default()
     }
@@ -1071,6 +1217,15 @@ fn value_row<'a>(label: &'a str, value: String) -> Element<'a, Message> {
 /// A text style closure for one fixed color.
 fn tinted(color: iced::Color) -> impl Fn(&Theme) -> text::Style {
     move |_| text::Style { color: Some(color) }
+}
+
+/// A labelled form field: [`field_label`] over the control. Returns the column so a caller can
+/// `.push` a trailing [`hint`].
+fn field<'a>(
+    label: &'a str,
+    control: impl Into<Element<'a, Message>>,
+) -> iced::widget::Column<'a, Message> {
+    column![field_label(label), control.into()].spacing(6)
 }
 
 /// Arena field label: small, bold, uppercase, secondary.

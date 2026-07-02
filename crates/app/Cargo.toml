@@ -34,7 +34,7 @@ futures-util.workspace = true
 # PNG decode for the tray icon. See docs/adr/0007.
 ksni = "0.3"
 notify-rust = "4"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image.workspace = true
 # ganked.tv upload from the tray (docs/adr/0009); jiff stamps clip titles in local time.
 rewynd-upload.workspace = true
 jiff.workspace = true
