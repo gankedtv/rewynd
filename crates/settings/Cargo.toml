@@ -10,10 +10,10 @@ publish = false
 description = "The rewynd app window: the clip library plus the settings editor (iced GUI)."
 
 [dependencies]
+# Also the clip store (listing + output-dir resolution): it lives in the config crate so this
+# deliberately GPU-free build never touches the saver's ring-buffer/encoder (wgpu) tree
+# (docs/adr/0006).
 rewynd-config.workspace = true
-# The clip store only (listing + output-dir resolution); the default saver feature would drag
-# the ring-buffer/encoder (wgpu) tree into this deliberately GPU-free build (docs/adr/0006).
-rewynd-clip = { workspace = true, default-features = false }
 # The MP4 read side: clip summary + first keyframe for thumbnails (docs/adr/0013).
 rewynd-mux.workspace = true
 tracing.workspace = true
@@ -51,5 +51,8 @@ notify-rust = "4"
 openh264 = "0.9"
 # The thumbnail disk cache lives under the user cache dir.
 dirs = "6"
-# Default upload titles ("rewynd <date time>"), matching the tray's.
+# Local-time "saved at" labels on the library cards.
 jiff.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

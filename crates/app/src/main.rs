@@ -390,28 +390,10 @@ mod uploads {
         }
     }
 
-    /// Upload errors in words a user can act on; the full error goes to the log.
-    pub(crate) fn user_facing_upload_error(e: &rewynd_upload::UploadError) -> String {
-        use rewynd_upload::UploadError;
-        match e {
-            UploadError::Http(_) => {
-                "Could not reach ganked.tv; check your connection and the API server URL."
-                    .to_owned()
-            }
-            UploadError::Io(_) => "The clip file could not be read.".to_owned(),
-            other => other.to_string(),
-        }
-    }
-
-    /// YouTube upload errors in words a user can act on; the full error goes to the log.
-    pub(crate) fn user_facing_youtube_error(e: &rewynd_upload::youtube::YouTubeError) -> String {
-        use rewynd_upload::youtube::YouTubeError;
-        match e {
-            YouTubeError::Http(_) => "Could not reach YouTube; check your connection.".to_owned(),
-            YouTubeError::Io(_) => "The clip file could not be read.".to_owned(),
-            other => other.to_string(),
-        }
-    }
+    // The user-facing error copy lives in rewynd-upload (shared with the settings library
+    // view); re-exported so the platform modules keep one import path for upload wiring.
+    pub(crate) use rewynd_upload::user_facing_upload_error;
+    pub(crate) use rewynd_upload::youtube::user_facing_youtube_error;
 }
 
 /// The shared reaction to game-focus changes (both platforms): mirror the gate into
@@ -1098,7 +1080,7 @@ mod linux {
     /// nothing else waits on it.
     async fn upload_and_toast(up: Uploader, path: PathBuf, busy: Arc<AtomicBool>) {
         let _busy = BusyGuard(busy);
-        let title = format!("rewynd {}", jiff::Zoned::now().strftime("%Y-%m-%d %H:%M"));
+        let title = rewynd_upload::default_title();
         tray::toast("Uploading clip", "Sending to ganked.tv...").await;
         match up.client.upload(&path, &title, up.visibility).await {
             Ok(clip) if clip.failed() => {
@@ -1127,7 +1109,7 @@ mod linux {
     /// releasing `busy` when done. Runs as its own task so nothing else waits on it.
     async fn upload_youtube_and_toast(up: YtUploader, path: PathBuf, busy: Arc<AtomicBool>) {
         let _busy = BusyGuard(busy);
-        let title = format!("rewynd {}", jiff::Zoned::now().strftime("%Y-%m-%d %H:%M"));
+        let title = rewynd_upload::default_title();
         tray::toast("Uploading clip", "Sending to YouTube...").await;
         match up.client.upload(&path, &title, up.visibility).await {
             Ok(video) => {
@@ -2130,7 +2112,7 @@ mod windows {
     /// Upload `path` and toast the outcome. Blocking — runs on the upload thread with
     /// its own small runtime (the client is async).
     fn upload_and_toast(up: &Uploader, path: &std::path::Path) {
-        let title = format!("rewynd {}", jiff::Zoned::now().strftime("%Y-%m-%d %H:%M"));
+        let title = rewynd_upload::default_title();
         toast("Uploading clip", "Sending to ganked.tv...");
         let outcome = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2191,7 +2173,7 @@ mod windows {
     /// Upload `path` to YouTube and toast the outcome (the youtu.be link on success).
     /// Blocking — runs on the upload thread with its own small runtime.
     fn upload_youtube_and_toast(up: &YtUploader, path: &std::path::Path) {
-        let title = format!("rewynd {}", jiff::Zoned::now().strftime("%Y-%m-%d %H:%M"));
+        let title = rewynd_upload::default_title();
         toast("Uploading clip", "Sending to YouTube...");
         let outcome = tokio::runtime::Builder::new_current_thread()
             .enable_all()

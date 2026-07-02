@@ -24,6 +24,8 @@ getrandom.workspace = true
 # Reads a clip's container duration for the client-side length pre-check (the
 # vendored muxer fork the rest of the workspace already uses).
 mp4.workspace = true
+# Local-time default clip titles, shared by every upload surface.
+jiff.workspace = true
 
 [dev-dependencies]
 # Synthesize real MP4s for the clip-length pre-check tests.

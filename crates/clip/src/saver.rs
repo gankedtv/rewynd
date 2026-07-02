@@ -11,7 +11,7 @@ use rewynd_mux::{AudioTrack, Mp4Muxer};
 use thiserror::Error;
 
 use crate::lock_unpoisoned;
-use crate::store::{clip_output_path, clips_dir, folder_name, newest_clip_in};
+use rewynd_config::{clip_output_path, clips_dir, folder_name, newest_clip_in};
 
 /// Shared, mutable video ring: the capture thread pushes, [`ClipSaver::save`] cuts.
 pub type SharedBuffer = Arc<Mutex<RingBuffer>>;

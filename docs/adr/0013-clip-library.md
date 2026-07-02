@@ -36,9 +36,12 @@ clip, in a GUI that deliberately has no GPU stack (ADR 0006), from files our own
   is per-process seeded). Corrupt or undecodable clips get a placeholder card, never a crash,
   and no cache entry.
 
-- **Clip store split** (`rewynd-clip`): listing and output-dir resolution move to an
-  always-on `store` module; the ring-buffer/encoder-dependent saver sits behind the default
-  `saver` feature so the settings GUI shares the store without pulling the encode/wgpu tree.
+- **Clip store moves to rewynd-config** (`config/src/clips.rs`): listing, naming, and
+  output-dir resolution live in the GPU-free config crate (which already owned the default
+  output dir), and `rewynd-clip` keeps only the saver. A feature split inside `rewynd-clip`
+  was tried first and rejected: `cargo build --workspace` unifies features, so any workspace
+  build of the settings GUI would still link the saver's encode/wgpu tree (ADR 0006
+  violation). Separate crates are immune to feature unification.
 
 ## Consequences
 

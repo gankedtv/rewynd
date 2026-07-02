@@ -23,7 +23,7 @@ rewynd-config.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 rewynd-capture.workspace = true
 rewynd-gpu.workspace = true
-rewynd-clip = { workspace = true, features = ["saver"] }
+rewynd-clip.workspace = true
 ashpd = { workspace = true, features = ["global_shortcuts"] }
 # macros/sync drive the select!-based hotkey loop; signal funnels SIGTERM/SIGINT through the
 # same orderly shutdown as tray Quit.
@@ -35,16 +35,15 @@ futures-util.workspace = true
 ksni = "0.3"
 notify-rust = "4"
 image.workspace = true
-# ganked.tv upload from the tray (docs/adr/0009); jiff stamps clip titles in local time.
+# ganked.tv upload from the tray (docs/adr/0009).
 rewynd-upload.workspace = true
-jiff.workspace = true
 
 # Windows wiring: WGC capture + D3D11 import + a RegisterHotKey message loop, with
 # the tray (tray-icon pumps on the same thread) and the ganked.tv upload menu.
 [target.'cfg(target_os = "windows")'.dependencies]
 rewynd-capture.workspace = true
 rewynd-gpu.workspace = true
-rewynd-clip = { workspace = true, features = ["saver"] }
+rewynd-clip.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 pollster.workspace = true
 notify-rust = "4"
@@ -52,7 +51,6 @@ notify-rust = "4"
 tray-icon = "0.24"
 image.workspace = true
 rewynd-upload.workspace = true
-jiff.workspace = true
 windows = { workspace = true, features = [
     # The in-game save badge (layered window, GDI-drawn) + chime (PlaySound).
     "Win32_Graphics_Gdi",

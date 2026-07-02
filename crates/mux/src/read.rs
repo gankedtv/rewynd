@@ -23,9 +23,12 @@ pub enum ReadError {
     /// No sync sample to decode (an empty or delta-only track).
     #[error("the video track has no keyframe")]
     NoKeyframe,
-    /// An AVCC sample whose length prefixes overrun the sample.
+    /// An AVCC sample whose length prefixes overrun the sample (or an invalid prefix size).
     #[error("the keyframe sample is malformed")]
     MalformedSample,
+    /// The reader panicked on inconsistent metadata (see [`catch_reader_panics`]).
+    #[error("the MP4 metadata is corrupt")]
+    Corrupt,
 }
 
 /// What a library card shows about a clip without decoding it.
@@ -65,16 +68,22 @@ fn video_track(reader: &Reader) -> Result<u32, ReadError> {
         .ok_or(ReadError::NoVideoTrack)
 }
 
+/// Run `body`, mapping panics to [`ReadError::Corrupt`]: the vendored reader `unwrap`s
+/// internally on inconsistent metadata (`read_sample` on a truncated `stts`/`stsz`) and
+/// divides by the raw `mdhd` timescale (`duration()` panics when it is zero), so a corrupt
+/// or hostile file must surface as an error, never a crash. `AssertUnwindSafe` is fine: the
+/// reader lives and dies inside the closure, so no broken state outlives an unwind.
+fn catch_reader_panics<T>(body: impl FnOnce() -> Result<T, ReadError>) -> Result<T, ReadError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or(Err(ReadError::Corrupt))
+}
+
 /// The dimensions and duration of the clip at `path` (from the video track's headers; no
 /// sample data is read).
 pub fn clip_summary(path: &Path) -> Result<ClipSummary, ReadError> {
-    let reader = open(path)?;
-    let track_id = video_track(&reader)?;
-    let track = &reader.tracks()[&track_id];
-    Ok(ClipSummary {
-        width: u32::from(track.width()),
-        height: u32::from(track.height()),
-        duration: track.duration(),
+    catch_reader_panics(|| {
+        let reader = open(path)?;
+        let track_id = video_track(&reader)?;
+        Ok(summary_of(&reader, track_id))
     })
 }
 
@@ -82,13 +91,41 @@ pub fn clip_summary(path: &Path) -> Result<ClipSummary, ReadError> {
 /// SPS/PPS, then the sync sample's NAL units, all start-code delimited — exactly what a raw
 /// H.264 decoder wants for a single-frame decode.
 pub fn first_keyframe_annexb(path: &Path) -> Result<Vec<u8>, ReadError> {
-    let mut reader = open(path)?;
-    let track_id = video_track(&reader)?;
+    catch_reader_panics(|| {
+        let mut reader = open(path)?;
+        let track_id = video_track(&reader)?;
+        keyframe_of(&mut reader, track_id)
+    })
+}
+
+/// Everything a preview needs from a single open + parse: the summary and the first keyframe
+/// (as [`clip_summary`] and [`first_keyframe_annexb`] would return, at half the file reads).
+pub fn clip_preview(path: &Path) -> Result<(ClipSummary, Vec<u8>), ReadError> {
+    catch_reader_panics(|| {
+        let mut reader = open(path)?;
+        let track_id = video_track(&reader)?;
+        let summary = summary_of(&reader, track_id);
+        let keyframe = keyframe_of(&mut reader, track_id)?;
+        Ok((summary, keyframe))
+    })
+}
+
+fn summary_of(reader: &Reader, track_id: u32) -> ClipSummary {
+    let track = &reader.tracks()[&track_id];
+    ClipSummary {
+        width: u32::from(track.width()),
+        height: u32::from(track.height()),
+        duration: track.duration(),
+    }
+}
+
+fn keyframe_of(reader: &mut Reader, track_id: u32) -> Result<Vec<u8>, ReadError> {
     let track = &reader.tracks()[&track_id];
     let (sps, pps) = (
         track.sequence_parameter_set()?.to_vec(),
         track.picture_parameter_set()?.to_vec(),
     );
+    let prefix_size = nal_length_size(track)?;
     let sample_count = track.sample_count();
 
     let mut out = Vec::new();
@@ -99,11 +136,30 @@ pub fn first_keyframe_annexb(path: &Path) -> Result<Vec<u8>, ReadError> {
             break;
         };
         if sample.is_sync {
-            avcc_to_annexb(&sample.bytes, &mut out)?;
+            avcc_to_annexb(&sample.bytes, prefix_size, &mut out)?;
             return Ok(out);
         }
     }
     Err(ReadError::NoKeyframe)
+}
+
+/// The sample NAL length-prefix size the track's `avcC` declares: 1, 2, or 4 bytes (our write
+/// side always uses 4; 3 is invalid per ISO 14496-15 and rejected).
+fn nal_length_size(track: &mp4::Mp4Track) -> Result<usize, ReadError> {
+    let avc1 = track
+        .trak
+        .mdia
+        .minf
+        .stbl
+        .stsd
+        .avc1
+        .as_ref()
+        .ok_or(ReadError::NoVideoTrack)?;
+    // Only the low two bits are meaningful (the write side pads the reserved bits with 1s).
+    match usize::from(avc1.avcc.length_size_minus_one & 0x3) + 1 {
+        3 => Err(ReadError::MalformedSample),
+        size => Ok(size),
+    }
 }
 
 fn append_nal(out: &mut Vec<u8>, nal: &[u8]) {
@@ -111,13 +167,17 @@ fn append_nal(out: &mut Vec<u8>, nal: &[u8]) {
     out.extend_from_slice(nal);
 }
 
-/// Convert one AVCC sample (four-byte big-endian length prefixes, as the write side stores)
-/// into Annex-B, appending to `out`.
-fn avcc_to_annexb(sample: &[u8], out: &mut Vec<u8>) -> Result<(), ReadError> {
+/// Convert one AVCC sample (big-endian length prefixes of `prefix_size` bytes, per the
+/// track's `avcC`) into Annex-B, appending to `out`.
+fn avcc_to_annexb(sample: &[u8], prefix_size: usize, out: &mut Vec<u8>) -> Result<(), ReadError> {
     let mut rest = sample;
     while !rest.is_empty() {
-        let (prefix, tail) = rest.split_at_checked(4).ok_or(ReadError::MalformedSample)?;
-        let len = u32::from_be_bytes(prefix.try_into().expect("split_at gave 4 bytes")) as usize;
+        let (prefix, tail) = rest
+            .split_at_checked(prefix_size)
+            .ok_or(ReadError::MalformedSample)?;
+        let len = prefix
+            .iter()
+            .fold(0usize, |acc, &b| (acc << 8) | usize::from(b));
         let (nal, tail) = tail
             .split_at_checked(len)
             .ok_or(ReadError::MalformedSample)?;
@@ -367,23 +427,127 @@ mod tests {
         let mut out = Vec::new();
         // Length prefix runs past the sample.
         assert!(matches!(
-            avcc_to_annexb(&[0, 0, 0, 9, 0x65], &mut out),
+            avcc_to_annexb(&[0, 0, 0, 9, 0x65], 4, &mut out),
             Err(ReadError::MalformedSample)
         ));
         // Truncated length prefix.
         assert!(matches!(
-            avcc_to_annexb(&[0, 0, 1], &mut out),
+            avcc_to_annexb(&[0, 0, 1], 4, &mut out),
             Err(ReadError::MalformedSample)
         ));
         // A zero-length NAL unit.
         assert!(matches!(
-            avcc_to_annexb(&[0, 0, 0, 0], &mut out),
+            avcc_to_annexb(&[0, 0, 0, 0], 4, &mut out),
             Err(ReadError::MalformedSample)
         ));
         // Well-formed input converts and appends.
         let mut ok = Vec::new();
-        avcc_to_annexb(&[0, 0, 0, 2, 0x65, 0x11, 0, 0, 0, 1, 0x41], &mut ok).expect("converts");
+        avcc_to_annexb(&[0, 0, 0, 2, 0x65, 0x11, 0, 0, 0, 1, 0x41], 4, &mut ok).expect("converts");
         assert_eq!(ok, vec![0, 0, 0, 1, 0x65, 0x11, 0, 0, 0, 1, 0x41]);
+    }
+
+    /// The avcC's declared prefix size drives the parse: the same NALs under 1- and 2-byte
+    /// prefixes convert identically (our muxer only ever writes 4, so this is unit-level).
+    #[test]
+    fn short_length_prefixes_convert_too() {
+        let expected = vec![0, 0, 0, 1, 0x65, 0x11, 0, 0, 0, 1, 0x41];
+        let mut one = Vec::new();
+        avcc_to_annexb(&[2, 0x65, 0x11, 1, 0x41], 1, &mut one).expect("1-byte prefixes");
+        assert_eq!(one, expected);
+        let mut two = Vec::new();
+        avcc_to_annexb(&[0, 2, 0x65, 0x11, 0, 1, 0x41], 2, &mut two).expect("2-byte prefixes");
+        assert_eq!(two, expected);
+        // A 4-byte parse of 2-byte-prefixed data must fail, not misread.
+        let mut wrong = Vec::new();
+        assert!(matches!(
+            avcc_to_annexb(&[0, 2, 0x65, 0x11], 4, &mut wrong),
+            Err(ReadError::MalformedSample)
+        ));
+    }
+
+    /// The files our own muxer writes declare 4-byte prefixes; an invalid size of 3 is refused.
+    #[test]
+    fn nal_length_size_reads_the_avcc() {
+        let clip = tiny_clip();
+        let reader = open(&clip.0).expect("open");
+        let track_id = video_track(&reader).expect("track");
+        let track = &reader.tracks()[&track_id];
+        assert_eq!(nal_length_size(track).expect("size"), 4);
+
+        let mut bad_trak = track.trak.clone();
+        bad_trak
+            .mdia
+            .minf
+            .stbl
+            .stsd
+            .avc1
+            .as_mut()
+            .expect("avc1")
+            .avcc
+            .length_size_minus_one = 2; // length size 3: invalid per 14496-15
+        let bad = mp4::Mp4Track {
+            trak: bad_trak,
+            trafs: Vec::new(),
+            default_sample_duration: 0,
+        };
+        assert!(matches!(
+            nal_length_size(&bad),
+            Err(ReadError::MalformedSample)
+        ));
+    }
+
+    /// One open returns both halves, matching the two single-purpose reads.
+    #[test]
+    fn preview_matches_summary_plus_keyframe() {
+        let clip = tiny_clip();
+        let (summary, keyframe) = clip_preview(&clip.0).expect("preview");
+        assert_eq!(summary, clip_summary(&clip.0).expect("summary"));
+        assert_eq!(keyframe, first_keyframe_annexb(&clip.0).expect("keyframe"));
+        assert!(matches!(
+            clip_preview(Path::new("/nonexistent/clip.mp4")).unwrap_err(),
+            ReadError::Io { .. }
+        ));
+    }
+
+    /// A zero `mdhd` timescale makes the vendored reader divide by zero inside `duration()`;
+    /// that panic must come back as `Corrupt`, not abort the caller.
+    #[test]
+    fn zero_timescale_is_corrupt_not_a_panic() {
+        let out = TempMp4::new();
+        let file = std::fs::File::create(&out.0).unwrap();
+        let mut writer = mp4::Mp4Writer::write_start(
+            file,
+            &mp4::Mp4Config {
+                major_brand: mp4::FourCC::from(*b"isom"),
+                minor_version: 512,
+                compatible_brands: vec![mp4::FourCC::from(*b"isom")],
+                timescale: 1_000_000,
+            },
+        )
+        .unwrap();
+        writer
+            .add_track(&mp4::TrackConfig {
+                track_type: mp4::TrackType::Video,
+                timescale: 0,
+                language: String::from("und"),
+                media_conf: mp4::MediaConfig::AvcConfig(mp4::AvcConfig {
+                    width: 640,
+                    height: 360,
+                    seq_param_set: SPS.to_vec(),
+                    pic_param_set: PPS.to_vec(),
+                }),
+            })
+            .unwrap();
+        writer.write_end().unwrap();
+
+        assert!(matches!(
+            clip_summary(&out.0).unwrap_err(),
+            ReadError::Corrupt
+        ));
+        assert!(matches!(
+            clip_preview(&out.0).unwrap_err(),
+            ReadError::Corrupt
+        ));
     }
 
     #[test]
@@ -399,6 +563,10 @@ mod tests {
         assert_eq!(
             ReadError::MalformedSample.to_string(),
             "the keyframe sample is malformed"
+        );
+        assert_eq!(
+            ReadError::Corrupt.to_string(),
+            "the MP4 metadata is corrupt"
         );
         let io = ReadError::Io {
             path: PathBuf::from("/x"),

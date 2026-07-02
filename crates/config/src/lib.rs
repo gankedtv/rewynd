@@ -17,8 +17,10 @@
 //!
 //! Beyond the config file itself, the crate hosts the other small, GPU-free pieces the recorder
 //! and the settings app share: well-known paths, the single-instance locks, desktop-entry
-//! installation, and recorder process control.
+//! installation, recorder process control, and the clip store (where clips live and what they
+//! are called).
 
+mod clips;
 mod desktop;
 #[cfg(windows)]
 mod devices;
@@ -27,6 +29,10 @@ mod paths;
 mod process;
 mod schema;
 
+pub use clips::{
+    ClipEntry, clip_output_path, clips_dir, ensure_private_dir, folder_name, list_clips,
+    newest_clip_in,
+};
 #[cfg(windows)]
 pub use desktop::register_toast_identity;
 pub use desktop::{BRAND_ICONS, install_autostart, refresh_autostart, remove_autostart};

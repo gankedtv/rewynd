@@ -2,7 +2,8 @@
 //! play / show-in-folder / delete and an upload flow (title, destination, visibility) that
 //! reuses the transport clients the tray uses.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -11,12 +12,11 @@ use iced::widget::{
 };
 use iced::{Background, Border, Element, Length, Task, Theme};
 
-use rewynd_clip::ClipEntry;
-use rewynd_config::Config;
+use rewynd_config::{ClipEntry, Config};
 use rewynd_upload::youtube::{
-    DEFAULT_CLIENT_ID, DEFAULT_CLIENT_SECRET, YouTubeClient, YouTubeError,
+    DEFAULT_CLIENT_ID, DEFAULT_CLIENT_SECRET, YouTubeClient, user_facing_youtube_error,
 };
-use rewynd_upload::{GankedClient, UploadError, Visibility};
+use rewynd_upload::{GankedClient, Visibility, default_title, user_facing_upload_error};
 
 use crate::theme::{
     self, DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, accent_chip, card, field_label, hint, link_button,
@@ -26,6 +26,10 @@ use crate::thumbs;
 
 /// Cards per grid row (the body column is width-capped, so a fixed count stays balanced).
 const GRID_COLUMNS: usize = 3;
+
+/// Thumbnail decodes running at once. Each holds a full decoded frame briefly, so a big
+/// library must stream through a small pool instead of decoding every stale clip at once.
+const MAX_DECODES: usize = 4;
 
 /// An upload destination the detail page can send a clip to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +126,11 @@ pub enum Message {
 pub struct Library {
     entries: Vec<ClipEntry>,
     thumbs: HashMap<PathBuf, Thumb>,
+    /// Thumbnail decodes not yet started; drained into `decoding` as slots free up.
+    pending_thumbs: VecDeque<(PathBuf, SystemTime)>,
+    /// The decodes currently on blocking tasks, keyed by path (the value is the mtime that
+    /// decode was started for). Its size is the in-flight count, capped at [`MAX_DECODES`].
+    decoding: HashMap<PathBuf, SystemTime>,
     scanning: bool,
     /// The clip whose detail page is open, if any.
     open: Option<PathBuf>,
@@ -129,6 +138,9 @@ pub struct Library {
     /// Play / show-in-folder / delete failure for the open clip.
     action_error: Option<String>,
     title: String,
+    /// The suggested title, snapshotted when the detail page opens (recomputing it per
+    /// `view()` would make the placeholder's minute stamp tick while the page sits open).
+    title_hint: String,
     dest: Dest,
     visibility: Visibility,
     upload: UploadState,
@@ -139,11 +151,14 @@ impl Library {
         Self {
             entries: Vec::new(),
             thumbs: HashMap::new(),
+            pending_thumbs: VecDeque::new(),
+            decoding: HashMap::new(),
             scanning: false,
             open: None,
             confirm_delete: false,
             action_error: None,
             title: String::new(),
+            title_hint: String::new(),
             dest: Dest::Ganked,
             visibility: Visibility::default(),
             upload: UploadState::Idle,
@@ -154,10 +169,10 @@ impl Library {
     /// blocking task. Called on view-enter and by the Refresh button.
     pub fn refresh(&mut self, config: &Config) -> Task<Message> {
         self.scanning = true;
-        let dir = rewynd_clip::clips_dir(config.output_dir().as_deref());
+        let dir = rewynd_config::clips_dir(config.output_dir().as_deref());
         Task::perform(
             async move {
-                tokio::task::spawn_blocking(move || rewynd_clip::list_clips(&dir))
+                tokio::task::spawn_blocking(move || rewynd_config::list_clips(&dir))
                     .await
                     .unwrap_or_default()
             },
@@ -170,6 +185,10 @@ impl Library {
             Message::Refresh => return self.refresh(config),
             Message::Scanned(entries) => return self.scanned(entries),
             Message::ThumbDone(path, modified, result) => {
+                // Free the decode slot, unless a newer decode for the same path superseded it.
+                if self.decoding.get(&path) == Some(&modified) {
+                    self.decoding.remove(&path);
+                }
                 // Drop a stale result: the file changed since this decode started.
                 if self.thumbs.get(&path).map(Thumb::modified) == Some(modified) {
                     let thumb = match result {
@@ -185,14 +204,16 @@ impl Library {
                     };
                     self.thumbs.insert(path, thumb);
                 }
+                return self.start_pending_decodes();
             }
             Message::Open(path) => {
                 self.open = Some(path);
                 self.confirm_delete = false;
                 self.action_error = None;
-                self.title = default_title();
-                let (ganked, youtube) = logged_in(config);
-                self.dest = if !ganked && youtube {
+                self.title_hint = default_title();
+                self.title = self.title_hint.clone();
+                let (ganked, youtube) = dest_statuses(config);
+                self.dest = if !ganked.ready() && youtube.ready() {
                     Dest::YouTube
                 } else {
                     Dest::Ganked
@@ -239,8 +260,13 @@ impl Library {
                 );
             }
             Message::Deleted(Ok(path)) => {
+                // The clip is gone; its cached preview (a frame of it) must not outlive it.
+                if let Some(entry) = self.entries.iter().find(|e| e.path == path) {
+                    thumbs::remove_cached(&path, entry.modified);
+                }
                 self.entries.retain(|e| e.path != path);
                 self.thumbs.remove(&path);
+                self.pending_thumbs.retain(|(p, _)| p != &path);
                 if self.open == Some(path) {
                     self.open = None;
                 }
@@ -290,25 +316,41 @@ impl Library {
         Task::none()
     }
 
-    /// Store a fresh scan and kick off thumbnail decodes for entries whose (path, mtime) slot
-    /// is missing or stale. Each decode is its own blocking task; results stream in.
+    /// Store a fresh scan and queue thumbnail decodes for entries whose (path, mtime) slot is
+    /// missing or stale. The queue is rebuilt from this scan; decodes already in flight keep
+    /// their slot and are not restarted.
     fn scanned(&mut self, entries: Vec<ClipEntry>) -> Task<Message> {
         self.scanning = false;
         self.thumbs
             .retain(|path, _| entries.iter().any(|e| &e.path == path));
-        let mut tasks = Vec::new();
+        self.pending_thumbs.clear();
         for entry in &entries {
-            let fresh = self
-                .thumbs
-                .get(&entry.path)
-                .is_some_and(|t| t.modified() == entry.modified);
-            if fresh {
+            let decoded = self.thumbs.get(&entry.path).is_some_and(|t| {
+                t.modified() == entry.modified && !matches!(t, Thumb::Loading { .. })
+            });
+            let in_flight = self.decoding.get(&entry.path) == Some(&entry.modified);
+            if decoded || in_flight {
                 continue;
             }
             let modified = entry.modified;
             self.thumbs
                 .insert(entry.path.clone(), Thumb::Loading { modified });
-            let path = entry.path.clone();
+            self.pending_thumbs
+                .push_back((entry.path.clone(), modified));
+        }
+        self.entries = entries;
+        self.start_pending_decodes()
+    }
+
+    /// Start queued decodes until [`MAX_DECODES`] are in flight, each on its own blocking
+    /// task; [`Message::ThumbDone`] frees a slot and comes back here for the next one.
+    fn start_pending_decodes(&mut self) -> Task<Message> {
+        let mut tasks = Vec::new();
+        while self.decoding.len() < MAX_DECODES {
+            let Some((path, modified)) = self.pending_thumbs.pop_front() else {
+                break;
+            };
+            self.decoding.insert(path.clone(), modified);
             tasks.push(Task::perform(
                 async move {
                     let result = tokio::task::spawn_blocking({
@@ -322,7 +364,6 @@ impl Library {
                 |(path, modified, result)| Message::ThumbDone(path, modified, result),
             ));
         }
-        self.entries = entries;
         Task::batch(tasks)
     }
 
@@ -335,7 +376,8 @@ impl Library {
     }
 
     /// Kick off the upload for the open clip: the client is built from the config at click
-    /// time, exactly as the tray does.
+    /// time, exactly as the tray does. Only the destination-specific upload future differs;
+    /// the readiness check and task scaffolding are shared.
     fn start_upload(&mut self, config: &Config) -> Task<Message> {
         if matches!(self.upload, UploadState::Uploading { .. }) {
             return Task::none();
@@ -343,55 +385,45 @@ impl Library {
         let Some(path) = self.open.clone() else {
             return Task::none();
         };
+        let dest = self.dest;
+        let (ganked, youtube) = dest_statuses(config);
+        let status = match dest {
+            Dest::Ganked => ganked,
+            Dest::YouTube => youtube,
+        };
+        if let Some(reason) = status.blocker(dest) {
+            self.upload = UploadState::Failed {
+                path,
+                error: reason,
+            };
+            return Task::none();
+        }
         let title = {
             let t = self.title.trim();
             if t.is_empty() {
-                default_title()
+                self.title_hint.clone()
             } else {
                 t.to_owned()
             }
         };
         let visibility = self.visibility;
-        let dest = self.dest;
-        let fail = |error: String| UploadState::Failed {
-            path: path.clone(),
-            error,
-        };
-        let (task, abort) = match dest {
-            Dest::Ganked => {
-                let up = config.upload();
-                if up.api_key.is_empty() {
-                    self.upload = fail("Log in to ganked.tv under Settings first.".to_owned());
-                    return Task::none();
+        let upload: std::pin::Pin<Box<dyn Future<Output = Result<Uploaded, String>> + Send>> = {
+            let clip = path.clone();
+            match dest {
+                Dest::Ganked => Box::pin(upload_ganked(config.upload(), clip, title, visibility)),
+                Dest::YouTube => {
+                    Box::pin(upload_youtube(config.youtube(), clip, title, visibility))
                 }
-                let clip = path.clone();
-                Task::perform(
-                    async move { upload_ganked(up, clip, title, visibility).await },
-                    Message::UploadDone,
-                )
-                .abortable()
-            }
-            Dest::YouTube => {
-                let yt = config.youtube();
-                if yt.refresh_token.is_empty() {
-                    self.upload = fail("Log in with YouTube under Settings first.".to_owned());
-                    return Task::none();
-                }
-                let clip = path.clone();
-                Task::perform(
-                    async move { upload_youtube(yt, clip, title, visibility).await },
-                    Message::UploadDone,
-                )
-                .abortable()
             }
         };
+        let (task, abort) = Task::perform(upload, Message::UploadDone).abortable();
         self.upload = UploadState::Uploading { path, dest, abort };
         task
     }
 
     pub fn view(&self, config: &Config) -> Element<'_, Message> {
         let body: Element<Message> = match self.open.as_ref().and_then(|p| self.entry(p)) {
-            Some(entry) => self.detail(entry, logged_in(config)),
+            Some(entry) => self.detail(entry, dest_statuses(config)),
             None => self.grid(),
         };
         let content = container(
@@ -468,22 +500,12 @@ impl Library {
     }
 
     fn clip_card<'a>(&'a self, entry: &'a ClipEntry) -> Element<'a, Message> {
-        let mut meta = size_label(entry.size_bytes);
-        if let Some(Thumb::Ready { duration, .. }) = self.thumbs.get(&entry.path) {
-            meta = format!("{} · {meta}", duration_label(*duration));
-        }
-        let mut meta_row = row![].spacing(8).align_y(iced::Alignment::Center);
-        if let Some(game) = &entry.game {
-            meta_row = meta_row.push(accent_chip(game.clone()));
-        }
-        meta_row = meta_row.push(text(meta).size(10).style(tinted(palette::MUTED)));
-
         let info = column![
             text(saved_at_label(entry.saved_at))
                 .size(12)
                 .font(UI_SEMIBOLD)
                 .style(tinted(palette::TEXT)),
-            meta_row,
+            self.meta_row(entry, 10.0, palette::MUTED),
         ]
         .spacing(7);
 
@@ -499,6 +521,25 @@ impl Library {
         .padding(0)
         .width(Length::Fill)
         .into()
+    }
+
+    /// The "duration · size" line with the per-game chip, shared by the cards and the
+    /// detail page (which differ only in type size and tint).
+    fn meta_row<'a>(
+        &'a self,
+        entry: &'a ClipEntry,
+        size: f32,
+        color: iced::Color,
+    ) -> Element<'a, Message> {
+        let mut meta = size_label(entry.size_bytes);
+        if let Some(Thumb::Ready { duration, .. }) = self.thumbs.get(&entry.path) {
+            meta = format!("{} · {meta}", duration_label(*duration));
+        }
+        let mut line = row![].spacing(8).align_y(iced::Alignment::Center);
+        if let Some(game) = &entry.game {
+            line = line.push(accent_chip(game.clone()));
+        }
+        line.push(text(meta).size(size).style(tinted(color))).into()
     }
 
     /// The clip's thumbnail at the given height, or a neutral placeholder while it loads
@@ -519,28 +560,18 @@ impl Library {
     fn detail<'a>(
         &'a self,
         entry: &'a ClipEntry,
-        (ganked_ready, yt_ready): (bool, bool),
+        (ganked, youtube): (DestStatus, DestStatus),
     ) -> Element<'a, Message> {
         let back = button(text("Back to library").size(12).font(UI_SEMIBOLD))
             .on_press(Message::Back)
             .style(link_button)
             .padding(0);
 
-        let mut meta_row = row![].spacing(8).align_y(iced::Alignment::Center);
-        if let Some(game) = &entry.game {
-            meta_row = meta_row.push(accent_chip(game.clone()));
-        }
-        let mut meta = size_label(entry.size_bytes);
-        if let Some(Thumb::Ready { duration, .. }) = self.thumbs.get(&entry.path) {
-            meta = format!("{} · {meta}", duration_label(*duration));
-        }
-        meta_row = meta_row.push(text(meta).size(11).style(tinted(palette::TEXT_SECONDARY)));
-
         let mut facts = column![
             text(saved_at_label(entry.saved_at).to_uppercase())
                 .size(26)
                 .font(DISPLAY_BLACK),
-            meta_row,
+            self.meta_row(entry, 11.0, palette::TEXT_SECONDARY),
             hint(entry.path.display().to_string()),
         ]
         .spacing(10);
@@ -556,7 +587,7 @@ impl Library {
         ]
         .spacing(20);
 
-        column![back, top, self.upload_panel(entry, ganked_ready, yt_ready),]
+        column![back, top, self.upload_panel(entry, ganked, youtube),]
             .spacing(20)
             .into()
     }
@@ -604,14 +635,14 @@ impl Library {
     fn upload_panel<'a>(
         &'a self,
         entry: &'a ClipEntry,
-        ganked_ready: bool,
-        yt_ready: bool,
+        ganked: DestStatus,
+        youtube: DestStatus,
     ) -> Element<'a, Message> {
         let uploading = matches!(self.upload, UploadState::Uploading { .. });
 
         let title = column![
             field_label("Title"),
-            text_input(&default_title(), &self.title)
+            text_input(&self.title_hint, &self.title)
                 .on_input(Message::TitleEdited)
                 .style(theme::arena_input),
         ]
@@ -635,8 +666,8 @@ impl Library {
         };
         let dest_control = container(
             row![
-                seg("ganked.tv", Dest::Ganked, ganked_ready),
-                seg("YouTube", Dest::YouTube, yt_ready),
+                seg("ganked.tv", Dest::Ganked, ganked.ready()),
+                seg("YouTube", Dest::YouTube, youtube.ready()),
             ]
             .spacing(2),
         )
@@ -651,15 +682,11 @@ impl Library {
             ..container::Style::default()
         });
         let mut destination = column![field_label("Destination"), dest_control].spacing(6);
-        if !ganked_ready {
-            destination = destination.push(hint(
-                "ganked.tv is off: log in under Settings to upload there.",
-            ));
+        if let Some(reason) = ganked.blocker(Dest::Ganked) {
+            destination = destination.push(hint(reason));
         }
-        if !yt_ready {
-            destination = destination.push(hint(
-                "YouTube is off: log in under Settings to upload there.",
-            ));
+        if let Some(reason) = youtube.blocker(Dest::YouTube) {
+            destination = destination.push(hint(reason));
         }
 
         let mut visibility = column![
@@ -681,8 +708,8 @@ impl Library {
         }
 
         let dest_ready = match self.dest {
-            Dest::Ganked => ganked_ready,
-            Dest::YouTube => yt_ready,
+            Dest::Ganked => ganked.ready(),
+            Dest::YouTube => youtube.ready(),
         };
         let mut send = button(
             text(format!("Upload to {}", self.dest.label()))
@@ -761,12 +788,51 @@ impl Library {
     }
 }
 
-/// Whether each destination is logged in (key / refresh token present): only those can be
-/// picked, matching what the tray would accept.
-fn logged_in(config: &Config) -> (bool, bool) {
+/// Whether one upload destination can actually receive a clip: logged in (key / refresh
+/// token present) AND switched on in the config — the same bar the tray applies before it
+/// builds an uploader.
+#[derive(Debug, Clone, Copy)]
+struct DestStatus {
+    logged_in: bool,
+    enabled: bool,
+}
+
+impl DestStatus {
+    fn ready(self) -> bool {
+        self.logged_in && self.enabled
+    }
+
+    /// Why `dest` can't be uploaded to right now, in words the user can act on.
+    fn blocker(self, dest: Dest) -> Option<String> {
+        if !self.logged_in {
+            Some(match dest {
+                Dest::Ganked => "Log in to ganked.tv under Settings first.".to_owned(),
+                Dest::YouTube => "Log in with YouTube under Settings first.".to_owned(),
+            })
+        } else if !self.enabled {
+            Some(format!(
+                "{} uploads are switched off in Settings; enable them there first.",
+                dest.label()
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+/// Both destinations' status, from the same validated config the tray uploads read.
+fn dest_statuses(config: &Config) -> (DestStatus, DestStatus) {
+    let up = config.upload();
+    let yt = config.youtube();
     (
-        !config.upload().api_key.is_empty(),
-        !config.youtube().refresh_token.is_empty(),
+        DestStatus {
+            logged_in: !up.api_key.is_empty(),
+            enabled: up.enabled,
+        },
+        DestStatus {
+            logged_in: !yt.refresh_token.is_empty(),
+            enabled: yt.enabled,
+        },
     )
 }
 
@@ -781,7 +847,11 @@ async fn upload_ganked(
     let clip = client
         .upload(&path, &title, visibility)
         .await
-        .map_err(|e| user_facing_upload_error(&e))?;
+        .map_err(|e| {
+            // The user-facing copy is shared with the tray; the full error goes to the log.
+            tracing::error!(error = %e, "upload failed");
+            user_facing_upload_error(&e)
+        })?;
     if clip.failed() {
         return Err(
             "ganked.tv could not process the clip (check its length and format).".to_owned(),
@@ -809,38 +879,14 @@ async fn upload_youtube(
     let video = client
         .upload(&path, &title, visibility)
         .await
-        .map_err(|e| user_facing_youtube_error(&e))?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "YouTube upload failed");
+            user_facing_youtube_error(&e)
+        })?;
     Ok(Uploaded {
         link: video.watch_url(),
         note: "Processing on YouTube.".to_owned(),
     })
-}
-
-// The user-facing error copy mirrors the tray's (crates/app); the full error goes to the log.
-
-fn user_facing_upload_error(e: &UploadError) -> String {
-    tracing::error!(error = %e, "upload failed");
-    match e {
-        UploadError::Http(_) => {
-            "Could not reach ganked.tv; check your connection and the API server URL.".to_owned()
-        }
-        UploadError::Io(_) => "The clip file could not be read.".to_owned(),
-        other => other.to_string(),
-    }
-}
-
-fn user_facing_youtube_error(e: &YouTubeError) -> String {
-    tracing::error!(error = %e, "YouTube upload failed");
-    match e {
-        YouTubeError::Http(_) => "Could not reach YouTube; check your connection.".to_owned(),
-        YouTubeError::Io(_) => "The clip file could not be read.".to_owned(),
-        other => other.to_string(),
-    }
-}
-
-/// The same default the tray uses for one-click uploads.
-fn default_title() -> String {
-    format!("rewynd {}", jiff::Zoned::now().strftime("%Y-%m-%d %H:%M"))
 }
 
 /// The saved-at instant in local time, for card titles.
@@ -945,11 +991,27 @@ mod tests {
     }
 
     #[test]
-    fn default_title_matches_the_tray_shape() {
-        let title = default_title();
-        assert!(title.starts_with("rewynd "), "{title}");
-        // "rewynd YYYY-MM-DD HH:MM"
-        assert_eq!(title.len(), "rewynd ".len() + 16, "{title}");
+    fn dest_status_gates_on_login_and_enabled() {
+        let ready = DestStatus {
+            logged_in: true,
+            enabled: true,
+        };
+        assert!(ready.ready());
+        assert_eq!(ready.blocker(Dest::Ganked), None);
+        let logged_out = DestStatus {
+            logged_in: false,
+            enabled: false,
+        };
+        assert!(!logged_out.ready());
+        let blocker = logged_out.blocker(Dest::YouTube).expect("blocked");
+        assert!(blocker.contains("Log in"), "{blocker}");
+        let disabled = DestStatus {
+            logged_in: true,
+            enabled: false,
+        };
+        assert!(!disabled.ready());
+        let blocker = disabled.blocker(Dest::Ganked).expect("blocked");
+        assert!(blocker.contains("switched off"), "{blocker}");
     }
 
     #[test]

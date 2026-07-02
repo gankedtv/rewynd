@@ -4158,7 +4158,6 @@ dependencies = [
  "ashpd",
  "futures-util",
  "image",
- "jiff",
  "ksni",
  "notify-rust",
  "pollster",
@@ -4215,8 +4214,6 @@ dependencies = [
 name = "rewynd-clip"
 version = "0.1.0"
 dependencies = [
- "dirs",
- "libc",
  "rewynd-buffer",
  "rewynd-config",
  "rewynd-encode",
@@ -4285,11 +4282,11 @@ dependencies = [
  "notify-rust",
  "open",
  "openh264",
- "rewynd-clip",
  "rewynd-config",
  "rewynd-mux",
  "rewynd-upload",
  "rfd",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -4302,6 +4299,7 @@ dependencies = [
  "base64",
  "futures-util",
  "getrandom 0.3.4",
+ "jiff",
  "mp4",
  "reqwest",
  "rewynd-buffer",

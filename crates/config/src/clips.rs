@@ -1,7 +1,8 @@
-//! The clip store: where clips live, what they are called, and what is in there.
+//! The clip store: where clips live, what they are called, and what is in there. Lives here
+//! (not in the clip crate) so the settings app can browse clips without the saver's
+//! ring-buffer/encoder tree behind it.
 
 use std::path::{Path, PathBuf};
-#[cfg(feature = "saver")]
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -27,7 +28,7 @@ pub struct ClipEntry {
 pub fn clips_dir(configured: Option<&Path>) -> PathBuf {
     configured
         .map(Path::to_path_buf)
-        .or_else(rewynd_config::default_output_dir)
+        .or_else(crate::default_output_dir)
         .unwrap_or_else(private_temp_dir)
 }
 
@@ -48,17 +49,27 @@ pub fn list_clips(dir: &Path) -> Vec<ClipEntry> {
             if let Ok(sub) = std::fs::read_dir(entry.path()) {
                 out.extend(
                     sub.filter_map(Result::ok)
-                        .filter(|e| e.file_type().is_ok_and(|k| k.is_file()))
+                        .filter(is_file_entry)
                         .filter_map(|e| clip_entry(&e, game.clone())),
                 );
             }
-        } else if kind.is_file() {
+        } else if is_file_entry(&entry) {
             out.extend(clip_entry(&entry, None));
         }
     }
     // Newest first; the name (which embeds the stamp) breaks same-instant ties stably.
     out.sort_by(|a, b| b.saved_at.cmp(&a.saved_at).then(b.path.cmp(&a.path)));
     out
+}
+
+/// Whether a directory entry counts as a clip candidate file: a regular file, or a symlink
+/// whose target is one. Shared by [`list_clips`] and [`newest_clip_in`] so the two never
+/// disagree about what is a clip.
+fn is_file_entry(entry: &std::fs::DirEntry) -> bool {
+    entry.file_type().is_ok_and(|kind| {
+        kind.is_file()
+            || (kind.is_symlink() && std::fs::metadata(entry.path()).is_ok_and(|m| m.is_file()))
+    })
 }
 
 /// Build a [`ClipEntry`] for a directory entry, or `None` when it isn't a clip.
@@ -68,7 +79,8 @@ fn clip_entry(entry: &std::fs::DirEntry, game: Option<String>) -> Option<ClipEnt
     if !is_clip_name(name) {
         return None;
     }
-    let meta = entry.metadata().ok()?;
+    // Follows symlinks, so a linked clip carries its target's size/mtime.
+    let meta = std::fs::metadata(entry.path()).ok()?;
     let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     let saved_at = clip_stamp_millis(name)
         .map(|ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms))
@@ -97,9 +109,9 @@ fn clip_stamp_millis(name: &str) -> Option<u64> {
 
 /// The newest `rewynd-*.mp4` under `dir` by file name, looking one level into per-game
 /// subfolders too (names embed a millisecond timestamp, so lexicographic max of the file
-/// name is newest — dir entry types come from readdir, so no per-file metadata calls).
-#[cfg(feature = "saver")]
-pub(crate) fn newest_clip_in(dir: &Path) -> Option<PathBuf> {
+/// name is newest).
+#[must_use]
+pub fn newest_clip_in(dir: &Path) -> Option<PathBuf> {
     fn newest_in(dir: &Path, recurse: bool) -> Option<PathBuf> {
         let entries = std::fs::read_dir(dir).ok()?;
         entries
@@ -108,6 +120,9 @@ pub(crate) fn newest_clip_in(dir: &Path) -> Option<PathBuf> {
                 let kind = entry.file_type().ok()?;
                 if kind.is_dir() {
                     return recurse.then(|| newest_in(&entry.path(), false)).flatten();
+                }
+                if !is_file_entry(&entry) {
+                    return None;
                 }
                 let name = entry.file_name();
                 let name = name.to_str()?;
@@ -121,8 +136,8 @@ pub(crate) fn newest_clip_in(dir: &Path) -> Option<PathBuf> {
 /// A filesystem-safe folder name derived from a game name: path separators and
 /// characters Windows forbids become spaces, whitespace collapses, and the result is
 /// length-capped. `None` when nothing usable remains.
-#[cfg(feature = "saver")]
-pub(crate) fn folder_name(raw: &str) -> Option<String> {
+#[must_use]
+pub fn folder_name(raw: &str) -> Option<String> {
     const MAX_LEN: usize = 80;
     let mapped: String = raw
         .chars()
@@ -151,8 +166,8 @@ pub(crate) fn folder_name(raw: &str) -> Option<String> {
 /// Where to write a saved clip: [`clips_dir`] plus the per-game subfolder when one is set,
 /// with a millisecond-stamped, per-process-sequenced name. The sequence number disambiguates
 /// two saves landing in the same millisecond.
-#[cfg(feature = "saver")]
-pub(crate) fn clip_output_path(output_dir: Option<&Path>, game_folder: Option<&str>) -> PathBuf {
+#[must_use]
+pub fn clip_output_path(output_dir: Option<&Path>, game_folder: Option<&str>) -> PathBuf {
     static SEQ: AtomicU32 = AtomicU32::new(0);
     let mut dir = clips_dir(output_dir);
     if let Some(game) = game_folder {
@@ -186,9 +201,11 @@ fn private_temp_dir() -> PathBuf {
 }
 
 /// Create `dir` 0700 if missing and verify it is a real directory owned by us with no group or
-/// world access (never following a planted symlink).
+/// world access (never following a planted symlink). Shared by the clip fallback dir and the
+/// settings app's thumbnail cache, which holds frames of the same recordings.
 #[cfg(unix)]
-fn ensure_private_dir(dir: &Path) -> bool {
+#[must_use]
+pub fn ensure_private_dir(dir: &Path) -> bool {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     let _ = std::fs::DirBuilder::new().mode(0o700).create(dir);
     std::fs::symlink_metadata(dir)
@@ -196,7 +213,8 @@ fn ensure_private_dir(dir: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn ensure_private_dir(dir: &Path) -> bool {
+#[must_use]
+pub fn ensure_private_dir(dir: &Path) -> bool {
     std::fs::create_dir_all(dir).is_ok()
 }
 
@@ -215,7 +233,6 @@ fn euid() -> u32 {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "saver")]
     #[test]
     fn folder_name_sanitizes() {
         assert_eq!(folder_name("Elden Ring"), Some("Elden Ring".to_owned()));
@@ -252,6 +269,21 @@ mod tests {
         // exercised without asserting which, since it depends on the machine.
         let fallback = clips_dir(None);
         assert!(!fallback.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn clip_output_path_stamps_and_sequences() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = clip_output_path(Some(dir.path()), None);
+        let b = clip_output_path(Some(dir.path()), Some("Elden Ring"));
+        assert_eq!(a.parent(), Some(dir.path()));
+        assert_eq!(b.parent(), Some(dir.path().join("Elden Ring").as_path()));
+        for p in [&a, &b] {
+            let name = p.file_name().unwrap().to_str().unwrap();
+            assert!(is_clip_name(name), "{name}");
+            assert!(clip_stamp_millis(name).is_some(), "{name}");
+        }
+        assert_ne!(a.file_name(), b.file_name(), "the sequence disambiguates");
     }
 
     #[test]
@@ -304,5 +336,62 @@ mod tests {
     fn missing_directory_lists_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(list_clips(&dir.path().join("nope")).is_empty());
+    }
+
+    #[test]
+    fn newest_clip_wins_by_name_across_subfolders() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        assert_eq!(newest_clip_in(root), None);
+        std::fs::write(root.join("rewynd-100-0.mp4"), b"a").expect("write");
+        std::fs::create_dir(root.join("Elden Ring")).expect("mkdir");
+        std::fs::write(root.join("Elden Ring/rewynd-200-0.mp4"), b"b").expect("write");
+        std::fs::write(root.join("other.mp4"), b"x").expect("write");
+        assert_eq!(
+            newest_clip_in(root),
+            Some(root.join("Elden Ring/rewynd-200-0.mp4"))
+        );
+    }
+
+    /// A symlink to a clip file counts everywhere; a dangling one and a symlink to a
+    /// directory count nowhere. `list_clips` and `newest_clip_in` share the predicate.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_clips_are_treated_consistently() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let target = root.join("real").join("clip.mp4");
+        std::fs::create_dir(root.join("real")).expect("mkdir");
+        std::fs::write(&target, b"video").expect("write");
+        std::os::unix::fs::symlink(&target, root.join("rewynd-100-0.mp4")).expect("symlink");
+        std::os::unix::fs::symlink(root.join("gone.mp4"), root.join("rewynd-200-0.mp4"))
+            .expect("symlink");
+        std::os::unix::fs::symlink(root.join("real"), root.join("rewynd-300-0.mp4"))
+            .expect("symlink");
+
+        let clips = list_clips(root);
+        assert_eq!(clips.len(), 1, "{clips:?}");
+        assert_eq!(clips[0].path, root.join("rewynd-100-0.mp4"));
+        assert_eq!(clips[0].size_bytes, 5, "size comes from the target");
+        assert_eq!(newest_clip_in(root), Some(root.join("rewynd-100-0.mp4")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_accepts_ours_and_rejects_loose_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let private = dir.path().join("private");
+        assert!(ensure_private_dir(&private), "fresh 0700 dir is ours");
+        assert!(ensure_private_dir(&private), "idempotent");
+
+        let loose = dir.path().join("loose");
+        std::fs::create_dir(&loose).expect("mkdir");
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(!ensure_private_dir(&loose), "group/world access is refused");
+
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").expect("write");
+        assert!(!ensure_private_dir(&file), "a non-directory is refused");
     }
 }
