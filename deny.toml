@@ -1,6 +1,11 @@
 # cargo-deny gate (PLAN §3.7: GPL-compatibility re-verified on every dependency change;
 # ADR 0001: exactly one wgpu source).
 
+[graph]
+# Only the platforms we ship; keeps advisories in macOS/BSD-only corners of the
+# tree from failing a build that never compiles them.
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+
 [advisories]
 version = 2
 yanked = "deny"
@@ -17,6 +22,20 @@ ignore = [
     # winit/wayland-rs and notify-rust move to a patched quick-xml.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # tray-icon's Linux backend (gtk-rs GTK3 bindings + proc-macro-error, all
+    # unmaintained): dead code here — our Linux tray is ksni over D-Bus, tray-icon is
+    # only ever compiled on Windows, where none of these are in the build. cargo-deny
+    # still walks the edges because its target filter is per-cfg, not per-platform
+    # reachability. Drop when tray-icon moves off GTK3 (its tracking issue: GTK4/xdg
+    # portal backend) or grows a feature to opt out of the GTK backend.
+    "RUSTSEC-2024-0370", # proc-macro-error (via gtk3-macros)
+    "RUSTSEC-2024-0412", # gdk
+    "RUSTSEC-2024-0413", # atk
+    "RUSTSEC-2024-0415", # gtk
+    "RUSTSEC-2024-0416", # atk-sys
+    "RUSTSEC-2024-0418", # gdk-sys
+    "RUSTSEC-2024-0419", # gtk-sys
+    "RUSTSEC-2024-0420", # gtk3-macros
 ]
 
 [licenses]
