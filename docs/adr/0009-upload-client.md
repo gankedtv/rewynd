@@ -29,9 +29,10 @@ Limits: 500 MiB, `video/mp4` (we already encode H.264 MP4), 120 s (our buffer ca
   `ganked.tv/c/<code>` share link, the server's rejection, or the failure. The upload settings are
   re-read from the config **per click**, so enabling uploads or fixing the key needs no recorder
   restart.
-- **Visibility** (`public`/`unlisted`) is a config default with a settings dropdown; per-clip
-  choice arrives with the trim/upload UI (issue #51). Parsing **fails closed**: any unrecognized
-  value uploads as unlisted, never widening visibility on a typo.
+- **Visibility** (`public`/`unlisted`, later joined by `private`) is a config default with a
+  settings dropdown; per-clip choice arrives with the trim/upload UI (issue #51). Parsing
+  **fails closed**: any unrecognized value uploads at the narrowest level (originally unlisted,
+  private once it existed), never widening visibility on a typo.
 - Defaults: API `https://api.ganked.tv`, share links `https://ganked.tv`; both overridable (dev
   runs against `http://localhost:5050`).
 
