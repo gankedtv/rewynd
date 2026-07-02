@@ -955,8 +955,9 @@ impl App {
 
         // The scrollable is a safety net for small windows and the opened Advanced disclosure;
         // the default window size is chosen (by eye — iced has no pre-layout measure) so the
-        // collapsed form fits without it.
-        container(scrollable(body))
+        // collapsed form fits without it. The body caps at 880, so on a wider window center it
+        // rather than leaving the slack on one side.
+        container(scrollable(container(body).center_x(Length::Fill)))
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
