@@ -21,15 +21,22 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
-    GetMessageW, MB_ICONHAND, MB_OK, MSG, PostQuitMessage, RegisterClassW, SW_SHOWNOACTIVATE,
-    SetTimer, ShowWindow, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WM_DESTROY, WM_TIMER,
-    WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
-    WS_POPUP,
+    GetMessageW, HWND_TOPMOST, MB_ICONHAND, MB_OK, MSG, PostQuitMessage, RegisterClassW,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetTimer, SetWindowPos, ShowWindow,
+    TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WM_DESTROY, WM_TIMER, WNDCLASSW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
-/// How long the badge stays on screen.
-const BADGE_MS: u32 = 2600;
+/// How long the badge stays on screen: long enough to catch mid-fight in the
+/// corner of the eye, short enough to never feel like HUD clutter.
+const BADGE_MS: u32 = 4000;
+/// Timer that dismisses the badge.
+const DISMISS_TIMER: usize = 1;
+/// Timer that re-asserts the badge's topmost position (see `place_badge`).
+const RAISE_TIMER: usize = 2;
+/// How often the badge lifts itself back above a competing topmost window.
+const RAISE_MS: u32 = 500;
 /// Whole-badge opacity (SourceConstantAlpha): solid enough to read, soft enough
 /// to feel like an overlay rather than a dialog.
 const BADGE_ALPHA: u8 = 242;
@@ -304,11 +311,14 @@ fn place_badge(dc: HDC, pos: POINT, size: SIZE) -> windows::core::Result<HWND> {
             return Err(e);
         }
         // A badge with no working timer would stay on screen (and pump) forever.
-        if SetTimer(Some(hwnd), 1, BADGE_MS, None) == 0 {
+        if SetTimer(Some(hwnd), DISMISS_TIMER, BADGE_MS, None) == 0 {
             let e = windows::core::Error::from_thread();
             let _ = DestroyWindow(hwnd);
             return Err(e);
         }
+        // Best-effort: a game (or its anti-cheat) re-asserting its own topmost
+        // window would bury the badge; this timer keeps lifting it back.
+        let _ = SetTimer(Some(hwnd), RAISE_TIMER, RAISE_MS, None);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         Ok(hwnd)
     }
@@ -325,6 +335,21 @@ unsafe extern "system" fn badge_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_TIMER if wparam.0 == RAISE_TIMER => {
+            // SAFETY: our own live window; no move/size/activation, only z-order.
+            let _ = unsafe {
+                SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                )
+            };
+            LRESULT(0)
+        }
         WM_TIMER => {
             // SAFETY: our own live window (messages stop after WM_DESTROY).
             let _ = unsafe { DestroyWindow(hwnd) };
