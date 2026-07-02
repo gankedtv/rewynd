@@ -62,8 +62,8 @@ pub struct UploadSettings {
     pub api_url: String,
     pub share_url: String,
     pub api_key: String,
-    /// `"public"` or `"unlisted"`. Consumers fail closed: anything else is treated as unlisted,
-    /// so a typo can never widen a clip's visibility.
+    /// `"public"`, `"unlisted"` or `"private"`. Consumers fail closed: anything else is treated
+    /// as private, so a typo can never widen a clip's visibility.
     pub visibility: String,
 }
 
@@ -225,7 +225,7 @@ impl Default for UploadConfig {
             api_url: DEFAULT_UPLOAD_API_URL.to_owned(),
             share_url: DEFAULT_UPLOAD_SHARE_URL.to_owned(),
             api_key: String::new(),
-            visibility: "public".to_owned(),
+            visibility: "unlisted".to_owned(),
         }
     }
 }
@@ -772,8 +772,8 @@ enabled = false
 api_url = \"https://api.ganked.tv\"
 share_url = \"https://ganked.tv\"
 api_key = \"\"
-# \"public\" or \"unlisted\"
-visibility = \"public\"
+# \"public\" (in feeds), \"unlisted\" (link only) or \"private\" (only you)
+visibility = \"unlisted\"
 ";
 
 /// Write [`DEFAULT_TEMPLATE`] to `path`, creating parent directories (0700 on unix). The file is
@@ -945,7 +945,7 @@ mod tests {
         assert!(!u.enabled);
         assert_eq!(u.api_url, DEFAULT_UPLOAD_API_URL);
         assert_eq!(u.share_url, DEFAULT_UPLOAD_SHARE_URL);
-        assert_eq!(u.visibility, "public");
+        assert_eq!(u.visibility, "unlisted");
 
         // Enabled without a key stays disabled; empty URL falls back to the default.
         let c =

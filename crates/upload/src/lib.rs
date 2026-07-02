@@ -25,33 +25,43 @@ const PUT_BASE_TIMEOUT: Duration = Duration::from_secs(60);
 /// size, so a slow-but-progressing upload isn't cut off by a flat total-request timeout.
 const PUT_MIN_RATE_BYTES_PER_SEC: u64 = 125_000;
 
-/// Clip visibility on ganked.tv.
+/// Clip visibility for uploads: `Public` is in feeds, `Unlisted` is reachable by link only,
+/// `Private` is owner-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Visibility {
-    #[default]
     Public,
+    #[default]
     Unlisted,
+    Private,
 }
 
 impl Visibility {
-    pub const ALL: [Visibility; 2] = [Visibility::Public, Visibility::Unlisted];
+    pub const ALL: [Visibility; 3] = [
+        Visibility::Public,
+        Visibility::Unlisted,
+        Visibility::Private,
+    ];
 
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Public => "public",
             Self::Unlisted => "unlisted",
+            Self::Private => "private",
         }
     }
 
-    /// Parse a config value. Fails closed: only an explicit `public` publishes; anything
-    /// unrecognized (a typo, say) becomes unlisted rather than widening visibility.
+    /// Parse a config value. Fails closed: only an explicit, recognized level is honored;
+    /// anything unrecognized (a typo, say) becomes private rather than widening visibility.
     #[must_use]
     pub fn parse(s: &str) -> Self {
-        if s.trim().eq_ignore_ascii_case("public") {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("public") {
             Self::Public
-        } else {
+        } else if s.eq_ignore_ascii_case("unlisted") {
             Self::Unlisted
+        } else {
+            Self::Private
         }
     }
 }
@@ -62,6 +72,7 @@ impl std::fmt::Display for Visibility {
         f.write_str(match self {
             Self::Public => "Public",
             Self::Unlisted => "Unlisted",
+            Self::Private => "Private",
         })
     }
 }
@@ -521,10 +532,12 @@ mod tests {
         assert_eq!(Visibility::parse("unlisted"), Visibility::Unlisted);
         assert_eq!(Visibility::parse("PUBLIC "), Visibility::Public);
         assert_eq!(Visibility::parse("public"), Visibility::Public);
+        assert_eq!(Visibility::parse("Private"), Visibility::Private);
         // A typo must never widen visibility.
-        assert_eq!(Visibility::parse("publik"), Visibility::Unlisted);
-        assert_eq!(Visibility::parse(""), Visibility::Unlisted);
+        assert_eq!(Visibility::parse("publik"), Visibility::Private);
+        assert_eq!(Visibility::parse(""), Visibility::Private);
         assert_eq!(Visibility::Unlisted.as_str(), "unlisted");
+        assert_eq!(Visibility::Private.as_str(), "private");
     }
 
     #[test]
