@@ -2,20 +2,24 @@
 //!
 //! Wires the pipeline together: capture → RGBA/BGRx→NV12 → encode → keyframe-aware
 //! ring buffer, and flushes a self-decodable clip on a global hotkey. The ring buffer
-//! is filled on a dedicated capture thread; the main thread drives the XDG portals
-//! (ScreenCast for capture, GlobalShortcuts for the hotkey) and cuts a clip on press.
+//! is filled on a dedicated capture thread.
 //!
-//! Every exit path — hotkey session end, tray Quit, SIGTERM/SIGINT — funnels through
-//! one orderly shutdown (stop flag → portal close → thread joins → audio flush).
-//!
-//! Linux-only at runtime; the binary compiles elsewhere via a stub `main`.
+//! On Linux the main thread drives the XDG portals (ScreenCast for capture,
+//! GlobalShortcuts for the hotkey) plus the tray, and every exit path — hotkey session
+//! end, tray Quit, SIGTERM/SIGINT — funnels through one orderly shutdown (stop flag →
+//! portal close → thread joins → audio flush). On Windows the capture is WGC, the
+//! hotkey is a `RegisterHotKey` message loop, and Ctrl+C drives the same
+//! stop-flag-then-join shutdown (video-only for now; audio/tray/upload follow).
 
 #[cfg(target_os = "linux")]
 mod tray;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn main() -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
     let result = linux::run();
+    #[cfg(target_os = "windows")]
+    let result = windows::run();
     if let Err(e) = &result {
         // The recorder is a windowless background app (often autostarted): without this, a
         // fatal startup error is invisible. Blocking `show` is fine — no runtime is live here.
@@ -31,6 +35,62 @@ fn main() -> anyhow::Result<()> {
             .show();
     }
     result
+}
+
+/// Config → encoder parameter mapping, shared by the platform recorders.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod params {
+    use rewynd_config::{AudioSettings, VideoSettings};
+    use rewynd_encode::{AudioEncodeParams, EncodeParams};
+
+    /// Map the GPU-free [`VideoSettings`] from the config onto the encoder's [`EncodeParams`].
+    /// A test guards that the config defaults stay in lockstep with [`EncodeParams::default`].
+    pub(crate) fn encode_params(v: VideoSettings) -> EncodeParams {
+        EncodeParams {
+            width: v.width,
+            height: v.height,
+            framerate: v.framerate,
+            bitrate_bps: v.bitrate_bps,
+            idr_period: v.idr_period,
+        }
+    }
+
+    /// Map [`AudioSettings`] onto [`AudioEncodeParams`] (frame size stays at the encoder default).
+    pub(crate) fn audio_encode_params(a: AudioSettings) -> AudioEncodeParams {
+        AudioEncodeParams {
+            sample_rate: a.sample_rate,
+            channels: a.channels,
+            bitrate_bps: a.bitrate_bps,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{audio_encode_params, encode_params};
+        use rewynd_config::Config;
+        use rewynd_encode::{AudioEncodeParams, EncodeParams};
+
+        #[test]
+        fn config_defaults_map_to_encoder_defaults() {
+            // rewynd-config is GPU-free and mirrors the encoder defaults as its own constants;
+            // this guards that the two never drift (a new EncodeParams default must be reflected
+            // in the config crate, or this fails).
+            let c = Config::default();
+            let v = encode_params(c.video());
+            let d = EncodeParams::default();
+            assert_eq!(
+                (v.width, v.height, v.framerate, v.bitrate_bps, v.idr_period),
+                (d.width, d.height, d.framerate, d.bitrate_bps, d.idr_period)
+            );
+            let a = audio_encode_params(c.audio());
+            let ad = AudioEncodeParams::default();
+            assert_eq!(
+                (a.sample_rate, a.channels, a.bitrate_bps),
+                (ad.sample_rate, ad.channels, ad.bitrate_bps)
+            );
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -56,8 +116,9 @@ mod linux {
         OpusAudioEncoder, apply_gain, center_mono_into,
     };
 
-    use rewynd_config::{self as config, AudioSettings, VideoSettings};
+    use rewynd_config::{self as config};
 
+    use crate::params::{audio_encode_params, encode_params};
     use crate::tray;
     use rewynd_buffer::{AudioRingBuffer, EncodedChunk, RingBuffer};
     use rewynd_gpu::{DmabufImport, GpuContext};
@@ -87,28 +148,6 @@ mod linux {
     enum RecorderEvent {
         CaptureFailed(String),
         SystemAudioFailed(String),
-    }
-
-    /// Map the GPU-free [`VideoSettings`] from the config onto the encoder's [`EncodeParams`].
-    /// A test guards that the config defaults stay in lockstep with [`EncodeParams::default`].
-    fn encode_params(v: VideoSettings) -> EncodeParams {
-        EncodeParams {
-            width: v.width,
-            height: v.height,
-            framerate: v.framerate,
-            bitrate_bps: v.bitrate_bps,
-            idr_period: v.idr_period,
-        }
-    }
-
-    /// Map [`AudioSettings`] onto [`AudioEncodeParams`] (frame size stays at the encoder default).
-    fn audio_encode_params(a: AudioSettings) -> AudioEncodeParams {
-        AudioEncodeParams {
-            sample_rate: a.sample_rate,
-            channels: a.channels,
-            bitrate_bps: a.bitrate_bps,
-            ..Default::default()
-        }
     }
 
     /// The recorder's threads, joined in dependency order by [`Recorder::shutdown`]. Fields are
@@ -1129,36 +1168,417 @@ mod linux {
     fn saver_window_secs(saver: &Arc<ClipSaver>) -> u64 {
         saver.window().as_secs()
     }
+}
+
+#[cfg(target_os = "windows")]
+mod windows {
+    use std::ops::ControlFlow;
+    use std::os::windows::io::AsHandle;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use anyhow::{Context, Result, anyhow};
+    use rewynd_buffer::{AudioRingBuffer, EncodedChunk, RingBuffer};
+    use rewynd_capture::StreamPrefs;
+    use rewynd_capture::windows::{CapturedD3d11Frame, capture_stream};
+    use rewynd_clip::{ClipSaver, SaveError, SharedAudioBuffer, SharedBuffer, lock_unpoisoned};
+    use rewynd_config::{self as config};
+    use rewynd_encode::{EncodeParams, Encoder, GpuVideoEncoder, Nv12Converter};
+    use rewynd_gpu::{D3d11HandleImport, GpuContext};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey,
+        UnregisterHotKey, VK_F1,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{MSG, PM_REMOVE, PeekMessageW, WM_HOTKEY};
+
+    use crate::params::{audio_encode_params, encode_params};
+
+    /// Our one thread-queue hotkey registration.
+    const HOTKEY_ID: i32 = 1;
+    /// How often the hotkey message pump wakes to drain its queue and check the stop
+    /// flag — the worst-case added latency on a press, well under perception.
+    const HOTKEY_POLL: Duration = Duration::from_millis(30);
+
+    pub fn run() -> Result<()> {
+        tracing_subscriber::fmt::init();
+
+        config::ensure_default_file();
+        let config = config::load();
+
+        // Single-instance guard (named mutex): two recorders would mean two WGC sessions
+        // and two hotkey registrations fighting each other. Degraded start on IO error,
+        // matching the Linux recorder.
+        let _instance = match config::acquire_recorder_lock() {
+            Ok(Some(lock)) => Some(lock),
+            Ok(None) => {
+                tracing::error!("another rewynd recorder is already running; exiting");
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not acquire the recorder lock; starting without one");
+                None
+            }
+        };
+
+        // Resolution / framerate / bitrate stay parameters (PLAN §9), sourced from the config.
+        let params = encode_params(config.video());
+        let buffer_window = config.buffer_window();
+        let output_dir = config.output_dir();
+        tracing::info!(
+            width = params.width,
+            height = params.height,
+            fps = params.framerate,
+            bitrate_bps = params.bitrate_bps,
+            idr_period = params.idr_period,
+            buffer_s = buffer_window.as_secs(),
+            "encode parameters"
+        );
+
+        let buffer: SharedBuffer = Arc::new(Mutex::new(RingBuffer::new(buffer_window)));
+        // Video-only for now: nothing feeds the audio ring, so the saver muxes
+        // video-only MP4s (system-audio capture lands with the Windows audio issue).
+        let audio_buffer: SharedAudioBuffer =
+            Arc::new(Mutex::new(AudioRingBuffer::new(buffer_window)));
+        let saver = ClipSaver::new(
+            buffer.clone(),
+            audio_buffer,
+            params,
+            audio_encode_params(config.audio()),
+            buffer_window,
+            output_dir,
+            None,
+        );
+
+        // One monotonic epoch for all capture PTS (audio joins the same clock later).
+        let epoch = Instant::now();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Fill the video ring on its own thread: the WGC watchdog loop blocks, and the
+        // GPU pipeline lives (and tears down) there.
+        let capture_buffer = buffer.clone();
+        let capture_stop = stop.clone();
+        let capture = std::thread::Builder::new()
+            .name("rewynd-capture".to_owned())
+            .spawn(move || {
+                if let Err(e) = run_capture(params, epoch, &capture_buffer, &capture_stop) {
+                    tracing::error!(error = %e, "capture loop stopped");
+                    toast(
+                        "Recording stopped",
+                        &format!(
+                            "The screen capture failed: {e:#}. Already-buffered footage can still be saved."
+                        ),
+                    );
+                }
+            })
+            .context("spawning the capture thread")?;
+
+        // Global hotkey on its own thread: RegisterHotKey delivers WM_HOTKEY to the
+        // registering thread's queue, so that thread must also pump messages.
+        let hotkey_saver = saver.clone();
+        let hotkey_stop = stop.clone();
+        let trigger = config.hotkey_trigger().to_owned();
+        let hotkey = std::thread::Builder::new()
+            .name("rewynd-hotkey".to_owned())
+            .spawn(move || run_hotkey_loop(&trigger, &hotkey_saver, &hotkey_stop))
+            .context("spawning the hotkey thread")?;
+
+        // Dev aid: flush once after N seconds without a keypress, so the pipeline can be
+        // exercised headlessly. Stop-aware and joined at shutdown like every other thread.
+        let mut flush_hook = None;
+        if let Ok(value) = std::env::var("REWYND_FLUSH_AFTER") {
+            match value.parse::<u64>() {
+                Ok(secs) => {
+                    let flush_saver = saver.clone();
+                    let flush_stop = stop.clone();
+                    flush_hook = Some(
+                        std::thread::Builder::new()
+                            .name("rewynd-flush-hook".to_owned())
+                            .spawn(move || {
+                                let deadline = Instant::now() + Duration::from_secs(secs);
+                                while Instant::now() < deadline {
+                                    if flush_stop.load(Ordering::Relaxed) {
+                                        return;
+                                    }
+                                    std::thread::sleep(Duration::from_millis(250));
+                                }
+                                if let Err(e) = flush_saver.save() {
+                                    tracing::warn!(error = %e, "dev flush produced no clip");
+                                }
+                            })
+                            .context("spawning the flush hook thread")?,
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(value, error = %e, "ignoring invalid REWYND_FLUSH_AFTER");
+                }
+            }
+        }
+
+        // Park until Ctrl+C (there is no tray on Windows yet), then run the same
+        // stop-flag-then-join shutdown as the Linux recorder.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime
+            .block_on(tokio::signal::ctrl_c())
+            .context("waiting for Ctrl+C")?;
+        tracing::info!("Ctrl+C received; shutting down");
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = capture.join();
+        let _ = hotkey.join();
+        if let Some(h) = flush_hook {
+            let _ = h.join();
+        }
+        Ok(())
+    }
+
+    /// Build the GPU pipeline and pump captured frames into `buffer` until the stream
+    /// ends. The encoder/converter/device are dropped in dependency order afterwards
+    /// (tearing the device down before the encoder it backs crashes the driver); by the
+    /// time `capture_stream` returns, the WGC thread is joined, so these Arcs are the
+    /// last owners.
+    fn run_capture(
+        params: EncodeParams,
+        epoch: Instant,
+        buffer: &SharedBuffer,
+        stop: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        let gpu = Arc::new(pollster::block_on(GpuContext::new())?);
+        // Mutexes, not RefCell/Rc as on Linux: the per-frame callback runs on the WGC
+        // capture thread, so everything it captures must be Send (+Sync via Arc).
+        let conv = Arc::new(Mutex::new(Nv12Converter::new(&gpu)?));
+        let enc = Arc::new(Mutex::new(GpuVideoEncoder::new(&gpu, params)?));
+        tracing::info!("capture pipeline ready; filling the ring buffer");
+
+        // WGC captures the monitor at its native size; whatever arrives is scaled to the
+        // encoder's dimensions in the NV12 pass. The framerate pref caps delivery.
+        let prefs = StreamPrefs {
+            width: params.width,
+            height: params.height,
+            framerate: params.framerate,
+        };
+        // A callback Break reads as a clean stop to the stream; record the real reason so
+        // it still surfaces as this function's Err. (Mutex, not Cell: the callback runs on
+        // the WGC capture thread.)
+        let failure: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(None));
+        capture_stream(None, epoch, prefs, Some(stop.clone()), {
+            let gpu = gpu.clone();
+            let conv = conv.clone();
+            let enc = enc.clone();
+            let stop = stop.clone();
+            let buffer = buffer.clone();
+            let failure = failure.clone();
+            let mut frame_index: u64 = 0;
+            move |captured: CapturedD3d11Frame| -> ControlFlow<()> {
+                if stop.load(Ordering::Relaxed) {
+                    return ControlFlow::Break(());
+                }
+                // Force an IDR on the very first frame so the buffer always has an early
+                // keyframe to cut on. A wgpu panic must not unwind into the WGC callback
+                // (an FFI boundary) — catch it and stop cleanly.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    encode_captured(
+                        &gpu,
+                        &lock_unpoisoned(&conv),
+                        &mut lock_unpoisoned(&enc),
+                        params,
+                        &captured,
+                        frame_index == 0,
+                    )
+                }));
+                match outcome {
+                    Ok(Ok(chunk)) => {
+                        lock_unpoisoned(&buffer).push(chunk);
+                        frame_index += 1;
+                        ControlFlow::Continue(())
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(error = %e, "frame failed; stopping capture");
+                        *lock_unpoisoned(&failure) = Some("a frame failed to encode");
+                        ControlFlow::Break(())
+                    }
+                    Err(_) => {
+                        tracing::error!("frame panicked (GPU error?); stopping capture");
+                        *lock_unpoisoned(&failure) = Some("the GPU pipeline panicked");
+                        ControlFlow::Break(())
+                    }
+                }
+            }
+        })?;
+
+        drop(enc);
+        drop(conv);
+        drop(gpu);
+        let reason = *lock_unpoisoned(&failure);
+        match reason {
+            Some(reason) => Err(anyhow!("{reason} (see the log for details)")),
+            None => Ok(()),
+        }
+    }
+
+    /// One frame of the hot path: import the shared NT handle, convert (and scale) to
+    /// NV12, encode. The handle closes when `captured` drops — Vulkan holds its own
+    /// reference to the D3D11 resource.
+    fn encode_captured(
+        gpu: &GpuContext,
+        conv: &Nv12Converter,
+        enc: &mut GpuVideoEncoder,
+        params: EncodeParams,
+        captured: &CapturedD3d11Frame,
+        force_keyframe: bool,
+    ) -> Result<EncodedChunk> {
+        let format = captured.texture_format().ok_or_else(|| {
+            anyhow!(
+                "unsupported DXGI format {:?} (expected packed 32-bit RGB)",
+                captured.dxgi_format
+            )
+        })?;
+
+        let import = D3d11HandleImport {
+            handle: captured.handle.as_handle(),
+            width: captured.width,
+            height: captured.height,
+            format,
+        };
+
+        // SAFETY: `captured` came straight from the WGC backend, so the handle refers to
+        // a shareable D3D11 texture matching these dimensions/format, fully written (the
+        // backend waits on the copy before handing the handle out).
+        let texture = unsafe { gpu.import_d3d11_shared_handle(import)? };
+        let nv12 = conv.convert(gpu, &texture, params.width, params.height);
+        Ok(enc.encode(&nv12, force_keyframe, captured.pts)?)
+    }
+
+    /// Register the configured trigger and pump this thread's message queue until the
+    /// stop flag rises, saving a clip on every WM_HOTKEY. A trigger that cannot be
+    /// parsed or registered degrades to a recorder without a hotkey (footage still
+    /// flushes via the dev hook) instead of killing the process.
+    fn run_hotkey_loop(trigger: &str, saver: &Arc<ClipSaver>, stop: &Arc<AtomicBool>) {
+        let Some((mods, vk)) = parse_trigger(trigger) else {
+            tracing::error!(trigger, "could not parse the hotkey trigger; no hotkey");
+            toast(
+                "Hotkey unavailable",
+                &format!("The configured hotkey \"{trigger}\" could not be understood."),
+            );
+            return;
+        };
+        // SAFETY: FFI; a NULL hwnd registers on this thread's queue, unregistered below.
+        if let Err(e) = unsafe { RegisterHotKey(None, HOTKEY_ID, mods | MOD_NOREPEAT, vk) } {
+            tracing::error!(error = %e, trigger, "could not register the global hotkey (in use elsewhere?)");
+            toast(
+                "Hotkey unavailable",
+                &format!("Could not register {trigger}: {e}"),
+            );
+            return;
+        }
+        tracing::info!(trigger, "global hotkey ready; press it to save a clip");
+
+        loop {
+            let mut msg = MSG::default();
+            // SAFETY: FFI; drains this thread's own queue.
+            while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+                if msg.message == WM_HOTKEY && msg.wParam.0 == HOTKEY_ID as usize {
+                    tracing::info!("hotkey activated");
+                    save_and_toast(saver);
+                }
+            }
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(HOTKEY_POLL);
+        }
+        // SAFETY: FFI; pairs the registration above.
+        let _ = unsafe { UnregisterHotKey(None, HOTKEY_ID) };
+    }
+
+    /// Parse a `CTRL+ALT+R`-style trigger (the config's format, shared with the Linux
+    /// portal hint) into `RegisterHotKey` modifiers + a virtual-key code. Exactly one
+    /// non-modifier key is required: a letter, a digit, or `F1`–`F24`.
+    fn parse_trigger(trigger: &str) -> Option<(HOT_KEY_MODIFIERS, u32)> {
+        let mut mods = HOT_KEY_MODIFIERS(0);
+        let mut key = None;
+        for part in trigger.split('+') {
+            match part.trim().to_ascii_uppercase().as_str() {
+                "CTRL" | "CONTROL" => mods |= MOD_CONTROL,
+                "ALT" => mods |= MOD_ALT,
+                "SHIFT" => mods |= MOD_SHIFT,
+                "SUPER" | "META" | "WIN" | "LOGO" => mods |= MOD_WIN,
+                k => {
+                    if key.replace(parse_key(k)?).is_some() {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some((mods, key?))
+    }
+
+    /// The virtual-key code for a single non-modifier key name (already uppercased).
+    /// Letters and digits map to their ASCII codes per the Win32 VK table.
+    fn parse_key(key: &str) -> Option<u32> {
+        let mut bytes = key.bytes();
+        if let (Some(c), None) = (bytes.next(), bytes.next()) {
+            return (c.is_ascii_uppercase() || c.is_ascii_digit()).then_some(u32::from(c));
+        }
+        let n: u32 = key.strip_prefix('F')?.parse().ok()?;
+        (1..=24).contains(&n).then(|| u32::from(VK_F1.0) + n - 1)
+    }
+
+    /// Cut + mux a clip and toast the outcome (there is no tray on Windows yet, so the
+    /// toast is the only feedback channel).
+    fn save_and_toast(saver: &Arc<ClipSaver>) {
+        match saver.save() {
+            Ok(path) => toast("Clip saved", &path.display().to_string()),
+            Err(SaveError::Empty(reason)) => toast("Nothing to save yet", &reason),
+            Err(e) => {
+                tracing::error!(error = %e, "clip save failed");
+                toast("Could not save the clip", &e.to_string());
+            }
+        }
+    }
+
+    /// Fire-and-forget desktop toast (blocking is fine on the hotkey/capture threads).
+    fn toast(title: &str, body: &str) {
+        let _ = notify_rust::Notification::new()
+            .summary(title)
+            .body(body)
+            .appname("rewynd")
+            .show();
+    }
 
     #[cfg(test)]
     mod tests {
-        use super::{audio_encode_params, encode_params};
-        use rewynd_config::Config;
-        use rewynd_encode::{AudioEncodeParams, EncodeParams};
+        use super::*;
 
         #[test]
-        fn config_defaults_map_to_encoder_defaults() {
-            // rewynd-config is GPU-free and mirrors the encoder defaults as its own constants;
-            // this guards that the two never drift (a new EncodeParams default must be reflected
-            // in the config crate, or this fails).
-            let c = Config::default();
-            let v = encode_params(c.video());
-            let d = EncodeParams::default();
-            assert_eq!(
-                (v.width, v.height, v.framerate, v.bitrate_bps, v.idr_period),
-                (d.width, d.height, d.framerate, d.bitrate_bps, d.idr_period)
-            );
-            let a = audio_encode_params(c.audio());
-            let ad = AudioEncodeParams::default();
-            assert_eq!(
-                (a.sample_rate, a.channels, a.bitrate_bps),
-                (ad.sample_rate, ad.channels, ad.bitrate_bps)
-            );
+        fn triggers_parse_to_modifiers_and_keys() {
+            let (mods, vk) = parse_trigger("CTRL+ALT+R").expect("parses");
+            assert_eq!(mods, MOD_CONTROL | MOD_ALT);
+            assert_eq!(vk, u32::from(b'R'));
+
+            let (mods, vk) = parse_trigger(" shift + win + f12 ").expect("parses");
+            assert_eq!(mods, MOD_SHIFT | MOD_WIN);
+            assert_eq!(vk, u32::from(VK_F1.0) + 11);
+
+            let (mods, vk) = parse_trigger("CTRL+9").expect("parses");
+            assert_eq!(mods, MOD_CONTROL);
+            assert_eq!(vk, u32::from(b'9'));
+        }
+
+        #[test]
+        fn bad_triggers_are_rejected() {
+            assert!(parse_trigger("").is_none(), "no key");
+            assert!(parse_trigger("CTRL+ALT").is_none(), "modifiers only");
+            assert!(parse_trigger("CTRL+R+S").is_none(), "two keys");
+            assert!(parse_trigger("CTRL+F25").is_none(), "F-key out of range");
+            assert!(parse_trigger("CTRL+ESC?").is_none(), "unsupported key name");
         }
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn main() {
-    println!("rewynd currently runs on Linux only");
+    println!("rewynd currently runs on Linux and Windows only");
 }
