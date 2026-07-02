@@ -103,7 +103,7 @@ impl Tray for RewyndTray {
             }
             .into(),
             StandardItem {
-                label: "Open settings".to_owned(),
+                label: "Open rewynd".to_owned(),
                 activate: Box::new(|t: &mut Self| {
                     let _ = t.tx.send(TrayCmd::OpenSettings);
                 }),

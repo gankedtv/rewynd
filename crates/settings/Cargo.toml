@@ -1,5 +1,7 @@
 [package]
-name = "rewynd-settings"
+# The GUI (library + settings). Directory stays `crates/settings` (git history); the binary and
+# package are `rewynd` so what a user installs and launches is `rewynd`, opening the library.
+name = "rewynd"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

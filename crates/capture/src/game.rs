@@ -67,7 +67,7 @@ const EXCLUDED_APP_IDS: &[&str] = &[
     // rewynd's own windows
     "tv.ganked.rewynd",
     "rewynd",
-    "rewynd-settings",
+    "rewynd-recorder",
 ];
 
 /// Whether `app_id` belongs to the desktop shell (or rewynd) rather than a game.

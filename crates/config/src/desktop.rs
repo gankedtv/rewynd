@@ -203,13 +203,49 @@ pub fn refresh_autostart(exec: &Path) -> std::io::Result<()> {
     refresh_autostart_at(&autostart_path_or_err()?, exec)
 }
 
+/// Old binary basenames a rename must migrate away from: the recorder used to be `rewynd` (now
+/// the GUI's name) and the GUI `rewynd-settings`. An autostart entry still launching one of these
+/// is a pre-rename entry of ours and is repointed at the current recorder — otherwise, because the
+/// old recorder name is now the GUI, boot would open the library window instead of recording.
+#[cfg(unix)]
+const RENAMED_BINARIES: &[&str] = &["rewynd", "rewynd-settings"];
+
+/// The binary basename in a desktop entry's `Exec` line, best-effort (the Exec is a quoted path;
+/// pathological paths with embedded quotes just yield a wrong basename, which is harmless here).
+#[cfg(unix)]
+fn entry_exec_basename(entry: &str) -> Option<String> {
+    let value = entry
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("Exec="))?;
+    let path = match value.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(rest),
+        None => value.split_whitespace().next().unwrap_or(value),
+    };
+    path.rsplit('/').next().map(str::to_owned)
+}
+
 /// The testable core of [`refresh_autostart`].
 #[cfg(unix)]
 fn refresh_autostart_at(path: &Path, exec: &Path) -> std::io::Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    refresh_iconless_entry_at(path, &desktop_entry(exec, "StartupNotify=false\n"))
+    let desired = desktop_entry(exec, "StartupNotify=false\n");
+    // Rename migration: an autostart entry still launching an old binary name gets repointed at
+    // the current recorder even when it already carries an icon. This overrides the icon-ownership
+    // guard because it's our own rename, not a packaged file (no packaged autostart exists).
+    let target = exec
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if let Ok(existing) = std::fs::read_to_string(path)
+        && let Some(basename) = entry_exec_basename(&existing)
+        && basename != target
+        && RENAMED_BINARIES.contains(&basename.as_str())
+    {
+        return write_file_atomic(path, desired.as_bytes());
+    }
+    refresh_iconless_entry_at(path, &desired)
 }
 
 /// Install [`BRAND_ICONS`] into the per-user hicolor theme
@@ -619,6 +655,45 @@ mod tests {
         std::fs::write(&path, managed).expect("seed managed");
         refresh_autostart_at(&path, Path::new("/opt/rewynd/rewynd")).expect("no-op");
         assert_eq!(std::fs::read_to_string(&path).expect("read"), managed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn autostart_refresh_migrates_the_pre_rename_recorder_binary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("autostart").join("rewynd.desktop");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+
+        // A pre-rename entry (icon-bearing) that still launches the old `rewynd` recorder — now
+        // the GUI's name — is repointed at the current recorder despite carrying an icon; without
+        // this, start-on-boot would open the library window instead of recording.
+        let stale = desktop_entry(Path::new("/opt/rewynd/rewynd"), "StartupNotify=false\n");
+        std::fs::write(&path, &stale).expect("seed stale");
+        refresh_autostart_at(&path, Path::new("/opt/rewynd/rewynd-recorder")).expect("migrate");
+        let migrated = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            entry_exec_basename(&migrated).as_deref(),
+            Some("rewynd-recorder")
+        );
+
+        // Idempotent: the now-current entry is left alone on a second pass.
+        refresh_autostart_at(&path, Path::new("/opt/rewynd/rewynd-recorder")).expect("idempotent");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), migrated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn entry_exec_basename_reads_the_quoted_exec_path() {
+        let entry = desktop_entry(Path::new("/opt/rewynd/rewynd-recorder"), "");
+        assert_eq!(
+            entry_exec_basename(&entry).as_deref(),
+            Some("rewynd-recorder")
+        );
+        assert_eq!(
+            entry_exec_basename("[Desktop Entry]\nExec=/usr/bin/rewynd\n").as_deref(),
+            Some("rewynd")
+        );
+        assert_eq!(entry_exec_basename("[Desktop Entry]\nName=x\n"), None);
     }
 
     // The mtime pinning below opens the theme *directory* as a file, which Windows

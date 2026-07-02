@@ -1,5 +1,8 @@
 [package]
-name = "rewynd"
+# The background recorder binary. Directory stays `crates/app` (git history); the binary and
+# package are `rewynd-recorder` so `cargo run -p rewynd-recorder` records, and the user-facing
+# `rewynd` name belongs to the GUI (crates/settings).
+name = "rewynd-recorder"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

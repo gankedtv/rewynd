@@ -4231,25 +4231,22 @@ dependencies = [
 name = "rewynd"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "ashpd",
- "futures-util",
+ "dirs",
+ "iced",
  "image",
- "ksni",
+ "jiff",
+ "notify",
  "notify-rust",
- "pollster",
- "rewynd-buffer",
- "rewynd-capture",
- "rewynd-clip",
+ "open",
+ "openh264",
  "rewynd-config",
- "rewynd-encode",
- "rewynd-gpu",
+ "rewynd-mux",
  "rewynd-upload",
+ "rfd",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "tray-icon",
- "windows 0.62.2",
 ]
 
 [[package]]
@@ -4349,25 +4346,28 @@ dependencies = [
 ]
 
 [[package]]
-name = "rewynd-settings"
+name = "rewynd-recorder"
 version = "0.1.0"
 dependencies = [
- "dirs",
- "iced",
+ "anyhow",
+ "ashpd",
+ "futures-util",
  "image",
- "jiff",
- "notify",
+ "ksni",
  "notify-rust",
- "open",
- "openh264",
+ "pollster",
+ "rewynd-buffer",
+ "rewynd-capture",
+ "rewynd-clip",
  "rewynd-config",
- "rewynd-mux",
+ "rewynd-encode",
+ "rewynd-gpu",
  "rewynd-upload",
- "rfd",
- "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "tray-icon",
+ "windows 0.62.2",
 ]
 
 [[package]]

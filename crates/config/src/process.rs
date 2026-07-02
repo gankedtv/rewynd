@@ -80,7 +80,7 @@ fn send_signal(pid: libc::pid_t, signal: libc::c_int) -> std::io::Result<bool> {
 #[cfg(unix)]
 pub fn stop_recorder(term_wait: Duration, kill_wait: Duration) -> std::io::Result<bool> {
     match read_recorder_pid() {
-        Some(pid) => stop_process(pid, "rewynd", term_wait, kill_wait),
+        Some(pid) => stop_process(pid, "rewynd-recorder", term_wait, kill_wait),
         None => Ok(true),
     }
 }
@@ -167,7 +167,7 @@ fn signal_stop_event_named(name: &str) -> std::io::Result<()> {
 pub fn stop_recorder(term_wait: Duration, kill_wait: Duration) -> std::io::Result<bool> {
     signal_stop_event_named(&stop_event_name())?;
     match read_recorder_pid() {
-        Some(pid) => stop_process(pid, "rewynd.exe", term_wait, kill_wait),
+        Some(pid) => stop_process(pid, "rewynd-recorder.exe", term_wait, kill_wait),
         None => Ok(true),
     }
 }

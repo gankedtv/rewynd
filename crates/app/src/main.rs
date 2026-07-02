@@ -729,13 +729,24 @@ mod linux {
             .enable_all()
             .build()?;
 
-        // The portal Registry only accepts an app id that has an installed desktop entry,
-        // so make sure one exists before registering. The login autostart entry is the settings
-        // app's business alone.
+        // The portal Registry only accepts an app id that has an installed desktop entry, so make
+        // sure one exists before registering. The launcher entry opens the GUI (`rewynd`); the
+        // recorder installs it too so the app id is registered even before the GUI has ever run.
         match std::env::current_exe() {
             Ok(exe) => {
-                if let Err(e) = config::install_launcher_entry(&exe) {
+                // Point the launcher at the GUI sibling when it's there, so clicking it opens the
+                // library; fall back to this binary so the entry (and thus the app id the portal
+                // binds the hotkey to) still exists in a recorder-only build.
+                let launcher = config::sibling_binary("rewynd")
+                    .filter(|p| p.is_file())
+                    .unwrap_or_else(|| exe.clone());
+                if let Err(e) = config::install_launcher_entry(&launcher) {
                     tracing::warn!(error = %e, "could not write a desktop entry; the hotkey may not bind");
+                }
+                // Migrate a pre-rename autostart entry (still launching the old `rewynd`, now the
+                // GUI) onto this recorder, so start-on-boot records instead of opening a window.
+                if let Err(e) = config::refresh_autostart(&exe) {
+                    tracing::warn!(error = %e, "could not refresh the autostart entry");
                 }
             }
             Err(e) => tracing::warn!(error = %e, "could not locate our own binary"),
@@ -1049,7 +1060,7 @@ mod linux {
     /// Launch the sibling settings binary for the tray's "Open settings", reaping the child in
     /// the background (an unwaited child stays a zombie for the recorder's whole lifetime).
     async fn open_settings() {
-        let Some(settings) = config::sibling_binary("rewynd-settings") else {
+        let Some(settings) = config::sibling_binary("rewynd") else {
             tray::toast(
                 "Could not open settings",
                 "The settings binary was not found.",
@@ -2060,7 +2071,7 @@ mod windows {
     /// Launch the sibling settings binary, reaping the child in the background (an
     /// unwaited child stays a zombie for the recorder's whole lifetime).
     fn open_settings() {
-        let Some(settings) = config::sibling_binary("rewynd-settings") else {
+        let Some(settings) = config::sibling_binary("rewynd") else {
             toast(
                 "Could not open settings",
                 "The settings binary was not found.",

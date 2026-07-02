@@ -21,7 +21,7 @@ const EXCLUDED_PROCESSES: &[&str] = &[
     "lockapp.exe",
     "dwm.exe",
     "rewynd.exe",
-    "rewynd-settings.exe",
+    "rewynd-recorder.exe",
 ];
 
 /// The foreground window when it looks like a running game: visible and valid, not

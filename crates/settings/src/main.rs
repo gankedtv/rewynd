@@ -168,12 +168,16 @@ fn main() -> iced::Result {
     if let Err(e) = config::register_toast_identity() {
         tracing::warn!(error = %e, "could not register the toast identity");
     }
+    // The launcher entry opens this GUI (the user-facing `rewynd`).
+    #[cfg(unix)]
+    if let Ok(exe) = std::env::current_exe()
+        && let Err(e) = config::install_launcher_entry(&exe)
+    {
+        tracing::warn!(error = %e, "could not write a desktop entry");
+    }
     if let Some(recorder) = recorder_path().filter(|p| p.is_file()) {
-        #[cfg(unix)]
-        if let Err(e) = config::install_launcher_entry(&recorder) {
-            tracing::warn!(error = %e, "could not write a desktop entry");
-        }
-        // Migrate a stale autostart entry (pre-icon on Linux, a moved binary on Windows).
+        // Migrate a stale autostart entry (pre-icon, or the pre-rename recorder binary on Linux;
+        // a moved binary on Windows) onto the current recorder.
         if let Err(e) = config::refresh_autostart(&recorder) {
             tracing::warn!(error = %e, "could not refresh the autostart entry");
         }
@@ -1598,7 +1602,7 @@ fn status_line(status: &Status) -> Element<'_, Message> {
 
 /// The recorder binary, expected as a sibling of this settings binary.
 fn recorder_path() -> Option<std::path::PathBuf> {
-    config::sibling_binary("rewynd")
+    config::sibling_binary("rewynd-recorder")
 }
 
 /// Stop the running recorder (if any), wait for it to exit, then launch a fresh one so it picks
