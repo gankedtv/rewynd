@@ -25,9 +25,12 @@ mod paths;
 mod process;
 mod schema;
 
+pub use desktop::{BRAND_ICONS, install_autostart, refresh_autostart, remove_autostart};
+// XDG desktop entries / hicolor icons exist only on unix desktops; Windows autostart is
+// a Run-key value behind the same install/remove/refresh surface above.
+#[cfg(unix)]
 pub use desktop::{
-    BRAND_ICONS, autostart_path, desktop_entry, desktop_exec_value, install_autostart,
-    install_icons, install_launcher_entry, refresh_autostart, remove_autostart,
+    autostart_path, desktop_entry, desktop_exec_value, install_icons, install_launcher_entry,
 };
 pub use lock::{InstanceLock, acquire_recorder_lock, acquire_settings_lock};
 pub use paths::{

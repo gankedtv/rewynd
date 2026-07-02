@@ -19,7 +19,9 @@ pub(crate) fn config_home_from(get: impl Fn(&str) -> Option<OsString>) -> Option
 }
 
 /// The user's data home from an environment lookup: `$XDG_DATA_HOME`, falling back to
-/// `$HOME/.local/share`. Absolute-only, like [`config_home_from`].
+/// `$HOME/.local/share`. Absolute-only, like [`config_home_from`]. Only unix desktops
+/// consume it (launcher entries, hicolor icons).
+#[cfg(unix)]
 pub(crate) fn data_home_from(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     get("XDG_DATA_HOME")
         .map(PathBuf::from)

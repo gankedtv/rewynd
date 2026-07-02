@@ -148,14 +148,16 @@ fn main() -> iced::Result {
     // Best-effort desktop integration, so the taskbar and notification icons resolve even when
     // the settings window is the first rewynd binary this machine ever runs. The recorder does
     // the same at startup; both paths are cheap and idempotent.
+    #[cfg(unix)]
     if let Err(e) = config::install_icons() {
         tracing::warn!(error = %e, "could not install app icons");
     }
     if let Some(recorder) = recorder_path().filter(|p| p.is_file()) {
+        #[cfg(unix)]
         if let Err(e) = config::install_launcher_entry(&recorder) {
             tracing::warn!(error = %e, "could not write a desktop entry");
         }
-        // Migrate a pre-icon autostart entry so it picks up the icon too.
+        // Migrate a stale autostart entry (pre-icon on Linux, a moved binary on Windows).
         if let Err(e) = config::refresh_autostart(&recorder) {
             tracing::warn!(error = %e, "could not refresh the autostart entry");
         }
