@@ -824,32 +824,41 @@ mod tests {
         let page = reqwest::get(&redirect).await.expect("redirect served");
         assert_eq!(page.status(), 200);
         let html = page.text().await.expect("page body");
-        assert!(html.contains("logged in"), "{html}");
+        // The page must not claim success: the code exchange runs after it is served.
+        assert!(html.contains("Approval received"), "{html}");
 
         let token = wait.await.expect("join").expect("exchange");
         assert_eq!(token, "rt_minted");
     }
 
     #[tokio::test]
-    async fn login_wait_rejects_a_denied_or_forged_redirect() {
+    async fn login_wait_rejects_a_denial_and_ignores_a_forged_redirect() {
+        // Google's own denial carries our state and is terminal, with a non-2xx page.
         let login = youtube_login_start("cid", "sec").await.expect("start");
-        let redirect = format!("{}/?error=access_denied", login.redirect_uri);
+        let redirect = format!(
+            "{}/?state={}&error=access_denied",
+            login.redirect_uri, login.state
+        );
         let wait = tokio::spawn(youtube_login_wait(login));
         let page = reqwest::get(&redirect).await.expect("redirect served");
+        assert_eq!(page.status(), 400);
         assert!(page.text().await.expect("body").contains("Login failed"));
         assert!(matches!(
             wait.await.expect("join"),
             Err(YouTubeError::LoginFailed(_))
         ));
 
-        // A state that isn't ours terminates the login without exchanging anything.
-        let login = youtube_login_start("cid", "sec").await.expect("start");
-        let redirect = format!("{}/?state=FORGED&code=x", login.redirect_uri);
+        // A forged state is someone else's request: 404, and the login keeps waiting for
+        // the real redirect instead of dying under a stray local GET.
+        let mut login = youtube_login_start("cid", "sec").await.expect("start");
+        login.timeout = Duration::from_millis(300);
+        let forged = format!("{}/?state=FORGED&code=x", login.redirect_uri);
         let wait = tokio::spawn(youtube_login_wait(login));
-        let _ = reqwest::get(&redirect).await.expect("redirect served");
+        let resp = reqwest::get(&forged).await.expect("stray served");
+        assert_eq!(resp.status(), 404);
         assert!(matches!(
             wait.await.expect("join"),
-            Err(YouTubeError::LoginFailed(_))
+            Err(YouTubeError::LoginExpired)
         ));
     }
 
