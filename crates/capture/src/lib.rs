@@ -29,6 +29,38 @@ pub struct StreamPrefs {
     pub framerate: u32,
 }
 
+/// Which audio endpoint to capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioSource {
+    /// The system output mix (what you hear): the default sink's monitor on Linux,
+    /// the default render endpoint's WASAPI loopback on Windows.
+    SinkMonitor,
+    /// The default input — the microphone.
+    Microphone,
+}
+
+/// System-audio capture parameters.
+///
+/// Opus operates natively at 48 kHz, and stereo matches a typical desktop sink, so those
+/// are the defaults. Like `rewynd_encode::EncodeParams`, rate and channel count are
+/// parameters rather than hard-coded constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioParams {
+    /// Sample rate in Hz (samples per channel per second).
+    pub sample_rate: u32,
+    /// Channel count (interleaved). 2 = stereo.
+    pub channels: u32,
+}
+
+impl Default for AudioParams {
+    fn default() -> Self {
+        Self {
+            sample_rate: 48_000,
+            channels: 2,
+        }
+    }
+}
+
 /// Errors from the platform capture backends.
 #[derive(Debug, Error)]
 pub enum CaptureError {
@@ -50,6 +82,9 @@ pub enum CaptureError {
     /// A Direct3D 11 error while preparing shareable capture textures.
     #[error("d3d11 error: {0}")]
     D3d11(String),
+    /// A WASAPI audio-capture error.
+    #[error("wasapi error: {0}")]
+    Wasapi(String),
 }
 
 #[cfg(test)]
@@ -81,6 +116,10 @@ mod tests {
         assert_eq!(
             CaptureError::D3d11("device lost".to_owned()).to_string(),
             "d3d11 error: device lost"
+        );
+        assert_eq!(
+            CaptureError::Wasapi("no endpoint".to_owned()).to_string(),
+            "wasapi error: no endpoint"
         );
     }
 }

@@ -37,14 +37,7 @@ const F32_BYTES: usize = std::mem::size_of::<f32>();
 /// idle time. Short enough that shutdown is prompt even when the sink delivers no buffers.
 const WATCHDOG_POLL: Duration = Duration::from_millis(200);
 
-/// Which audio endpoint to capture.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AudioSource {
-    /// The default sink's monitor — the system output mix (what you hear).
-    SinkMonitor,
-    /// The default source — the microphone.
-    Microphone,
-}
+pub use crate::{AudioParams, AudioSource};
 
 impl AudioSource {
     /// Stream name for logs / the PipeWire graph.
@@ -60,28 +53,6 @@ impl AudioSource {
         match self {
             AudioSource::SinkMonitor => "Music",
             AudioSource::Microphone => "Production",
-        }
-    }
-}
-
-/// System-audio capture parameters.
-///
-/// Opus operates natively at 48 kHz, and stereo matches a typical desktop sink, so those
-/// are the defaults. Like [`rewynd_encode::EncodeParams`], rate and channel count are
-/// parameters rather than hard-coded constants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AudioParams {
-    /// Sample rate in Hz (samples per channel per second).
-    pub sample_rate: u32,
-    /// Channel count (interleaved). 2 = stereo.
-    pub channels: u32,
-}
-
-impl Default for AudioParams {
-    fn default() -> Self {
-        Self {
-            sample_rate: 48_000,
-            channels: 2,
         }
     }
 }

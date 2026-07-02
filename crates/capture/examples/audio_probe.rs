@@ -1,30 +1,32 @@
-//! Diagnostic probe for system-audio capture: connect to PipeWire, capture the default
-//! sink's monitor (what you hear) as interleaved `F32LE` PCM, and log each buffer's peak
-//! and RMS level plus its capture-relative PTS. Proves the capture path delivers real,
-//! non-silent samples — play some audio while it runs.
-//!
-//! Run it (Linux, live PipeWire session) with:
+//! Diagnostic probe for system-audio capture: capture the system output mix (what you
+//! hear — PipeWire sink monitor on Linux, WASAPI loopback on Windows) as interleaved
+//! `F32LE` PCM, and log each buffer's peak and RMS level plus its capture-relative PTS.
+//! Proves the capture path delivers real, non-silent samples — play some audio while
+//! it runs.
 //!
 //! ```text
 //! cargo run -p rewynd-capture --example audio_probe
 //! ```
 //!
 //! Captures 200 buffers by default; override with `AUDIO_PROBE_BUFFERS`.
-//! On non-Linux targets this compiles to a stub that just prints "Linux only".
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    linux::run()
+    probe::run()
 }
 
-#[cfg(target_os = "linux")]
-mod linux {
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod probe {
     use std::cell::Cell;
     use std::ops::ControlFlow;
     use std::rc::Rc;
     use std::time::Duration;
 
-    use rewynd_capture::linux::{AudioParams, AudioSource, capture_audio};
+    #[cfg(target_os = "linux")]
+    use rewynd_capture::linux::capture_audio;
+    #[cfg(target_os = "windows")]
+    use rewynd_capture::windows::capture_audio;
+    use rewynd_capture::{AudioParams, AudioSource};
 
     /// Default number of buffers to capture when `AUDIO_PROBE_BUFFERS` is unset.
     const DEFAULT_BUFFERS: u32 = 200;
@@ -147,7 +149,7 @@ mod linux {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn main() {
-    println!("Linux only");
+    println!("Linux and Windows only");
 }

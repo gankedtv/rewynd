@@ -39,6 +39,215 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
+/// The audio half of the pipeline, shared by the platform recorders: capture threads
+/// summing into the mixer, and the mixer thread draining into the Opus encoder + ring.
+/// Only `capture_audio` itself is platform-specific (PipeWire vs WASAPI); the callback
+/// shape and everything downstream are identical.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod audio_pipeline {
+    use std::ops::ControlFlow;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use anyhow::{Context, Result};
+    #[cfg(target_os = "linux")]
+    use rewynd_capture::linux::capture_audio;
+    #[cfg(target_os = "windows")]
+    use rewynd_capture::windows::capture_audio;
+    use rewynd_capture::{AudioParams, AudioSource};
+    use rewynd_clip::{SharedAudioBuffer, lock_unpoisoned};
+    use rewynd_encode::{
+        AudioEncodeParams, AudioMixer, OpusAudioEncoder, apply_gain, center_mono_into,
+    };
+
+    /// Shared mixer: the system + mic capture threads sum into it, the mixer thread drains it.
+    pub(crate) type SharedMixer = Arc<Mutex<AudioMixer>>;
+
+    /// How far behind real time the mixer holds audio before encoding it, so the system and
+    /// mic streams have both contributed. Latency is irrelevant for a replay buffer; this
+    /// just absorbs the two streams' jitter.
+    pub(crate) const AUDIO_SETTLE: Duration = Duration::from_millis(120);
+    /// How often the mixer thread drains settled audio into the encoder.
+    const AUDIO_DRAIN_INTERVAL: Duration = Duration::from_millis(20);
+
+    /// Spawn a thread that captures `source`, applies `gain`, and sums each buffer into the
+    /// shared `mixer`, aligned by its capture-relative PTS. A capture error is logged at a
+    /// severity matching the source; a failed system capture loses the clips' primary audio,
+    /// so that one also fires `on_system_failure` (the platform surfaces it: tray or toast).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_audio_capture(
+        name: &str,
+        source: AudioSource,
+        audio_params: AudioEncodeParams,
+        gain: f32,
+        mixer: SharedMixer,
+        stop: &Arc<AtomicBool>,
+        epoch: Instant,
+        on_system_failure: Option<Box<dyn FnOnce(String) + Send>>,
+    ) -> Result<std::thread::JoinHandle<()>> {
+        let stop = stop.clone();
+        let capture_params = AudioParams {
+            sample_rate: audio_params.sample_rate,
+            channels: audio_params.channels,
+        };
+        let channels = capture_params.channels as usize;
+        std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || {
+                // Per-source prep, reused across buffers so the hot path doesn't realloc: the
+                // mic is centred to mono (see `center_mono_into`) so a single-sided mic isn't
+                // stuck in one ear, system audio keeps its stereo image, and the configured
+                // gain is applied to each.
+                let mut prep = Vec::new();
+                let panicked = std::rc::Rc::new(std::cell::Cell::new(false));
+                // No idle timeout (capture runs until shutdown); the stop flag drives the
+                // watchdog so the loop quits promptly even if the endpoint suspends.
+                let panicked_flag = panicked.clone();
+                let mut buffers: u64 = 0;
+                let result = capture_audio(
+                    capture_params,
+                    source,
+                    None,
+                    Some(stop.clone()),
+                    epoch,
+                    move |pcm, pts| {
+                        // Level telemetry for chasing "why is this clip silent" reports —
+                        // ~once a second at the usual 10 ms buffer cadence, debug only.
+                        buffers += 1;
+                        if buffers % 100 == 1 && tracing::enabled!(tracing::Level::DEBUG) {
+                            let peak = pcm.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+                            tracing::debug!(
+                                ?source,
+                                buffers,
+                                pts_ms = pts.as_millis() as u64,
+                                peak,
+                                "audio level"
+                            );
+                        }
+                        // A panic must not unwind across the PipeWire C callback boundary (UB);
+                        // treat it as a stream failure instead (harmless-but-uniform on WASAPI,
+                        // where the loop is plain Rust).
+                        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let prepared = match source {
+                                AudioSource::Microphone => {
+                                    center_mono_into(pcm, channels, &mut prep);
+                                    apply_gain(&mut prep, gain);
+                                    prep.as_slice()
+                                }
+                                // Only copy to scale when the gain isn't (near) unity; the
+                                // common gain == 1.0 case passes the buffer through untouched.
+                                // The predicate matches `apply_gain`'s own no-op threshold.
+                                AudioSource::SinkMonitor
+                                    if (gain - 1.0).abs() >= f32::EPSILON =>
+                                {
+                                    prep.clear();
+                                    prep.extend_from_slice(pcm);
+                                    apply_gain(&mut prep, gain);
+                                    prep.as_slice()
+                                }
+                                AudioSource::SinkMonitor => pcm,
+                            };
+                            lock_unpoisoned(&mixer).add(prepared, pts);
+                        }));
+                        match outcome {
+                            Ok(()) => ControlFlow::Continue(()),
+                            Err(_) => {
+                                tracing::error!("audio callback panicked; stopping this capture");
+                                panicked_flag.set(true);
+                                ControlFlow::Break(())
+                            }
+                        }
+                    },
+                );
+                // A panic Break reads as a clean stream end; surface it like a capture error.
+                let result = match result {
+                    Ok(()) if panicked.get() => Err(rewynd_capture::CaptureError::PipeWire(
+                        "the audio callback panicked".to_owned(),
+                    )),
+                    other => other,
+                };
+                if let Err(e) = result {
+                    // A missing mic is expected; a failed system capture means the clip loses
+                    // its primary audio, so surface that louder.
+                    match source {
+                        AudioSource::Microphone => {
+                            tracing::info!(error = %e, "no microphone capture; clips use system audio only");
+                        }
+                        AudioSource::SinkMonitor => {
+                            tracing::error!(error = %e, "system-audio capture failed; clips will have no system sound");
+                            if let Some(surface) = on_system_failure {
+                                surface(e.to_string());
+                            }
+                        }
+                    }
+                }
+            })
+            .with_context(|| format!("spawning the {name} thread"))
+    }
+
+    /// Drain settled mixed audio from `mixer`, Opus-encode it, and push packets into the
+    /// audio ring. Runs until `captures_done` is set — which the shutdown path raises only
+    /// *after* the capture threads are joined, so the final `drain_all` catches every sample
+    /// they added. `drain_now` (raised by a clip save) forces an immediate full drain so the
+    /// clip's audio reaches the cut instant. The encoder is built here so it stays on this
+    /// thread; `epoch` matches the mixer's alignment clock.
+    pub(crate) fn run_audio_mixer(
+        epoch: Instant,
+        audio_params: AudioEncodeParams,
+        mixer: SharedMixer,
+        buffer: SharedAudioBuffer,
+        captures_done: &Arc<AtomicBool>,
+        drain_now: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        let mut encoder = OpusAudioEncoder::new(audio_params)?;
+        tracing::info!("audio pipeline ready; mixing system + mic into the audio ring");
+
+        let push_packet = |buffer: &SharedAudioBuffer, chunk| {
+            lock_unpoisoned(buffer).push(chunk);
+        };
+
+        loop {
+            std::thread::sleep(AUDIO_DRAIN_INTERVAL);
+            let finalize = captures_done.load(Ordering::Relaxed);
+            let drain_all = finalize || drain_now.load(Ordering::SeqCst);
+
+            // Drain under the mixer lock, encode outside it. A full drain ignores the settle
+            // delay: at shutdown no more samples arrive; at a clip cut the last ~140 ms matter
+            // more than a mic that hasn't contributed to them yet.
+            let drained = {
+                let mut guard = lock_unpoisoned(&mixer);
+                if drain_all {
+                    guard.drain_all()
+                } else {
+                    guard.drain_settled(epoch.elapsed())
+                }
+            };
+            if let Some((pts, pcm)) = drained
+                && let Err(e) = encoder.push(&pcm, pts, |chunk| push_packet(&buffer, chunk))
+            {
+                // Drop this chunk but keep mixing: a transient encode error shouldn't kill
+                // audio for the rest of the session (and would skip the shutdown flush).
+                tracing::error!(error = %e, "audio encode failed; dropping this chunk");
+            }
+            // Cleared only after the drained packets are in the ring: the saver waits on this
+            // (also on the finalize pass, so a save racing shutdown is not left waiting).
+            if drain_all {
+                drain_now.store(false, Ordering::SeqCst);
+            }
+
+            if finalize {
+                // Flush the encoder's final sub-frame so the tail isn't dropped.
+                if let Err(e) = encoder.flush(|chunk| push_packet(&buffer, chunk)) {
+                    tracing::error!(error = %e, "audio flush failed");
+                }
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Config → encoder parameter mapping, shared by the platform recorders.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod params {
@@ -108,18 +317,14 @@ mod linux {
     use anyhow::{Context, Result, anyhow};
     use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
     use futures_util::StreamExt;
-    use rewynd_capture::linux::{
-        AudioParams, AudioSource, CapturedDmabuf, StreamPrefs, capture_audio, capture_stream,
-        open_portal_with,
-    };
+    use rewynd_capture::AudioSource;
+    use rewynd_capture::linux::{CapturedDmabuf, StreamPrefs, capture_stream, open_portal_with};
     use rewynd_clip::{ClipSaver, SaveError, SharedAudioBuffer, SharedBuffer, lock_unpoisoned};
-    use rewynd_encode::{
-        AudioEncodeParams, AudioMixer, EncodeParams, Encoder, GpuVideoEncoder, Nv12Converter,
-        OpusAudioEncoder, apply_gain, center_mono_into,
-    };
+    use rewynd_encode::{AudioMixer, EncodeParams, Encoder, GpuVideoEncoder, Nv12Converter};
 
     use rewynd_config::{self as config};
 
+    use crate::audio_pipeline::{AUDIO_SETTLE, SharedMixer, run_audio_mixer, spawn_audio_capture};
     use crate::params::{audio_encode_params, encode_params};
     use crate::tray;
     use rewynd_buffer::{AudioRingBuffer, EncodedChunk, RingBuffer};
@@ -131,15 +336,6 @@ mod linux {
     /// Stable id for our one shortcut; the compositor binds a trigger to it.
     const SHORTCUT_ID: &str = "save-clip";
 
-    /// Shared mixer: the system + mic capture threads sum into it, the mixer thread drains it.
-    type SharedMixer = Arc<Mutex<AudioMixer>>;
-
-    /// How far behind real time the mixer holds audio before encoding it, so the system and
-    /// mic streams have both contributed. Latency is irrelevant for a replay buffer; this
-    /// just absorbs the two streams' jitter.
-    const AUDIO_SETTLE: Duration = Duration::from_millis(120);
-    /// How often the mixer thread drains settled audio into the encoder.
-    const AUDIO_DRAIN_INTERVAL: Duration = Duration::from_millis(20);
     /// How long Quit waits for an in-flight upload before abandoning it.
     const QUIT_UPLOAD_GRACE: Duration = Duration::from_secs(5);
     /// Rebind attempts before the hotkey is declared gone (the recorder keeps running).
@@ -335,7 +531,12 @@ mod linux {
                 mixer.clone(),
                 &stop,
                 epoch,
-                Some(events_tx.clone()),
+                Some(Box::new({
+                    let events = events_tx.clone();
+                    move |e| {
+                        let _ = events.send(RecorderEvent::SystemAudioFailed(e));
+                    }
+                })),
             )?);
             // The mic is optional: with no input device the mixer simply never receives mic
             // samples (the stream idles until shutdown), so clips are system-only.
@@ -702,106 +903,6 @@ mod linux {
         }
     }
 
-    /// Spawn a thread that captures `source`, applies `gain`, and sums each buffer into the
-    /// shared `mixer`, aligned by its capture-relative PTS. A capture error is logged at a
-    /// severity matching the source (a missing mic is benign; a failed system sink loses the
-    /// primary audio, so that one also raises a [`RecorderEvent`]).
-    #[allow(clippy::too_many_arguments)]
-    fn spawn_audio_capture(
-        name: &str,
-        source: AudioSource,
-        audio_params: AudioEncodeParams,
-        gain: f32,
-        mixer: SharedMixer,
-        stop: &Arc<AtomicBool>,
-        epoch: Instant,
-        events: Option<tokio::sync::mpsc::UnboundedSender<RecorderEvent>>,
-    ) -> Result<std::thread::JoinHandle<()>> {
-        let stop = stop.clone();
-        let capture_params = AudioParams {
-            sample_rate: audio_params.sample_rate,
-            channels: audio_params.channels,
-        };
-        let channels = capture_params.channels as usize;
-        std::thread::Builder::new()
-            .name(name.to_owned())
-            .spawn(move || {
-                // Per-source prep, reused across buffers so the hot path doesn't realloc: the
-                // mic is centred to mono (see `center_mono_into`) so a single-sided mic isn't
-                // stuck in one ear, system audio keeps its stereo image, and the configured
-                // gain is applied to each.
-                let mut prep = Vec::new();
-                let panicked = std::rc::Rc::new(std::cell::Cell::new(false));
-                // No idle timeout (capture runs until shutdown); the stop flag drives the
-                // watchdog so the loop quits promptly even if the endpoint suspends.
-                let panicked_flag = panicked.clone();
-                let result = capture_audio(
-                    capture_params,
-                    source,
-                    None,
-                    Some(stop.clone()),
-                    epoch,
-                    move |pcm, pts| {
-                        // A panic must not unwind across the PipeWire C callback boundary (UB);
-                        // treat it as a stream failure instead.
-                        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            let prepared = match source {
-                                AudioSource::Microphone => {
-                                    center_mono_into(pcm, channels, &mut prep);
-                                    apply_gain(&mut prep, gain);
-                                    prep.as_slice()
-                                }
-                                // Only copy to scale when the gain isn't (near) unity; the
-                                // common gain == 1.0 case passes the buffer through untouched.
-                                // The predicate matches `apply_gain`'s own no-op threshold.
-                                AudioSource::SinkMonitor
-                                    if (gain - 1.0).abs() >= f32::EPSILON =>
-                                {
-                                    prep.clear();
-                                    prep.extend_from_slice(pcm);
-                                    apply_gain(&mut prep, gain);
-                                    prep.as_slice()
-                                }
-                                AudioSource::SinkMonitor => pcm,
-                            };
-                            lock_unpoisoned(&mixer).add(prepared, pts);
-                        }));
-                        match outcome {
-                            Ok(()) => ControlFlow::Continue(()),
-                            Err(_) => {
-                                tracing::error!("audio callback panicked; stopping this capture");
-                                panicked_flag.set(true);
-                                ControlFlow::Break(())
-                            }
-                        }
-                    },
-                );
-                // A panic Break reads as a clean stream end; surface it like a capture error.
-                let result = match result {
-                    Ok(()) if panicked.get() => Err(rewynd_capture::CaptureError::PipeWire(
-                        "the audio callback panicked".to_owned(),
-                    )),
-                    other => other,
-                };
-                if let Err(e) = result {
-                    // A missing mic is expected; a failed system sink means the clip loses its
-                    // primary audio, so surface that louder (and to the tray).
-                    match source {
-                        AudioSource::Microphone => {
-                            tracing::info!(error = %e, "no microphone capture; clips use system audio only");
-                        }
-                        AudioSource::SinkMonitor => {
-                            tracing::error!(error = %e, "system-audio capture failed; clips will have no system sound");
-                            if let Some(events) = events {
-                                let _ = events.send(RecorderEvent::SystemAudioFailed(e.to_string()));
-                            }
-                        }
-                    }
-                }
-            })
-            .with_context(|| format!("spawning the {name} thread"))
-    }
-
     /// Build the GPU pipeline and pump captured frames into `buffer` until the stream
     /// ends. The encoder/converter/device are dropped in dependency order afterwards
     /// (tearing the device down before the encoder it backs crashes the driver).
@@ -882,67 +983,6 @@ mod linux {
             Some(reason) => Err(anyhow!("{reason} (see the log for details)")),
             None => Ok(()),
         }
-    }
-
-    /// Drain settled mixed audio from `mixer`, Opus-encode it, and push packets into the
-    /// audio ring. Runs until `captures_done` is set — which the shutdown path raises only
-    /// *after* the capture threads are joined, so the final `drain_all` catches every sample
-    /// they added. `drain_now` (raised by a clip save) forces an immediate full drain so the
-    /// clip's audio reaches the cut instant. The encoder is built here so it stays on this
-    /// thread; `epoch` matches the mixer's alignment clock.
-    fn run_audio_mixer(
-        epoch: Instant,
-        audio_params: AudioEncodeParams,
-        mixer: SharedMixer,
-        buffer: SharedAudioBuffer,
-        captures_done: &Arc<AtomicBool>,
-        drain_now: &Arc<AtomicBool>,
-    ) -> Result<()> {
-        let mut encoder = OpusAudioEncoder::new(audio_params)?;
-        tracing::info!("audio pipeline ready; mixing system + mic into the audio ring");
-
-        let push_packet = |buffer: &SharedAudioBuffer, chunk| {
-            lock_unpoisoned(buffer).push(chunk);
-        };
-
-        loop {
-            std::thread::sleep(AUDIO_DRAIN_INTERVAL);
-            let finalize = captures_done.load(Ordering::Relaxed);
-            let drain_all = finalize || drain_now.load(Ordering::SeqCst);
-
-            // Drain under the mixer lock, encode outside it. A full drain ignores the settle
-            // delay: at shutdown no more samples arrive; at a clip cut the last ~140 ms matter
-            // more than a mic that hasn't contributed to them yet.
-            let drained = {
-                let mut guard = lock_unpoisoned(&mixer);
-                if drain_all {
-                    guard.drain_all()
-                } else {
-                    guard.drain_settled(epoch.elapsed())
-                }
-            };
-            if let Some((pts, pcm)) = drained
-                && let Err(e) = encoder.push(&pcm, pts, |chunk| push_packet(&buffer, chunk))
-            {
-                // Drop this chunk but keep mixing: a transient encode error shouldn't kill
-                // audio for the rest of the session (and would skip the shutdown flush).
-                tracing::error!(error = %e, "audio encode failed; dropping this chunk");
-            }
-            // Cleared only after the drained packets are in the ring: the saver waits on this
-            // (also on the finalize pass, so a save racing shutdown is not left waiting).
-            if drain_all {
-                drain_now.store(false, Ordering::SeqCst);
-            }
-
-            if finalize {
-                // Flush the encoder's final sub-frame so the tail isn't dropped.
-                if let Err(e) = encoder.flush(|chunk| push_packet(&buffer, chunk)) {
-                    tracing::error!(error = %e, "audio flush failed");
-                }
-                break;
-            }
-        }
-        Ok(())
     }
 
     /// One frame of the hot path: import the DMA-BUF, convert (and scale) to NV12, encode.
@@ -1182,11 +1222,11 @@ mod windows {
 
     use anyhow::{Context, Result, anyhow};
     use rewynd_buffer::{AudioRingBuffer, EncodedChunk, RingBuffer};
-    use rewynd_capture::StreamPrefs;
     use rewynd_capture::windows::{CapturedD3d11Frame, capture_stream};
+    use rewynd_capture::{AudioSource, StreamPrefs};
     use rewynd_clip::{ClipSaver, SaveError, SharedAudioBuffer, SharedBuffer, lock_unpoisoned};
     use rewynd_config::{self as config};
-    use rewynd_encode::{EncodeParams, Encoder, GpuVideoEncoder, Nv12Converter};
+    use rewynd_encode::{AudioMixer, EncodeParams, Encoder, GpuVideoEncoder, Nv12Converter};
     use rewynd_gpu::{D3d11HandleImport, GpuContext};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey,
@@ -1194,6 +1234,7 @@ mod windows {
     };
     use windows::Win32::UI::WindowsAndMessaging::{MSG, PM_REMOVE, PeekMessageW, WM_HOTKEY};
 
+    use crate::audio_pipeline::{AUDIO_SETTLE, SharedMixer, run_audio_mixer, spawn_audio_capture};
     use crate::params::{audio_encode_params, encode_params};
 
     /// Our one thread-queue hotkey registration.
@@ -1243,24 +1284,93 @@ mod windows {
             "encode parameters"
         );
 
-        let buffer: SharedBuffer = Arc::new(Mutex::new(RingBuffer::new(buffer_window)));
-        // Video-only for now: nothing feeds the audio ring, so the saver muxes
-        // video-only MP4s (system-audio capture lands with the Windows audio issue).
-        let audio_buffer: SharedAudioBuffer =
-            Arc::new(Mutex::new(AudioRingBuffer::new(buffer_window)));
-        let saver = ClipSaver::new(
-            buffer.clone(),
-            audio_buffer,
-            params,
-            audio_encode_params(config.audio()),
-            buffer_window,
-            output_dir,
-            None,
+        let audio_params = audio_encode_params(config.audio());
+        tracing::info!(
+            sample_rate = audio_params.sample_rate,
+            channels = audio_params.channels,
+            bitrate_bps = audio_params.bitrate_bps,
+            mic_gain = config.mic_gain(),
+            system_gain = config.system_gain(),
+            "audio parameters"
         );
 
-        // One monotonic epoch for all capture PTS (audio joins the same clock later).
+        let buffer: SharedBuffer = Arc::new(Mutex::new(RingBuffer::new(buffer_window)));
+        let audio_buffer: SharedAudioBuffer =
+            Arc::new(Mutex::new(AudioRingBuffer::new(buffer_window)));
+        // The system (loopback) + mic capture threads sum into this; the mixer thread
+        // drains + encodes it.
+        let mixer: SharedMixer = Arc::new(Mutex::new(AudioMixer::new(
+            audio_params.sample_rate,
+            audio_params.channels,
+            AUDIO_SETTLE,
+        )));
+        // Raised by a clip save so the mixer drains its in-flight tail before the audio cut.
+        let audio_drain_now = Arc::new(AtomicBool::new(false));
+        let saver = ClipSaver::new(
+            buffer.clone(),
+            audio_buffer.clone(),
+            params,
+            audio_params,
+            buffer_window,
+            output_dir,
+            Some(audio_drain_now.clone()),
+        );
+
+        // One monotonic epoch shared by all capture threads, so the video, system-audio
+        // and mic PTS are on the same clock and the mixer/muxer can align them.
         let epoch = Instant::now();
         let stop = Arc::new(AtomicBool::new(false));
+        // Raised only after the audio capture threads are joined, releasing the mixer's
+        // final drain + Opus flush.
+        let captures_done = Arc::new(AtomicBool::new(false));
+
+        // Audio: system loopback + mic sum into the mixer; the mixer thread drains it.
+        let system_audio = spawn_audio_capture(
+            "rewynd-audio-system",
+            AudioSource::SinkMonitor,
+            audio_params,
+            config.system_gain(),
+            mixer.clone(),
+            &stop,
+            epoch,
+            Some(Box::new(|e: String| {
+                toast(
+                    "System audio lost",
+                    &format!("Clips will have no system sound: {e}"),
+                );
+            })),
+        )?;
+        // The mic is optional: with no input device the mixer simply never receives mic
+        // samples, so clips are system-only.
+        let mic_audio = spawn_audio_capture(
+            "rewynd-audio-mic",
+            AudioSource::Microphone,
+            audio_params,
+            config.mic_gain(),
+            mixer.clone(),
+            &stop,
+            epoch,
+            None,
+        )?;
+        let mixer_buffer = audio_buffer.clone();
+        let mixer_mixer = mixer.clone();
+        let mixer_done = captures_done.clone();
+        let mixer_drain_now = audio_drain_now.clone();
+        let audio_mixer = std::thread::Builder::new()
+            .name("rewynd-audio-mixer".to_owned())
+            .spawn(move || {
+                if let Err(e) = run_audio_mixer(
+                    epoch,
+                    audio_params,
+                    mixer_mixer,
+                    mixer_buffer,
+                    &mixer_done,
+                    &mixer_drain_now,
+                ) {
+                    tracing::error!(error = %e, "audio mixer loop stopped");
+                }
+            })
+            .context("spawning the audio mixer thread")?;
 
         // Fill the video ring on its own thread: the WGC watchdog loop blocks, and the
         // GPU pipeline lives (and tears down) there.
@@ -1363,8 +1473,15 @@ mod windows {
             .unwrap_or("all shutdown waiters died; shutting down");
         tracing::info!(reason, "shutting down");
 
+        // Join in the order the pipeline requires (the Linux Recorder::shutdown mirror):
+        // the audio captures must stop adding to the mixer before `captures_done`
+        // releases the mixer's final drain + Opus flush.
         stop.store(true, Ordering::Relaxed);
         let _ = capture.join();
+        let _ = system_audio.join();
+        let _ = mic_audio.join();
+        captures_done.store(true, Ordering::Relaxed);
+        let _ = audio_mixer.join();
         let _ = hotkey.join();
         if let Some(h) = flush_hook {
             let _ = h.join();
