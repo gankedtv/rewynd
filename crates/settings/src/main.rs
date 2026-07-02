@@ -134,12 +134,14 @@ fn main() -> iced::Result {
             tracing::info!("rewynd settings is already open; not opening a second window");
             // Blocking show is fine: no async runtime is live yet. Without this, the tray's
             // "Open settings" appears to do nothing when a window is already open.
-            let _ = notify_rust::Notification::new()
-                .summary("rewynd settings is already open")
+            let mut note = notify_rust::Notification::new();
+            note.summary("rewynd settings is already open")
                 .body("Look for the existing settings window.")
                 .icon(config::APP_ID)
-                .appname("rewynd")
-                .show();
+                .appname("rewynd");
+            #[cfg(windows)]
+            note.app_id(config::APP_ID);
+            let _ = note.show();
             return Ok(());
         }
         Err(e) => {
@@ -154,6 +156,10 @@ fn main() -> iced::Result {
     #[cfg(unix)]
     if let Err(e) = config::install_icons() {
         tracing::warn!(error = %e, "could not install app icons");
+    }
+    #[cfg(windows)]
+    if let Err(e) = config::register_toast_identity() {
+        tracing::warn!(error = %e, "could not register the toast identity");
     }
     if let Some(recorder) = recorder_path().filter(|p| p.is_file()) {
         #[cfg(unix)]

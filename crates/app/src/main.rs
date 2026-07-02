@@ -27,12 +27,14 @@ fn main() -> anyhow::Result<()> {
             .replace('&', "&amp;")
             .replace('<', "&lt;")
             .replace('>', "&gt;");
-        let _ = notify_rust::Notification::new()
-            .summary("rewynd could not start")
+        let mut note = notify_rust::Notification::new();
+        note.summary("rewynd could not start")
             .body(&body)
             .icon(rewynd_config::APP_ID)
-            .appname("rewynd")
-            .show();
+            .appname("rewynd");
+        #[cfg(target_os = "windows")]
+        note.app_id(rewynd_config::APP_ID);
+        let _ = note.show();
     }
     result
 }
@@ -1206,6 +1208,12 @@ mod windows {
         config::ensure_default_file();
         let config = config::load();
 
+        // Best-effort toast identity, so notifications carry rewynd's name and icon
+        // instead of the launching host's (e.g. "Windows PowerShell").
+        if let Err(e) = config::register_toast_identity() {
+            tracing::warn!(error = %e, "could not register the toast identity");
+        }
+
         // Single-instance guard (named mutex): two recorders would mean two WGC sessions
         // and two hotkey registrations fighting each other. Degraded start on IO error,
         // matching the Linux recorder.
@@ -1574,6 +1582,9 @@ mod windows {
         let _ = notify_rust::Notification::new()
             .summary(title)
             .body(body)
+            // The registered AUMID (see `register_toast_identity`), so the toast
+            // carries rewynd's name and icon instead of the launching host's.
+            .app_id(config::APP_ID)
             .appname("rewynd")
             .show();
     }
