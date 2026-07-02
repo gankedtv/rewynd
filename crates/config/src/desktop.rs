@@ -4,7 +4,7 @@
 
 #[cfg(any(unix, windows))]
 use std::path::Path;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::path::PathBuf;
 
 use crate::paths::APP_ID;
@@ -353,6 +353,49 @@ pub fn refresh_autostart(exec: &Path) -> std::io::Result<()> {
     refresh_autostart_at_key(RUN_KEY_PATH, exec)
 }
 
+/// Registry parent for AppUserModelID metadata: gives our app id a display name and
+/// icon, so toasts carry rewynd's identity instead of the launching host's (an
+/// unregistered AUMID shows as e.g. "Windows PowerShell").
+#[cfg(windows)]
+const AUMID_KEY_PATH: &str = r"Software\Classes\AppUserModelId";
+
+/// Where the toast icon PNG lives (`%LOCALAPPDATA%\rewynd\toast-icon.png`) — the
+/// registry's `IconUri` needs a file path, not embedded bytes.
+#[cfg(windows)]
+fn toast_icon_path() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|dir| dir.join("rewynd").join("toast-icon.png"))
+}
+
+/// Register the toast identity for [`APP_ID`]: write the brand icon to disk and point
+/// the AppUserModelId registry entry's `DisplayName`/`IconUri` at it. Idempotent —
+/// call at every startup.
+#[cfg(windows)]
+pub fn register_toast_identity() -> std::io::Result<()> {
+    let icon = toast_icon_path()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no local data dir"))?;
+    // The largest render: Windows scales down, and small sources blur in the header.
+    let (_, png) = BRAND_ICONS.last().expect("BRAND_ICONS is non-empty");
+    if !std::fs::read(&icon).is_ok_and(|current| current == *png) {
+        if let Some(parent) = icon.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&icon, png)?;
+    }
+    register_toast_identity_at(AUMID_KEY_PATH, &icon)
+}
+
+/// The testable core of [`register_toast_identity`].
+#[cfg(windows)]
+fn register_toast_identity_at(key_path: &str, icon: &Path) -> std::io::Result<()> {
+    let key = windows_registry::CURRENT_USER
+        .create(format!(r"{key_path}\{APP_ID}"))
+        .map_err(registry_io_err)?;
+    key.set_string("DisplayName", "rewynd")
+        .map_err(registry_io_err)?;
+    key.set_string("IconUri", icon.display().to_string())
+        .map_err(registry_io_err)
+}
+
 // No autostart mechanism on other targets; the settings toggle surfaces the error.
 #[cfg(not(any(unix, windows)))]
 pub fn install_autostart(_exec: &Path) -> std::io::Result<()> {
@@ -420,6 +463,23 @@ mod windows_tests {
         remove_autostart_at_key(&key.0).expect("remove");
         assert_eq!(key.value(), None, "disabling removes the value");
         remove_autostart_at_key(&key.0).expect("idempotent remove");
+    }
+
+    #[test]
+    fn toast_identity_registers_name_and_icon() {
+        let key = TestKey::new("aumid");
+        let icon = Path::new(r"C:\somewhere\toast-icon.png");
+        register_toast_identity_at(&key.0, icon).expect("register");
+        let entry = windows_registry::CURRENT_USER
+            .create(format!(r"{}\{}", key.0, crate::paths::APP_ID))
+            .expect("open");
+        assert_eq!(entry.get_string("DisplayName").as_deref(), Ok("rewynd"));
+        assert_eq!(
+            entry.get_string("IconUri").as_deref(),
+            Ok(r"C:\somewhere\toast-icon.png")
+        );
+        // Idempotent re-register.
+        register_toast_identity_at(&key.0, icon).expect("re-register");
     }
 
     #[test]

@@ -25,6 +25,8 @@ mod paths;
 mod process;
 mod schema;
 
+#[cfg(windows)]
+pub use desktop::register_toast_identity;
 pub use desktop::{BRAND_ICONS, install_autostart, refresh_autostart, remove_autostart};
 // XDG desktop entries / hicolor icons exist only on unix desktops; Windows autostart is
 // a Run-key value behind the same install/remove/refresh surface above.
