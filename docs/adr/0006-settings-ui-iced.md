@@ -15,7 +15,8 @@ wgpu/naga crate in the workspace.
 ## Decision
 
 **A standalone `rewynd-settings` binary built with `iced` 0.14, using the `tiny-skia` software
-renderer (no wgpu), as a normal workspace member.** It reads and writes the same
+renderer (no wgpu), as a normal workspace member.** (Renamed to `rewynd` for v1.0 — it is the
+GUI a user launches; the recorder became `rewynd-recorder`.) It reads and writes the same
 `config.toml` as the recorder (ADR 0005) — the file is the single source of truth, so there is no
 IPC. Changes apply on the recorder's next clip / restart; the window says so after saving
 (live-reload is a future refinement).
@@ -60,5 +61,5 @@ IPC. Changes apply on the recorder's next clip / restart; the window says so aft
   unit-tested and `settings/src/` is excluded from the coverage gate (like the GPU/portal code).
 - A **tray icon + "clip saved" toast** was deferred here and has since landed — superseded on
   this point by ADR 0007, which chose `ksni` (no GTK) over the `tray-icon` path sketched below.
-- Sanity-check on dependency drift: `cargo tree -p rewynd-settings | grep -i wgpu` must stay empty.
+- Sanity-check on dependency drift: `cargo tree -p rewynd | grep -i wgpu` must stay empty (the GUI crate, formerly `rewynd-settings`).
   If iced later moves to wgpu-only, hold iced at this line or revisit per ADR 0001.

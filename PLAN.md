@@ -110,11 +110,12 @@ rewynd/
 │   ├── buffer/                # ring buffer, keyframe-aware; the "interesting" pure-Rust core
 │   ├── mux/                   # H.264 Annex-B + PTS → MP4 (our timestamps, not guessed fps)
 │   ├── upload/                # ganked.tv client (later feature)
-│   └── app/                   # the `rewynd` binary: wires it together, hotkey, config, tray/overlay
+│   ├── app/                   # the `rewynd-recorder` binary: the background recorder, hotkey, tray
+│   └── settings/              # the `rewynd` binary: the GUI (clip library + settings, iced)
 └── PLAN.md
 ```
 
-**Crate naming:** the binary crate is `rewynd`; library members take the `rewynd-` prefix (`rewynd-capture`, `rewynd-encode`, …) — reserve those names on crates.io only for the ones you actually publish.
+**Crate naming:** the two binaries are `rewynd` (the GUI in `crates/settings` — what a user launches) and `rewynd-recorder` (the background recorder in `crates/app`); library members take the `rewynd-` prefix (`rewynd-capture`, `rewynd-encode`, …) — reserve those names on crates.io only for the ones you actually publish. Directories keep their original names to preserve git history.
 
 ### 4.3 Key trait boundaries
 - **`FrameSource`** (in `capture`): yields a `GpuFrame` (an imported `wgpu::Texture` + timestamp + format). Per-platform impls behind a common trait so `app` is platform-agnostic.

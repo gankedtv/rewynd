@@ -22,7 +22,8 @@ See [`PLAN.md`](PLAN.md) for the full design and rationale, and
 | [`rewynd-buffer`](crates/buffer) | Keyframe-aware ring buffer — the pure-Rust core, no GPU dependency. |
 | [`rewynd-mux`](crates/mux) | H.264 Annex-B → MP4 with real PTS. |
 | [`rewynd-upload`](crates/upload) | Upload clients: ganked.tv (API key) and YouTube (OAuth). |
-| [`rewynd`](crates/app) | The binary: wires the pipeline, hotkey, config. |
+| [`rewynd-recorder`](crates/app) | The background recorder: wires the pipeline, hotkey, config, tray. |
+| [`rewynd`](crates/settings) | The GUI you launch: clip library + settings editor (iced). |
 
 ## Building
 
@@ -34,7 +35,8 @@ libpipewire-0.3-dev clang libclang-dev`.
 ```sh
 cargo build
 cargo test
-cargo run -p rewynd
+cargo run -p rewynd            # the GUI: clip library + settings
+cargo run -p rewynd-recorder   # the background recorder
 ```
 
 The GPU stack (`wgpu` + `gpu-video`) is **pinned to a single source** — see

@@ -17,8 +17,8 @@ D-Bus (zbus 5, pulled by ashpd). UI deps should be permissive and low-footprint.
 stack; no GTK. The tray runs as a background **task of the existing tokio runtime** (not a thread,
 not a second event loop). It lives in `crates/app/src/tray.rs`; the recorder spawns it alongside —
 and leaves untouched — the proven GlobalShortcuts hotkey loop. Menu clicks arrive as a `TrayCmd`
-over an `mpsc` channel ("Save clip now" → the same `save_clip`, "Open settings" → launches the
-sibling `rewynd-settings`, "Quit" → exits). The clip-saved toast fires from the
+over an `mpsc` channel ("Save clip now" → the same `save_clip`, "Open rewynd" → launches the
+sibling GUI `rewynd` (formerly `rewynd-settings`), "Quit" → exits). The clip-saved toast fires from the
 callers' success paths (hotkey loop and tray; the toast is async so `save_clip` itself stays
 sync), so both triggers show it.
 
