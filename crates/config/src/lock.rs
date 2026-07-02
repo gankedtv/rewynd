@@ -111,14 +111,16 @@ fn create_instance_mutex(name: &str) -> std::io::Result<Option<std::os::windows:
 
     let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: FFI; `wide` is NUL-terminated and outlives the call.
-    let handle = unsafe { CreateMutexW(None, false, PCWSTR(wide.as_ptr())) }
-        .map_err(std::io::Error::other)?;
+    let handle = unsafe { CreateMutexW(None, false, PCWSTR(wide.as_ptr())) };
+    // Snapshot last-error before anything else can touch it. Documented contract: on
+    // success it is ERROR_ALREADY_EXISTS iff the named object pre-existed.
+    // SAFETY: trivially safe FFI.
+    let already_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+    let handle = handle.map_err(std::io::Error::other)?;
     // SAFETY: `CreateMutexW` succeeded, so `handle` is a valid handle we own.
     let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
-    // Documented contract: on success last-error is ERROR_ALREADY_EXISTS iff the named
-    // object pre-existed. Our fresh handle drops here, leaving the holder's object alone.
-    // SAFETY: trivially safe FFI.
-    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+    // Our fresh handle drops here, leaving the holder's object alone.
+    if already_exists {
         return Ok(None);
     }
     Ok(Some(handle))
