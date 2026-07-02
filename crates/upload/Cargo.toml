@@ -21,8 +21,14 @@ tokio = { workspace = true, features = ["fs", "time", "net", "io-util"] }
 sha2.workspace = true
 base64.workspace = true
 getrandom.workspace = true
+# Reads a clip's container duration for the client-side length pre-check (the
+# vendored muxer fork the rest of the workspace already uses).
+mp4.workspace = true
 
 [dev-dependencies]
+# Synthesize real MP4s for the clip-length pre-check tests.
+rewynd-mux.workspace = true
+rewynd-buffer.workspace = true
 # test-util pauses tokio's clock so the device-login polling tests run instantly.
 tokio = { workspace = true, features = ["fs", "time", "macros", "rt-multi-thread", "test-util"] }
 wiremock.workspace = true

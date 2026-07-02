@@ -10,7 +10,11 @@ Phase 8 connects the recorder to ganked.tv: a saved clip should be shareable wit
 desktop. The server (gankedtv#155) mints `gtv_`-prefixed API keys that authenticate the full upload
 flow — `POST /clips` → `POST /clips/{id}/upload-url` → presigned `PUT` to storage → `POST
 /clips/{id}/complete` → `GET /clips/{id}/status` (share code) — with RFC 7807 problem responses.
-Limits: 500 MiB, `video/mp4` (we already encode H.264 MP4), 120 s (our buffer caps at 120 s).
+Limits: 500 MiB, `video/mp4` (we already encode H.264 MP4), and 60 s of runtime
+(`MAX_CLIP_DURATION_SECS` on ganked.tv). Both are pre-checked client-side so a
+too-large or too-long clip fails before any bytes move; the length cap is a hard
+constant on purpose (the platform's limit is not the client's to change), and the
+server stays authoritative either way.
 
 ## Decision
 

@@ -16,6 +16,10 @@ use thiserror::Error;
 /// Server-side upload cap (500 MiB by default); pre-checked here so an oversized clip fails fast
 /// instead of after the whole PUT.
 const DEFAULT_MAX_UPLOAD_BYTES: u64 = 524_288_000;
+/// ganked.tv's clip-length cap (its `MAX_CLIP_DURATION_SECS`); pre-checked here so a too-long
+/// clip fails before the upload instead of server-side after the whole PUT. Deliberately not
+/// configurable: the platform's limit is not the client's to change.
+const MAX_CLIP_SECS: u64 = 60;
 /// Server-side title length cap (characters).
 const MAX_TITLE_CHARS: usize = 255;
 
@@ -93,6 +97,8 @@ pub enum UploadError {
     Io(#[from] std::io::Error),
     #[error("clip is {} MB; ganked.tv accepts at most {} MB", size.div_ceil(1_000_000), max / 1_000_000)]
     TooLarge { size: u64, max: u64 },
+    #[error("clip is {secs} seconds; ganked.tv accepts at most {max} seconds")]
+    TooLong { secs: u64, max: u64 },
     #[error("request failed: {0}")]
     Http(#[from] reqwest::Error),
     #[error("ganked.tv rejected the request (HTTP {status}, {code}): {detail}")]
@@ -214,6 +220,24 @@ impl GankedClient {
             return Err(UploadError::TooLarge {
                 size,
                 max: self.max_upload_bytes,
+            });
+        }
+
+        // Length check up front too: the server rejects an over-long clip only after the
+        // whole PUT. Whole seconds, matching how the server truncates before comparing.
+        let duration = {
+            let path = path.to_owned();
+            tokio::task::spawn_blocking(move || clip_duration(&path))
+                .await
+                .ok()
+                .flatten()
+        };
+        if let Some(duration) = duration
+            && duration.as_secs() > MAX_CLIP_SECS
+        {
+            return Err(UploadError::TooLong {
+                secs: duration.as_secs(),
+                max: MAX_CLIP_SECS,
             });
         }
 
@@ -497,6 +521,15 @@ fn put_timeout(size: u64) -> Duration {
     PUT_BASE_TIMEOUT + Duration::from_secs(size / PUT_MIN_RATE_BYTES_PER_SEC)
 }
 
+/// The clip's container duration, when parseable. Lenient by design: an unreadable or exotic
+/// file skips the client-side length pre-check and the server stays authoritative.
+fn clip_duration(path: &Path) -> Option<Duration> {
+    let file = std::fs::File::open(path).ok()?;
+    let size = file.metadata().ok()?.len();
+    let reader = mp4::Mp4Reader::read_header(std::io::BufReader::new(file), size).ok()?;
+    Some(reader.duration())
+}
+
 /// Truncate to the server's title cap on a character boundary.
 fn clamp_title(title: &str) -> &str {
     truncate_chars(title, MAX_TITLE_CHARS)
@@ -547,6 +580,81 @@ mod tests {
         assert_eq!(Visibility::parse(""), Visibility::Private);
         assert_eq!(Visibility::Unlisted.as_str(), "unlisted");
         assert_eq!(Visibility::Private.as_str(), "private");
+    }
+
+    /// A real MP4 spanning `secs` seconds, written by the workspace muxer.
+    fn mp4_spanning(secs: u64) -> PathBuf {
+        use rewynd_buffer::EncodedChunk;
+        let keyframe: std::sync::Arc<[u8]> = vec![
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1f, 0x8c, 0x8d, 0x40, // SPS
+            0, 0, 0, 1, 0x68, 0xce, 0x3c, 0x80, // PPS
+            0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00, 0x33, 0xff, // IDR
+        ]
+        .into();
+        let delta: std::sync::Arc<[u8]> =
+            vec![0, 0, 0, 1, 0x41, 0x9a, 0x24, 0x6c, 0x41, 0x4f].into();
+        let path =
+            std::env::temp_dir().join(format!("rewynd-span-{}-{secs}.mp4", std::process::id()));
+        // Three samples so the muxer's last-frame heuristic (reuse the previous gap)
+        // adds one second, not a doubled runtime: total = secs + 1.
+        rewynd_mux::Mp4Muxer::new(64, 64, 60)
+            .write_mp4(
+                &[
+                    EncodedChunk {
+                        bytes: keyframe,
+                        is_keyframe: true,
+                        pts: Duration::ZERO,
+                    },
+                    EncodedChunk {
+                        bytes: delta.clone(),
+                        is_keyframe: false,
+                        pts: Duration::from_secs(secs - 1),
+                    },
+                    EncodedChunk {
+                        bytes: delta,
+                        is_keyframe: false,
+                        pts: Duration::from_secs(secs),
+                    },
+                ],
+                &path,
+            )
+            .expect("mux test clip");
+        path
+    }
+
+    #[tokio::test]
+    async fn a_too_long_clip_is_refused_before_any_request() {
+        let path = mp4_spanning(61);
+        // Port 9 (discard) is never a ganked.tv server: reaching it at all would fail the
+        // test with an Http error instead of the expected pre-check.
+        let client = GankedClient::new("http://127.0.0.1:9", "gtv_k").expect("client");
+        match client.upload(&path, "t", Visibility::Unlisted).await {
+            Err(UploadError::TooLong { secs, max }) => {
+                assert_eq!(max, 60);
+                assert!(secs >= 61, "{secs}");
+            }
+            other => panic!("expected TooLong, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_short_clip_passes_the_length_guard() {
+        let path = mp4_spanning(5);
+        let client = GankedClient::new("http://127.0.0.1:9", "gtv_k").expect("client");
+        match client.upload(&path, "t", Visibility::Unlisted).await {
+            Err(UploadError::TooLong { .. }) => panic!("5s must pass a 60s guard"),
+            Err(_) => {}
+            Ok(_) => panic!("nothing is listening on the discard port"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn clip_duration_is_lenient_on_non_mp4s() {
+        let path = clip_file(b"not an mp4");
+        assert_eq!(clip_duration(&path), None);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
