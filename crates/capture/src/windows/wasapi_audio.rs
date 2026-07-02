@@ -15,10 +15,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Media::Audio::{
-    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
-    AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, IAudioCaptureClient,
-    IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX, eCapture, eConsole,
-    eRender,
+    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
+    AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
+    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, IAudioCaptureClient, IAudioClient,
+    IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX, eCapture, eConsole, eRender,
 };
 use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
@@ -32,6 +32,12 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// `WAVE_FORMAT_IEEE_FLOAT` (mmreg.h): 32-bit float PCM, the format the mixer expects.
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
+
+/// How far the continuous stream clock may drift from the wall clock before a
+/// packet re-anchors. Above the engine period (10 ms) so burst-drained packets
+/// stay on the stream clock; small enough that a real gap (idle loopback)
+/// re-syncs promptly instead of back-dating the resumed audio.
+const REANCHOR_DRIFT: Duration = Duration::from_millis(100);
 
 /// Balances `CoInitializeEx` on drop, so every exit path uninitializes COM exactly once.
 struct ComGuard;
@@ -145,6 +151,14 @@ pub fn capture_audio(
     let channels = params.channels as usize;
     let mut silence: Vec<f32> = Vec::new();
     let mut last_packet = Instant::now();
+    // A continuous per-stream clock: packets drained in one poll burst arrive
+    // microseconds apart while each represents ~10 ms of audio, so stamping them
+    // with the dequeue time would make the mixer sum them partially on top of each
+    // other — audible crackle that grows with amplitude. Instead the first packet
+    // anchors on the wall clock and every next PTS advances by the frames
+    // delivered; a real delivery gap (idle loopback, engine discontinuity)
+    // re-anchors so the stream clock can't drift from the shared epoch.
+    let mut stream_clock: Option<Duration> = None;
     let result = 'run: loop {
         if stop
             .as_ref()
@@ -180,7 +194,17 @@ pub fn capture_audio(
                 break 'run Err(CaptureError::Wasapi(format!("GetBuffer: {e}")));
             }
             last_packet = Instant::now();
-            let pts = epoch.elapsed();
+            let wall = epoch.elapsed();
+            let discontinuity = flags & (AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32) != 0;
+            let pts = match stream_clock {
+                Some(clock) if !discontinuity && clock.abs_diff(wall) < REANCHOR_DRIFT => clock,
+                _ => wall,
+            };
+            stream_clock = Some(
+                pts + Duration::from_nanos(
+                    u64::from(frames) * 1_000_000_000 / u64::from(params.sample_rate),
+                ),
+            );
             let samples = frames as usize * channels;
             let action = if flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 {
                 // The spec says to treat the buffer as silence regardless of content.
