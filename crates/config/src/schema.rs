@@ -1140,7 +1140,7 @@ mod tests {
         let c = Config::from_toml_str("").expect("parses");
         let y = c.youtube();
         assert!(!y.enabled);
-        assert_eq!(y.visibility, "public", "empty falls back to [upload]");
+        assert_eq!(y.visibility, "unlisted", "empty falls back to [upload]");
 
         // Enabled without a refresh token stays disabled.
         let c = Config::from_toml_str("[youtube]\nenabled = true\n").expect("parses");
