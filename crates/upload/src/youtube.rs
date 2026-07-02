@@ -665,6 +665,17 @@ fn urldecode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// A YouTube upload error in words a user can act on (shared by the tray toasts and the
+/// library view). Callers log the full error themselves.
+#[must_use]
+pub fn user_facing_youtube_error(e: &YouTubeError) -> String {
+    match e {
+        YouTubeError::Http(_) => "Could not reach YouTube; check your connection.".to_owned(),
+        YouTubeError::Io(_) => "The clip file could not be read.".to_owned(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,6 +689,26 @@ mod tests {
         let p = std::env::temp_dir().join(format!("rewynd-yt-{}-{n}.mp4", std::process::id()));
         std::fs::write(&p, contents).expect("write clip fixture");
         p
+    }
+
+    #[test]
+    fn user_facing_youtube_errors_read_like_advice() {
+        let io = YouTubeError::Io(std::io::Error::other("boom"));
+        assert_eq!(
+            user_facing_youtube_error(&io),
+            "The clip file could not be read."
+        );
+        let http = YouTubeError::Http(
+            reqwest::Client::new()
+                .get("not a url")
+                .build()
+                .expect_err("invalid URL"),
+        );
+        assert!(user_facing_youtube_error(&http).contains("Could not reach YouTube"));
+        assert_eq!(
+            user_facing_youtube_error(&YouTubeError::NeedsReauth),
+            YouTubeError::NeedsReauth.to_string()
+        );
     }
 
     /// A client whose token + upload endpoints point at the mock server.

@@ -53,8 +53,8 @@ server stays authoritative either way.
 
 - New deps: `reqwest` 0.13 (+rustls stack), `serde_json`, `jiff` (local-time clip titles),
   `wiremock` (dev-only, client tests). All permissive, GPL-compatible; no new CI system deps.
-- The clip is read into memory for the PUT (tens of MB at the 30 s default; ~200 MB worst case at
-  120 s), only after the presigned URL is in hand. Streaming from disk is a later refinement —
+- The clip is read into memory for the PUT (tens of MB at the 30 s default; ~100 MB worst case at
+  the 60 s cap), only after the presigned URL is in hand. Streaming from disk is a later refinement —
   presigned S3 PUTs generally want a Content-Length, so it needs care. The PUT deadline scales
   with file size (~1 Mbit/s floor) instead of a flat timeout, so slow-but-progressing uploads
   survive.

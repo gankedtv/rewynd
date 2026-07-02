@@ -6,6 +6,8 @@
 //! encoder's Annex-B output to the AVCC (length-prefixed) form MP4 stores and pull the
 //! SPS/PPS out of the first IDR to build the `avcC` config.
 
+pub mod read;
+
 use std::path::Path;
 use std::time::Duration;
 

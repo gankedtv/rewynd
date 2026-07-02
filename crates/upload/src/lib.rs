@@ -521,6 +521,26 @@ fn put_timeout(size: u64) -> Duration {
     PUT_BASE_TIMEOUT + Duration::from_secs(size / PUT_MIN_RATE_BYTES_PER_SEC)
 }
 
+/// An upload error in words a user can act on (shared by the tray toasts and the library
+/// view, so both surfaces speak identically). Callers log the full error themselves.
+#[must_use]
+pub fn user_facing_upload_error(e: &UploadError) -> String {
+    match e {
+        UploadError::Http(_) => {
+            "Could not reach ganked.tv; check your connection and the API server URL.".to_owned()
+        }
+        UploadError::Io(_) => "The clip file could not be read.".to_owned(),
+        other => other.to_string(),
+    }
+}
+
+/// The default title every upload surface stamps on a clip: "rewynd YYYY-MM-DD HH:MM"
+/// in local time.
+#[must_use]
+pub fn default_title() -> String {
+    format!("rewynd {}", jiff::Zoned::now().strftime("%Y-%m-%d %H:%M"))
+}
+
 /// The clip's container duration, when parseable. Lenient by design: an unreadable or exotic
 /// file skips the client-side length pre-check and the server stays authoritative.
 fn clip_duration(path: &Path) -> Option<Duration> {
@@ -676,6 +696,36 @@ mod tests {
         };
         assert_eq!(without.share_url("https://ganked.tv"), None);
         assert!(without.failed());
+    }
+
+    #[test]
+    fn default_title_is_rewynd_plus_a_local_stamp() {
+        let title = default_title();
+        assert!(title.starts_with("rewynd "), "{title}");
+        // "rewynd YYYY-MM-DD HH:MM"
+        assert_eq!(title.len(), "rewynd ".len() + 16, "{title}");
+    }
+
+    #[test]
+    fn user_facing_upload_errors_read_like_advice() {
+        let io = UploadError::Io(std::io::Error::other("boom"));
+        assert_eq!(
+            user_facing_upload_error(&io),
+            "The clip file could not be read."
+        );
+        let http = UploadError::Http(
+            reqwest::Client::new()
+                .get("not a url")
+                .build()
+                .expect_err("invalid URL"),
+        );
+        assert!(user_facing_upload_error(&http).contains("Could not reach ganked.tv"));
+        let api = UploadError::Api {
+            status: 401,
+            code: "unauthorized".into(),
+            detail: "bad key".into(),
+        };
+        assert_eq!(user_facing_upload_error(&api), api.to_string());
     }
 
     #[test]
