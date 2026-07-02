@@ -5,6 +5,8 @@
 //! triggers it from the tray). Errors carry the server's RFC 7807 `code`/`detail` so the caller
 //! can show something actionable.
 
+pub mod youtube;
+
 use std::path::Path;
 use std::time::Duration;
 
@@ -374,7 +376,7 @@ async fn api_request(req: reqwest::RequestBuilder) -> Result<reqwest::Response, 
 }
 
 /// Read at most [`MAX_ERROR_BODY_BYTES`] of a response body as (lossy) text.
-async fn bounded_text(resp: reqwest::Response) -> String {
+pub(crate) async fn bounded_text(resp: reqwest::Response) -> String {
     use futures_util::StreamExt;
     let mut collected: Vec<u8> = Vec::new();
     let mut stream = resp.bytes_stream();
@@ -501,7 +503,7 @@ fn clamp_title(title: &str) -> &str {
 }
 
 /// A short slice of a non-JSON error body for diagnostics.
-fn snippet(body: &str) -> &str {
+pub(crate) fn snippet(body: &str) -> &str {
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return "no detail";
