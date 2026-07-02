@@ -76,11 +76,32 @@ jiff = "0.2"
 wiremock = "0.6"
 # RAII temp files/dirs for filesystem tests (dev-only). MIT/Apache.
 tempfile = "3"
+# PNG decode for the embedded brand mark (tray pixmap, window icon). MIT/Apache.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Linux capture (PLAN §3.5): XDG ScreenCast portal + PipeWire. Linux-only.
 ashpd = { version = "0.13", features = ["screencast"] }
 pipewire = { version = "0.10", features = ["v0_3_65"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
+
+# The settings window renders on the CPU (tiny-skia rasterizing, cosmic-text shaping), which
+# is unusably slow at opt-level 0 — `cargo run` scrolled at a few fps. Only that render stack
+# builds optimized in dev: a blanket `package."*"` would also optimize the wgpu tree and every
+# other dependency, roughly doubling cold dev builds (locally and in CI) for no visible gain.
+[profile.dev.package]
+tiny-skia = { opt-level = 2 }
+tiny-skia-path = { opt-level = 2 }
+cosmic-text = { opt-level = 2 }
+harfrust = { opt-level = 2 }
+swash = { opt-level = 2 }
+zeno = { opt-level = 2 }
+ttf-parser = { opt-level = 2 }
+fontdb = { opt-level = 2 }
+softbuffer = { opt-level = 2 }
+unicode-bidi = { opt-level = 2 }
+unicode-script = { opt-level = 2 }
+unicode-segmentation = { opt-level = 2 }
+iced_tiny_skia = { opt-level = 2 }
 
 # Force every wgpu/naga crate to the single pinned source (docs/adr/0001-wgpu-rev.md),
 # so no transitive dependency can pull a second, incompatible wgpu from crates.io.

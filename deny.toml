@@ -4,11 +4,17 @@
 [advisories]
 version = 2
 yanked = "deny"
-# Unmaintained-only advisories, each consciously accepted:
+# Advisories consciously accepted, each with the reason and its removal condition:
 ignore = [
     "RUSTSEC-2026-0150", # audiopus_sys unmaintained — we link SYSTEM libopus via pkg-config, the bundled-CMake path never runs
     "RUSTSEC-2026-0192", # ttf-parser unmaintained — transitive via iced/winit; upstream migration (skrifa) is theirs
     "RUSTSEC-2024-0388", # derivative unmaintained — inside the ADR-0001-pinned gpu-video rev
+    # quick-xml quadratic-runtime DoS on attacker-supplied start tags; patched only in >= 0.41
+    # while both our copies are semver-pinned upstream. Not reachable here: 0.39 sits in
+    # wayland-scanner, a proc-macro parsing the BUNDLED protocol XML at compile time, and 0.37
+    # sits in notify-rust's Windows-only backend serializing our own toast XML. Drop when
+    # winit/wayland-rs and notify-rust move to a patched quick-xml.
+    "RUSTSEC-2026-0194",
 ]
 
 [licenses]
@@ -35,7 +41,10 @@ allow = [
 [bans]
 multiple-versions = "allow"
 [[bans.deny]]
-# ADR 0001: wgpu must come from the single pinned git source, never crates.io.
+# ADR 0001: wgpu must come from the single pinned git source, never crates.io. Cargo.lock also
+# carries a DORMANT crates.io wgpu 27 entry via iced_renderer's weak `iced_wgpu?` feature (see
+# the ADR 0001 note): it never resolves into a build graph today, and this ban is the tripwire
+# that fails CI if some future feature change activates it.
 crate = "wgpu"
 wrappers = []
 deny-multiple-versions = true

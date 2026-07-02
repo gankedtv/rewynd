@@ -16,24 +16,25 @@ pub enum TrayCmd {
     Quit,
 }
 
-// The embedded mark, decoded once to ksni's ARGB32 byte order.
+// The brand mark in every shipped size (the host picks the closest), decoded once to ksni's
+// ARGB32 byte order.
 static ICON: LazyLock<Vec<Icon>> = LazyLock::new(|| {
-    let Ok(img) = image::load_from_memory_with_format(
-        include_bytes!("../assets/tray.png"),
-        image::ImageFormat::Png,
-    ) else {
-        return Vec::new();
-    };
-    let (width, height) = (img.width() as i32, img.height() as i32);
-    let mut data = img.into_rgba8().into_vec();
-    for px in data.chunks_exact_mut(4) {
-        px.rotate_right(1); // RGBA -> ARGB32
-    }
-    vec![Icon {
-        width,
-        height,
-        data,
-    }]
+    rewynd_config::BRAND_ICONS
+        .iter()
+        .filter_map(|(_, bytes)| {
+            let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Png).ok()?;
+            let (width, height) = (img.width() as i32, img.height() as i32);
+            let mut data = img.into_rgba8().into_vec();
+            for px in data.chunks_exact_mut(4) {
+                px.rotate_right(1); // RGBA -> ARGB32
+            }
+            Some(Icon {
+                width,
+                height,
+                data,
+            })
+        })
+        .collect()
 });
 
 pub struct RewyndTray {
@@ -55,10 +56,11 @@ impl Tray for RewyndTray {
         ICON.clone()
     }
 
-    // Fall back to a themed icon only if the embedded mark failed to decode (else the pixmap wins).
+    // Fall back to the installed themed icon only if the embedded mark failed to decode (else
+    // the pixmap wins).
     fn icon_name(&self) -> String {
         if ICON.is_empty() {
-            "camera-video".to_owned()
+            rewynd_config::APP_ID.to_owned()
         } else {
             String::new()
         }

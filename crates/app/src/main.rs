@@ -243,6 +243,11 @@ mod linux {
             }
             Err(e) => tracing::warn!(error = %e, "could not locate our own binary"),
         }
+        // Per-user hicolor icons back the entry's `Icon=` name: taskbar, tray fallback and
+        // notifications all resolve through it.
+        if let Err(e) = config::install_icons() {
+            tracing::warn!(error = %e, "could not install app icons");
+        }
 
         // Register our app id with the portal before any other portal call: ashpd shares
         // one D-Bus connection across portals, and the connection can only be associated

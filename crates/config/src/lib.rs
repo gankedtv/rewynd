@@ -26,8 +26,8 @@ mod process;
 mod schema;
 
 pub use desktop::{
-    autostart_path, desktop_entry, desktop_exec_value, install_autostart, install_launcher_entry,
-    remove_autostart,
+    BRAND_ICONS, autostart_path, desktop_entry, desktop_exec_value, install_autostart,
+    install_icons, install_launcher_entry, refresh_autostart, remove_autostart,
 };
 pub use lock::{InstanceLock, acquire_recorder_lock, acquire_settings_lock};
 pub use paths::{

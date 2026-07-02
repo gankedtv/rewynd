@@ -1,9 +1,20 @@
 //! Desktop integration: `.desktop` entries for the launcher (app-id registration) and the
-//! login autostart.
+//! login autostart, plus the brand icons both entries' `Icon=` name resolves to.
 
 use std::path::{Path, PathBuf};
 
 use crate::paths::{APP_ID, config_home_from, data_home_from};
+
+/// The brand mark's PNG renders as `(pixel_size, png_bytes)`, smallest first — the one owner
+/// for every consumer: the hicolor install below, the recorder's tray pixmaps, and the
+/// settings window's icon and header mark. (The master vector is `docs/design/logo.svg`.)
+pub const BRAND_ICONS: &[(u32, &[u8])] = &[
+    (24, include_bytes!("../assets/brand/logo-24.png")),
+    (32, include_bytes!("../assets/brand/logo-32.png")),
+    (48, include_bytes!("../assets/brand/logo-48.png")),
+    (64, include_bytes!("../assets/brand/logo-64.png")),
+    (128, include_bytes!("../assets/brand/logo-128.png")),
+];
 
 /// Render a path as a single quoted desktop-entry `Exec` value, applying the unescaping layers
 /// the Desktop Entry spec runs on read: wrap in double quotes and backslash-escape the reserved
@@ -30,7 +41,8 @@ pub fn desktop_exec_value(path: &str) -> String {
 }
 
 /// A minimal `[Desktop Entry]` body for `exec`, with `extra` key-lines appended — the shared
-/// core of the launcher entry (app id registration) and the login autostart entry.
+/// core of the launcher entry (app id registration) and the login autostart entry. `Icon` is
+/// the app id, resolved through the icon theme (see [`install_icons`]).
 #[must_use]
 pub fn desktop_entry(exec: &Path, extra: &str) -> String {
     format!(
@@ -38,6 +50,7 @@ pub fn desktop_entry(exec: &Path, extra: &str) -> String {
          Type=Application\n\
          Name=rewynd\n\
          Comment=Instant-replay clip recorder\n\
+         Icon={APP_ID}\n\
          Exec={}\n\
          Terminal=false\n\
          {extra}",
@@ -53,14 +66,14 @@ pub fn autostart_path() -> Option<PathBuf> {
         .map(|home| home.join("autostart").join(format!("{APP_ID}.desktop")))
 }
 
-/// Write `entry` to `path` atomically (temp + rename), creating parent directories: a crash
-/// can't leave a truncated entry that would silently break the launcher or autostart.
-fn write_entry_atomic(path: &Path, entry: &str) -> std::io::Result<()> {
+/// Write `contents` to `path` atomically (temp + rename), creating parent directories: a crash
+/// can't leave a truncated file that would silently break the launcher, autostart, or icon.
+fn write_file_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("desktop.tmp");
-    let result = std::fs::write(&tmp, entry).and_then(|()| std::fs::rename(&tmp, path));
+    let tmp = path.with_extension("tmp");
+    let result = std::fs::write(&tmp, contents).and_then(|()| std::fs::rename(&tmp, path));
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -70,7 +83,10 @@ fn write_entry_atomic(path: &Path, entry: &str) -> std::io::Result<()> {
 /// Install (or refresh) the autostart entry at `path`, launching `exec` at login. The testable
 /// core of [`install_autostart`].
 fn install_autostart_at(path: &Path, exec: &Path) -> std::io::Result<()> {
-    write_entry_atomic(path, &desktop_entry(exec, "StartupNotify=false\n"))
+    write_file_atomic(
+        path,
+        desktop_entry(exec, "StartupNotify=false\n").as_bytes(),
+    )
 }
 
 /// Remove the autostart entry at `path`; an already-absent entry is fine. The testable core of
@@ -118,15 +134,102 @@ pub fn install_launcher_entry(exec: &Path) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Whether a desktop entry carries an `Icon` key, in any of the spec's spellings: optional
+/// space around `=`, optional `[locale]` suffix. Used as the ownership heuristic below — every
+/// entry we write (and any real packaged one) has an icon, so a missing key marks one of our
+/// own pre-icon self-installs.
+fn has_icon_key(entry: &str) -> bool {
+    entry.lines().any(|line| {
+        let Some(rest) = line.trim_start().strip_prefix("Icon") else {
+            return false;
+        };
+        let rest = match rest.trim_start().strip_prefix('[') {
+            Some(bracketed) => match bracketed.split_once(']') {
+                Some((_, after)) => after,
+                None => return false,
+            },
+            None => rest,
+        };
+        rest.trim_start().starts_with('=')
+    })
+}
+
+/// Refresh `path` with a fresh entry unless the existing one carries an Icon key (then it is
+/// packaged or user-managed and must stay untouched). Unreadable-as-text entries are treated
+/// as foreign and also left alone.
+fn refresh_iconless_entry_at(path: &Path, entry: &str) -> std::io::Result<()> {
+    match std::fs::read_to_string(path) {
+        Ok(existing) if has_icon_key(&existing) => return Ok(()),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return Ok(()),
+        Err(e) => return Err(e),
+    }
+    write_file_atomic(path, entry.as_bytes())
+}
+
 /// The testable core of [`install_launcher_entry`].
 fn install_launcher_entry_at(path: &Path, exec: &Path) -> std::io::Result<()> {
-    if path.exists() {
-        return Ok(());
-    }
-    write_entry_atomic(
+    refresh_iconless_entry_at(
         path,
         &desktop_entry(exec, "Categories=AudioVideo;Recorder;\n"),
     )
+}
+
+/// Bring a pre-icon autostart entry up to date so it gains the `Icon=` key. Only an existing,
+/// icon-less entry is rewritten: a missing one means start-on-boot is off (this must not turn
+/// it on), and one with an icon may be user-managed.
+pub fn refresh_autostart(exec: &Path) -> std::io::Result<()> {
+    refresh_autostart_at(&autostart_path_or_err()?, exec)
+}
+
+/// The testable core of [`refresh_autostart`].
+fn refresh_autostart_at(path: &Path, exec: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    refresh_iconless_entry_at(path, &desktop_entry(exec, "StartupNotify=false\n"))
+}
+
+/// Install [`BRAND_ICONS`] into the per-user hicolor theme
+/// (`<data-home>/icons/hicolor/<S>x<S>/apps/<APP_ID>.png`), so the desktop can resolve the
+/// `Icon=` name in our entries, the taskbar icon for our app id, and notification icons.
+/// Unlike the launcher entry a stale icon is refreshed: packaged icons live under
+/// `/usr/share/icons`, never in the user's data home, so nothing package-managed is at risk.
+pub fn install_icons() -> std::io::Result<()> {
+    let hicolor = data_home_from(|k| std::env::var_os(k))
+        .map(|home| home.join("icons").join("hicolor"))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "neither XDG_DATA_HOME nor HOME is set",
+            )
+        })?;
+    install_icons_at(&hicolor, BRAND_ICONS)
+}
+
+/// The testable core of [`install_icons`]. Writes only what differs — the common case (every
+/// start after the first install) touches nothing.
+fn install_icons_at(hicolor: &Path, icons: &[(u32, &[u8])]) -> std::io::Result<()> {
+    let mut changed = false;
+    for (size, png) in icons {
+        let path = hicolor
+            .join(format!("{size}x{size}"))
+            .join("apps")
+            .join(format!("{APP_ID}.png"));
+        if std::fs::read(&path).is_ok_and(|current| current == *png) {
+            continue;
+        }
+        write_file_atomic(&path, png)?;
+        changed = true;
+    }
+    if changed {
+        // Bump the theme directory's mtime so icon caches re-scan on their next lookup. Best
+        // effort — a session that already cached a miss may still need a re-login to see it.
+        let _ = std::fs::File::open(hicolor)
+            .and_then(|dir| dir.set_modified(std::time::SystemTime::now()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -198,11 +301,102 @@ mod tests {
         let entry = std::fs::read_to_string(&path).expect("read entry");
         assert!(entry.starts_with("[Desktop Entry]\n"));
         assert!(entry.contains("Exec=\"/opt/rewynd/rewynd\"\n"));
+        assert!(entry.contains(&format!("Icon={APP_ID}\n")));
         assert!(entry.contains("Categories=AudioVideo;Recorder;\n"));
 
-        // A pre-existing entry (e.g. shipped by a package) stays untouched.
-        std::fs::write(&path, "# packaged").expect("seed");
-        install_launcher_entry_at(&path, Path::new("/elsewhere/rewynd")).expect("no-op");
-        assert_eq!(std::fs::read_to_string(&path).expect("read"), "# packaged");
+        // A pre-existing entry with an Icon key (e.g. shipped by a package, or user-managed)
+        // stays untouched — in any spec-legal spelling.
+        for packaged in [
+            "[Desktop Entry]\nIcon=rewynd\n",
+            "[Desktop Entry]\nIcon = rewynd\nExec=env FOO=1 /custom/rewynd\n",
+            "[Desktop Entry]\nIcon[da]=rewynd\n",
+        ] {
+            std::fs::write(&path, packaged).expect("seed");
+            install_launcher_entry_at(&path, Path::new("/elsewhere/rewynd")).expect("no-op");
+            assert_eq!(std::fs::read_to_string(&path).expect("read"), packaged);
+        }
+
+        // An icon-less entry is one of our own pre-icon installs: refreshed in place. A key
+        // merely starting with "Icon" doesn't count.
+        std::fs::write(&path, "[Desktop Entry]\nName=rewynd\nIconTheme=x\n").expect("seed old");
+        install_launcher_entry_at(&path, Path::new("/elsewhere/rewynd")).expect("refresh");
+        let refreshed = std::fs::read_to_string(&path).expect("read refreshed");
+        assert!(refreshed.contains(&format!("Icon={APP_ID}\n")));
+        assert!(refreshed.contains("Exec=\"/elsewhere/rewynd\"\n"));
+
+        // A non-UTF-8 file is foreign: left alone rather than clobbered or errored on.
+        std::fs::write(&path, [0x80u8, 0xff]).expect("seed binary");
+        install_launcher_entry_at(&path, Path::new("/elsewhere/rewynd")).expect("tolerated");
+        assert_eq!(std::fs::read(&path).expect("read"), [0x80u8, 0xff]);
+    }
+
+    #[test]
+    fn autostart_refresh_only_touches_existing_iconless_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("autostart").join("rewynd.desktop");
+
+        // Missing entry: start-on-boot is off; the refresh must not create one.
+        refresh_autostart_at(&path, Path::new("/opt/rewynd/rewynd")).expect("absent ok");
+        assert!(!path.exists());
+
+        // Pre-icon entry gains the Icon key (and the current exec).
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, "[Desktop Entry]\nName=rewynd\n").expect("seed old");
+        refresh_autostart_at(&path, Path::new("/opt/rewynd/rewynd")).expect("refresh");
+        let refreshed = std::fs::read_to_string(&path).expect("read");
+        assert!(refreshed.contains(&format!("Icon={APP_ID}\n")));
+        assert!(refreshed.contains("StartupNotify=false\n"));
+
+        // Already-current (or user-managed) entries stay untouched.
+        let managed = "[Desktop Entry]\nIcon=custom\nExec=/my/wrapper\n";
+        std::fs::write(&path, managed).expect("seed managed");
+        refresh_autostart_at(&path, Path::new("/opt/rewynd/rewynd")).expect("no-op");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), managed);
+    }
+
+    #[test]
+    fn icons_install_into_hicolor_skip_unchanged_and_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hicolor = dir.path().join("icons").join("hicolor");
+
+        install_icons_at(&hicolor, &[(24, b"png-24"), (48, b"png-48")]).expect("install");
+        let icon = hicolor
+            .join("24x24")
+            .join("apps")
+            .join(format!("{APP_ID}.png"));
+        assert_eq!(std::fs::read(&icon).expect("read 24"), b"png-24");
+        assert!(
+            hicolor
+                .join("48x48")
+                .join("apps")
+                .join(format!("{APP_ID}.png"))
+                .is_file()
+        );
+
+        // Identical bytes are skipped entirely: the theme dir's mtime stays put.
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        std::fs::File::open(&hicolor)
+            .and_then(|d| d.set_modified(epoch))
+            .expect("pin mtime");
+        install_icons_at(&hicolor, &[(24, b"png-24"), (48, b"png-48")]).expect("no-op");
+        assert_eq!(
+            std::fs::metadata(&hicolor)
+                .expect("meta")
+                .modified()
+                .expect("mtime"),
+            epoch,
+            "unchanged icons must not touch the theme"
+        );
+
+        // A stale icon is refreshed in place, and the theme mtime moves so caches re-scan.
+        install_icons_at(&hicolor, &[(24, b"png-24-v2")]).expect("refresh");
+        assert_eq!(std::fs::read(&icon).expect("read refreshed"), b"png-24-v2");
+        assert_ne!(
+            std::fs::metadata(&hicolor)
+                .expect("meta")
+                .modified()
+                .expect("mtime"),
+            epoch
+        );
     }
 }
