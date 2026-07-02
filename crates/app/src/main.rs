@@ -301,6 +301,41 @@ mod uploads {
         }
     }
 
+    /// Decide what "Upload last clip" should do: the uploader + clip to send, or the
+    /// toast `(title, body)` explaining why nothing will upload. On `Ok` the busy flag
+    /// has been taken — the upload path must release it ([`BusyGuard`]), or the caller
+    /// must put it back if the upload fails to even start.
+    pub(crate) fn plan_upload(
+        status: UploaderStatus,
+        last_clip: Option<std::path::PathBuf>,
+        busy: &AtomicBool,
+    ) -> Result<(Uploader, std::path::PathBuf), (&'static str, String)> {
+        match (status, last_clip) {
+            (UploaderStatus::Ready(up), Some(path)) => {
+                if busy.swap(true, Ordering::SeqCst) {
+                    Err((
+                        "Upload already running",
+                        "Wait for the current upload to finish.".to_owned(),
+                    ))
+                } else {
+                    Ok((up, path))
+                }
+            }
+            (UploaderStatus::BadUrl(e), _) => Err((
+                "Upload misconfigured",
+                format!("The API server URL in the settings is invalid: {e}"),
+            )),
+            (UploaderStatus::Disabled, _) => Err((
+                "Upload not configured",
+                "Enable uploads and log in with ganked.tv in the settings.".to_owned(),
+            )),
+            (UploaderStatus::Ready(_), None) => Err((
+                "No clip yet",
+                "Save a clip first, then upload it.".to_owned(),
+            )),
+        }
+    }
+
     /// Clears the upload-busy flag on drop, so a panicking upload task can't wedge the tray's
     /// "Upload last clip" in the busy state.
     pub(crate) struct BusyGuard(pub(crate) Arc<AtomicBool>);
@@ -405,7 +440,7 @@ mod linux {
     use crate::params::{audio_encode_params, encode_params};
     use crate::tray;
     use crate::uploads::{
-        BusyGuard, Uploader, UploaderStatus, build_uploader, user_facing_upload_error,
+        BusyGuard, Uploader, build_uploader, plan_upload, user_facing_upload_error,
     };
     use rewynd_buffer::{AudioRingBuffer, EncodedChunk, RingBuffer};
     use rewynd_gpu::{DmabufImport, GpuContext};
@@ -779,37 +814,17 @@ mod linux {
                         tray::TrayCmd::UploadClip => {
                             // Fresh config each click: enabling uploads or changing the key in
                             // the settings works without restarting the recorder.
-                            match (build_uploader(config::load().upload()), saver.last_clip()) {
-                                (UploaderStatus::Ready(up), Some(path)) => {
-                                    if upload_busy.swap(true, Ordering::SeqCst) {
-                                        tray::toast(
-                                            "Upload already running",
-                                            "Wait for the current upload to finish.",
-                                        )
-                                        .await;
-                                    } else {
-                                        // Its own task so a slow upload never stalls the tray menu.
-                                        tokio::spawn(upload_and_toast(up, path, upload_busy.clone()));
-                                    }
+                            let plan = plan_upload(
+                                build_uploader(config::load().upload()),
+                                saver.last_clip(),
+                                &upload_busy,
+                            );
+                            match plan {
+                                // Its own task so a slow upload never stalls the tray menu.
+                                Ok((up, path)) => {
+                                    tokio::spawn(upload_and_toast(up, path, upload_busy.clone()));
                                 }
-                                (UploaderStatus::BadUrl(e), _) => {
-                                    tray::toast(
-                                        "Upload misconfigured",
-                                        &format!("The API server URL in the settings is invalid: {e}"),
-                                    )
-                                    .await;
-                                }
-                                (UploaderStatus::Disabled, _) => {
-                                    tray::toast(
-                                        "Upload not configured",
-                                        "Enable uploads and log in with ganked.tv in the settings.",
-                                    )
-                                    .await;
-                                }
-                                (UploaderStatus::Ready(_), None) => {
-                                    tray::toast("No clip yet", "Save a clip first, then upload it.")
-                                        .await;
-                                }
+                                Err((title, body)) => tray::toast(title, &body).await,
                             }
                         }
                         tray::TrayCmd::OpenSettings => open_settings().await,
@@ -1247,7 +1262,6 @@ mod windows {
     use rewynd_config::{self as config};
     use rewynd_encode::{AudioMixer, EncodeParams, Encoder, GpuVideoEncoder, Nv12Converter};
     use rewynd_gpu::{D3d11HandleImport, GpuContext};
-    use windows::Win32::System::Diagnostics::Debug::MessageBeep;
     use windows::Win32::UI::HiDpi::{
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
     };
@@ -1256,13 +1270,14 @@ mod windows {
         UnregisterHotKey, VK_F1,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, MB_ICONHAND, MSG, PM_REMOVE, PeekMessageW, TranslateMessage, WM_HOTKEY,
+        DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage, WM_HOTKEY,
     };
 
     use crate::audio_pipeline::{AUDIO_SETTLE, SharedMixer, run_audio_mixer, spawn_audio_capture};
+    use crate::overlay;
     use crate::params::{audio_encode_params, encode_params};
     use crate::uploads::{
-        BusyGuard, Uploader, UploaderStatus, build_uploader, user_facing_upload_error,
+        BusyGuard, Uploader, build_uploader, plan_upload, user_facing_upload_error,
     };
 
     /// Our one thread-queue hotkey registration.
@@ -1840,15 +1855,12 @@ mod windows {
     /// uploads in the settings works without restarting the recorder), guarding
     /// against concurrent uploads with `busy`.
     fn spawn_upload(saver: &Arc<ClipSaver>, busy: &Arc<AtomicBool>) {
-        match (build_uploader(config::load().upload()), saver.last_clip()) {
-            (UploaderStatus::Ready(up), Some(path)) => {
-                if busy.swap(true, Ordering::SeqCst) {
-                    toast(
-                        "Upload already running",
-                        "Wait for the current upload to finish.",
-                    );
-                    return;
-                }
+        match plan_upload(
+            build_uploader(config::load().upload()),
+            saver.last_clip(),
+            busy,
+        ) {
+            Ok((up, path)) => {
                 let thread_busy = busy.clone();
                 let spawned = std::thread::Builder::new()
                     .name("rewynd-upload".to_owned())
@@ -1861,21 +1873,7 @@ mod windows {
                     toast("Upload failed", "Could not start the upload thread.");
                 }
             }
-            (UploaderStatus::BadUrl(e), _) => {
-                toast(
-                    "Upload misconfigured",
-                    &format!("The API server URL in the settings is invalid: {e}"),
-                );
-            }
-            (UploaderStatus::Disabled, _) => {
-                toast(
-                    "Upload not configured",
-                    "Enable uploads and log in with ganked.tv in the settings.",
-                );
-            }
-            (UploaderStatus::Ready(_), None) => {
-                toast("No clip yet", "Save a clip first, then upload it.");
-            }
+            Err((title, body)) => toast(title, &body),
         }
     }
 
@@ -1949,38 +1947,28 @@ mod windows {
     }
 
     /// Cut + mux a clip and confirm on every channel: toast (desktop), on-screen badge
-    /// + chime (in a fullscreen game, where Windows suppresses toasts).
+    /// + chime/beep (in a fullscreen game, where Windows suppresses toasts).
     fn save_and_toast(saver: &Arc<ClipSaver>) {
         let (accent, title, body) = match saver.save() {
-            Ok(path) => {
-                crate::overlay::play_chime();
-                (
-                    crate::overlay::Accent::Success,
-                    "Clip saved",
-                    path.display().to_string(),
-                )
-            }
+            Ok(path) => (
+                overlay::Accent::Success,
+                "Clip saved",
+                path.display().to_string(),
+            ),
             Err(SaveError::Empty(reason)) => {
-                // SAFETY: trivially safe FFI.
-                let _ = unsafe { MessageBeep(MB_ICONHAND) };
-                (
-                    crate::overlay::Accent::Failure,
-                    "Nothing to save yet",
-                    reason,
-                )
+                (overlay::Accent::Failure, "Nothing to save yet", reason)
             }
             Err(e) => {
                 tracing::error!(error = %e, "clip save failed");
-                // SAFETY: trivially safe FFI.
-                let _ = unsafe { MessageBeep(MB_ICONHAND) };
                 (
-                    crate::overlay::Accent::Failure,
+                    overlay::Accent::Failure,
                     "Could not save the clip",
                     e.to_string(),
                 )
             }
         };
-        crate::overlay::show(accent, title);
+        overlay::play(accent);
+        overlay::show(accent, title);
         toast(title, &body);
     }
 

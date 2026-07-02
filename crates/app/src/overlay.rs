@@ -21,9 +21,10 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
-    GetMessageW, MB_OK, MSG, PostQuitMessage, RegisterClassW, SW_SHOWNOACTIVATE, SetTimer,
-    ShowWindow, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WM_DESTROY, WM_TIMER, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    GetMessageW, MB_ICONHAND, MB_OK, MSG, PostQuitMessage, RegisterClassW, SW_SHOWNOACTIVATE,
+    SetTimer, ShowWindow, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WM_DESTROY, WM_TIMER,
+    WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+    WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -53,9 +54,22 @@ impl Accent {
 /// The clip-saved chime (see `assets/`): generated two-note pling, mono 16-bit WAV.
 static CHIME: &[u8] = include_bytes!("../assets/clip-saved.wav");
 
+/// The audible half of the feedback: the chime on success, the system error
+/// beep on failure — the confirmation channel that still works over exclusive
+/// fullscreen, where the badge can't show.
+pub fn play(accent: Accent) {
+    match accent {
+        Accent::Success => play_chime(),
+        Accent::Failure => {
+            // SAFETY: trivially safe FFI.
+            let _ = unsafe { MessageBeep(MB_ICONHAND) };
+        }
+    }
+}
+
 /// Play the save chime (async, from memory). Falls back to the system beep if
 /// winmm refuses, so a save never confirms silently.
-pub fn play_chime() {
+fn play_chime() {
     // SAFETY: trivially safe FFI; the buffer is 'static, outliving async playback.
     let ok = unsafe {
         PlaySoundW(
