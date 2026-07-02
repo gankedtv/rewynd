@@ -10,9 +10,13 @@ use thiserror::Error;
 
 #[cfg(target_os = "linux")]
 mod import;
+#[cfg(target_os = "windows")]
+mod import_windows;
 
 #[cfg(target_os = "linux")]
 pub use import::DmabufImport;
+#[cfg(target_os = "windows")]
+pub use import_windows::D3d11HandleImport;
 
 /// Errors from GPU setup.
 #[derive(Debug, Error)]

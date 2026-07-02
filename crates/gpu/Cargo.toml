@@ -17,5 +17,10 @@ thiserror.workspace = true
 [target.'cfg(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "emscripten"))))'.dependencies]
 gpu-video.workspace = true
 
+# The D3D11 shared-handle import takes a windows-rs HANDLE — the same 0.62.x
+# wgpu-hal itself uses at the pinned rev, so the types unify.
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
 [build-dependencies]
 cfg_aliases = "0.2.1"

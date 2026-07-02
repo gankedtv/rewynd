@@ -35,6 +35,9 @@ windows.workspace = true
 windows = { workspace = true, features = ["Win32_Graphics_Direct3D"] }
 tracing-subscriber.workspace = true
 png = "0.18"
+# Import probe: NT handle → wgpu::Texture on the shared Vulkan device → PNG.
+rewynd-gpu.workspace = true
+pollster.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tokio.workspace = true
@@ -82,3 +85,9 @@ name = "audio_probe"
 # Windows-only at runtime; compiles everywhere via a stub `main`.
 [[example]]
 name = "windows_capture_probe"
+
+# Import one WGC frame's NT handle as a wgpu::Texture on the shared Vulkan device
+# and save it as a PNG, proving the D3D11→Vulkan import + readback path.
+# Windows-only at runtime; compiles everywhere via a stub `main`.
+[[example]]
+name = "windows_import_to_png"
