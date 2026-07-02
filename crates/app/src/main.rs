@@ -14,6 +14,9 @@
 #[cfg(target_os = "linux")]
 mod tray;
 
+#[cfg(target_os = "windows")]
+mod overlay;
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
@@ -251,6 +254,77 @@ mod audio_pipeline {
     }
 }
 
+/// ganked.tv upload wiring shared by the platform trays; the platform module owns the
+/// toast/task plumbing around it.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod uploads {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// ganked.tv upload wiring, built from the config at the moment of use.
+    pub(crate) struct Uploader {
+        pub(crate) client: rewynd_upload::GankedClient,
+        pub(crate) visibility: rewynd_upload::Visibility,
+        pub(crate) share_base: String,
+    }
+
+    /// Why there is (or isn't) an uploader — the tray tells the user different things for
+    /// "switched off" versus "misconfigured".
+    pub(crate) enum UploaderStatus {
+        Ready(Uploader),
+        Disabled,
+        BadUrl(String),
+    }
+
+    pub(crate) fn build_uploader(settings: rewynd_config::UploadSettings) -> UploaderStatus {
+        if !settings.enabled {
+            return UploaderStatus::Disabled;
+        }
+        let vis = settings.visibility.trim();
+        if !vis.eq_ignore_ascii_case("public") && !vis.eq_ignore_ascii_case("unlisted") {
+            // parse() fails closed to unlisted; still tell the user their config has a typo.
+            tracing::warn!(
+                visibility = vis,
+                "unknown upload visibility; using unlisted"
+            );
+        }
+        match rewynd_upload::GankedClient::new(&settings.api_url, &settings.api_key) {
+            Ok(client) => UploaderStatus::Ready(Uploader {
+                client,
+                visibility: rewynd_upload::Visibility::parse(vis),
+                share_base: settings.share_url,
+            }),
+            Err(e) => {
+                tracing::warn!(error = %e, "uploads unavailable: could not build the ganked.tv client");
+                UploaderStatus::BadUrl(e.to_string())
+            }
+        }
+    }
+
+    /// Clears the upload-busy flag on drop, so a panicking upload task can't wedge the tray's
+    /// "Upload last clip" in the busy state.
+    pub(crate) struct BusyGuard(pub(crate) Arc<AtomicBool>);
+
+    impl Drop for BusyGuard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Upload errors in words a user can act on; the full error goes to the log.
+    pub(crate) fn user_facing_upload_error(e: &rewynd_upload::UploadError) -> String {
+        use rewynd_upload::UploadError;
+        match e {
+            UploadError::Http(_) => {
+                "Could not reach ganked.tv — check your connection and the API server URL."
+                    .to_owned()
+            }
+            UploadError::Io(_) => "The clip file could not be read.".to_owned(),
+            other => other.to_string(),
+        }
+    }
+}
+
 /// Config → encoder parameter mapping, shared by the platform recorders.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod params {
@@ -330,6 +404,9 @@ mod linux {
     use crate::audio_pipeline::{AUDIO_SETTLE, SharedMixer, run_audio_mixer, spawn_audio_capture};
     use crate::params::{audio_encode_params, encode_params};
     use crate::tray;
+    use crate::uploads::{
+        BusyGuard, Uploader, UploaderStatus, build_uploader, user_facing_upload_error,
+    };
     use rewynd_buffer::{AudioRingBuffer, EncodedChunk, RingBuffer};
     use rewynd_gpu::{DmabufImport, GpuContext};
 
@@ -816,56 +893,6 @@ mod linux {
         }
     }
 
-    /// ganked.tv upload wiring, built from the config at the moment of use.
-    struct Uploader {
-        client: rewynd_upload::GankedClient,
-        visibility: rewynd_upload::Visibility,
-        share_base: String,
-    }
-
-    /// Why there is (or isn't) an uploader — the tray tells the user different things for
-    /// "switched off" versus "misconfigured".
-    enum UploaderStatus {
-        Ready(Uploader),
-        Disabled,
-        BadUrl(String),
-    }
-
-    fn build_uploader(settings: rewynd_config::UploadSettings) -> UploaderStatus {
-        if !settings.enabled {
-            return UploaderStatus::Disabled;
-        }
-        let vis = settings.visibility.trim();
-        if !vis.eq_ignore_ascii_case("public") && !vis.eq_ignore_ascii_case("unlisted") {
-            // parse() fails closed to unlisted; still tell the user their config has a typo.
-            tracing::warn!(
-                visibility = vis,
-                "unknown upload visibility; using unlisted"
-            );
-        }
-        match rewynd_upload::GankedClient::new(&settings.api_url, &settings.api_key) {
-            Ok(client) => UploaderStatus::Ready(Uploader {
-                client,
-                visibility: rewynd_upload::Visibility::parse(vis),
-                share_base: settings.share_url,
-            }),
-            Err(e) => {
-                tracing::warn!(error = %e, "uploads unavailable: could not build the ganked.tv client");
-                UploaderStatus::BadUrl(e.to_string())
-            }
-        }
-    }
-
-    /// Clears the upload-busy flag on drop, so a panicking upload task can't wedge the tray's
-    /// "Upload last clip" in the busy state.
-    struct BusyGuard(Arc<AtomicBool>);
-
-    impl Drop for BusyGuard {
-        fn drop(&mut self) {
-            self.0.store(false, Ordering::SeqCst);
-        }
-    }
-
     /// Upload `path` and toast the outcome, releasing `busy` when done. Runs as its own task so
     /// nothing else waits on it.
     async fn upload_and_toast(up: Uploader, path: PathBuf, busy: Arc<AtomicBool>) {
@@ -892,19 +919,6 @@ mod linux {
                 tracing::error!(error = %e, path = %path.display(), "upload failed");
                 tray::toast("Upload failed", &user_facing_upload_error(&e)).await;
             }
-        }
-    }
-
-    /// Upload errors in words a user can act on; the full error goes to the log.
-    fn user_facing_upload_error(e: &rewynd_upload::UploadError) -> String {
-        use rewynd_upload::UploadError;
-        match e {
-            UploadError::Http(_) => {
-                "Could not reach ganked.tv — check your connection and the API server URL."
-                    .to_owned()
-            }
-            UploadError::Io(_) => "The clip file could not be read.".to_owned(),
-            other => other.to_string(),
         }
     }
 
@@ -1242,17 +1256,22 @@ mod windows {
         UnregisterHotKey, VK_F1,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        MB_ICONHAND, MB_OK, MSG, PM_REMOVE, PeekMessageW, WM_HOTKEY,
+        DispatchMessageW, MB_ICONHAND, MSG, PM_REMOVE, PeekMessageW, TranslateMessage, WM_HOTKEY,
     };
 
     use crate::audio_pipeline::{AUDIO_SETTLE, SharedMixer, run_audio_mixer, spawn_audio_capture};
     use crate::params::{audio_encode_params, encode_params};
+    use crate::uploads::{
+        BusyGuard, Uploader, UploaderStatus, build_uploader, user_facing_upload_error,
+    };
 
     /// Our one thread-queue hotkey registration.
     const HOTKEY_ID: i32 = 1;
     /// How often the hotkey message pump wakes to drain its queue and check the stop
     /// flag — the worst-case added latency on a press, well under perception.
     const HOTKEY_POLL: Duration = Duration::from_millis(30);
+    /// How long Quit waits for an in-flight upload before abandoning it.
+    const QUIT_UPLOAD_GRACE: Duration = Duration::from_secs(5);
 
     pub fn run() -> Result<()> {
         tracing_subscriber::fmt::init();
@@ -1418,15 +1437,32 @@ mod windows {
             })
             .context("spawning the capture thread")?;
 
-        // Global hotkey on its own thread: RegisterHotKey delivers WM_HOTKEY to the
-        // registering thread's queue, so that thread must also pump messages.
-        let hotkey_saver = saver.clone();
-        let hotkey_stop = stop.clone();
+        // Every exit path funnels through this channel: tray Quit, the settings
+        // restart's stop event, and Ctrl+C all send the shutdown reason here.
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<&'static str>();
+        // Raised while a ganked.tv upload runs; Quit waits briefly on it (as on Linux).
+        let upload_busy = Arc::new(AtomicBool::new(false));
+
+        // The tray and the global hotkey share one thread: RegisterHotKey delivers
+        // WM_HOTKEY to the registering thread's queue, tray-icon needs the same
+        // message pump, and one PeekMessageW loop drives both.
+        let tray_saver = saver.clone();
+        let tray_stop = stop.clone();
+        let tray_shutdown = shutdown_tx.clone();
+        let tray_busy = upload_busy.clone();
         let trigger = config.hotkey_trigger().to_owned();
         let hotkey = std::thread::Builder::new()
-            .name("rewynd-hotkey".to_owned())
-            .spawn(move || run_hotkey_loop(&trigger, &hotkey_saver, &hotkey_stop))
-            .context("spawning the hotkey thread")?;
+            .name("rewynd-tray".to_owned())
+            .spawn(move || {
+                run_tray_loop(
+                    &trigger,
+                    &tray_saver,
+                    &tray_stop,
+                    &tray_shutdown,
+                    &tray_busy,
+                )
+            })
+            .context("spawning the tray thread")?;
 
         // Dev aid: flush once after N seconds without a keypress, so the pipeline can be
         // exercised headlessly. Stop-aware and joined at shutdown like every other thread.
@@ -1464,7 +1500,6 @@ mod windows {
         // — the Windows SIGTERM stand-in), then run the same stop-flag-then-join
         // shutdown as the Linux recorder. Both waiter threads are detached: they hold
         // nothing that needs teardown and die with the process.
-        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<&'static str>();
         match config::RecorderStopEvent::create() {
             Ok(stop_event) => {
                 let tx = shutdown_tx.clone();
@@ -1499,6 +1534,19 @@ mod windows {
             .recv()
             .unwrap_or("all shutdown waiters died; shutting down");
         tracing::info!(reason, "shutting down");
+
+        // Give an in-flight upload a moment to finish rather than cutting it off
+        // mid-transfer (mirrors the Linux tray's quit grace).
+        if upload_busy.load(Ordering::SeqCst) {
+            toast(
+                "Finishing upload",
+                "rewynd quits when it completes (a few seconds at most).",
+            );
+            let waited = Instant::now();
+            while upload_busy.load(Ordering::SeqCst) && waited.elapsed() < QUIT_UPLOAD_GRACE {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
 
         // Join in the order the pipeline requires (the Linux Recorder::shutdown mirror):
         // the audio captures must stop adding to the mixer before `captures_done`
@@ -1641,29 +1689,77 @@ mod windows {
         Ok(enc.encode(&nv12, force_keyframe, captured.pts)?)
     }
 
-    /// Register the configured trigger and pump this thread's message queue until the
-    /// stop flag rises, saving a clip on every WM_HOTKEY. A trigger that cannot be
-    /// parsed or registered degrades to a recorder without a hotkey (footage still
-    /// flushes via the dev hook) instead of killing the process.
-    fn run_hotkey_loop(trigger: &str, saver: &Arc<ClipSaver>, stop: &Arc<AtomicBool>) {
-        let Some((mods, vk)) = parse_trigger(trigger) else {
-            tracing::error!(trigger, "could not parse the hotkey trigger; no hotkey");
-            toast(
-                "Hotkey unavailable",
-                &format!("The configured hotkey \"{trigger}\" could not be understood."),
-            );
-            return;
+    /// The tray + hotkey thread: build the tray icon and menu, register the configured
+    /// trigger, and pump this thread's message queue until the stop flag rises. One
+    /// pump drives both — WM_HOTKEY saves a clip, menu events run the tray commands.
+    /// A hotkey that cannot be parsed or registered degrades to tray-only saving; a
+    /// failed tray degrades to hotkey-only (matching the Linux "continuing without it").
+    fn run_tray_loop(
+        trigger: &str,
+        saver: &Arc<ClipSaver>,
+        stop: &Arc<AtomicBool>,
+        shutdown: &std::sync::mpsc::Sender<&'static str>,
+        upload_busy: &Arc<AtomicBool>,
+    ) {
+        use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+
+        let save_item = MenuItem::new("Save clip now", true, None);
+        let upload_item = MenuItem::new("Upload last clip", true, None);
+        let settings_item = MenuItem::new("Open settings", true, None);
+        let quit_item = MenuItem::new("Quit rewynd", true, None);
+        let menu = Menu::new();
+        let _tray = match menu
+            .append_items(&[
+                &save_item,
+                &upload_item,
+                &settings_item,
+                &PredefinedMenuItem::separator(),
+                &quit_item,
+            ])
+            .map_err(|e| e.to_string())
+            .and_then(|()| {
+                let mut builder = tray_icon::TrayIconBuilder::new()
+                    .with_menu(Box::new(menu))
+                    .with_tooltip("rewynd — instant replay");
+                if let Some(icon) = tray_brand_icon() {
+                    builder = builder.with_icon(icon);
+                }
+                builder.build().map_err(|e| e.to_string())
+            }) {
+            Ok(tray) => Some(tray),
+            Err(e) => {
+                tracing::warn!(error = %e, "tray unavailable; continuing without it");
+                None
+            }
         };
-        // SAFETY: FFI; a NULL hwnd registers on this thread's queue, unregistered below.
-        if let Err(e) = unsafe { RegisterHotKey(None, HOTKEY_ID, mods | MOD_NOREPEAT, vk) } {
-            tracing::error!(error = %e, trigger, "could not register the global hotkey (in use elsewhere?)");
-            toast(
-                "Hotkey unavailable",
-                &format!("Could not register {trigger}: {e}"),
-            );
-            return;
-        }
-        tracing::info!(trigger, "global hotkey ready; press it to save a clip");
+
+        let hotkey_registered = match parse_trigger(trigger) {
+            // SAFETY: FFI; a NULL hwnd registers on this thread's queue, unregistered below.
+            Some((mods, vk)) => {
+                match unsafe { RegisterHotKey(None, HOTKEY_ID, mods | MOD_NOREPEAT, vk) } {
+                    Ok(()) => {
+                        tracing::info!(trigger, "global hotkey ready; press it to save a clip");
+                        true
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, trigger, "could not register the global hotkey (in use elsewhere?)");
+                        toast(
+                            "Hotkey unavailable",
+                            &format!("Could not register {trigger}: use the tray's Save clip now."),
+                        );
+                        false
+                    }
+                }
+            }
+            None => {
+                tracing::error!(trigger, "could not parse the hotkey trigger; no hotkey");
+                toast(
+                    "Hotkey unavailable",
+                    &format!("The configured hotkey \"{trigger}\" could not be understood."),
+                );
+                false
+            }
+        };
 
         loop {
             let mut msg = MSG::default();
@@ -1673,14 +1769,150 @@ mod windows {
                     tracing::info!("hotkey activated");
                     save_and_toast(saver);
                 }
+                // tray-icon's internal window procs need the messages dispatched.
+                // SAFETY: FFI.
+                unsafe {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            while let Ok(event) = MenuEvent::receiver().try_recv() {
+                let id = event.id();
+                if id == save_item.id() {
+                    save_and_toast(saver);
+                } else if id == upload_item.id() {
+                    spawn_upload(saver, upload_busy);
+                } else if id == settings_item.id() {
+                    open_settings();
+                } else if id == quit_item.id() {
+                    tracing::info!("quit requested from the tray");
+                    let _ = shutdown.send("quit from the tray");
+                }
             }
             if stop.load(Ordering::Relaxed) {
                 break;
             }
             std::thread::sleep(HOTKEY_POLL);
         }
-        // SAFETY: FFI; pairs the registration above.
-        let _ = unsafe { UnregisterHotKey(None, HOTKEY_ID) };
+        if hotkey_registered {
+            // SAFETY: FFI; pairs the registration above.
+            let _ = unsafe { UnregisterHotKey(None, HOTKEY_ID) };
+        }
+        // `_tray` drops here, removing the icon.
+    }
+
+    /// The brand mark as a tray icon, from the PNG ladder the config crate owns.
+    fn tray_brand_icon() -> Option<tray_icon::Icon> {
+        let (_, png) = config::BRAND_ICONS.iter().find(|(size, _)| *size >= 32)?;
+        let img = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?;
+        let rgba = img.into_rgba8();
+        let (width, height) = rgba.dimensions();
+        tray_icon::Icon::from_rgba(rgba.into_vec(), width, height).ok()
+    }
+
+    /// Launch the sibling settings binary, reaping the child in the background (an
+    /// unwaited child stays a zombie for the recorder's whole lifetime).
+    fn open_settings() {
+        let Some(settings) = config::sibling_binary("rewynd-settings") else {
+            toast(
+                "Could not open settings",
+                "The settings binary was not found.",
+            );
+            return;
+        };
+        match std::process::Command::new(&settings).spawn() {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, path = %settings.display(), "could not open settings");
+                toast(
+                    "Could not open settings",
+                    &format!("{}: {e}", settings.display()),
+                );
+            }
+        }
+    }
+
+    /// Upload the last clip on its own thread (fresh config each click, so enabling
+    /// uploads in the settings works without restarting the recorder), guarding
+    /// against concurrent uploads with `busy`.
+    fn spawn_upload(saver: &Arc<ClipSaver>, busy: &Arc<AtomicBool>) {
+        match (build_uploader(config::load().upload()), saver.last_clip()) {
+            (UploaderStatus::Ready(up), Some(path)) => {
+                if busy.swap(true, Ordering::SeqCst) {
+                    toast(
+                        "Upload already running",
+                        "Wait for the current upload to finish.",
+                    );
+                    return;
+                }
+                let thread_busy = busy.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("rewynd-upload".to_owned())
+                    .spawn(move || {
+                        let _busy = BusyGuard(thread_busy);
+                        upload_and_toast(&up, &path);
+                    });
+                if spawned.is_err() {
+                    busy.store(false, Ordering::SeqCst);
+                    toast("Upload failed", "Could not start the upload thread.");
+                }
+            }
+            (UploaderStatus::BadUrl(e), _) => {
+                toast(
+                    "Upload misconfigured",
+                    &format!("The API server URL in the settings is invalid: {e}"),
+                );
+            }
+            (UploaderStatus::Disabled, _) => {
+                toast(
+                    "Upload not configured",
+                    "Enable uploads and log in with ganked.tv in the settings.",
+                );
+            }
+            (UploaderStatus::Ready(_), None) => {
+                toast("No clip yet", "Save a clip first, then upload it.");
+            }
+        }
+    }
+
+    /// Upload `path` and toast the outcome. Blocking — runs on the upload thread with
+    /// its own small runtime (the client is async).
+    fn upload_and_toast(up: &Uploader, path: &std::path::Path) {
+        let title = format!("rewynd {}", jiff::Zoned::now().strftime("%Y-%m-%d %H:%M"));
+        toast("Uploading clip", "Sending to ganked.tv...");
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())
+            .map(|rt| rt.block_on(up.client.upload(path, &title, up.visibility)));
+        match outcome {
+            Ok(Ok(clip)) if clip.failed() => {
+                tracing::error!(clip_id = %clip.id, "server rejected the clip after upload");
+                toast(
+                    "Upload failed",
+                    "ganked.tv could not process the clip (check its length and format).",
+                );
+            }
+            Ok(Ok(clip)) => {
+                let body = clip
+                    .share_url(&up.share_base)
+                    .unwrap_or_else(|| "Processing on ganked.tv".to_owned());
+                tracing::info!(clip_id = %clip.id, "clip uploaded");
+                toast("Clip uploaded", &body);
+            }
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, path = %path.display(), "upload failed");
+                toast("Upload failed", &user_facing_upload_error(&e));
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "could not build the upload runtime");
+                toast("Upload failed", "Could not start the upload runtime.");
+            }
+        }
     }
 
     /// Parse a `CTRL+ALT+R`-style trigger (the config's format, shared with the Linux
@@ -1716,20 +1948,39 @@ mod windows {
         (1..=24).contains(&n).then(|| u32::from(VK_F1.0) + n - 1)
     }
 
-    /// Cut + mux a clip, toast the outcome, and beep: Windows suppresses toasts while
-    /// a fullscreen game has focus (focus assist), so the sound is the in-game
-    /// confirmation that the press landed.
+    /// Cut + mux a clip and confirm on every channel: toast (desktop), on-screen badge
+    /// + chime (in a fullscreen game, where Windows suppresses toasts).
     fn save_and_toast(saver: &Arc<ClipSaver>) {
-        let (beep, title, body) = match saver.save() {
-            Ok(path) => (MB_OK, "Clip saved", path.display().to_string()),
-            Err(SaveError::Empty(reason)) => (MB_ICONHAND, "Nothing to save yet", reason),
+        let (accent, title, body) = match saver.save() {
+            Ok(path) => {
+                crate::overlay::play_chime();
+                (
+                    crate::overlay::Accent::Success,
+                    "Clip saved",
+                    path.display().to_string(),
+                )
+            }
+            Err(SaveError::Empty(reason)) => {
+                // SAFETY: trivially safe FFI.
+                let _ = unsafe { MessageBeep(MB_ICONHAND) };
+                (
+                    crate::overlay::Accent::Failure,
+                    "Nothing to save yet",
+                    reason,
+                )
+            }
             Err(e) => {
                 tracing::error!(error = %e, "clip save failed");
-                (MB_ICONHAND, "Could not save the clip", e.to_string())
+                // SAFETY: trivially safe FFI.
+                let _ = unsafe { MessageBeep(MB_ICONHAND) };
+                (
+                    crate::overlay::Accent::Failure,
+                    "Could not save the clip",
+                    e.to_string(),
+                )
             }
         };
-        // SAFETY: trivially safe FFI.
-        let _ = unsafe { MessageBeep(beep) };
+        crate::overlay::show(accent, title);
         toast(title, &body);
     }
 
