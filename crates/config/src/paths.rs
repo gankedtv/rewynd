@@ -41,8 +41,13 @@ pub(crate) fn config_path_from(get: impl Fn(&str) -> Option<OsString>) -> Option
 /// (`%APPDATA%` on Windows, where the XDG vars and `HOME` don't exist).
 #[must_use]
 pub fn config_path() -> Option<PathBuf> {
-    config_path_from(|k| std::env::var_os(k))
-        .or_else(|| dirs::config_dir().map(|home| home.join("rewynd").join("config.toml")))
+    config_path_from(|k| std::env::var_os(k)).or_else(|| {
+        dirs::config_dir()
+            // Same absolute-only rule as the env route: a relative dir would silently
+            // resolve against the process cwd.
+            .filter(|p| p.is_absolute())
+            .map(|home| home.join("rewynd").join("config.toml"))
+    })
 }
 
 /// The default directory for saved clips when none is configured: the user's **Videos** folder
