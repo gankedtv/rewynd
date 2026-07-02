@@ -1,10 +1,14 @@
-//! Single-instance guards (docs/adr/0008): advisory `flock` on per-user pid/lock files.
+//! Single-instance guards (docs/adr/0008): advisory `flock` on per-user pid/lock files
+//! on unix; per-session named kernel mutexes on Windows. Both release on process death,
+//! so there is no stale lock to clean up.
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::path::Path;
 
 #[cfg(unix)]
-use crate::paths::{ensure_instance_dir, instance_dir, recorder_pid_path, settings_lock_path};
+use crate::paths::settings_lock_path;
+#[cfg(any(unix, windows))]
+use crate::paths::{ensure_instance_dir, instance_dir, recorder_pid_path};
 
 /// A held single-instance lock (advisory `flock`). Keep it alive for the whole run: dropping it,
 /// or the process exiting/crashing, releases the lock so the next instance can start. The kernel
@@ -84,19 +88,150 @@ pub fn acquire_settings_lock() -> std::io::Result<Option<InstanceLock>> {
     Ok(lock_file(&settings_lock_path())?.map(|file| InstanceLock { _file: file }))
 }
 
-// No `flock` off unix yet, so the guard is a no-op there (a Windows named-mutex equivalent lands
-// with Windows parity). Stubs keep the public API total so callers need no `#[cfg]`.
-#[cfg(not(unix))]
+/// A held single-instance lock (a named kernel mutex in the per-session `Local\`
+/// namespace). Keep it alive for the whole run: dropping it closes the handle, and the
+/// kernel destroys the named object once the last handle (including a crashed holder's)
+/// closes, so the next instance can start.
+#[cfg(windows)]
+#[must_use = "the single-instance lock releases as soon as this guard is dropped"]
+pub struct InstanceLock {
+    _mutex: std::os::windows::io::OwnedHandle,
+}
+
+/// Create (or open) the named mutex for `name`. `Ok(None)` means the object already
+/// existed — another live process holds the guard. Existence is the whole signal:
+/// ownership (`WaitForSingleObject`) is never taken, so an abandoned mutex can't occur.
+#[cfg(windows)]
+fn create_instance_mutex(name: &str) -> std::io::Result<Option<std::os::windows::io::OwnedHandle>> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+
+    use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+    use windows::Win32::System::Threading::CreateMutexW;
+    use windows::core::PCWSTR;
+
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: FFI; `wide` is NUL-terminated and outlives the call.
+    let handle = unsafe { CreateMutexW(None, false, PCWSTR(wide.as_ptr())) };
+    // Snapshot last-error before anything else can touch it. Documented contract: on
+    // success it is ERROR_ALREADY_EXISTS iff the named object pre-existed.
+    // SAFETY: trivially safe FFI.
+    let already_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+    let handle = handle.map_err(std::io::Error::other)?;
+    // SAFETY: `CreateMutexW` succeeded, so `handle` is a valid handle we own.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+    // Our fresh handle drops here, leaving the holder's object alone.
+    if already_exists {
+        return Ok(None);
+    }
+    Ok(Some(handle))
+}
+
+/// The per-session mutex name for one of our guards, derived from the app id so it
+/// can't collide with other software.
+#[cfg(windows)]
+fn mutex_name(suffix: &str) -> String {
+    format!("Local\\{}.{suffix}", crate::paths::APP_ID)
+}
+
+/// The testable core of the Windows [`acquire_recorder_lock`]: take the named mutex,
+/// then (re)write our pid to `pid_path` so a peer can find this process.
+#[cfg(windows)]
+fn acquire_recorder_lock_at(name: &str, pid_path: &Path) -> std::io::Result<Option<InstanceLock>> {
+    let Some(mutex) = create_instance_mutex(name)? else {
+        return Ok(None);
+    };
+    std::fs::write(pid_path, format!("{}\n", std::process::id()))?;
+    Ok(Some(InstanceLock { _mutex: mutex }))
+}
+
+/// Acquire the recorder's single-instance lock (a named mutex), writing our pid to
+/// [`recorder_pid_path`] for the settings app's restart path. `Ok(None)` means another
+/// live recorder already holds it.
+#[cfg(windows)]
+pub fn acquire_recorder_lock() -> std::io::Result<Option<InstanceLock>> {
+    ensure_instance_dir(&instance_dir())?;
+    acquire_recorder_lock_at(&mutex_name("recorder"), &recorder_pid_path())
+}
+
+/// Acquire the settings app's single-instance lock (a named mutex). `Ok(None)` means a
+/// settings window is already open.
+#[cfg(windows)]
+pub fn acquire_settings_lock() -> std::io::Result<Option<InstanceLock>> {
+    Ok(create_instance_mutex(&mutex_name("settings"))?.map(|mutex| InstanceLock { _mutex: mutex }))
+}
+
+// No guard on other targets; stubs keep the public API total so callers need no `#[cfg]`.
+#[cfg(not(any(unix, windows)))]
 pub struct InstanceLock;
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn acquire_recorder_lock() -> std::io::Result<Option<InstanceLock>> {
     Ok(Some(InstanceLock))
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn acquire_settings_lock() -> std::io::Result<Option<InstanceLock>> {
     Ok(Some(InstanceLock))
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// A mutex name unique to one test, so parallel tests (and reruns against a
+    /// crashed run's leftovers) never collide.
+    fn unique_name(tag: &str) -> String {
+        format!("Local\\rewynd-test-{}-{tag}", std::process::id())
+    }
+
+    #[test]
+    fn instance_mutex_is_exclusive_and_releases_on_drop() {
+        let name = unique_name("exclusive");
+        let first = create_instance_mutex(&name)
+            .expect("io ok")
+            .expect("first acquires");
+        assert!(
+            create_instance_mutex(&name).expect("io ok").is_none(),
+            "a second mutex with the same name is refused"
+        );
+        drop(first);
+        assert!(
+            create_instance_mutex(&name).expect("io ok").is_some(),
+            "the guard is free once the first holder drops it"
+        );
+    }
+
+    #[test]
+    fn recorder_lock_writes_the_current_pid_and_is_exclusive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.pid");
+        let name = unique_name("recorder");
+        let lock = acquire_recorder_lock_at(&name, &path)
+            .expect("io ok")
+            .expect("acquires");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read pid"),
+            format!("{}\n", std::process::id())
+        );
+        assert!(
+            acquire_recorder_lock_at(&name, &path)
+                .expect("io ok")
+                .is_none(),
+            "a peer is refused while the lock is held"
+        );
+        drop(lock);
+    }
+
+    #[test]
+    fn distinct_names_do_not_contend() {
+        let a = create_instance_mutex(&unique_name("a"))
+            .expect("io ok")
+            .expect("acquires");
+        let b = create_instance_mutex(&unique_name("b"))
+            .expect("io ok")
+            .expect("acquires independently");
+        drop((a, b));
+    }
 }
 
 #[cfg(all(test, unix))]

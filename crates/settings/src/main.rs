@@ -181,6 +181,7 @@ fn main() -> iced::Result {
             // On Wayland this is a no-op until winit speaks xdg-toplevel-icon; there the
             // taskbar icon resolves through the app id's desktop entry + hicolor icons.
             icon: window_icon(),
+            #[cfg(target_os = "linux")]
             platform_specific: iced::window::settings::PlatformSpecific {
                 // Wayland app_id, so the compositor can match the window to our identity.
                 application_id: config::APP_ID.to_owned(),

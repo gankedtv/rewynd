@@ -354,6 +354,9 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).expect("read"), managed);
     }
 
+    // The mtime pinning below opens the theme *directory* as a file, which Windows
+    // refuses (and hicolor icon installs are a Linux desktop concern anyway).
+    #[cfg(unix)]
     #[test]
     fn icons_install_into_hicolor_skip_unchanged_and_refresh() {
         let dir = tempfile::tempdir().expect("tempdir");

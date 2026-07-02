@@ -84,6 +84,17 @@ ashpd = { version = "0.13", features = ["screencast"] }
 pipewire = { version = "0.10", features = ["v0_3_65"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
+# Windows capture (PLAN §3.5): Windows Graphics Capture → D3D11. Windows-only. MIT.
+# windows-capture drives the WGC session/frame pool; the `windows` crate (same 0.62.x
+# its API surfaces, so the D3D11 types unify) creates the shareable textures + NT handles.
+windows-capture = "2.0"
+windows = { version = "0.62", features = [
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Foundation",
+] }
+
 # The settings window renders on the CPU (tiny-skia rasterizing, cosmic-text shaping), which
 # is unusably slow at opt-level 0 — `cargo run` scrolled at a few fps. Only that render stack
 # builds optimized in dev: a blanket `package."*"` would also optimize the wgpu tree and every

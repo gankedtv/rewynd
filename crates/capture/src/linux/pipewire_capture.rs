@@ -39,6 +39,7 @@ use pw::spa::pod::{ChoiceValue, Object, Pod, Property, PropertyFlags, Value, obj
 use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction, Id, Rectangle, SpaTypes};
 
 use crate::CaptureError;
+pub use crate::StreamPrefs;
 
 /// `DRM_FORMAT_MOD_INVALID` — "let the driver pick" / implicit modifier
 /// (`0x00ffffffffffffff`). `From` is not const, so this is a tiny helper rather
@@ -162,15 +163,6 @@ fn spa_format_to_drm_fourcc(format: VideoFormat) -> Option<u32> {
 
 /// Outcome of a per-frame callback: keep running the loop, or stop it.
 type FrameAction = ControlFlow<()>;
-
-/// Negotiation preferences offered to the compositor (which may still pick differently —
-/// the negotiated format is what arrives in the frames).
-#[derive(Debug, Clone, Copy)]
-pub struct StreamPrefs {
-    pub width: u32,
-    pub height: u32,
-    pub framerate: u32,
-}
 
 /// Negotiation preference for the diagnostic probes only — the live pipeline always passes the
 /// configured values. Any sane numbers work; the compositor picks what it can deliver.
