@@ -462,6 +462,7 @@ mod tests {
             AudioSource::SinkMonitor,
             None,
             None,
+            None,
             Instant::now(),
             |_, _| ControlFlow::Break(()),
         )
@@ -474,6 +475,7 @@ mod tests {
                 channels: 0,
             },
             AudioSource::SinkMonitor,
+            None,
             None,
             None,
             Instant::now(),
