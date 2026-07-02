@@ -116,6 +116,10 @@ pub(crate) fn ensure_instance_dir(dir: &InstanceDir) -> std::io::Result<()> {
 
 #[cfg(not(unix))]
 pub(crate) fn ensure_instance_dir(dir: &InstanceDir) -> std::io::Result<()> {
+    if dir.in_shared_temp {
+        // Windows' temp dir is already per-user, so no ownership dance is needed there.
+        tracing::debug!(path = %dir.path.display(), "instance dir falls back under the temp dir");
+    }
     std::fs::create_dir_all(&dir.path)
 }
 
@@ -154,6 +158,10 @@ pub fn sibling_binary(name: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    // The XDG-semantics tests assert against unix path literals (`/home/u` is not an
+    // absolute path on Windows), so they only run there — matching the environments
+    // where the XDG lookup is the real code path.
+    #[cfg(unix)]
     #[test]
     fn config_home_rejects_relative_values() {
         // Relative XDG_CONFIG_HOME falls back to HOME; a relative HOME resolves to nothing.
@@ -167,6 +175,7 @@ mod tests {
         assert_eq!(both, Some(PathBuf::from("/home/u/.config")));
     }
 
+    #[cfg(unix)]
     #[test]
     fn config_path_prefers_xdg_then_home() {
         let xdg = config_path_from(|k| match k {
@@ -196,6 +205,7 @@ mod tests {
         assert!(config_path_from(|_| None).is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn data_home_prefers_xdg_then_home() {
         let xdg = data_home_from(|k| match k {
@@ -213,6 +223,7 @@ mod tests {
         assert!(data_home_from(|_| None).is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn instance_dir_prefers_runtime_dir() {
         let rt = instance_dir_from(Some(OsString::from("/run/u")), PathBuf::from("/tmp"));

@@ -23,5 +23,9 @@ dirs = "6"
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+# Named-mutex single-instance guard (docs/adr/0008); windows-only.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_System_Threading", "Win32_Security"] }
+
 [dev-dependencies]
 tempfile.workspace = true
