@@ -1228,11 +1228,17 @@ mod windows {
     use rewynd_config::{self as config};
     use rewynd_encode::{AudioMixer, EncodeParams, Encoder, GpuVideoEncoder, Nv12Converter};
     use rewynd_gpu::{D3d11HandleImport, GpuContext};
+    use windows::Win32::System::Diagnostics::Debug::MessageBeep;
+    use windows::Win32::UI::HiDpi::{
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey,
         UnregisterHotKey, VK_F1,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{MSG, PM_REMOVE, PeekMessageW, WM_HOTKEY};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MB_ICONHAND, MB_OK, MSG, PM_REMOVE, PeekMessageW, WM_HOTKEY,
+    };
 
     use crate::audio_pipeline::{AUDIO_SETTLE, SharedMixer, run_audio_mixer, spawn_audio_capture};
     use crate::params::{audio_encode_params, encode_params};
@@ -1245,6 +1251,13 @@ mod windows {
 
     pub fn run() -> Result<()> {
         tracing_subscriber::fmt::init();
+
+        // Per-monitor DPI awareness, set before any threads or windows exist: without
+        // it, window/monitor rects arrive DPI-virtualized on scaled displays and the
+        // fullscreen-game check compares mismatched coordinate spaces.
+        // SAFETY: trivially safe FFI (process-wide flag).
+        let _ =
+            unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 
         config::ensure_default_file();
         let config = config::load();
@@ -1696,17 +1709,21 @@ mod windows {
         (1..=24).contains(&n).then(|| u32::from(VK_F1.0) + n - 1)
     }
 
-    /// Cut + mux a clip and toast the outcome (there is no tray on Windows yet, so the
-    /// toast is the only feedback channel).
+    /// Cut + mux a clip, toast the outcome, and beep: Windows suppresses toasts while
+    /// a fullscreen game has focus (focus assist), so the sound is the in-game
+    /// confirmation that the press landed.
     fn save_and_toast(saver: &Arc<ClipSaver>) {
-        match saver.save() {
-            Ok(path) => toast("Clip saved", &path.display().to_string()),
-            Err(SaveError::Empty(reason)) => toast("Nothing to save yet", &reason),
+        let (beep, title, body) = match saver.save() {
+            Ok(path) => (MB_OK, "Clip saved", path.display().to_string()),
+            Err(SaveError::Empty(reason)) => (MB_ICONHAND, "Nothing to save yet", reason),
             Err(e) => {
                 tracing::error!(error = %e, "clip save failed");
-                toast("Could not save the clip", &e.to_string());
+                (MB_ICONHAND, "Could not save the clip", e.to_string())
             }
-        }
+        };
+        // SAFETY: trivially safe FFI.
+        let _ = unsafe { MessageBeep(beep) };
+        toast(title, &body);
     }
 
     /// Fire-and-forget desktop toast (blocking is fine on the hotkey/capture threads).
