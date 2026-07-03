@@ -5,7 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use iced::widget::{
     Space, button, column, container, pick_list, row, scrollable, slider, text, text_input,
@@ -222,6 +222,8 @@ pub struct Library {
     /// `view()` would make the placeholder's minute stamp tick while the page sits open).
     title_hint: String,
     dest: Dest,
+    /// An in-flight destination-accent fade, or `None` when the panel sits on a fixed brand.
+    accent_fade: Option<AccentFade>,
     visibility: Visibility,
     upload: UploadState,
     /// Remembered successful uploads (per clip, per destination), for badges + the duplicate
@@ -249,6 +251,7 @@ impl Library {
             title: String::new(),
             title_hint: String::new(),
             dest: Dest::Ganked,
+            accent_fade: None,
             visibility: Visibility::default(),
             upload: UploadState::Idle,
             history: upload_history::load(),
@@ -810,6 +813,19 @@ impl Library {
     fn open_entry(&self) -> Option<&ClipEntry> {
         let path = self.open.as_ref()?;
         self.entries.iter().find(|e| &e.path == path)
+    }
+
+    /// The (fill, ink) accent the upload panel paints with right now: the destination brand,
+    /// or the interpolated value while a switch is fading.
+    fn current_accent(&self) -> (iced::Color, iced::Color) {
+        self.accent_fade
+            .as_ref()
+            .map_or_else(|| dest_accent(self.dest), AccentFade::accent)
+    }
+
+    /// Whether an accent fade is running (drives the frame subscription in `main`).
+    pub fn animating(&self) -> bool {
+        self.accent_fade.is_some()
     }
 
     pub fn view(&self, config: &Config) -> Element<'_, Message> {
@@ -1771,6 +1787,54 @@ fn unique_trim_path(src: &Path) -> PathBuf {
     candidate
 }
 
+/// How long the upload-panel accent takes to fade when the destination switches.
+const ACCENT_FADE: Duration = Duration::from_millis(180);
+
+/// An in-flight accent fade between two (fill, ink) brand pairs. `start` is anchored on the
+/// first tick, so all time comes from the frame subscription rather than `Instant::now()` in
+/// update.
+struct AccentFade {
+    from: (iced::Color, iced::Color),
+    to: (iced::Color, iced::Color),
+    start: Option<Instant>,
+    progress: f32,
+}
+
+impl AccentFade {
+    /// The interpolated (fill, ink) at the current progress.
+    fn accent(&self) -> (iced::Color, iced::Color) {
+        (
+            lerp_color(self.from.0, self.to.0, self.progress),
+            lerp_color(self.from.1, self.to.1, self.progress),
+        )
+    }
+
+    /// Advance to frame time `now`, anchoring the clock on the first call. Returns `true` once
+    /// the fade has reached its end (the caller then drops it).
+    fn advance(&mut self, now: Instant) -> bool {
+        let start = *self.start.get_or_insert(now);
+        let linear = now.duration_since(start).as_secs_f32() / ACCENT_FADE.as_secs_f32();
+        self.progress = ease(linear);
+        linear >= 1.0
+    }
+}
+
+/// Smoothstep easing, clamped to `0.0..=1.0`.
+fn ease(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Per-channel linear interpolation between two colours.
+fn lerp_color(a: iced::Color, b: iced::Color, t: f32) -> iced::Color {
+    iced::Color {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        a: a.a + (b.a - a.a) * t,
+    }
+}
+
 /// The brand accent and its ink for an upload destination: mint for ganked.tv, red for YouTube.
 fn dest_accent(dest: Dest) -> (iced::Color, iced::Color) {
     match dest {
@@ -1819,6 +1883,76 @@ fn placeholder<'a>(label: &'a str, height: f32) -> Element<'a, Message> {
             ..container::Style::default()
         })
         .into()
+}
+
+#[cfg(test)]
+mod accent_tests {
+    use super::*;
+    use iced::Color;
+    use std::time::{Duration, Instant};
+
+    fn approx(a: Color, b: Color) {
+        for (x, y) in [(a.r, b.r), (a.g, b.g), (a.b, b.b), (a.a, b.a)] {
+            assert!((x - y).abs() < 1e-4, "{x} vs {y}");
+        }
+    }
+
+    #[test]
+    fn lerp_color_hits_both_ends() {
+        let a = Color::from_rgb(0.0, 0.0, 0.0);
+        let b = Color::from_rgb(1.0, 0.5, 0.25);
+        approx(lerp_color(a, b, 0.0), a);
+        approx(lerp_color(a, b, 1.0), b);
+        approx(lerp_color(a, b, 0.5), Color::from_rgb(0.5, 0.25, 0.125));
+    }
+
+    #[test]
+    fn ease_is_clamped_and_smooth() {
+        assert_eq!(ease(0.0), 0.0);
+        assert_eq!(ease(1.0), 1.0);
+        assert_eq!(ease(-1.0), 0.0);
+        assert_eq!(ease(2.0), 1.0);
+        assert!((ease(0.5) - 0.5).abs() < 1e-6, "symmetric midpoint");
+    }
+
+    #[test]
+    fn fade_runs_from_source_to_target_then_ends() {
+        let from = (palette::ACCENT, palette::INK_ON_ACCENT);
+        let to = (palette::YOUTUBE, palette::INK_ON_YOUTUBE);
+        let mut fade = AccentFade {
+            from,
+            to,
+            start: None,
+            progress: 0.0,
+        };
+        let t0 = Instant::now();
+
+        // First tick anchors the clock; still fully at `from`.
+        assert!(!fade.advance(t0));
+        approx(fade.accent().0, from.0);
+
+        // Partway through: strictly between the endpoints.
+        assert!(!fade.advance(t0 + Duration::from_millis(90)));
+        let mid = fade.accent().0;
+        assert!(mid.r > from.0.r && mid.r < to.0.r + 1e-3);
+
+        // At/after the duration: reports done and sits on the target.
+        assert!(fade.advance(t0 + ACCENT_FADE));
+        approx(fade.accent().0, to.0);
+    }
+
+    #[test]
+    fn advance_fade_clears_when_complete() {
+        let mut fade = AccentFade {
+            from: (palette::ACCENT, palette::INK_ON_ACCENT),
+            to: (palette::YOUTUBE, palette::INK_ON_YOUTUBE),
+            start: None,
+            progress: 0.0,
+        };
+        let t0 = Instant::now();
+        assert!(!fade.advance(t0));
+        assert!(fade.advance(t0 + ACCENT_FADE + Duration::from_millis(1)));
+    }
 }
 
 #[cfg(test)]
