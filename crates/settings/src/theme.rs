@@ -194,17 +194,20 @@ pub fn danger_button(_theme: &Theme, status: button::Status) -> button::Style {
 /// Outline destructive button (the delete trigger): transparent with a red hairline and red text,
 /// hover fills a faint red. Reads as dangerous without shouting before the confirm step.
 pub fn danger_outline_button(_theme: &Theme, status: button::Status) -> button::Style {
-    let background = match status {
-        button::Status::Hovered | button::Status::Pressed => {
-            Some(Background::Color(palette::DANGER_BG))
-        }
-        _ => None,
+    let (background, border_color, text_color) = match status {
+        button::Status::Hovered | button::Status::Pressed => (
+            Some(Background::Color(palette::DANGER_BG)),
+            palette::DANGER,
+            palette::DANGER,
+        ),
+        button::Status::Disabled => (None, palette::BORDER, palette::MUTED),
+        _ => (None, palette::DANGER, palette::DANGER),
     };
     button::Style {
         background,
-        text_color: palette::DANGER,
+        text_color,
         border: Border {
-            color: palette::DANGER,
+            color: border_color,
             width: 1.0,
             radius: 8.0.into(),
         },
@@ -273,6 +276,11 @@ pub fn overlay_button(_theme: &Theme, status: button::Status) -> button::Style {
             iced::Color::from_rgba(0.0, 0.0, 0.0, 0.80),
             palette::ACCENT,
             palette::ACCENT,
+        ),
+        button::Status::Disabled => (
+            iced::Color::from_rgba(0.0, 0.0, 0.0, 0.45),
+            palette::BORDER,
+            palette::MUTED,
         ),
         _ => (
             iced::Color::from_rgba(0.0, 0.0, 0.0, 0.62),

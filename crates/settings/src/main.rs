@@ -39,6 +39,17 @@ fn is_custom_url(stored: &str, default: &str) -> bool {
     !stored.is_empty() && stored != default
 }
 
+/// Cap a microphone label so a long PipeWire description doesn't run past the dropdown; the ellipsis
+/// signals it was shortened. Counts by `char` so a multi-byte name is never split mid-codepoint.
+fn truncate_mic_label(label: &str) -> String {
+    const MAX_CHARS: usize = 38;
+    if label.chars().count() <= MAX_CHARS {
+        return label.to_owned();
+    }
+    let head: String = label.chars().take(MAX_CHARS - 1).collect();
+    format!("{head}…")
+}
+
 /// The stored URL when it's a genuine custom endpoint, else empty — so the built-in default is
 /// only ever a placeholder in the custom-connector fields, never a value the user seems to have
 /// typed.
@@ -1117,6 +1128,11 @@ impl App {
                 });
             }
             options.extend(self.mic_options.iter().cloned());
+            // PipeWire descriptions can be long enough to overrun the dropdown; cap the visible
+            // label. The stored id (used for matching and persistence) is left untouched.
+            for o in &mut options {
+                o.label = truncate_mic_label(&o.label);
+            }
             let selected = options
                 .iter()
                 .find(|o| o.id == mic_value)
@@ -1241,8 +1257,10 @@ impl App {
 
         // The full default path is too long to read as a placeholder, so the box just says
         // "Leave empty for default" and the resolved location is spelled out on its own line.
+        // With no Videos folder, clips fall back to a private rewynd-clips dir under the temp
+        // dir (then ~/.rewynd-clips) — describe that rather than implying a shared temp folder.
         let default_location = config::default_output_dir().map_or_else(
-            || "the system temp folder".to_owned(),
+            || "a private rewynd-clips folder under your temp directory".to_owned(),
             |p| p.display().to_string(),
         );
         let output_capture = column![

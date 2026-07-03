@@ -92,23 +92,60 @@ mod imp {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use std::process::Command;
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
 
     use super::AudioInput;
 
+    /// How long to wait for `pw-dump` before giving up. It normally returns in well under a
+    /// second; the cap keeps a wedged PipeWire from hanging the settings window at startup.
+    const PW_DUMP_TIMEOUT: Duration = Duration::from_secs(2);
+
     /// The PipeWire audio sources, for the microphone picker. Best-effort: if `pw-dump` is
-    /// missing or fails the list is empty and the picker falls back to free text. The stored
-    /// value is the `node.name` (what the capture backend matches via `target.object`); the
-    /// label is the friendlier `node.description`.
+    /// missing, fails, or does not finish within [`PW_DUMP_TIMEOUT`], the list is empty and the
+    /// picker falls back to free text. The stored value is the `node.name` (what the capture
+    /// backend matches via `target.object`); the label is the friendlier `node.description`.
     #[must_use]
     pub fn list_audio_inputs() -> Vec<AudioInput> {
-        let Ok(output) = Command::new("pw-dump").output() else {
-            return Vec::new();
+        run_pw_dump(PW_DUMP_TIMEOUT).map_or_else(Vec::new, |json| parse_pw_dump(&json))
+    }
+
+    /// Run `pw-dump` with a bounded wait, returning its stdout on a clean exit or `None` on
+    /// spawn failure, a non-zero exit, or the timeout. A reader thread drains stdout so a large
+    /// dump can't dead-lock on a full pipe while we wait, and the child is killed on timeout.
+    fn run_pw_dump(timeout: Duration) -> Option<Vec<u8>> {
+        let mut child = Command::new("pw-dump")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut stdout = child.stdout.take()?;
+        let reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf);
+            buf
+        });
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    return None;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = reader.join();
+                    return None;
+                }
+            }
         };
-        if !output.status.success() {
-            return Vec::new();
-        }
-        parse_pw_dump(&output.stdout)
+        let buf = reader.join().ok()?;
+        status.success().then_some(buf)
     }
 
     /// Extract the audio sources from a `pw-dump` JSON payload. Split from the process call so the
