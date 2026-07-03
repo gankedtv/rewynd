@@ -35,6 +35,12 @@ const ROOT_GROUP: &str = "Desktop";
 /// library must stream through a small pool instead of decoding every stale clip at once.
 const MAX_DECODES: usize = 4;
 
+/// Keyframe thumbnails shown across the trim filmstrip.
+const FILMSTRIP_FRAMES: usize = 12;
+
+/// Decoded width of one filmstrip cell (~2x its ~60px logical size for hidpi sharpness).
+const FILMSTRIP_CELL_WIDTH: u32 = 120;
+
 /// An upload destination the detail page can send a clip to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dest {
@@ -1815,6 +1821,26 @@ fn unique_trim_path(src: &Path) -> PathBuf {
     candidate
 }
 
+/// `n` evenly spaced, centred sample positions in `0.0..1.0` (cell i samples its own midpoint),
+/// so the strip skips the very first and last frames.
+fn filmstrip_positions(n: usize) -> Vec<f32> {
+    (0..n).map(|i| (i as f32 + 0.5) / n as f32).collect()
+}
+
+/// FillPortion weights (left scrim, kept band, right scrim) for the `[start, end]` window over
+/// `dur`, on a fixed 1000 scale. A zero weight renders as zero width (iced treats FillPortion(0)
+/// as non-fluid). A non-positive `dur` degenerates to "all kept".
+fn range_portions(start: f32, end: f32, dur: f32) -> (u16, u16, u16) {
+    if dur <= 0.0 {
+        return (0, 1000, 0);
+    }
+    let clamp = |v: f32| (v / dur).clamp(0.0, 1.0);
+    let left = (clamp(start) * 1000.0).round() as u16;
+    let right = ((1.0 - clamp(end)) * 1000.0).round() as u16;
+    let mid = 1000u16.saturating_sub(left).saturating_sub(right);
+    (left, mid, right)
+}
+
 /// How long the upload-panel accent takes to fade when the destination switches.
 const ACCENT_FADE: Duration = Duration::from_millis(180);
 
@@ -1911,6 +1937,34 @@ fn placeholder<'a>(label: &'a str, height: f32) -> Element<'a, Message> {
             ..container::Style::default()
         })
         .into()
+}
+
+#[cfg(test)]
+mod filmstrip_tests {
+    use super::*;
+
+    #[test]
+    fn positions_are_centred_and_ordered() {
+        let p = filmstrip_positions(4);
+        assert_eq!(p.len(), 4);
+        assert!((p[0] - 0.125).abs() < 1e-6);
+        assert!((p[3] - 0.875).abs() < 1e-6);
+        assert!(p.windows(2).all(|w| w[0] < w[1]), "strictly increasing");
+        assert!(p.iter().all(|&x| x > 0.0 && x < 1.0), "inside (0,1)");
+        assert!(filmstrip_positions(0).is_empty());
+    }
+
+    #[test]
+    fn portions_split_the_track_by_time() {
+        // Whole clip kept: no scrim on either side.
+        assert_eq!(range_portions(0.0, 10.0, 10.0), (0, 1000, 0));
+        // A middle window.
+        assert_eq!(range_portions(2.0, 9.0, 10.0), (200, 700, 100));
+        // Empty band (start == end): both scrims, no kept middle.
+        assert_eq!(range_portions(5.0, 5.0, 10.0), (500, 0, 500));
+        // Degenerate duration stays drawable as "all kept".
+        assert_eq!(range_portions(0.0, 0.0, 0.0), (0, 1000, 0));
+    }
 }
 
 #[cfg(test)]
