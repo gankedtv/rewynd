@@ -1145,8 +1145,6 @@ mod linux {
         }
     }
 
-    /// Launch the sibling settings binary for the tray's "Open settings", reaping the child in
-    /// the background (an unwaited child stays a zombie for the recorder's whole lifetime).
     /// Flip the microphone on/off in the config file and restart the recorder to apply it (the
     /// recorder reads audio config once at startup). Errors are toasted, never fatal.
     async fn toggle_mic_and_restart() {
@@ -1189,6 +1187,8 @@ mod linux {
         }
     }
 
+    /// Launch the sibling settings binary for the tray's "Open settings", reaping the child in
+    /// the background (an unwaited child stays a zombie for the recorder's whole lifetime).
     async fn open_settings() {
         let Some(settings) = config::sibling_binary("rewynd") else {
             tray::toast(
