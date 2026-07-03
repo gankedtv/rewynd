@@ -20,8 +20,8 @@ pub type GpuVideoEncoderParameters = gpu_video::parameters::EncoderParametersH26
 /// Errors from the encoder.
 #[derive(Debug, Error)]
 pub enum EncodeError {
-    /// The encoder failed to initialise on the shared device.
-    #[error("failed to initialise the gpu-video encoder: {0}")]
+    /// The encoder failed to initialise.
+    #[error("failed to initialise the encoder: {0}")]
     Init(String),
     /// The encoder failed while encoding a frame.
     #[error("failed to encode a frame: {0}")]
@@ -82,6 +82,18 @@ mod gpu_video_backend;
 #[cfg(vulkan)]
 pub use gpu_video_backend::{GpuVideoEncoder, Nv12Converter};
 
+// The CPU H.264 encoder core (libopenh264) is platform-agnostic like the audio codecs, so
+// it's unconditional and CI-tested. Its GPU-texture adapter is the part that needs Vulkan.
+mod software;
+pub use software::{I420Frame, SoftwareEncoder};
+
+// The NV12 texture -> I420 readback adapter that feeds the CPU encoder. Needs a wgpu device,
+// so it only exists where the GPU stack builds.
+#[cfg(vulkan)]
+mod software_texture;
+#[cfg(vulkan)]
+pub use software_texture::SoftwareTextureEncoder;
+
 // Opus audio encoding is CPU-side and platform-agnostic (libopus), so it's unconditional.
 mod opus_audio;
 pub use opus_audio::{AudioEncodeError, AudioEncodeParams, OpusAudioEncoder};
@@ -107,10 +119,7 @@ mod tests {
     #[test]
     fn init_error_displays_the_cause() {
         let err = EncodeError::Init("boom".to_owned());
-        assert_eq!(
-            err.to_string(),
-            "failed to initialise the gpu-video encoder: boom"
-        );
+        assert_eq!(err.to_string(), "failed to initialise the encoder: boom");
     }
 
     #[test]

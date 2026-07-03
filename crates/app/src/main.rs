@@ -19,6 +19,12 @@ mod overlay;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn main() -> anyhow::Result<()> {
+    // `--probe-encoders`: enumerate this machine's encoders and print them as JSON, then exit.
+    // The settings GUI (deliberately wgpu-free) spawns us for this to populate its device picker,
+    // so it must do nothing else — no tracing, no lock, no config side effects.
+    if std::env::args().any(|arg| arg == "--probe-encoders") {
+        return probe::run();
+    }
     // `--restart`: stop the recorder that's currently running (a config change such as the tray's
     // microphone toggle needs a fresh process to pick it up) before we take the single-instance
     // lock it still holds.
@@ -307,6 +313,7 @@ mod game_gate {
         buffer: SharedBuffer,
         audio: SharedAudioBuffer,
         mic_audio: Option<SharedAudioBuffer>,
+        status: crate::status::StatusPublisher,
     ) -> GameReaction {
         // The app id whose footage the rings currently hold (while recording).
         let held = Mutex::new(None::<String>);
@@ -341,10 +348,12 @@ mod game_gate {
                         }
                     }
                     recording.store(true, Ordering::Relaxed);
+                    status.set_recording(Some(game.display_name()));
                 }
                 None => {
                     recording.store(false, Ordering::Relaxed);
                     *lock_unpoisoned(&held) = None;
+                    status.set_idle();
                 }
             }
         })
@@ -407,6 +416,128 @@ mod params {
     }
 }
 
+/// Encoder-capability probe: enumerate Vulkan adapters and flatten them into the config's
+/// GPU-free [`rewynd_config::ProbeAdapter`] (so the selector and the GUI never see GPU types).
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod probe {
+    use rewynd_config::{EncoderProbe, ProbeAdapter};
+
+    /// Enumerate the machine's Vulkan adapters and their H.264-encode capability.
+    pub(crate) fn adapter_list() -> Vec<ProbeAdapter> {
+        pollster::block_on(rewynd_gpu::GpuContext::probe_adapters())
+            .into_iter()
+            .map(|a| ProbeAdapter {
+                name: a.name.clone(),
+                device_type: a.device_kind().to_owned(),
+                h264_encode: a.h264_encode,
+                max_width: a.max_width,
+                max_height: a.max_height,
+            })
+            .collect()
+    }
+
+    /// The `--probe-encoders` subcommand: print the probe as JSON on stdout, nothing else.
+    pub(crate) fn run() -> anyhow::Result<()> {
+        println!("{}", EncoderProbe::new(adapter_list()).to_json());
+        Ok(())
+    }
+}
+
+/// The recorder's live status, published to a file the GUI polls. A single shared cell holds
+/// the current state so any thread (the game gate, the capture thread, the tray) can update one
+/// field and re-publish atomically.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod status {
+    use std::sync::{Arc, Mutex};
+
+    use rewynd_clip::lock_unpoisoned;
+    use rewynd_config::{
+        RECORDER_STATUS_VERSION, RecorderState, RecorderStatus, write_recorder_status,
+    };
+
+    /// A cloneable handle that publishes the recorder's status to disk on every change.
+    #[derive(Clone)]
+    pub(crate) struct StatusPublisher {
+        inner: Arc<Mutex<Inner>>,
+    }
+
+    struct Inner {
+        encoder: String,
+        state: RecorderState,
+        game: Option<String>,
+        detail: Option<String>,
+    }
+
+    impl StatusPublisher {
+        /// Create the publisher with the chosen backend and initial state, writing it once.
+        pub(crate) fn new(encoder: String, state: RecorderState) -> Self {
+            let publisher = Self {
+                inner: Arc::new(Mutex::new(Inner {
+                    encoder,
+                    state,
+                    game: None,
+                    detail: None,
+                })),
+            };
+            publisher.write();
+            publisher
+        }
+
+        /// Recording a game (`Some`) or the whole desktop (`None`).
+        pub(crate) fn set_recording(&self, game: Option<String>) {
+            {
+                let mut inner = lock_unpoisoned(&self.inner);
+                inner.state = RecorderState::Recording;
+                inner.game = game;
+                inner.detail = None;
+            }
+            self.write();
+        }
+
+        /// Running but waiting for a game to focus (game-only capture).
+        pub(crate) fn set_idle(&self) {
+            {
+                let mut inner = lock_unpoisoned(&self.inner);
+                inner.state = RecorderState::Idle;
+                inner.game = None;
+                inner.detail = None;
+            }
+            self.write();
+        }
+
+        /// The capture pipeline failed.
+        pub(crate) fn set_failed(&self, detail: String) {
+            {
+                let mut inner = lock_unpoisoned(&self.inner);
+                inner.state = RecorderState::Failed;
+                inner.detail = Some(detail);
+            }
+            self.write();
+        }
+
+        /// Correct the recorded backend (a mid-run GPU→CPU fallback).
+        pub(crate) fn set_encoder(&self, encoder: String) {
+            lock_unpoisoned(&self.inner).encoder = encoder;
+            self.write();
+        }
+
+        fn write(&self) {
+            let inner = lock_unpoisoned(&self.inner);
+            let status = RecorderStatus {
+                version: RECORDER_STATUS_VERSION,
+                pid: std::process::id(),
+                encoder: inner.encoder.clone(),
+                state: inner.state,
+                game: inner.game.clone(),
+                detail: inner.detail.clone(),
+            };
+            if let Err(e) = write_recorder_status(&status) {
+                tracing::debug!(error = %e, "could not publish recorder status");
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::cell::RefCell;
@@ -423,7 +554,9 @@ mod linux {
     use rewynd_capture::AudioSource;
     use rewynd_capture::linux::{CapturedDmabuf, StreamPrefs, capture_stream, open_portal_with};
     use rewynd_clip::{ClipSaver, SaveError, SharedAudioBuffer, SharedBuffer, lock_unpoisoned};
-    use rewynd_encode::{AudioMixer, EncodeParams, Encoder, GpuVideoEncoder, Nv12Converter};
+    use rewynd_encode::{
+        AudioMixer, EncodeParams, Encoder, GpuVideoEncoder, Nv12Converter, SoftwareTextureEncoder,
+    };
 
     use rewynd_config::{self as config};
 
@@ -447,6 +580,8 @@ mod linux {
     enum RecorderEvent {
         CaptureFailed(String),
         SystemAudioFailed(String),
+        /// The GPU encoder was unavailable mid-run; recording continues on the CPU.
+        EncoderFallback(String),
     }
 
     /// The recorder's threads, joined in dependency order by [`Recorder::shutdown`]. Fields are
@@ -532,6 +667,27 @@ mod linux {
             idr_period = params.idr_period,
             "encode parameters"
         );
+
+        // Pick the encoder backend up front (issue #115): probe the machine's adapters, honour
+        // the config override, and log both. The capture thread builds the actual encoder from
+        // this; a mid-run GPU-init failure still falls back to the CPU inside that thread.
+        let adapters = crate::probe::adapter_list();
+        let (encoder_choice, encoder_warning) =
+            config::choose_encoder(&config.encoder_preference(), &adapters);
+        tracing::info!(
+            adapters = ?adapters,
+            choice = %encoder_choice.label(),
+            "encoder capability and selection"
+        );
+        if matches!(encoder_choice, config::EncoderChoice::Cpu) {
+            tracing::warn!(
+                width = params.width,
+                height = params.height,
+                fps = params.framerate,
+                "software H.264 encoding is CPU-heavy at high resolutions; expect high CPU use"
+            );
+        }
+
         let audio_params = audio_encode_params(config.audio());
         let buffer_window = config.buffer_window();
         let output_dir = config.output_dir();
@@ -599,6 +755,17 @@ mod linux {
         // initial burst may already report a fullscreen game, and a store after spawn
         // could clobber that reaction.
         let recording = Arc::new(AtomicBool::new(!game_only));
+
+        // Publish the recorder's live status (chosen backend + game/desktop/idle state) so the
+        // GUI can show it. Game-only capture starts Idle (waiting for a game); desktop capture
+        // starts Recording the whole desktop.
+        let initial_state = if game_only {
+            config::RecorderState::Idle
+        } else {
+            config::RecorderState::Recording
+        };
+        let status = crate::status::StatusPublisher::new(encoder_choice.label(), initial_state);
+
         let _focus_watcher = if game_only || game_folders {
             let reaction = crate::game_gate::reaction(
                 game_only,
@@ -608,12 +775,14 @@ mod linux {
                 buffer.clone(),
                 audio_buffer.clone(),
                 mic_audio_buffer.clone(),
+                status.clone(),
             );
             match rewynd_capture::linux::FocusWatcher::spawn(Some(reaction)) {
                 Ok(watcher) => Some(watcher),
                 Err(e) => {
                     // No watcher, no gate: fall back to continuous capture.
                     recording.store(true, Ordering::Relaxed);
+                    status.set_recording(None);
                     if capture_desktop {
                         tracing::info!(error = %e, "no game detection; per-game folders unavailable");
                     } else {
@@ -696,6 +865,13 @@ mod linux {
         };
         // Pipeline failures flow to the tray task, which owns the user-visible state.
         let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<RecorderEvent>();
+
+        // Surface a backend-selection warning (a pinned GPU that vanished, or an auto fall-back
+        // to the CPU) as a non-fatal toast, once the tray is listening.
+        if let Some(warning) = encoder_warning {
+            tracing::warn!(warning, "encoder selection fell back");
+            let _ = events_tx.send(RecorderEvent::EncoderFallback(warning));
+        }
 
         // From here on, any startup error must tear down the threads spawned so far — a
         // detached PipeWire callback racing process exit is undefined behaviour.
@@ -799,6 +975,8 @@ mod linux {
             let capture_stop = stop.clone();
             let capture_events = events_tx.clone();
             let capture_recording = recording.clone();
+            let capture_choice = encoder_choice.clone();
+            let capture_status = status.clone();
             recorder.capture = Some(
                 std::thread::Builder::new()
                     .name("rewynd-capture".to_owned())
@@ -811,8 +989,12 @@ mod linux {
                             capture_buffer,
                             &capture_stop,
                             capture_recording,
+                            capture_choice,
+                            &capture_events,
+                            &capture_status,
                         ) {
                             tracing::error!(error = %e, "capture loop stopped");
+                            capture_status.set_failed(format!("{e:#}"));
                             let _ =
                                 capture_events.send(RecorderEvent::CaptureFailed(format!("{e:#}")));
                         }
@@ -879,6 +1061,10 @@ mod linux {
         ));
 
         recorder.shutdown(&runtime, portal);
+        // Drop the status file so the GUI shows "not recording" once we exit. Unlike the pid
+        // file, this is unlinked: it's advisory (the reader also verifies the pid is live), so a
+        // benign race with an incoming instance's fresh write is fine.
+        config::clear_recorder_status();
         // The pid file isn't removed on exit: the kernel releases the `flock` when the process
         // dies, and unlinking it would race a relock by an incoming instance. A leftover pid is
         // harmless — the settings app verifies it against `/proc` before signalling it.
@@ -905,18 +1091,24 @@ mod linux {
                     let Some(event) = event else { continue };
                     let (title, body) = match event {
                         RecorderEvent::CaptureFailed(e) => (
-                            "Recording stopped",
+                            "Recording stopped".to_owned(),
                             format!("The screen capture failed: {e}. Already-buffered footage can still be saved."),
                         ),
                         RecorderEvent::SystemAudioFailed(e) => (
-                            "System audio lost",
+                            "System audio lost".to_owned(),
                             format!("Clips will have no system sound: {e}"),
+                        ),
+                        // A fall-back to the CPU encoder isn't a failure — recording continues,
+                        // just at a higher CPU cost, so keep an unalarming tooltip.
+                        RecorderEvent::EncoderFallback(e) => (
+                            "Recording (CPU encoder)".to_owned(),
+                            format!("{e} Recording continues on the CPU, which uses more processor power."),
                         ),
                     };
                     handle
-                        .update(|tray: &mut tray::RewyndTray| tray.status = title.to_owned())
+                        .update(|tray: &mut tray::RewyndTray| tray.status = title.clone())
                         .await;
-                    tray::toast(title, &body).await;
+                    tray::toast(&title, &body).await;
                 }
                 cmd = rx.recv() => {
                     let Some(cmd) = cmd else { break };
@@ -1034,11 +1226,50 @@ mod linux {
         }
     }
 
+    /// Build the GPU-backed encoder for `choice`, falling back to the CPU encoder if the GPU
+    /// device or encoder can't be created (the probe said it could, but init still failed).
+    fn build_encoder(
+        choice: &config::EncoderChoice,
+        params: EncodeParams,
+        events: &tokio::sync::mpsc::UnboundedSender<RecorderEvent>,
+        status: &crate::status::StatusPublisher,
+    ) -> Result<(Rc<GpuContext>, Box<dyn Encoder>)> {
+        match choice {
+            config::EncoderChoice::Gpu(name) => match gpu_encoder(name, params) {
+                Ok(pair) => Ok(pair),
+                Err(e) => {
+                    tracing::warn!(error = %e, "GPU encoder init failed; falling back to the CPU encoder");
+                    let _ = events.send(RecorderEvent::EncoderFallback(format!(
+                        "The GPU encoder failed to start: {e}."
+                    )));
+                    status.set_encoder(config::EncoderChoice::Cpu.label());
+                    cpu_encoder(params)
+                }
+            },
+            config::EncoderChoice::Cpu => cpu_encoder(params),
+        }
+    }
+
+    /// The GPU (Vulkan Video) encoder on the named adapter.
+    fn gpu_encoder(name: &str, params: EncodeParams) -> Result<(Rc<GpuContext>, Box<dyn Encoder>)> {
+        let gpu = Rc::new(pollster::block_on(GpuContext::new_for_adapter(name))?);
+        let enc: Box<dyn Encoder> = Box::new(GpuVideoEncoder::new(&gpu, params)?);
+        Ok((gpu, enc))
+    }
+
+    /// The software (CPU) encoder on a render-only device.
+    fn cpu_encoder(params: EncodeParams) -> Result<(Rc<GpuContext>, Box<dyn Encoder>)> {
+        let gpu = Rc::new(pollster::block_on(GpuContext::new_render_only())?);
+        let enc: Box<dyn Encoder> = Box::new(SoftwareTextureEncoder::new(&gpu, params)?);
+        Ok((gpu, enc))
+    }
+
     /// Build the GPU pipeline and pump captured frames into `buffer` until the stream
     /// ends. `recording` is the game gate (kept current by the focus watcher): while
     /// false, frames are dropped before the GPU so the desktop never enters the ring.
     /// The encoder/converter/device are dropped in dependency order afterwards
     /// (tearing the device down before the encoder it backs crashes the driver).
+    #[allow(clippy::too_many_arguments)]
     fn run_capture(
         node_id: u32,
         fd: std::os::fd::OwnedFd,
@@ -1047,10 +1278,13 @@ mod linux {
         buffer: SharedBuffer,
         stop: &Arc<AtomicBool>,
         recording: Arc<AtomicBool>,
+        choice: config::EncoderChoice,
+        events: &tokio::sync::mpsc::UnboundedSender<RecorderEvent>,
+        status: &crate::status::StatusPublisher,
     ) -> Result<()> {
-        let gpu = Rc::new(pollster::block_on(GpuContext::new())?);
+        let (gpu, enc) = build_encoder(&choice, params, events, status)?;
         let conv = Rc::new(Nv12Converter::new(&gpu)?);
-        let enc = Rc::new(RefCell::new(GpuVideoEncoder::new(&gpu, params)?));
+        let enc = Rc::new(RefCell::new(enc));
         tracing::info!("capture pipeline ready; filling the ring buffer");
 
         // Ask the compositor for the configured size/rate; whatever it actually delivers is
@@ -1092,7 +1326,7 @@ mod linux {
                     encode_captured(
                         &gpu,
                         &conv,
-                        &mut enc.borrow_mut(),
+                        &mut **enc.borrow_mut(),
                         params,
                         captured,
                         frame_index == 0 || resume_keyframe || fresh_ring,
@@ -1134,7 +1368,7 @@ mod linux {
     fn encode_captured(
         gpu: &GpuContext,
         conv: &Nv12Converter,
-        enc: &mut GpuVideoEncoder,
+        enc: &mut dyn Encoder,
         params: EncodeParams,
         captured: CapturedDmabuf,
         force_keyframe: bool,
@@ -1407,7 +1641,9 @@ mod windows {
     use rewynd_capture::{AudioSource, StreamPrefs};
     use rewynd_clip::{ClipSaver, SaveError, SharedAudioBuffer, SharedBuffer, lock_unpoisoned};
     use rewynd_config::{self as config};
-    use rewynd_encode::{AudioMixer, EncodeParams, Encoder, GpuVideoEncoder, Nv12Converter};
+    use rewynd_encode::{
+        AudioMixer, EncodeParams, Encoder, GpuVideoEncoder, Nv12Converter, SoftwareTextureEncoder,
+    };
     use rewynd_gpu::{D3d11HandleImport, GpuContext};
     use windows::Win32::UI::HiDpi::{
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
@@ -1478,6 +1714,30 @@ mod windows {
             "encode parameters"
         );
 
+        // Pick the encoder backend up front (issue #115): probe adapters, honour the config
+        // override, log both. The capture thread builds the actual encoder, falling back to the
+        // CPU there if the chosen GPU device/encoder can't be created.
+        let adapters = crate::probe::adapter_list();
+        let (encoder_choice, encoder_warning) =
+            config::choose_encoder(&config.encoder_preference(), &adapters);
+        tracing::info!(
+            adapters = ?adapters,
+            choice = %encoder_choice.label(),
+            "encoder capability and selection"
+        );
+        if matches!(encoder_choice, config::EncoderChoice::Cpu) {
+            tracing::warn!(
+                width = params.width,
+                height = params.height,
+                fps = params.framerate,
+                "software H.264 encoding is CPU-heavy at high resolutions; expect high CPU use"
+            );
+        }
+        if let Some(warning) = &encoder_warning {
+            tracing::warn!(warning, "encoder selection fell back");
+            toast("Recording method", warning);
+        }
+
         let audio_params = audio_encode_params(config.audio());
         tracing::info!(
             sample_rate = audio_params.sample_rate,
@@ -1536,6 +1796,16 @@ mod windows {
         // rings so a clip never spans an between-games gap.
         let capture_desktop = config.capture_desktop();
         let recording = Arc::new(AtomicBool::new(capture_desktop));
+
+        // Publish the recorder's live status (chosen backend + game/desktop/idle state) for the
+        // GUI. Game-only capture starts Idle; desktop capture starts Recording the desktop.
+        let initial_state = if capture_desktop {
+            config::RecorderState::Recording
+        } else {
+            config::RecorderState::Idle
+        };
+        let status = crate::status::StatusPublisher::new(encoder_choice.label(), initial_state);
+
         let on_game: Option<rewynd_capture::windows::GameCallback> = if capture_desktop {
             None
         } else {
@@ -1547,6 +1817,7 @@ mod windows {
                 buffer.clone(),
                 audio_buffer.clone(),
                 mic_audio_buffer.clone(),
+                status.clone(),
             ))
         };
 
@@ -1651,6 +1922,8 @@ mod windows {
         // GPU pipeline lives (and tears down) there.
         let capture_buffer = buffer.clone();
         let capture_stop = stop.clone();
+        let capture_choice = encoder_choice.clone();
+        let capture_status = status.clone();
         let capture = std::thread::Builder::new()
             .name("rewynd-capture".to_owned())
             .spawn(move || {
@@ -1661,8 +1934,11 @@ mod windows {
                     &capture_stop,
                     capture_desktop,
                     on_game,
+                    capture_choice,
+                    &capture_status,
                 ) {
                     tracing::error!(error = %e, "capture loop stopped");
+                    capture_status.set_failed(format!("{e:#}"));
                     toast(
                         "Recording stopped",
                         &format!(
@@ -1786,7 +2062,52 @@ mod windows {
         if let Some(h) = flush_hook {
             let _ = h.join();
         }
+        // Drop the status file so the GUI shows "not recording" once we exit.
+        config::clear_recorder_status();
         Ok(())
+    }
+
+    /// Build the GPU-backed encoder for `choice`, falling back to the CPU encoder if the GPU
+    /// device or encoder can't be created.
+    fn build_encoder(
+        choice: &config::EncoderChoice,
+        params: EncodeParams,
+        status: &crate::status::StatusPublisher,
+    ) -> Result<(Arc<GpuContext>, Box<dyn Encoder + Send>)> {
+        match choice {
+            config::EncoderChoice::Gpu(name) => match gpu_encoder(name, params) {
+                Ok(pair) => Ok(pair),
+                Err(e) => {
+                    tracing::warn!(error = %e, "GPU encoder init failed; falling back to the CPU encoder");
+                    toast(
+                        "Recording (CPU encoder)",
+                        &format!(
+                            "The GPU encoder failed to start: {e}. Recording continues on the CPU, which uses more processor power."
+                        ),
+                    );
+                    status.set_encoder(config::EncoderChoice::Cpu.label());
+                    cpu_encoder(params)
+                }
+            },
+            config::EncoderChoice::Cpu => cpu_encoder(params),
+        }
+    }
+
+    /// The GPU (Vulkan Video) encoder on the named adapter.
+    fn gpu_encoder(
+        name: &str,
+        params: EncodeParams,
+    ) -> Result<(Arc<GpuContext>, Box<dyn Encoder + Send>)> {
+        let gpu = Arc::new(pollster::block_on(GpuContext::new_for_adapter(name))?);
+        let enc: Box<dyn Encoder + Send> = Box::new(GpuVideoEncoder::new(&gpu, params)?);
+        Ok((gpu, enc))
+    }
+
+    /// The software (CPU) encoder on a render-only device.
+    fn cpu_encoder(params: EncodeParams) -> Result<(Arc<GpuContext>, Box<dyn Encoder + Send>)> {
+        let gpu = Arc::new(pollster::block_on(GpuContext::new_render_only())?);
+        let enc: Box<dyn Encoder + Send> = Box::new(SoftwareTextureEncoder::new(&gpu, params)?);
+        Ok((gpu, enc))
     }
 
     /// Build the GPU pipeline and pump captured frames into `buffer` until the stream
@@ -1796,6 +2117,7 @@ mod windows {
     /// dependency order afterwards (tearing the device down before the encoder it
     /// backs crashes the driver); by the time the stream returns, the WGC thread is
     /// joined, so these Arcs are the last owners.
+    #[allow(clippy::too_many_arguments)]
     fn run_capture(
         params: EncodeParams,
         epoch: Instant,
@@ -1803,12 +2125,14 @@ mod windows {
         stop: &Arc<AtomicBool>,
         desktop: bool,
         on_game: Option<rewynd_capture::windows::GameCallback>,
+        choice: config::EncoderChoice,
+        status: &crate::status::StatusPublisher,
     ) -> Result<()> {
-        let gpu = Arc::new(pollster::block_on(GpuContext::new())?);
+        let (gpu, enc) = build_encoder(&choice, params, status)?;
         // Mutexes, not RefCell/Rc as on Linux: the per-frame callback runs on the WGC
         // capture thread, so everything it captures must be Send (+Sync via Arc).
         let conv = Arc::new(Mutex::new(Nv12Converter::new(&gpu)?));
-        let enc = Arc::new(Mutex::new(GpuVideoEncoder::new(&gpu, params)?));
+        let enc = Arc::new(Mutex::new(enc));
         tracing::info!(desktop, "capture pipeline ready; filling the ring buffer");
 
         // WGC captures the source at its native size; whatever arrives is scaled to the
@@ -1843,7 +2167,7 @@ mod windows {
                     encode_captured(
                         &gpu,
                         &lock_unpoisoned(&conv),
-                        &mut lock_unpoisoned(&enc),
+                        &mut **lock_unpoisoned(&enc),
                         params,
                         &captured,
                         frame_index == 0 || fresh_ring,
@@ -1890,7 +2214,7 @@ mod windows {
     fn encode_captured(
         gpu: &GpuContext,
         conv: &Nv12Converter,
-        enc: &mut GpuVideoEncoder,
+        enc: &mut dyn Encoder,
         params: EncodeParams,
         captured: &CapturedD3d11Frame,
         force_keyframe: bool,

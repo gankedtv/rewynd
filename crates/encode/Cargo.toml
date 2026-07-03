@@ -15,6 +15,10 @@ rewynd-buffer.workspace = true
 rewynd-gpu.workspace = true
 # Opus audio encoding (docs/adr/0004). Codec work lives here; the muxer stays codec-agnostic.
 opus.workspace = true
+# CPU H.264 encoder fallback (docs/adr/0014): libopenh264 (BSD-2-Clause), Constrained Baseline.
+# Platform-agnostic CPU codec like `opus`, so unconditional; the trait adapter that feeds it
+# from a GPU texture (software_texture.rs) is what needs Vulkan.
+openh264.workspace = true
 
 # gpu-video only builds where Vulkan exists (Windows + non-Apple unixes), matching the
 # crate's own target gating. macOS is out of scope (PLAN §3.6).
@@ -26,6 +30,9 @@ cfg_aliases = "0.2.1"
 
 [dev-dependencies]
 pollster.workspace = true
+# The software encoder's output is validated by muxing it into a real MP4 (no GPU needed).
+rewynd-mux.workspace = true
+tempfile.workspace = true
 
 # The RGBA→NV12 verification test needs the shared GpuContext, which only exists where
 # gpu-video builds; gate its dep on the same targets.

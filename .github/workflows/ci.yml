@@ -109,5 +109,5 @@ jobs:
       - name: coverage gate
         run: |
           cargo llvm-cov --workspace --locked \
-            --ignore-filename-regex '(capture/src/linux/|gpu/src/|encode/src/gpu_video_backend\.rs|app/src/|settings/src/|vendor/mp4/)' \
+            --ignore-filename-regex '(capture/src/linux/|gpu/src/|encode/src/(gpu_video_backend|software_texture)\.rs|app/src/|settings/src/|vendor/mp4/)' \
             --fail-under-lines 85 --summary-only

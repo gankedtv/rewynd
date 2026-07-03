@@ -14,6 +14,9 @@ const DEFAULT_HEIGHT: u32 = 1080;
 const DEFAULT_FRAMERATE: u32 = 60;
 const DEFAULT_VIDEO_BITRATE_BPS: u32 = 12_000_000;
 const DEFAULT_IDR_PERIOD: u32 = 60;
+/// Default encoder selection: prefer a GPU that can encode H.264, else the CPU. See
+/// [`EncoderPreference`].
+const DEFAULT_ENCODER: &str = "auto";
 /// Built-in audio defaults (must match `rewynd_encode::AudioEncodeParams::default`).
 const DEFAULT_SAMPLE_RATE: u32 = 48_000;
 const DEFAULT_CHANNELS: u32 = 2;
@@ -111,7 +114,7 @@ impl std::fmt::Debug for YouTubeSettings {
 }
 
 /// Video encode settings as parsed from TOML, defaulting to the built-ins.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct VideoConfig {
     width: u32,
@@ -119,6 +122,10 @@ struct VideoConfig {
     framerate: u32,
     bitrate_bps: u32,
     idr_period: u32,
+    /// Which encoder records: `"auto"`, `"cpu"`, or `"gpu:<adapter name>"`. Parsed by
+    /// [`EncoderPreference::parse`]; not part of [`VideoSettings`] (it selects a backend, it
+    /// isn't an encode parameter).
+    encoder: String,
 }
 
 impl Default for VideoConfig {
@@ -129,6 +136,53 @@ impl Default for VideoConfig {
             framerate: DEFAULT_FRAMERATE,
             bitrate_bps: DEFAULT_VIDEO_BITRATE_BPS,
             idr_period: DEFAULT_IDR_PERIOD,
+            encoder: DEFAULT_ENCODER.to_owned(),
+        }
+    }
+}
+
+/// The recorder's encoder selection, parsed from the `[video] encoder` config value.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EncoderPreference {
+    /// Prefer a GPU that can encode H.264, fall back to the CPU.
+    #[default]
+    Auto,
+    /// Force the software (CPU) encoder.
+    Cpu,
+    /// Pin a specific GPU by adapter name.
+    Gpu(String),
+}
+
+impl EncoderPreference {
+    /// Parse the stored config string. Unknown values fall back to [`Auto`](Self::Auto) with
+    /// a warning. `"auto"` / `"cpu"` are case-insensitive; the adapter name in `"gpu:<name>"`
+    /// keeps its case (it must match `wgpu`'s reported name exactly).
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
+        let trimmed = value.trim();
+        if let Some(name) = trimmed
+            .strip_prefix("gpu:")
+            .or_else(|| trimmed.strip_prefix("GPU:"))
+        {
+            return Self::Gpu(name.trim().to_owned());
+        }
+        match trimmed.to_ascii_lowercase().as_str() {
+            "" | "auto" => Self::Auto,
+            "cpu" => Self::Cpu,
+            other => {
+                tracing::warn!(value = other, "unknown encoder preference; using auto");
+                Self::Auto
+            }
+        }
+    }
+
+    /// The canonical config string for this preference.
+    #[must_use]
+    pub fn as_config_value(&self) -> String {
+        match self {
+            Self::Auto => "auto".to_owned(),
+            Self::Cpu => "cpu".to_owned(),
+            Self::Gpu(name) => format!("gpu:{name}"),
         }
     }
 }
@@ -358,6 +412,9 @@ impl Config {
         if let Some(v) = u32_of("REWYND_IDR_PERIOD") {
             self.video.idr_period = v;
         }
+        if let Some(v) = get("REWYND_ENCODER").filter(|s| !s.trim().is_empty()) {
+            self.video.encoder = v;
+        }
         if let Some(v) = u32_of("REWYND_AUDIO_BITRATE_BPS") {
             self.audio.bitrate_bps = v;
         }
@@ -524,6 +581,23 @@ impl Config {
         self.capture.desktop
     }
 
+    /// The parsed encoder selection (`auto` / `cpu` / a pinned GPU).
+    #[must_use]
+    pub fn encoder_preference(&self) -> EncoderPreference {
+        EncoderPreference::parse(&self.video.encoder)
+    }
+
+    /// The raw stored encoder value, for the settings editor's dropdown state.
+    #[must_use]
+    pub fn encoder_stored(&self) -> &str {
+        &self.video.encoder
+    }
+
+    /// Set the encoder selection (a raw config value such as `"auto"` or `"gpu:<name>"`).
+    pub fn set_encoder(&mut self, value: String) {
+        self.video.encoder = value;
+    }
+
     /// Whether the recorder should start automatically at login.
     #[must_use]
     pub fn start_on_boot(&self) -> bool {
@@ -645,15 +719,14 @@ impl Config {
         &self.youtube.visibility
     }
 
-    /// Replace the video settings.
+    /// Replace the video settings. The encoder selection is preserved (it isn't part of
+    /// [`VideoSettings`]).
     pub fn set_video(&mut self, v: VideoSettings) {
-        self.video = VideoConfig {
-            width: v.width,
-            height: v.height,
-            framerate: v.framerate,
-            bitrate_bps: v.bitrate_bps,
-            idr_period: v.idr_period,
-        };
+        self.video.width = v.width;
+        self.video.height = v.height;
+        self.video.framerate = v.framerate;
+        self.video.bitrate_bps = v.bitrate_bps;
+        self.video.idr_period = v.idr_period;
     }
 
     /// Set the microphone mix gain.
@@ -923,6 +996,9 @@ height = 1080
 framerate = 60
 bitrate_bps = 12000000
 idr_period = 60
+# Which encoder records: \"auto\" (the GPU when it can encode H.264, else the CPU), \"cpu\",
+# or \"gpu:<adapter name>\" to pin a specific GPU. The CPU path is slower but works anywhere.
+encoder = \"auto\"
 
 [audio]
 sample_rate = 48000

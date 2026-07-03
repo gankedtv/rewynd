@@ -29,7 +29,7 @@ use rewynd_config::{self as config, Config};
 use crate::theme::{
     DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, arena_check, arena_input, arena_pick, arena_slider, card,
     field, field_label, hint, link_button, logo, oauth_button, palette, primary_button,
-    secondary_button, setting, tinted, value_row, window_icon,
+    secondary_button, setting, status_pill, tinted, value_row, window_icon,
 };
 
 /// Whether a stored URL points somewhere other than the shipped default (empty means "use the
@@ -80,6 +80,36 @@ const WATCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500
 /// How long to wait before re-arming the clip-directory watch when the directory does not exist
 /// yet (a fresh machine that has never saved a clip).
 const WATCH_RETRY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How often to poll the recorder's status file for the top-right pill.
+const STATUS_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Poll the recorder's status file about once a second, emitting a [`Message::RecorderStatus`]
+/// only when it changes (plus once at startup). The read is a small file plus a pid liveness
+/// check, run off the UI thread.
+fn recorder_status_stream() -> impl iced::futures::Stream<Item = Message> {
+    iced::stream::channel(
+        4,
+        |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+            use iced::futures::SinkExt;
+            let mut last: Option<config::RecorderStatus> = None;
+            let mut first = true;
+            loop {
+                let current = tokio::task::spawn_blocking(config::read_recorder_status)
+                    .await
+                    .unwrap_or(None);
+                if first || current != last {
+                    first = false;
+                    last = current.clone();
+                    if output.send(Message::RecorderStatus(current)).await.is_err() {
+                        break;
+                    }
+                }
+                tokio::time::sleep(STATUS_POLL).await;
+            }
+        },
+    )
+}
 
 /// Watch `dir` recursively and yield a debounced [`Message::ClipsChanged`] whenever clips there
 /// appear or disappear. Recursive so a brand-new per-game subfolder (the first clip of a new
@@ -285,6 +315,73 @@ impl fmt::Display for Resolution {
     }
 }
 
+/// One entry in the "Recording method" dropdown: the stored config value plus a display label.
+#[derive(Clone, PartialEq, Eq)]
+struct EncoderOption {
+    value: String,
+    label: String,
+}
+
+impl fmt::Display for EncoderOption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+/// Build the recording-method options from the recorder's probe (just auto + CPU when the probe
+/// is missing). Encode-incapable adapters are excluded; a pinned GPU that isn't in the probe
+/// stays visible as "(unavailable)" so the selection never silently snaps to auto.
+fn encoder_options(probe: Option<&config::EncoderProbe>, stored: &str) -> Vec<EncoderOption> {
+    let mut options = vec![EncoderOption {
+        value: "auto".to_owned(),
+        label: "Automatic (recommended)".to_owned(),
+    }];
+    let mut saw_stored = stored == "auto" || stored == "cpu";
+    if let Some(probe) = probe {
+        for adapter in &probe.adapters {
+            if !adapter.h264_encode {
+                continue;
+            }
+            let value = format!("gpu:{}", adapter.name);
+            saw_stored |= value == stored;
+            options.push(EncoderOption {
+                label: format!("GPU: {}", adapter.name),
+                value,
+            });
+        }
+    }
+    if !saw_stored && let Some(name) = stored.strip_prefix("gpu:") {
+        options.push(EncoderOption {
+            value: stored.to_owned(),
+            label: format!("{name} (unavailable)"),
+        });
+    }
+    options.push(EncoderOption {
+        value: "cpu".to_owned(),
+        label: "CPU (not recommended)".to_owned(),
+    });
+    options
+}
+
+/// The top-right status pill's text and dot colour for a recorder status (`None` = not running).
+fn status_pill_parts(status: Option<&config::RecorderStatus>) -> (String, iced::Color) {
+    use config::RecorderState;
+    match status {
+        None => ("Not recording".to_owned(), palette::MUTED),
+        Some(s) => match s.state {
+            RecorderState::Recording => match &s.game {
+                Some(game) => (
+                    format!("Recording: {}", truncate_mic_label(game)),
+                    palette::ACCENT,
+                ),
+                None => ("Recording: Desktop".to_owned(), palette::ACCENT),
+            },
+            RecorderState::Idle => ("Waiting for a game".to_owned(), palette::MUTED),
+            RecorderState::Failed => ("Capture failed".to_owned(), palette::DANGER),
+        },
+    }
+}
+
 #[derive(Debug, Clone)]
 enum Status {
     Editing,
@@ -348,6 +445,11 @@ struct App {
     yt_advanced_open: bool,
     yt_login: YtLoginState,
     status: Status,
+    /// The recorder's encoder probe (adapters + capability), for the recording-method picker.
+    /// `None` until the probe returns (or if it fails).
+    encoder_probe: Option<config::EncoderProbe>,
+    /// The recorder's live status (game/desktop/idle/failed), polled for the top-right pill.
+    recorder_status: Option<config::RecorderStatus>,
 }
 
 /// Where the ganked.tv device login stands. "Connected" is not a state here — it is derived from
@@ -408,6 +510,11 @@ enum Message {
     ResolutionPicked(Resolution),
     FpsPicked(u32),
     BitrateMbps(u32),
+    EncoderPicked(String),
+    /// The recorder's `--probe-encoders` output (for the recording-method picker).
+    EncodersProbed(Result<config::EncoderProbe, String>),
+    /// A poll of the recorder's status file (for the top-right pill).
+    RecorderStatus(Option<config::RecorderStatus>),
     OutputDirEdited(String),
     BrowseDir,
     DirPicked(Option<String>),
@@ -452,7 +559,17 @@ impl App {
     fn load() -> (Self, Task<Message>) {
         let mut app = Self::new();
         let scan = app.library.refresh(&app.config).map(Message::Library);
-        (app, scan)
+        // Ask the recorder to enumerate the machine's encoders in the background (it spawns a
+        // short-lived Vulkan probe process); the recording-method picker fills in when it returns.
+        let probe = Task::perform(
+            async {
+                tokio::task::spawn_blocking(probe_encoders_via_recorder)
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+            },
+            Message::EncodersProbed,
+        );
+        (app, Task::batch([scan, probe]))
     }
 
     fn new() -> Self {
@@ -502,6 +619,8 @@ impl App {
             yt_login: YtLoginState::Idle,
             status: Status::Editing,
             last_save_ok: false,
+            encoder_probe: None,
+            recorder_status: None,
         }
     }
 
@@ -626,6 +745,20 @@ impl App {
                 v.bitrate_bps = mbps.saturating_mul(BITS_PER_MBIT);
                 self.config.set_video(v);
                 self.touch();
+            }
+            Message::EncoderPicked(value) => {
+                self.config.set_encoder(value);
+                self.touch();
+            }
+            Message::EncodersProbed(Ok(probe)) => {
+                self.encoder_probe = Some(probe);
+            }
+            Message::EncodersProbed(Err(e)) => {
+                // Not fatal: the picker falls back to just Automatic + CPU.
+                tracing::warn!(error = %e, "could not probe encoders; the picker lists auto + CPU only");
+            }
+            Message::RecorderStatus(status) => {
+                self.recorder_status = status;
             }
             Message::OutputDirEdited(s) => {
                 self.output_dir = s;
@@ -999,7 +1132,7 @@ impl App {
             View::Settings => self.settings_view(),
             View::Onboarding => unreachable!("handled above"),
         };
-        column![nav_bar(self.view), body].into()
+        column![nav_bar(self.view, self.recorder_status.as_ref()), body].into()
     }
 
     /// Apply the wizard's choices, persist, and open the library. The recorder is restarted so it
@@ -1073,12 +1206,15 @@ impl App {
         let clips = iced::Subscription::run_with(dir, |dir| {
             clip_watch_stream(std::path::PathBuf::from(dir))
         });
+        // Poll the recorder's status file for the top-right pill.
+        let status = iced::Subscription::run(recorder_status_stream);
         // The library adds its own conditional subscriptions (accent-fade ticks, preview
         // playback); iced re-diffs after each update, so they vanish when idle and the software
         // renderer stops redrawing.
         iced::Subscription::batch([
             focus,
             clips,
+            status,
             self.library.subscription().map(Message::Library),
         ])
     }
@@ -1213,6 +1349,30 @@ impl App {
         }
         let audio = card("AUDIO", column(audio_items).spacing(18));
 
+        // Recording method: Automatic / one entry per encode-capable GPU / CPU. Populated from
+        // the recorder's probe; a CPU pick gets a processor-cost hint.
+        let stored_encoder = self.config.encoder_stored().to_owned();
+        let encoder_opts = encoder_options(self.encoder_probe.as_ref(), &stored_encoder);
+        let selected_encoder = encoder_opts
+            .iter()
+            .find(|o| o.value == stored_encoder)
+            .cloned();
+        let encoder_control = pick_list(encoder_opts, selected_encoder, |o: EncoderOption| {
+            Message::EncoderPicked(o.value)
+        })
+        .style(arena_pick)
+        .width(Length::Fill);
+        let encoder_method: Element<Message> = if stored_encoder == "cpu" {
+            column![
+                setting("Recording method", String::new(), encoder_control),
+                hint("The CPU encoder works everywhere but uses much more processor power at high resolutions."),
+            ]
+            .spacing(7)
+            .into()
+        } else {
+            setting("Recording method", String::new(), encoder_control)
+        };
+
         let recording = card(
             "RECORDING",
             column![
@@ -1250,6 +1410,7 @@ impl App {
                     )
                     .style(arena_slider),
                 ),
+                encoder_method,
                 value_row("Estimated clip size", format!("about {est_mb} MB")),
             ]
             .spacing(18),
@@ -1741,7 +1902,10 @@ fn brand_home() -> Element<'static, Message> {
 
 /// The top navigation, Arena style: the brand on the left, then the Library/Settings links
 /// (accent-on-tint pill when active), on a raised bar over a hairline divider.
-fn nav_bar(active: View) -> Element<'static, Message> {
+fn nav_bar(
+    active: View,
+    recorder_status: Option<&config::RecorderStatus>,
+) -> Element<'static, Message> {
     let tab = |label: &'static str, view: View| {
         let is_active = view == active;
         button(text(label).size(12).font(UI_SEMIBOLD))
@@ -1749,12 +1913,15 @@ fn nav_bar(active: View) -> Element<'static, Message> {
             .style(move |_: &Theme, status| nav_link(is_active, status))
             .padding([6, 10])
     };
+    let (pill_label, pill_dot) = status_pill_parts(recorder_status);
     let bar = container(
         row![
             brand_home(),
             iced::widget::Space::new().width(8),
             tab("Library", View::Library),
             tab("Settings", View::Settings),
+            iced::widget::Space::new().width(Length::Fill),
+            status_pill(pill_label, pill_dot),
         ]
         .spacing(10)
         .align_y(iced::Alignment::Center),
@@ -1845,6 +2012,22 @@ fn recorder_path() -> Option<std::path::PathBuf> {
     config::sibling_binary("rewynd-recorder")
 }
 
+/// Ask the (sibling) recorder to enumerate the machine's encoders (`--probe-encoders`). Blocking
+/// — runs on a `spawn_blocking` thread. A non-zero exit or unparseable output is an error, and
+/// the picker falls back to just Automatic + CPU.
+fn probe_encoders_via_recorder() -> Result<config::EncoderProbe, String> {
+    let recorder =
+        recorder_path().ok_or_else(|| "could not locate the recorder binary".to_owned())?;
+    let output = std::process::Command::new(&recorder)
+        .arg("--probe-encoders")
+        .output()
+        .map_err(|e| format!("could not run the encoder probe: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("the encoder probe exited with {}", output.status));
+    }
+    config::EncoderProbe::from_json(String::from_utf8_lossy(&output.stdout).trim())
+}
+
 /// Stop the running recorder (if any), wait for it to exit, then launch a fresh one so it picks
 /// up the saved config. Blocking — runs on a `spawn_blocking` thread, not the UI thread.
 /// The stop half (pid verification, SIGTERM→SIGKILL escalation, start-time identity guard)
@@ -1893,5 +2076,77 @@ mod tests {
         // The view shows bps/1_000_000; a message multiplies back.
         assert_eq!(12_000_000 / BITS_PER_MBIT, 12);
         assert_eq!(25u32.saturating_mul(BITS_PER_MBIT), 25_000_000);
+    }
+
+    fn probe(adapters: &[(&str, bool)]) -> config::EncoderProbe {
+        config::EncoderProbe::new(
+            adapters
+                .iter()
+                .map(|(name, h264)| config::ProbeAdapter {
+                    name: (*name).to_owned(),
+                    device_type: "discrete".to_owned(),
+                    h264_encode: *h264,
+                    max_width: 4096,
+                    max_height: 4096,
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn encoder_options_lists_auto_capable_gpus_and_cpu() {
+        let p = probe(&[("RTX 3080 Ti", true), ("iGPU", false)]);
+        let opts = encoder_options(Some(&p), "auto");
+        let values: Vec<&str> = opts.iter().map(|o| o.value.as_str()).collect();
+        // Auto first, the encode-capable GPU, then CPU; the incapable iGPU is excluded.
+        assert_eq!(values, ["auto", "gpu:RTX 3080 Ti", "cpu"]);
+    }
+
+    #[test]
+    fn encoder_options_without_probe_are_auto_and_cpu() {
+        let opts = encoder_options(None, "auto");
+        let values: Vec<&str> = opts.iter().map(|o| o.value.as_str()).collect();
+        assert_eq!(values, ["auto", "cpu"]);
+    }
+
+    #[test]
+    fn encoder_options_keep_a_pinned_but_missing_gpu_visible() {
+        let p = probe(&[("RTX 3080 Ti", true)]);
+        let opts = encoder_options(Some(&p), "gpu:Old Card");
+        let missing = opts
+            .iter()
+            .find(|o| o.value == "gpu:Old Card")
+            .expect("stored-but-missing GPU stays selectable");
+        assert!(missing.label.contains("unavailable"));
+    }
+
+    #[test]
+    fn status_pill_reflects_state() {
+        use config::{RecorderState, RecorderStatus};
+        let base = RecorderStatus {
+            version: config::RECORDER_STATUS_VERSION,
+            pid: 1,
+            encoder: "cpu".to_owned(),
+            state: RecorderState::Recording,
+            game: Some("Hades II".to_owned()),
+            detail: None,
+        };
+        assert_eq!(status_pill_parts(None).0, "Not recording");
+        assert_eq!(status_pill_parts(Some(&base)).0, "Recording: Hades II");
+        let desktop = RecorderStatus {
+            game: None,
+            ..base.clone()
+        };
+        assert_eq!(status_pill_parts(Some(&desktop)).0, "Recording: Desktop");
+        let idle = RecorderStatus {
+            state: RecorderState::Idle,
+            ..base.clone()
+        };
+        assert_eq!(status_pill_parts(Some(&idle)).0, "Waiting for a game");
+        let failed = RecorderStatus {
+            state: RecorderState::Failed,
+            ..base
+        };
+        assert_eq!(status_pill_parts(Some(&failed)).0, "Capture failed");
     }
 }

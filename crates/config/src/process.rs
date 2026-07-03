@@ -97,12 +97,7 @@ pub fn request_recorder_save() -> std::io::Result<bool> {
     let Ok(raw) = libc::pid_t::try_from(pid) else {
         return Ok(false);
     };
-    if raw <= 0 {
-        return Ok(false);
-    }
-    if !std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .is_ok_and(|comm| comm.trim() == "rewynd-recorder")
-    {
+    if raw <= 0 || !recorder_alive(pid) {
         return Ok(false);
     }
     send_signal(raw, libc::SIGUSR1)
@@ -112,6 +107,53 @@ pub fn request_recorder_save() -> std::io::Result<bool> {
 #[cfg(not(unix))]
 pub fn request_recorder_save() -> std::io::Result<bool> {
     Ok(false)
+}
+
+/// Whether `pid` is a live recorder process. The identity check (a reused pid must never read
+/// as alive) mirrors [`stop_process`]: `/proc/<pid>/comm` on unix, the image file name on
+/// Windows. Used by the status reader to reject a stale `status.json` after a crash.
+#[cfg(unix)]
+pub(crate) fn recorder_alive(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .is_ok_and(|comm| comm.trim() == "rewynd-recorder")
+}
+
+#[cfg(windows)]
+pub(crate) fn recorder_alive(pid: u32) -> bool {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
+    };
+    use windows::core::PWSTR;
+
+    // SAFETY: FFI; a failed open (process gone / no access) reads as not-alive.
+    let Ok(handle) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
+        return false;
+    };
+    // SAFETY: `OpenProcess` succeeded, so `handle` is a valid handle we own.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+    let raw = HANDLE(handle.as_raw_handle());
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: FFI; `buf`/`len` describe a valid buffer.
+    if unsafe {
+        QueryFullProcessImageNameW(raw, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len)
+    }
+    .is_err()
+    {
+        return false;
+    }
+    let image = String::from_utf16_lossy(&buf[..len as usize]);
+    std::path::Path::new(&image)
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("rewynd-recorder.exe"))
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn recorder_alive(_pid: u32) -> bool {
+    false
 }
 
 /// Name of the per-session stop event the recorder waits on — the Windows stand-in for

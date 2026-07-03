@@ -9,7 +9,7 @@
 - Dev box: CachyOS / RTX 3080 Ti / KWin Wayland.
 
 ### Coverage
-- CI gates **85% line coverage** on CI-testable code, excluding GPU/portal/GUI/wiring code via `--ignore-filename-regex '(capture/src/linux/|gpu/src/|encode/src/gpu_video_backend\.rs|app/src/|settings/src/|vendor/mp4/)'` (no GPU/live Wayland/display/tray in CI; `app/src/` is the binary wiring + the tray; `settings/src/` is the iced GUI; `vendor/mp4/` is the vendored third-party muxer fork — ADR 0004). Testable logic lives in the library crates.
+- CI gates **85% line coverage** on CI-testable code, excluding GPU/portal/GUI/wiring code via `--ignore-filename-regex '(capture/src/linux/|gpu/src/|encode/src/(gpu_video_backend|software_texture)\.rs|app/src/|settings/src/|vendor/mp4/)'` (no GPU/live Wayland/display/tray in CI; `app/src/` is the binary wiring + the tray; `settings/src/` is the iced GUI; `encode/src/software_texture.rs` is the CPU encoder's GPU-readback adapter, while its pure CPU core in `software.rs` stays covered; `vendor/mp4/` is the vendored third-party muxer fork — ADR 0004). Testable logic lives in the library crates.
 - That GPU/portal code is validated by `#[ignore]`d tests on a GPU box. Full local coverage including them: `cargo llvm-cov --workspace --include-ignored`.
 
 ## Hard rules

@@ -53,7 +53,7 @@ open = "5"
 notify-rust = "4"
 # CPU H.264 decode for library thumbnails (docs/adr/0013). BSD-2-Clause; the default `source`
 # feature compiles Cisco's openh264 from vendored source (decode-only use here).
-openh264 = "0.9"
+openh264.workspace = true
 # The thumbnail disk cache lives under the user cache dir.
 dirs = "6"
 # Auto-refresh: watch the clips directory (and its per-game subfolders) so a clip saved with the

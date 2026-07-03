@@ -470,3 +470,29 @@ pub fn accent_chip<'a, M: 'a>(label: String) -> Element<'a, M> {
     })
     .into()
 }
+
+/// The recorder-status pill for the window's top-right (Arena §5.9 status dot): a small coloured
+/// dot plus a quiet label.
+pub fn status_pill<'a, M: 'a>(label: String, dot: iced::Color) -> Element<'a, M> {
+    let indicator =
+        container(iced::widget::Space::new().width(7).height(7)).style(move |_: &Theme| {
+            container::Style {
+                background: Some(Background::Color(dot)),
+                border: Border {
+                    radius: 4.0.into(),
+                    ..Border::default()
+                },
+                ..container::Style::default()
+            }
+        });
+    row![
+        indicator,
+        text(label)
+            .size(11)
+            .font(UI_SEMIBOLD)
+            .style(tinted(palette::TEXT_SECONDARY)),
+    ]
+    .spacing(7)
+    .align_y(iced::Alignment::Center)
+    .into()
+}

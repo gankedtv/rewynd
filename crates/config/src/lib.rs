@@ -23,10 +23,12 @@
 mod clips;
 mod desktop;
 mod devices;
+mod encoders;
 mod lock;
 mod paths;
 mod process;
 mod schema;
+mod status;
 pub mod upload_history;
 
 pub use clips::{
@@ -37,6 +39,9 @@ pub use clips::{
 pub use desktop::register_toast_identity;
 pub use desktop::{BRAND_ICONS, install_autostart, refresh_autostart, remove_autostart};
 pub use devices::{AudioInput, list_audio_inputs};
+pub use encoders::{
+    ENCODER_PROBE_VERSION, EncoderChoice, EncoderProbe, ProbeAdapter, choose_encoder,
+};
 // XDG desktop entries / hicolor icons exist only on unix desktops; Windows autostart is
 // a Run-key value behind the same install/remove/refresh surface above.
 #[cfg(unix)]
@@ -52,6 +57,10 @@ pub use process::RecorderStopEvent;
 pub use process::{read_recorder_pid, request_recorder_save, stop_recorder};
 pub use schema::{
     AudioSettings, Config, DEFAULT_HOTKEY_TRIGGER, DEFAULT_TEMPLATE, DEFAULT_UPLOAD_API_URL,
-    DEFAULT_UPLOAD_SHARE_URL, MAX_BUFFER_SECONDS, UploadSettings, VideoSettings, YouTubeSettings,
-    ensure_default_file, load, load_file, non_empty_or,
+    DEFAULT_UPLOAD_SHARE_URL, EncoderPreference, MAX_BUFFER_SECONDS, UploadSettings, VideoSettings,
+    YouTubeSettings, ensure_default_file, load, load_file, non_empty_or,
+};
+pub use status::{
+    RECORDER_STATUS_VERSION, RecorderState, RecorderStatus, clear_recorder_status,
+    read_recorder_status, recorder_status_path, write_recorder_status,
 };
