@@ -63,6 +63,21 @@ pub fn load(path: &Path, modified: SystemTime) -> Result<Loaded, String> {
     })
 }
 
+/// Decode the keyframe nearest `position` (0.0..=1.0) of the clip at `path`, downscaled to at
+/// most `width` px wide, as an in-memory handle. No disk cache: filmstrip cells are small and
+/// live only while the clip's detail page is open. Blocking; runs on a background task.
+pub fn load_at(path: &Path, position: f32, width: u32) -> Result<Handle, String> {
+    let (_summary, annexb) =
+        rewynd_mux::read::clip_preview_at(path, position).map_err(|e| e.to_string())?;
+    let (w, h, rgb) = decode_first_frame(&annexb)?;
+    let frame = image::RgbImage::from_raw(w, h, rgb)
+        .ok_or_else(|| "decoded frame size mismatch".to_owned())?;
+    let (tw, th) = scaled_dims(w, h, width);
+    let thumb = image::imageops::thumbnail(&frame, tw, th);
+    let rgba = image::DynamicImage::ImageRgb8(thumb).into_rgba8();
+    Ok(Handle::from_rgba(tw, th, rgba.into_raw()))
+}
+
 /// Drop the cached PNG for a clip the user deleted (best effort).
 pub fn remove_cached(path: &Path, modified: SystemTime) {
     if let Some(cached) = cache_file(path, modified) {
@@ -218,14 +233,19 @@ fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-/// Thumbnail dimensions: capped at [`THUMB_WIDTH`] keeping the aspect ratio; smaller frames
-/// stay as they are.
+/// Thumbnail dimensions: capped at [`THUMB_WIDTH`] keeping the aspect ratio.
 fn thumb_dims(width: u32, height: u32) -> (u32, u32) {
-    if width <= THUMB_WIDTH || width == 0 {
+    scaled_dims(width, height, THUMB_WIDTH)
+}
+
+/// Dimensions capped at `cap` px wide, keeping the aspect ratio; smaller frames stay as they
+/// are. Degenerate input collapses to 1x1 so the result is always drawable.
+fn scaled_dims(width: u32, height: u32, cap: u32) -> (u32, u32) {
+    if width <= cap || width == 0 {
         return (width.max(1), height.max(1));
     }
-    let th = (u64::from(height) * u64::from(THUMB_WIDTH) / u64::from(width)) as u32;
-    (THUMB_WIDTH, th.max(1))
+    let sh = (u64::from(height) * u64::from(cap) / u64::from(width)) as u32;
+    (cap, sh.max(1))
 }
 
 #[cfg(test)]
@@ -250,6 +270,14 @@ mod tests {
             ),
             "a rewritten file gets a fresh cache entry"
         );
+    }
+
+    #[test]
+    fn scaled_dims_caps_to_the_given_width() {
+        assert_eq!(scaled_dims(1920, 1080, 120), (120, 67));
+        assert_eq!(scaled_dims(1920, 1080, 480), (480, 270));
+        assert_eq!(scaled_dims(64, 36, 120), (64, 36), "smaller than cap stays as-is");
+        assert_eq!(scaled_dims(0, 0, 120), (1, 1), "degenerate input stays drawable");
     }
 
     #[test]
