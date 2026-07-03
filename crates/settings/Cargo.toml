@@ -32,6 +32,9 @@ iced = { version = "0.14", default-features = false, features = [
     "tokio",
     "wayland",
     "x11",
+    # The custom trim-bar widget (docs/adr 0006 keeps us on the software renderer) is built on
+    # `iced::advanced`.
+    "advanced",
     # Raster brand mark. Deliberately NOT `svg`: iced's svg path (resvg) scans every system
     # font on the first draw, and NOT `image`: that turns on every codec in the image crate.
     "image-without-codecs",

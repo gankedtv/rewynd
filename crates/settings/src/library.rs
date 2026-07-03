@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use iced::widget::{
-    Space, button, column, container, pick_list, row, scrollable, slider, text, text_input,
+    Space, button, column, container, pick_list, row, scrollable, text, text_input,
 };
 use iced::{Background, Border, Element, Length, Task, Theme};
 
@@ -21,9 +21,10 @@ use rewynd_upload::{GankedClient, Visibility, default_title, user_facing_upload_
 
 use crate::theme::{
     self, DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, accent_button_style, accent_chip, card, field_label,
-    hint, link_button, palette, primary_button, secondary_button, setting, tinted, value_row,
+    hint, link_button, palette, primary_button, secondary_button, tinted, value_row,
 };
 use crate::thumbs;
+use crate::trimbar;
 
 /// Cards per grid row (the body column is width-capped, so a fixed count stays balanced).
 const GRID_COLUMNS: usize = 3;
@@ -179,9 +180,10 @@ pub enum Message {
     Deleted(Result<PathBuf, String>),
     TrimStartChanged(f32),
     TrimEndChanged(f32),
-    TrimSave,
+    TrimSave(SaveMode),
     TrimSaved {
         src: PathBuf,
+        mode: SaveMode,
         result: Result<PathBuf, String>,
     },
     TitleEdited(String),
@@ -202,11 +204,21 @@ pub enum Message {
     StripDone(PathBuf, usize, Result<iced::widget::image::Handle, String>),
 }
 
+/// What a trim save does with the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveMode {
+    /// Replace the original clip in place, so the open detail page (and the upload below it) act
+    /// on the trimmed clip.
+    Overwrite,
+    /// Keep the original and write the trim to a new file.
+    Copy,
+}
+
 /// Where the open clip's trim stands.
 enum TrimState {
     Idle,
     Saving,
-    Saved(PathBuf),
+    Saved { overwrite: bool, path: PathBuf },
     Failed(String),
 }
 
@@ -447,7 +459,7 @@ impl Library {
                 self.trim_end = v.clamp(self.trim_start + 0.2, hi.max(0.2));
                 self.trim = TrimState::Idle;
             }
-            Message::TrimSave => {
+            Message::TrimSave(mode) => {
                 let Some(src) = self.open.clone() else {
                     return Task::none();
                 };
@@ -457,31 +469,34 @@ impl Library {
                 let work_src = src.clone();
                 return Task::perform(
                     async move {
-                        tokio::task::spawn_blocking(move || {
-                            let dst = unique_trim_path(&work_src);
-                            rewynd_mux::read::trim_clip(&work_src, &dst, start, end)
-                                .map(|_| dst)
-                                .map_err(|e| e.to_string())
-                        })
-                        .await
-                        .unwrap_or_else(|e| Err(e.to_string()))
+                        tokio::task::spawn_blocking(move || save_trim(&work_src, mode, start, end))
+                            .await
+                            .unwrap_or_else(|e| Err(e.to_string()))
                     },
                     move |result| Message::TrimSaved {
                         src: src.clone(),
+                        mode,
                         result,
                     },
                 );
             }
-            Message::TrimSaved { src, result } => {
+            Message::TrimSaved { src, mode, result } => {
                 // The trim may finish after the user opened another clip; only stamp the result on
                 // its own detail page. The rescan still runs so the new clip shows up regardless.
                 let current = self.open.as_deref() == Some(src.as_path());
                 match result {
                     Ok(path) => {
+                        let overwrite = matches!(mode, SaveMode::Overwrite);
                         if current {
-                            self.trim = TrimState::Saved(path);
+                            self.trim = TrimState::Saved { overwrite, path };
                         }
-                        return self.refresh(config);
+                        let mut tasks = vec![self.refresh(config)];
+                        // Overwrite replaced the open clip in place: reload its span + filmstrip so
+                        // the panel (and the upload below) work on the now-trimmed content.
+                        if current && overwrite {
+                            tasks.push(self.refresh_open_after_trim());
+                        }
+                        return Task::batch(tasks);
                     }
                     Err(e) if current => {
                         self.trim =
@@ -607,6 +622,19 @@ impl Library {
             ));
         }
         Task::batch(tasks)
+    }
+
+    /// Reload the open clip's trim span and filmstrip after an in-place overwrite: its duration
+    /// and frames changed, so reset the range to the new full span and re-decode the strip.
+    fn refresh_open_after_trim(&mut self) -> Task<Message> {
+        let Some(path) = self.open.clone() else {
+            return Task::none();
+        };
+        self.open_dur =
+            rewynd_mux::read::clip_summary(&path).map_or(0.0, |s| s.duration.as_secs_f32());
+        self.trim_start = 0.0;
+        self.trim_end = self.open_dur;
+        self.build_strip(path)
     }
 
     /// Drop the filmstrip for whatever clip was open (free the decoded frames).
@@ -1263,8 +1291,8 @@ impl Library {
         self.open_dur
     }
 
-    /// A row of keyframe thumbnails across the whole clip, the kept `[start, end]` band bright
-    /// with a mint edge and the rest scrimmed. Driven by the trim sliders; purely visual.
+    /// A row of keyframe thumbnails across the whole clip, with the draggable [`TrimBar`] on top:
+    /// the kept `[start, end]` band stays lit with mint handles, the rest is scrimmed.
     fn filmstrip(&self) -> Element<'_, Message> {
         if self.strip.is_empty() {
             return Space::new().into();
@@ -1293,36 +1321,14 @@ impl Library {
             );
         }
 
-        let (left, mid, right) = range_portions(self.trim_start, self.trim_end, self.open_dur);
-        let scrim = |portion: u16| -> Element<Message> {
-            container(Space::new())
-                .width(Length::FillPortion(portion))
-                .height(Length::Fill)
-                .style(|_: &Theme| container::Style {
-                    background: Some(Background::Color(iced::Color {
-                        a: 0.62,
-                        ..palette::BACKGROUND
-                    })),
-                    ..container::Style::default()
-                })
-                .into()
-        };
-        let kept = container(Space::new())
-            .width(Length::FillPortion(mid))
-            .height(Length::Fill)
-            .style(|_: &Theme| container::Style {
-                border: Border {
-                    color: palette::ACCENT,
-                    width: 2.0,
-                    radius: 4.0.into(),
-                },
-                ..container::Style::default()
-            });
-        let overlay = row![scrim(left), kept, scrim(right)]
-            .width(Length::Fill)
-            .height(Length::Fill);
-
-        container(iced::widget::stack![cells, overlay])
+        let bar = trimbar::TrimBar::new(
+            self.trim_start,
+            self.trim_end,
+            self.open_dur,
+            Message::TrimStartChanged,
+            Message::TrimEndChanged,
+        );
+        container(iced::widget::stack![cells, bar])
             .width(Length::Fill)
             .height(Length::Fixed(64.0))
             .style(theme::card_style)
@@ -1338,43 +1344,51 @@ impl Library {
 
         let panel = column![
             self.filmstrip(),
-            setting(
-                "Start",
-                secs_label(start),
-                slider(0.0..=dur, start, Message::TrimStartChanged)
-                    .step(0.1f32)
-                    .style(theme::arena_slider),
-            ),
-            setting(
-                "End",
-                secs_label(end),
-                slider(0.0..=dur, end, Message::TrimEndChanged)
-                    .step(0.1f32)
-                    .style(theme::arena_slider),
-            ),
+            value_row("Start", secs_label(start)),
+            value_row("End", secs_label(end)),
             value_row("Trimmed length", secs_label(length)),
             hint(
-                "The start snaps back to the nearest keyframe (about a second), so the cut is \
-                 instant and lossless. The trimmed clip is saved as a new file.",
+                "Drag the handles on the timeline to set the range. The start snaps back to the \
+                 nearest keyframe (about a second), so the cut is lossless. Save replaces this \
+                 clip; Save as copy keeps the original.",
             ),
         ]
         .spacing(14);
 
         let busy = matches!(self.trim, TrimState::Saving);
-        let mut save = button(text("Save trimmed clip").size(13).font(UI_BOLD))
+        let ready = !busy && length >= 0.2;
+        let mut save = button(text("Save").size(13).font(UI_BOLD))
             .style(primary_button)
             .padding([11, 24]);
-        if !busy && length >= 0.2 {
-            save = save.on_press(Message::TrimSave);
+        let mut save_copy = button(text("Save as copy").size(12).font(UI_SEMIBOLD))
+            .style(secondary_button)
+            .padding([11, 20]);
+        if ready {
+            save = save.on_press(Message::TrimSave(SaveMode::Overwrite));
+            save_copy = save_copy.on_press(Message::TrimSave(SaveMode::Copy));
         }
-        let panel = panel.push(row![save].spacing(10));
+        let panel = panel.push(
+            row![save, save_copy]
+                .spacing(10)
+                .align_y(iced::Alignment::Center),
+        );
 
         let panel = match &self.trim {
             TrimState::Idle => panel,
             TrimState::Saving => panel.push(hint("Saving the trimmed clip...")),
-            TrimState::Saved(path) => panel.push(
+            TrimState::Saved {
+                overwrite: true, ..
+            } => panel.push(
+                text("Trimmed. Ready to upload below.")
+                    .size(12)
+                    .style(tinted(palette::ACCENT)),
+            ),
+            TrimState::Saved {
+                overwrite: false,
+                path,
+            } => panel.push(
                 column![
-                    text("Saved a trimmed clip.")
+                    text("Saved a trimmed copy.")
                         .size(12)
                         .style(tinted(palette::ACCENT)),
                     hint(path.display().to_string()),
@@ -1977,28 +1991,50 @@ fn unique_trim_path(src: &Path) -> PathBuf {
     candidate
 }
 
+/// A sibling temp path in `src`'s directory (so the replace is a same-filesystem, atomic rename).
+fn overwrite_temp_path(src: &Path) -> PathBuf {
+    let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("clip");
+    src.with_file_name(format!(".{name}.trimming.{}.tmp", std::process::id()))
+}
+
+/// Trim `src` to `[start, end]`. [`SaveMode::Copy`] writes a fresh sibling file and returns it;
+/// [`SaveMode::Overwrite`] writes a temp then atomically renames it over `src` (leaving the
+/// original untouched if anything fails), returning `src`. Blocking.
+fn save_trim(
+    src: &Path,
+    mode: SaveMode,
+    start: Duration,
+    end: Duration,
+) -> Result<PathBuf, String> {
+    match mode {
+        SaveMode::Copy => {
+            let dst = unique_trim_path(src);
+            rewynd_mux::read::trim_clip(src, &dst, start, end)
+                .map(|_| dst)
+                .map_err(|e| e.to_string())
+        }
+        SaveMode::Overwrite => {
+            let temp = overwrite_temp_path(src);
+            let result = rewynd_mux::read::trim_clip(src, &temp, start, end)
+                .map_err(|e| e.to_string())
+                .and_then(|_| std::fs::rename(&temp, src).map_err(|e| e.to_string()))
+                .map(|()| src.to_path_buf());
+            if result.is_err() {
+                let _ = std::fs::remove_file(&temp);
+            }
+            result
+        }
+    }
+}
+
 /// `n` evenly spaced, centred sample positions in `0.0..1.0` (cell i samples its own midpoint),
 /// so the strip skips the very first and last frames.
 fn filmstrip_positions(n: usize) -> Vec<f32> {
     (0..n).map(|i| (i as f32 + 0.5) / n as f32).collect()
 }
 
-/// FillPortion weights (left scrim, kept band, right scrim) for the `[start, end]` window over
-/// `dur`, on a fixed 1000 scale. A zero weight renders as zero width (iced treats FillPortion(0)
-/// as non-fluid). A non-positive `dur` degenerates to "all kept".
-fn range_portions(start: f32, end: f32, dur: f32) -> (u16, u16, u16) {
-    if dur <= 0.0 {
-        return (0, 1000, 0);
-    }
-    let clamp = |v: f32| (v / dur).clamp(0.0, 1.0);
-    let left = (clamp(start) * 1000.0).round() as u16;
-    let right = ((1.0 - clamp(end)) * 1000.0).round() as u16;
-    let mid = 1000u16.saturating_sub(left).saturating_sub(right);
-    (left, mid, right)
-}
-
 /// How long the upload-panel accent takes to fade when the destination switches.
-const ACCENT_FADE: Duration = Duration::from_millis(180);
+const ACCENT_FADE: Duration = Duration::from_millis(220);
 
 /// An in-flight accent fade between two (fill, ink) brand pairs. `start` is anchored on the
 /// first tick, so all time comes from the frame subscription rather than `Instant::now()` in
@@ -2108,18 +2144,6 @@ mod filmstrip_tests {
         assert!(p.windows(2).all(|w| w[0] < w[1]), "strictly increasing");
         assert!(p.iter().all(|&x| x > 0.0 && x < 1.0), "inside (0,1)");
         assert!(filmstrip_positions(0).is_empty());
-    }
-
-    #[test]
-    fn portions_split_the_track_by_time() {
-        // Whole clip kept: no scrim on either side.
-        assert_eq!(range_portions(0.0, 10.0, 10.0), (0, 1000, 0));
-        // A middle window.
-        assert_eq!(range_portions(2.0, 9.0, 10.0), (200, 700, 100));
-        // Empty band (start == end): both scrims, no kept middle.
-        assert_eq!(range_portions(5.0, 5.0, 10.0), (500, 0, 500));
-        // Degenerate duration stays drawable as "all kept".
-        assert_eq!(range_portions(0.0, 0.0, 0.0), (0, 1000, 0));
     }
 }
 

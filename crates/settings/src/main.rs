@@ -12,6 +12,7 @@
 mod library;
 mod theme;
 mod thumbs;
+mod trimbar;
 mod wizard;
 
 use std::fmt;
