@@ -19,6 +19,8 @@ tracing-subscriber.workspace = true
 rewynd-buffer.workspace = true
 rewynd-encode.workspace = true
 rewynd-config.workspace = true
+# VelopackApp runs first in main so packaged-install/update hooks fire before anything else.
+velopack.workspace = true
 
 # Linux MVP wiring: capture + GPU import + the ScreenCast (capture) and
 # GlobalShortcuts (hotkey) portals. Linux-only; the binary compiles elsewhere via a

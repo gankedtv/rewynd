@@ -18,7 +18,7 @@ members = [
 exclude = ["vendor/mp4"]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0-beta.1"
 edition = "2024"
 # Tracks the real floor of the tree (iced 0.14 needs 1.88; notify-rust 4.18 needs 1.89). Keeping
 # this honest matters: MSRV-aware resolution otherwise pins vulnerable transitive versions (it
@@ -85,6 +85,11 @@ wiremock = "0.6"
 tempfile = "3"
 # PNG decode for the embedded brand mark (tray pixmap, window icon). MIT/Apache.
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Cross-platform install + in-app update framework (Velopack, MIT). Pinned in lockstep with the
+# `vpk` CLI the release workflow installs — a crate/CLI mismatch breaks the update protocol.
+# VelopackApp runs first in both mains; the GUI drives the opt-in update check. Inert outside a
+# packaged install (UpdateManager::new errors when there is no receipt), so dev/cargo runs no-op.
+velopack = "=1.2.0"
 
 # Linux capture (PLAN §3.5): XDG ScreenCast portal + PipeWire. Linux-only.
 ashpd = { version = "0.13", features = ["screencast"] }

@@ -22,6 +22,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 # Runs the stop-and-relaunch off the UI thread (spawn_blocking) so the window never freezes.
 tokio.workspace = true
+# In-app updater: VelopackApp install/update hooks run first in main, and the nav-bar
+# "Check for updates" button drives check → download → stop recorder → apply/restart.
+velopack.workspace = true
 
 # iced with the tiny-skia SOFTWARE renderer only (no wgpu): the workspace's wgpu-v29
 # [patch.crates-io] rewrite can't bite a tree with no wgpu, and a settings window doesn't need

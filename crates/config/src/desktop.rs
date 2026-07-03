@@ -138,6 +138,11 @@ pub fn remove_autostart() -> std::io::Result<()> {
 /// entry path either way.
 #[cfg(unix)]
 pub fn install_launcher_entry(exec: &Path) -> std::io::Result<PathBuf> {
+    // In an AppImage the launcher must point at the image itself ($APPIMAGE), not the ephemeral
+    // mount path in `exec` (stale once the image unmounts). The AppImage's mainExe is the GUI,
+    // which is exactly what the launcher opens, so this holds for both callers.
+    let appimage = std::env::var_os("APPIMAGE").map(PathBuf::from);
+    let exec = appimage.as_deref().unwrap_or(exec);
     let path = data_home_from(|k| std::env::var_os(k))
         .map(|home| home.join("applications").join(format!("{APP_ID}.desktop")))
         .ok_or_else(|| {

@@ -81,6 +81,14 @@ impl Tray for RewyndTray {
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
         vec![
+            // A read-only header so a tester can report which build they are on.
+            StandardItem {
+                label: concat!("rewynd v", env!("CARGO_PKG_VERSION")).to_owned(),
+                enabled: false,
+                ..Default::default()
+            }
+            .into(),
+            MenuItem::Separator,
             StandardItem {
                 label: "Save clip now".to_owned(),
                 activate: Box::new(|t: &mut Self| {
