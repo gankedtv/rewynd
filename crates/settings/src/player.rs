@@ -71,7 +71,17 @@ pub fn stream(
             use iced::futures::SinkExt;
 
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(2);
-            std::thread::spawn(move || decode_loop(&path, start, end, width, &tx));
+            std::thread::spawn(move || {
+                // A panic mid-decode must still end the playback state machine: without a
+                // terminal event the UI would stay in "playing" forever.
+                let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    decode_loop(&path, start, end, width, &tx);
+                }));
+                if run.is_err() {
+                    tracing::error!("preview decode panicked; ending playback");
+                    let _ = tx.blocking_send(Event::Ended);
+                }
+            });
             while let Some(event) = rx.recv().await {
                 if output.send(event).await.is_err() {
                     // The subscription was dropped; the dead channel stops the reader thread.

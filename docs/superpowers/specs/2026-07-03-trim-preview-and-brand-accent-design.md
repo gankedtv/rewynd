@@ -38,7 +38,7 @@ fn current_accent(&self) -> (Color, Color)
 
 - No transition in flight → `dest_accent(self.dest)` (unchanged behaviour).
 - Transition in flight → per-channel lerp `from → to` of both the fill and the ink, by an
-  eased progress (smoothstep over `ACCENT_FADE`, ~180 ms).
+  eased progress (smoothstep over `ACCENT_FADE`, ~220 ms).
 
 Every accent in the upload panel reads from `current_accent()`:
 
@@ -65,10 +65,11 @@ State added to `Library`:
 
 ```rust
 /// An in-flight accent fade: where it started, the target, and when it began. `None` when idle.
+/// `start` anchors lazily on the first frame tick, so all time comes from the subscription.
 struct AccentFade {
     from: (Color, Color),
     to: (Color, Color),
-    start: Instant,
+    start: Option<Instant>,
 }
 accent_fade: Option<AccentFade>,
 ```
@@ -171,7 +172,7 @@ work.
 
 ## Data flow
 
-```
+```text
 open clip ─▶ read clip_summary (duration) ─▶ reset trim to full span
          └▶ queue FILMSTRIP_FRAMES decodes (clip_preview_at at i/N) ─▶ pool ─▶ cells fill in
 
