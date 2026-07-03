@@ -1268,7 +1268,11 @@ impl Library {
 
         let seg = |label: &'static str, dest: Dest, ready: bool| {
             let active = self.dest == dest;
-            let (accent, ink) = dest_accent(dest);
+            let (accent, ink) = if active {
+                self.current_accent()
+            } else {
+                dest_accent(dest)
+            };
             let b = button(
                 container(text(label).size(11).font(UI_SEMIBOLD))
                     .center_x(Length::Fill)
@@ -1335,7 +1339,8 @@ impl Library {
         let already_uploaded = self.record_for(entry, self.dest).is_some();
         // The action button takes the destination's brand accent: mint for ganked.tv, red for
         // YouTube, so the whole panel reads as "this clip is headed to YouTube".
-        let (accent, ink) = dest_accent(self.dest);
+        let (accent, ink) = self.current_accent();
+        // Hover tracks the destination target (a hover mid-fade is rare and cosmetic).
         let accent_hover = match self.dest {
             Dest::Ganked => palette::ACCENT_HOVER,
             Dest::YouTube => palette::YOUTUBE_HOVER,
@@ -1361,12 +1366,14 @@ impl Library {
 
         let mut panel = column![title, destination, visibility].spacing(16);
         panel = panel.push(row![send].spacing(10).align_y(iced::Alignment::Center));
-        panel = panel.push(self.upload_status(entry));
-        card("UPLOAD", panel)
+        panel = panel.push(self.upload_status(entry, accent));
+        theme::card_accent("UPLOAD", accent, panel)
     }
 
-    /// The status line under the upload button, for whatever upload concerns this clip.
-    fn upload_status(&self, entry: &ClipEntry) -> Element<'_, Message> {
+    /// The status line under the upload button, for whatever upload concerns this clip. `accent`
+    /// is the destination brand colour (mint/red, or the fading value), so success lines and
+    /// share links match the rest of the panel.
+    fn upload_status(&self, entry: &ClipEntry, accent: iced::Color) -> Element<'_, Message> {
         match &self.upload {
             UploadState::Uploading { path, dest, .. } if *path == entry.path => {
                 cancellable(format!("Uploading to {}...", dest.label()))
@@ -1386,7 +1393,7 @@ impl Library {
                 ]
                 .spacing(8);
                 if let Some(url) = link {
-                    col = col.push(link_actions(url));
+                    col = col.push(link_actions(url, accent));
                 }
                 col.push(anyway_button("Upload another copy")).into()
             }
@@ -1407,12 +1414,12 @@ impl Library {
                 let mut line = row![
                     text(format!("Uploaded to {}.", dest.label()))
                         .size(12)
-                        .style(tinted(palette::ACCENT))
+                        .style(tinted(accent))
                 ]
                 .spacing(12)
                 .align_y(iced::Alignment::Center);
                 line = match link {
-                    Some(url) => line.push(link_actions(url)),
+                    Some(url) => line.push(link_actions(url, accent)),
                     None => line.push(
                         text(note.clone())
                             .size(12)
@@ -1436,12 +1443,12 @@ impl Library {
                     let mut line = row![
                         text(format!("Already on {}.", self.dest.label()))
                             .size(12)
-                            .style(tinted(palette::ACCENT))
+                            .style(tinted(accent))
                     ]
                     .spacing(12)
                     .align_y(iced::Alignment::Center);
                     if let Some(url) = &record.url {
-                        line = line.push(link_actions(url));
+                        line = line.push(link_actions(url, accent));
                     }
                     line.into()
                 }
@@ -1451,13 +1458,13 @@ impl Library {
     }
 }
 
-/// A share/watch link with Open + Copy-link buttons, shared by the upload status lines.
-fn link_actions(url: &str) -> Element<'static, Message> {
+/// A share/watch link with Open + Copy-link buttons, in the destination's brand accent.
+fn link_actions(url: &str, accent: iced::Color) -> Element<'static, Message> {
     row![
         text(url.to_owned())
             .size(12)
             .font(UI_SEMIBOLD)
-            .style(tinted(palette::ACCENT)),
+            .style(tinted(accent)),
         button(text("Open").size(11).font(UI_SEMIBOLD))
             .on_press(Message::OpenLink(url.to_owned()))
             .style(secondary_button)
