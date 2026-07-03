@@ -172,7 +172,6 @@ const POLL_MAX_READS: u32 = 60;
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Refresh,
     SearchEdited(String),
     GameFilterPicked(Option<String>),
     Scanned(Vec<ClipEntry>),
@@ -225,6 +224,10 @@ pub enum Message {
     FullscreenToggle,
     /// Leave the fullscreen preview (Escape).
     FullscreenExit,
+    /// Move the playhead to this time (a press/drag between the trim edges).
+    Seek(f32),
+    /// A timeline drag was released; playback resumes here if seeking paused it.
+    TrimDragEnd,
 }
 
 /// What a trim save does with the result.
@@ -283,6 +286,8 @@ pub struct Library {
     play_pos: Option<f32>,
     /// Why in-app playback can't run on this machine, when it can't (ffmpeg missing).
     play_error: Option<&'static str>,
+    /// Whether seeking paused a running playback; releasing the drag resumes it.
+    seek_resume: bool,
     /// Whether the preview fills the whole window.
     fullscreen: bool,
     /// The open clip's normalized audio peaks for the timeline lane.
@@ -332,6 +337,7 @@ impl Library {
             play_frame: None,
             play_pos: None,
             play_error: None,
+            seek_resume: false,
             fullscreen: false,
             waveform: None,
             confirm_delete: false,
@@ -368,6 +374,7 @@ impl Library {
         self.play_frame = None;
         self.play_pos = None;
         self.play_error = None;
+        self.seek_resume = false;
         self.fullscreen = false;
     }
 
@@ -407,7 +414,6 @@ impl Library {
 
     pub fn update(&mut self, message: Message, config: &Config) -> Task<Message> {
         match message {
-            Message::Refresh => return self.refresh(config),
             Message::SearchEdited(q) => self.search = q,
             Message::GameFilterPicked(game) => self.game_filter = game,
             Message::Scanned(entries) => return self.scanned(entries),
@@ -528,6 +534,7 @@ impl Library {
                 self.play_range = None;
                 self.play_frame = None;
                 self.play_pos = None;
+                self.seek_resume = false;
                 return self.scrub(self.trim_start);
             }
             Message::TrimEndChanged(v) => {
@@ -537,6 +544,7 @@ impl Library {
                 self.play_range = None;
                 self.play_frame = None;
                 self.play_pos = None;
+                self.seek_resume = false;
                 return self.scrub(self.trim_end);
             }
             Message::TrimSave(mode) => {
@@ -682,6 +690,28 @@ impl Library {
             }
             Message::FullscreenToggle => self.set_fullscreen(!self.fullscreen),
             Message::FullscreenExit => self.set_fullscreen(false),
+            Message::Seek(secs) => {
+                let secs = secs.clamp(self.trim_start, self.trim_end.max(self.trim_start));
+                self.play_pos = Some(secs);
+                // Seeking scrubs (one ffmpeg per pixel would be a process storm); a paused
+                // playback resumes from here when the drag lets go.
+                if self.play_range.is_some() {
+                    self.seek_resume = true;
+                    self.play_range = None;
+                }
+                self.play_frame = None;
+                return self.scrub(secs);
+            }
+            Message::TrimDragEnd => {
+                if self.seek_resume {
+                    self.seek_resume = false;
+                    let from = self
+                        .play_pos
+                        .unwrap_or(self.trim_start)
+                        .clamp(self.trim_start, (self.trim_end - 0.05).max(self.trim_start));
+                    self.play_range = Some((from, self.trim_end));
+                }
+            }
             Message::OpenLink(url) => {
                 if let Err(e) = open::that_detached(&url) {
                     tracing::warn!(error = %e, url, "could not open the link");
@@ -1242,6 +1272,7 @@ impl Library {
                 .style(tinted(palette::TEXT_SECONDARY)),
         ]
         .spacing(4);
+        // No manual refresh: the directory watcher and window focus already rescan.
         let header = row![
             title,
             Space::new().width(Length::Fill),
@@ -1250,10 +1281,6 @@ impl Library {
             } else {
                 Space::new().into()
             },
-            button(text("Refresh").size(12).font(UI_SEMIBOLD))
-                .on_press(Message::Refresh)
-                .style(secondary_button)
-                .padding([8, 16]),
         ]
         .spacing(12)
         .align_y(iced::Alignment::Center);
@@ -1682,8 +1709,10 @@ impl Library {
             Message::TrimStartChanged,
             Message::TrimEndChanged,
         )
-        .playhead(self.play_range.and(self.play_pos))
-        .waveform(self.waveform.as_deref());
+        .playhead(self.play_pos)
+        .waveform(self.waveform.as_deref())
+        .on_seek(Message::Seek)
+        .on_released(Message::TrimDragEnd);
         let stack = layered([cells.into(), bar.into()])
             .width(Length::Fill)
             .height(Length::Fill);

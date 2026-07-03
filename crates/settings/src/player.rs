@@ -117,12 +117,17 @@ fn decode_loop(
         move || audio_loop(&path, start, end, &stop)
     });
 
+    let mut natural_end = false;
     if let Some(stdout) = child.stdout.take() {
-        read_frames(stdout, start, end, width, height, frame_time, tx);
+        natural_end = read_frames(stdout, start, end, width, height, frame_time, tx);
     }
     let _ = child.kill();
     let _ = child.wait();
-    stop.store(true, Ordering::Relaxed);
+    // On a natural end the audio thread drains its queued tail before joining; a cancelled
+    // playback (pause, subscription dropped) cuts it immediately.
+    if !natural_end {
+        stop.store(true, Ordering::Relaxed);
+    }
     let _ = audio.join();
     let _ = tx.blocking_send(Event::Ended);
 }
@@ -177,8 +182,9 @@ fn ffmpeg_range(path: &Path, start: Duration, end: Duration) -> Command {
     command
 }
 
-/// Read raw frames off the pipe and send them paced to their nominal times. Returns when the
-/// pipe ends (range done or ffmpeg died) or the receiver is gone.
+/// Read raw frames off the pipe and send them paced to their nominal times. Returns `true`
+/// when the pipe ended naturally (range done or ffmpeg died), `false` when the receiver is
+/// gone (playback was cancelled).
 fn read_frames(
     mut stdout: impl Read,
     start: Duration,
@@ -187,13 +193,13 @@ fn read_frames(
     height: u32,
     frame_time: Duration,
     tx: &tokio::sync::mpsc::Sender<Event>,
-) {
+) -> bool {
     let frame_bytes = width as usize * height as usize * 4;
     let mut buffer = vec![0u8; frame_bytes];
     let mut clock: Option<(Instant, Duration)> = None;
     for index in 0u32.. {
         if stdout.read_exact(&mut buffer).is_err() {
-            return;
+            return true;
         }
         let pts = (start + frame_time * index).min(end);
         let (epoch, base) = *clock.get_or_insert_with(|| (Instant::now(), pts));
@@ -207,9 +213,10 @@ fn read_frames(
         }
         let handle = Handle::from_rgba(width, height, buffer.clone());
         if tx.blocking_send(Event::Frame(handle, pts)).is_err() {
-            return;
+            return false;
         }
     }
+    true
 }
 
 /// Decode the range's audio and feed it to the default output device until the pipe ends or
@@ -238,7 +245,9 @@ fn audio_loop(path: &Path, start: Duration, end: Duration, stop: &AtomicBool) {
     sink.log_on_drop(false);
     let player = rodio::Player::connect_new(sink.mixer());
 
-    let started = Instant::now();
+    // The clock anchors on the first appended chunk, so decoder startup does not count as
+    // played time.
+    let mut started: Option<Instant> = None;
     let mut queued = Duration::ZERO;
     let mut pending: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 32 * 1024];
@@ -262,8 +271,17 @@ fn audio_loop(path: &Path, start: Duration, end: Duration, stop: &AtomicBool) {
             samples.len() as f64 / f64::from(AUDIO_CHANNELS) / f64::from(AUDIO_RATE),
         );
         player.append(rodio::buffer::SamplesBuffer::new(channels, rate, samples));
-        while !stop.load(Ordering::Relaxed) && queued > started.elapsed() + AUDIO_LEAD {
+        let epoch = *started.get_or_insert_with(Instant::now);
+        while !stop.load(Ordering::Relaxed) && queued > epoch.elapsed() + AUDIO_LEAD {
             std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    // Natural end of the pipe: the sink still holds up to [`AUDIO_LEAD`] of unplayed sound
+    // (decode runs ahead of the clock), so let it drain instead of chopping the tail. A stop
+    // request (pause, subscription dropped) still cuts immediately.
+    if let Some(epoch) = started {
+        while !stop.load(Ordering::Relaxed) && epoch.elapsed() < queued {
+            std::thread::sleep(Duration::from_millis(25));
         }
     }
     player.stop();

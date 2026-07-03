@@ -15,7 +15,12 @@ use crate::theme::palette;
 enum Handle {
     Start,
     End,
+    /// Anywhere between the edges: move the playhead (seek).
+    Seek,
 }
+
+/// How near (px) a press must be to a trim edge to grab it; further away it seeks instead.
+const GRAB: f32 = 10.0;
 
 #[derive(Default)]
 struct State {
@@ -34,6 +39,11 @@ pub struct TrimBar<'a, Message> {
     waveform: Option<&'a [f32]>,
     on_start: Box<dyn Fn(f32) -> Message + 'a>,
     on_end: Box<dyn Fn(f32) -> Message + 'a>,
+    /// Pressing/dragging between the edges moves the playhead here; without it such a press
+    /// grabs the nearest edge instead.
+    on_seek: Option<Box<dyn Fn(f32) -> Message + 'a>>,
+    /// Published when a drag (of any handle) is let go.
+    on_released: Option<Message>,
 }
 
 impl<'a, Message> TrimBar<'a, Message> {
@@ -53,7 +63,21 @@ impl<'a, Message> TrimBar<'a, Message> {
             waveform: None,
             on_start: Box::new(on_start),
             on_end: Box::new(on_end),
+            on_seek: None,
+            on_released: None,
         }
+    }
+
+    /// Let presses between the edges move the playhead (seek) instead of grabbing an edge.
+    pub fn on_seek(mut self, seek: impl Fn(f32) -> Message + 'a) -> Self {
+        self.on_seek = Some(Box::new(seek));
+        self
+    }
+
+    /// Publish `message` when a drag is released.
+    pub fn on_released(mut self, message: Message) -> Self {
+        self.on_released = Some(message);
+        self
     }
 
     /// Mark the playback position with a vertical line.
@@ -71,6 +95,19 @@ impl<'a, Message> TrimBar<'a, Message> {
     /// The x pixel for clip time `secs`, within a bar spanning `[left, left + width]`.
     fn pixel_of(&self, secs: f32, left: f32, width: f32) -> f32 {
         left + (secs / self.dur).clamp(0.0, 1.0) * width
+    }
+
+    /// Send the drag's message for time `t` through the right callback.
+    fn publish(&self, handle: Handle, t: f32, shell: &mut Shell<'_, Message>) {
+        match handle {
+            Handle::Start => shell.publish((self.on_start)(t)),
+            Handle::End => shell.publish((self.on_end)(t)),
+            Handle::Seek => {
+                if let Some(seek) = &self.on_seek {
+                    shell.publish(seek(t));
+                }
+            }
+        }
     }
 }
 
@@ -90,6 +127,7 @@ fn nearer_is_start(x: f32, start_x: f32, end_x: f32) -> bool {
 
 impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer> for TrimBar<'_, Message>
 where
+    Message: Clone,
     Renderer: renderer::Renderer,
 {
     fn tag(&self) -> tree::Tag {
@@ -134,18 +172,22 @@ where
                 if let Some(pos) = cursor.position_over(bounds) {
                     let sx = self.pixel_of(self.start, bounds.x, bounds.width);
                     let ex = self.pixel_of(self.end, bounds.x, bounds.width);
-                    let handle = if nearer_is_start(pos.x, sx, ex) {
+                    // Near an edge grabs it to trim; anywhere else seeks the playhead (or,
+                    // without a seek handler, snaps the nearest edge like before).
+                    let handle = if (pos.x - sx).abs() <= GRAB {
+                        Handle::Start
+                    } else if (pos.x - ex).abs() <= GRAB {
+                        Handle::End
+                    } else if self.on_seek.is_some() {
+                        Handle::Seek
+                    } else if nearer_is_start(pos.x, sx, ex) {
                         Handle::Start
                     } else {
                         Handle::End
                     };
                     state.drag = Some(handle);
-                    // Snap the grabbed edge to the click, then the drag fine-tunes from there.
                     let t = time_at(pos.x, bounds.x, bounds.width, self.dur);
-                    shell.publish(match handle {
-                        Handle::Start => (self.on_start)(t),
-                        Handle::End => (self.on_end)(t),
-                    });
+                    self.publish(handle, t, shell);
                     shell.capture_event();
                 }
             }
@@ -154,15 +196,16 @@ where
                     && let Some(pos) = cursor.position()
                 {
                     let t = time_at(pos.x, bounds.x, bounds.width, self.dur);
-                    shell.publish(match handle {
-                        Handle::Start => (self.on_start)(t),
-                        Handle::End => (self.on_end)(t),
-                    });
+                    self.publish(handle, t, shell);
                     shell.capture_event();
                 }
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                state.drag = None;
+                if state.drag.take().is_some()
+                    && let Some(message) = &self.on_released
+                {
+                    shell.publish(message.clone());
+                }
             }
             _ => {}
         }
@@ -251,11 +294,18 @@ where
     ) -> mouse::Interaction {
         let dragging = tree.state.downcast_ref::<State>().drag.is_some();
         if dragging {
-            mouse::Interaction::Grabbing
-        } else if cursor.is_over(layout.bounds()) {
+            return mouse::Interaction::Grabbing;
+        }
+        let bounds = layout.bounds();
+        let Some(pos) = cursor.position_over(bounds) else {
+            return mouse::Interaction::default();
+        };
+        let sx = self.pixel_of(self.start, bounds.x, bounds.width);
+        let ex = self.pixel_of(self.end, bounds.x, bounds.width);
+        if (pos.x - sx).abs() <= GRAB || (pos.x - ex).abs() <= GRAB || self.on_seek.is_none() {
             mouse::Interaction::ResizingHorizontally
         } else {
-            mouse::Interaction::default()
+            mouse::Interaction::Pointer
         }
     }
 }
@@ -311,7 +361,7 @@ fn handle<Renderer: renderer::Renderer>(renderer: &mut Renderer, x: f32, b: Rect
 impl<'a, Message, Theme, Renderer> From<TrimBar<'a, Message>>
     for Element<'a, Message, Theme, Renderer>
 where
-    Message: 'a,
+    Message: Clone + 'a,
     Theme: 'a,
     Renderer: renderer::Renderer + 'a,
 {
