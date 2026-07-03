@@ -40,12 +40,16 @@ pub enum SaveError {
 pub struct ClipSaver {
     buffer: SharedBuffer,
     audio: SharedAudioBuffer,
+    /// The mic-only ring, when the separate-mic-track option is on: a second Opus track written
+    /// alongside the system+mic mix. `None` = single mixed track.
+    mic_audio: Option<SharedAudioBuffer>,
     params: EncodeParams,
     audio_params: AudioEncodeParams,
     window: Duration,
     output_dir: Option<PathBuf>,
-    /// Set to ask the mixer for an immediate drain before the audio cut; the mixer clears it.
-    audio_drain_now: Option<Arc<AtomicBool>>,
+    /// Set to ask each mixer for an immediate drain before the audio cut; the mixer clears it.
+    /// One per audio ring (the mix, and the mic when present).
+    audio_drain_now: Vec<Arc<AtomicBool>>,
     last_clip: Mutex<Option<PathBuf>>,
     /// The per-game subfolder the next save lands in (ShadowPlay-style), when game
     /// detection knows what the buffer holds. The platform wiring keeps it current.
@@ -53,19 +57,22 @@ pub struct ClipSaver {
 }
 
 impl ClipSaver {
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         buffer: SharedBuffer,
         audio: SharedAudioBuffer,
+        mic_audio: Option<SharedAudioBuffer>,
         params: EncodeParams,
         audio_params: AudioEncodeParams,
         window: Duration,
         output_dir: Option<PathBuf>,
-        audio_drain_now: Option<Arc<AtomicBool>>,
+        audio_drain_now: Vec<Arc<AtomicBool>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             buffer,
             audio,
+            mic_audio,
             params,
             audio_params,
             window,
@@ -86,12 +93,20 @@ impl ClipSaver {
     /// file write run inline (callers use a blocking thread). On success the path is remembered
     /// for [`last_clip`](Self::last_clip).
     pub fn save(&self) -> Result<PathBuf, SaveError> {
-        // Let the mixer flush what it is holding (settle window + encoder sub-frame) so the
-        // audio track ends as close to "now" as possible, then give it one beat to drain.
-        if let Some(drain) = &self.audio_drain_now {
-            drain.store(true, Ordering::SeqCst);
+        // Let each mixer flush what it is holding (settle window + encoder sub-frame) so the
+        // audio tracks end as close to "now" as possible, then give them one beat to drain. Each
+        // mixer clears its own flag, so a shared flag can't be cleared out from under another.
+        if !self.audio_drain_now.is_empty() {
+            for drain in &self.audio_drain_now {
+                drain.store(true, Ordering::SeqCst);
+            }
             let waited = std::time::Instant::now();
-            while drain.load(Ordering::SeqCst) && waited.elapsed() < AUDIO_DRAIN_WAIT {
+            while self
+                .audio_drain_now
+                .iter()
+                .any(|d| d.load(Ordering::SeqCst))
+                && waited.elapsed() < AUDIO_DRAIN_WAIT
+            {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
@@ -102,9 +117,14 @@ impl ClipSaver {
             .map_err(|e| SaveError::Empty(e.to_string()))?;
 
         // The clip starts at its first (keyframe) chunk; take the audio from that instant on —
-        // both PTS share the capture epoch, so this keeps the tracks aligned.
+        // all PTS share the capture epoch, so this keeps the tracks aligned.
         let clip_base = chunks.first().map_or(Duration::ZERO, |c| c.pts);
         let audio_chunks = lock_unpoisoned(&self.audio).flush_from(clip_base);
+        let mic_chunks = self
+            .mic_audio
+            .as_ref()
+            .map(|mic| lock_unpoisoned(mic).flush_from(clip_base))
+            .unwrap_or_default();
 
         let game_folder = lock_unpoisoned(&self.game_folder).clone();
         let path = clip_output_path(self.output_dir.as_deref(), game_folder.as_deref());
@@ -112,19 +132,31 @@ impl ClipSaver {
             let _ = std::fs::create_dir_all(parent);
         }
 
+        // Mid-stream cut: the encoder startup priming isn't present at the clip's first packet,
+        // so no pre-skip trim. The mix is audio track 1, the mic (when separate) audio track 2;
+        // the muxer drops any empty track and assigns ids in order.
+        let channels = self.audio_params.channels as u8;
+        let sample_rate = self.audio_params.sample_rate;
+        let audio_tracks = [
+            AudioTrack {
+                chunks: &audio_chunks,
+                channels,
+                sample_rate,
+                pre_skip: 0,
+            },
+            AudioTrack {
+                chunks: &mic_chunks,
+                channels,
+                sample_rate,
+                pre_skip: 0,
+            },
+        ];
+
         let muxer = Mp4Muxer::new(self.params.width, self.params.height, self.params.framerate);
-        let result = if audio_chunks.is_empty() {
+        let result = if audio_chunks.is_empty() && mic_chunks.is_empty() {
             muxer.write_mp4(&chunks, &path)
         } else {
-            let audio = AudioTrack {
-                chunks: &audio_chunks,
-                channels: self.audio_params.channels as u8,
-                sample_rate: self.audio_params.sample_rate,
-                // Mid-stream cut: the encoder startup priming isn't present at the clip's
-                // first packet, so don't trim.
-                pre_skip: 0,
-            };
-            muxer.write_mp4_with_audio(&chunks, &audio, &path)
+            muxer.write_mp4_with_audio_tracks(&chunks, &audio_tracks, &path)
         };
 
         match result {
@@ -137,6 +169,7 @@ impl ClipSaver {
                     path = %path.display(),
                     frames = chunks.len(),
                     audio_packets = audio_chunks.len(),
+                    mic_packets = mic_chunks.len(),
                     span_s = span.as_secs_f64(),
                     "saved clip"
                 );
@@ -192,11 +225,12 @@ mod tests {
         let saver = ClipSaver::new(
             buffer.clone(),
             audio.clone(),
+            None,
             EncodeParams::default(),
             AudioEncodeParams::default(),
             window,
             Some(dir.to_path_buf()),
-            None,
+            Vec::new(),
         );
         (saver, buffer, audio)
     }
@@ -302,11 +336,12 @@ mod tests {
         let saver = ClipSaver::new(
             buffer.clone(),
             audio,
+            None,
             EncodeParams::default(),
             AudioEncodeParams::default(),
             window,
             Some(dir.path().to_path_buf()),
-            Some(drain.clone()),
+            vec![drain.clone()],
         );
         lock_unpoisoned(&buffer).push(EncodedChunk {
             bytes: keyframe_bytes(),

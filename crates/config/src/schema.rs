@@ -148,6 +148,12 @@ struct AudioConfig {
     /// case-insensitively against the device's name (a substring is enough on Windows;
     /// the PipeWire node name on Linux).
     microphone: String,
+    /// Record the microphone at all. Off = no mic stream is even opened (privacy) and clips carry
+    /// only system audio.
+    mic_enabled: bool,
+    /// Keep the microphone on its own second audio track (in addition to the system+mic mix), so
+    /// editors can separate voice from game audio. Off = the single mixed track.
+    separate_mic_track: bool,
 }
 
 impl Default for AudioConfig {
@@ -159,6 +165,8 @@ impl Default for AudioConfig {
             mic_gain: 1.0,
             system_gain: 1.0,
             microphone: String::new(),
+            mic_enabled: true,
+            separate_mic_track: false,
         }
     }
 }
@@ -468,6 +476,19 @@ impl Config {
         (!mic.is_empty()).then_some(mic)
     }
 
+    /// Whether to record the microphone at all (off = no mic stream is opened).
+    #[must_use]
+    pub fn mic_enabled(&self) -> bool {
+        self.audio.mic_enabled
+    }
+
+    /// Whether the microphone gets its own second audio track in the clip (in addition to the
+    /// system+mic mix). Only meaningful while the mic is enabled.
+    #[must_use]
+    pub fn separate_mic_track(&self) -> bool {
+        self.audio.mic_enabled && self.audio.separate_mic_track
+    }
+
     /// Retention window, clamped to `[1, MAX_BUFFER_SECONDS]`: a zero window would keep
     /// nothing, and an unbounded one would grow the in-memory ring buffer until it OOMs.
     #[must_use]
@@ -643,6 +664,16 @@ impl Config {
     /// Set the system-audio mix gain.
     pub fn set_system_gain(&mut self, gain: f32) {
         self.audio.system_gain = gain;
+    }
+
+    /// Set whether to record the microphone at all.
+    pub fn set_mic_enabled(&mut self, enabled: bool) {
+        self.audio.mic_enabled = enabled;
+    }
+
+    /// Set whether the microphone gets its own second audio track.
+    pub fn set_separate_mic_track(&mut self, separate: bool) {
+        self.audio.separate_mic_track = separate;
     }
 
     /// Set the microphone to capture (empty = the system default).
@@ -904,6 +935,11 @@ system_gain = 1.0
 # Capture a specific microphone instead of the system default. Case-insensitive; on
 # Windows a part of the device name is enough, on Linux use the PipeWire node name.
 microphone = \"\"
+# Record the microphone at all. false = no mic stream is opened; clips carry only system audio.
+mic_enabled = true
+# Keep the microphone on its own second audio track (as well as the system+mic mix), so editors
+# can separate voice from game sound.
+separate_mic_track = false
 
 [buffer]
 # How many seconds of footage to keep for a clip.
@@ -1048,6 +1084,34 @@ mod tests {
         assert!(c.always_prompt());
         assert_eq!(c.hotkey_trigger(), "CTRL+ALT+K");
         assert_eq!(c.buffer_window(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn mic_flags_default_and_gate_the_separate_track() {
+        let c = Config::default();
+        assert!(c.mic_enabled(), "the mic records by default");
+        assert!(!c.separate_mic_track(), "single mixed track by default");
+
+        let mut c = Config::default();
+        c.set_separate_mic_track(true);
+        assert!(
+            c.separate_mic_track(),
+            "separate track on when the mic is enabled"
+        );
+        // Disabling the mic also disables the separate track (nothing to put on it).
+        c.set_mic_enabled(false);
+        assert!(!c.mic_enabled());
+        assert!(!c.separate_mic_track(), "no separate track without the mic");
+
+        // Round-trips through TOML.
+        let parsed =
+            Config::from_toml_str("[audio]\nmic_enabled = false\nseparate_mic_track = true\n")
+                .expect("parses");
+        assert!(!parsed.mic_enabled());
+        assert!(
+            !parsed.separate_mic_track(),
+            "gated off by the disabled mic"
+        );
     }
 
     #[test]
