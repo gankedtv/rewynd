@@ -1056,7 +1056,9 @@ impl App {
         // Drive the accent fade only while one is running: iced re-diffs subscriptions after each
         // update, so when the fade clears this is dropped and the software renderer goes idle.
         if self.library.animating() {
-            subs.push(iced::window::frames().map(|at| Message::Library(library::Message::Tick(at))));
+            subs.push(
+                iced::window::frames().map(|at| Message::Library(library::Message::Tick(at))),
+            );
         }
         iced::Subscription::batch(subs)
     }

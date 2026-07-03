@@ -276,8 +276,16 @@ mod tests {
     fn scaled_dims_caps_to_the_given_width() {
         assert_eq!(scaled_dims(1920, 1080, 120), (120, 67));
         assert_eq!(scaled_dims(1920, 1080, 480), (480, 270));
-        assert_eq!(scaled_dims(64, 36, 120), (64, 36), "smaller than cap stays as-is");
-        assert_eq!(scaled_dims(0, 0, 120), (1, 1), "degenerate input stays drawable");
+        assert_eq!(
+            scaled_dims(64, 36, 120),
+            (64, 36),
+            "smaller than cap stays as-is"
+        );
+        assert_eq!(
+            scaled_dims(0, 0, 120),
+            (1, 1),
+            "degenerate input stays drawable"
+        );
     }
 
     #[test]
