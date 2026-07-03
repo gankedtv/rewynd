@@ -65,6 +65,13 @@ impl Dest {
     }
 }
 
+/// One filmstrip cell for the open clip: a decoded keyframe, still decoding, or undecodable.
+enum StripCell {
+    Loading,
+    Ready(iced::widget::image::Handle),
+    Failed,
+}
+
 /// One clip's thumbnail slot, keyed by path; `modified` is the freshness check.
 enum Thumb {
     Loading {
@@ -191,6 +198,8 @@ pub enum Message {
     CopyLink(String),
     /// A frame tick while an accent fade is running (carries the frame instant).
     Tick(Instant),
+    /// A filmstrip cell finished decoding: (clip path, cell index, decoded frame or error).
+    StripDone(PathBuf, usize, Result<iced::widget::image::Handle, String>),
 }
 
 /// Where the open clip's trim stands.
@@ -216,6 +225,14 @@ pub struct Library {
     game_filter: Option<String>,
     /// The clip whose detail page is open, if any.
     open: Option<PathBuf>,
+    /// The clip the filmstrip cells belong to (guards a late `StripDone` for a since-closed clip).
+    strip_path: Option<PathBuf>,
+    /// One slot per [`FILMSTRIP_FRAMES`] position for the open clip; empty when no clip is open.
+    strip: Vec<StripCell>,
+    /// Cells not yet decoding, drained into flight as slots free up: (cell index, position).
+    strip_pending: VecDeque<(usize, f32)>,
+    /// How many strip decodes are in flight (capped at [`MAX_DECODES`]).
+    strip_decoding: usize,
     confirm_delete: bool,
     /// Trim in/out points for the open clip, in seconds; reset to the full span on open.
     trim_start: f32,
@@ -250,6 +267,10 @@ impl Library {
             search: String::new(),
             game_filter: None,
             open: None,
+            strip_path: None,
+            strip: Vec::new(),
+            strip_pending: VecDeque::new(),
+            strip_decoding: 0,
             confirm_delete: false,
             trim_start: 0.0,
             trim_end: 0.0,
@@ -271,6 +292,7 @@ impl Library {
         self.open = None;
         self.confirm_delete = false;
         self.action_error = None;
+        self.clear_strip();
     }
 
     /// The upload record for `entry` at `dest`, if the clip was uploaded there.
@@ -342,7 +364,7 @@ impl Library {
                 self.trim_start = 0.0;
                 self.trim_end = self.open_dur;
                 self.trim = TrimState::Idle;
-                self.open = Some(path);
+                self.open = Some(path.clone());
                 self.confirm_delete = false;
                 self.action_error = None;
                 self.upload = UploadState::Idle;
@@ -356,11 +378,13 @@ impl Library {
                     Dest::Ganked
                 };
                 self.visibility = self.default_visibility(config);
+                return self.build_strip(path);
             }
             Message::Back => {
                 self.open = None;
                 self.confirm_delete = false;
                 self.action_error = None;
+                self.clear_strip();
             }
             Message::Play => {
                 if let Some(path) = &self.open
@@ -406,6 +430,7 @@ impl Library {
                 self.pending_thumbs.retain(|(p, _)| p != &path);
                 if self.open == Some(path) {
                     self.open = None;
+                    self.clear_strip();
                 }
                 self.action_error = None;
             }
@@ -497,6 +522,21 @@ impl Library {
                 return self.verified(path, dest, result, config);
             }
             Message::Tick(now) => self.advance_fade(now),
+            Message::StripDone(path, index, result) => {
+                if self.strip_path.as_deref() == Some(path.as_path()) {
+                    self.strip_decoding = self.strip_decoding.saturating_sub(1);
+                    if let Some(cell) = self.strip.get_mut(index) {
+                        *cell = match result {
+                            Ok(handle) => StripCell::Ready(handle),
+                            Err(e) => {
+                                tracing::warn!(path = %path.display(), index, error = %e, "no filmstrip frame");
+                                StripCell::Failed
+                            }
+                        };
+                    }
+                    return self.start_strip_decodes();
+                }
+            }
             Message::OpenLink(url) => {
                 if let Err(e) = open::that_detached(&url) {
                     tracing::warn!(error = %e, url, "could not open the link");
@@ -564,6 +604,55 @@ impl Library {
                     (path, modified, result)
                 },
                 |(path, modified, result)| Message::ThumbDone(path, modified, result),
+            ));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Drop the filmstrip for whatever clip was open (free the decoded frames).
+    fn clear_strip(&mut self) {
+        self.strip_path = None;
+        self.strip.clear();
+        self.strip_pending.clear();
+        self.strip_decoding = 0;
+    }
+
+    /// Queue all filmstrip cells for `path` and kick off the first decodes.
+    fn build_strip(&mut self, path: PathBuf) -> Task<Message> {
+        self.strip_path = Some(path);
+        self.strip = (0..FILMSTRIP_FRAMES).map(|_| StripCell::Loading).collect();
+        self.strip_pending = filmstrip_positions(FILMSTRIP_FRAMES)
+            .into_iter()
+            .enumerate()
+            .collect();
+        self.strip_decoding = 0;
+        self.start_strip_decodes()
+    }
+
+    /// Start queued strip decodes until [`MAX_DECODES`] are in flight; each is one blocking
+    /// `thumbs::load_at`. [`Message::StripDone`] frees a slot and returns here for the next.
+    fn start_strip_decodes(&mut self) -> Task<Message> {
+        let Some(path) = self.strip_path.clone() else {
+            return Task::none();
+        };
+        let mut tasks = Vec::new();
+        while self.strip_decoding < MAX_DECODES {
+            let Some((index, position)) = self.strip_pending.pop_front() else {
+                break;
+            };
+            self.strip_decoding += 1;
+            let path = path.clone();
+            tasks.push(Task::perform(
+                async move {
+                    let result = tokio::task::spawn_blocking({
+                        let path = path.clone();
+                        move || thumbs::load_at(&path, position, FILMSTRIP_CELL_WIDTH)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()));
+                    (path, index, result)
+                },
+                |(path, index, result)| Message::StripDone(path, index, result),
             ));
         }
         Task::batch(tasks)
@@ -1174,6 +1263,66 @@ impl Library {
         self.open_dur
     }
 
+    /// A row of keyframe thumbnails across the whole clip, the kept `[start, end]` band bright
+    /// with a mint edge and the rest scrimmed. Driven by the trim sliders; purely visual.
+    fn filmstrip(&self) -> Element<'_, Message> {
+        if self.strip.is_empty() {
+            return Space::new().into();
+        }
+        let mut cells = row![].width(Length::Fill);
+        for cell in &self.strip {
+            let content: Element<Message> = match cell {
+                StripCell::Ready(handle) => iced::widget::image(handle.clone())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .content_fit(iced::ContentFit::Cover)
+                    .into(),
+                _ => container(Space::new())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(|_: &Theme| container::Style {
+                        background: Some(Background::Color(palette::HIGH)),
+                        ..container::Style::default()
+                    })
+                    .into(),
+            };
+            cells = cells.push(container(content).width(Length::FillPortion(1)));
+        }
+
+        let (left, mid, right) = range_portions(self.trim_start, self.trim_end, self.open_dur);
+        let scrim = |portion: u16| -> Element<Message> {
+            container(Space::new())
+                .width(Length::FillPortion(portion))
+                .height(Length::Fill)
+                .style(|_: &Theme| container::Style {
+                    background: Some(Background::Color(iced::Color {
+                        a: 0.62,
+                        ..palette::BACKGROUND
+                    })),
+                    ..container::Style::default()
+                })
+                .into()
+        };
+        let kept = container(Space::new())
+            .width(Length::FillPortion(mid))
+            .height(Length::Fill)
+            .style(|_: &Theme| container::Style {
+                border: Border {
+                    color: palette::ACCENT,
+                    width: 2.0,
+                    radius: 4.0.into(),
+                },
+                ..container::Style::default()
+            });
+        let overlay = row![scrim(left), kept, scrim(right)].width(Length::Fill);
+
+        container(iced::widget::stack![cells, overlay])
+            .width(Length::Fill)
+            .height(Length::Fixed(64.0))
+            .style(theme::card_style)
+            .into()
+    }
+
     /// The trim panel: a start/end range over the clip, and a lossless "save a trimmed copy" action.
     fn trim_panel(&self) -> Element<'_, Message> {
         let dur = self.open_dur.max(0.2);
@@ -1182,6 +1331,7 @@ impl Library {
         let length = (end - start).max(0.0);
 
         let panel = column![
+            self.filmstrip(),
             setting(
                 "Start",
                 secs_label(start),
