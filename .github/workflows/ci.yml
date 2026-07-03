@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call: # lets the tag-triggered release workflow gate on these exact checks
+
+# Read-only: none of these jobs write to the repo.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,24 +23,7 @@ jobs:
         with:
           persist-credentials: false
 
-      # Linux capture deps: pipewire-sys/libspa-sys need libpipewire-0.3 (pkg-config)
-      # and libclang (bindgen). vk-mem needs a C++ compiler (preinstalled). The Opus audio
-      # encoder (audiopus_sys) links system libopus → libopus-dev. The iced settings GUI's
-      # winit/softbuffer backend needs libxkbcommon (keymap) to build (ADR 0006).
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libpipewire-0.3-dev clang libclang-dev libopus-dev libxkbcommon-dev libasound2-dev
-
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
-        with:
-          toolchain: stable
-          components: clippy, rustfmt
-
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/linux-build-deps
 
       # Fails fast before the heavy GPU-stack compile.
       - name: rustfmt
@@ -60,6 +48,35 @@ jobs:
       - name: test vendored mp4 fork
         run: cargo test --manifest-path vendor/mp4/Cargo.toml --locked --lib
 
+  windows:
+    name: windows · clippy · build · test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      # No apt deps here: pipewire/ashpd are cfg(linux)-gated; the Windows capture path
+      # (windows-capture, windows-rs) and vk-mem build against the preinstalled MSVC
+      # toolchain. rustfmt runs on the Linux job (formatting is platform-independent).
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: build
+        run: cargo build --workspace --all-targets --locked
+
+      - name: test
+        run: cargo test --workspace --locked
+
   deny:
     name: advisories · licenses · sources
     runs-on: ubuntu-latest
@@ -83,25 +100,14 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libpipewire-0.3-dev clang libclang-dev libopus-dev libxkbcommon-dev libasound2-dev
-
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+      - uses: ./.github/actions/linux-build-deps
         with:
-          toolchain: stable
           components: llvm-tools-preview
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2
         with:
           tool: cargo-llvm-cov
-
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       # Gates 85% line coverage on CI-testable code only. GPU/portal code needs a
       # GPU/live Wayland session CI does not have, so it is excluded here and covered

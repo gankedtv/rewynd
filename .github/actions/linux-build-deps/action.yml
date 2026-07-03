@@ -1,0 +1,34 @@
+name: Linux build deps
+description: Install rewynd's Linux capture/build system deps, the Rust toolchain, and the cargo cache.
+
+inputs:
+  components:
+    description: Rust toolchain components to install (comma-separated).
+    required: false
+    default: clippy, rustfmt
+
+runs:
+  using: composite
+  steps:
+    # pipewire-sys/libspa-sys need libpipewire-0.3 (pkg-config) and libclang (bindgen).
+    # vk-mem needs a C++ compiler (preinstalled). The Opus audio encoder (audiopus_sys)
+    # links system libopus → libopus-dev. The iced settings GUI's winit/softbuffer backend
+    # needs libxkbcommon (keymap) to build (ADR 0006).
+    - name: Install system dependencies
+      shell: bash
+      run: |
+        # Runners run as non-root (sudo present); the release container runs as root (no sudo).
+        sudo=""; command -v sudo >/dev/null 2>&1 && sudo=sudo
+        $sudo apt-get update
+        $sudo apt-get install -y --no-install-recommends \
+          pkg-config libpipewire-0.3-dev clang libclang-dev libopus-dev libxkbcommon-dev libasound2-dev
+
+    - name: Install Rust (stable)
+      # Third-party actions are pinned to commit SHAs (tags are mutable).
+      uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+      with:
+        toolchain: stable
+        components: ${{ inputs.components }}
+
+    - name: Cache cargo build
+      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2

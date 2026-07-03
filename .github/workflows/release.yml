@@ -1,0 +1,151 @@
+name: Release
+
+# Tag-triggered. The prerelease-ness is a pure function of the tag: `v1.0.0-beta.1` (contains a
+# `-`) publishes a GitHub prerelease + Velopack prerelease; `v1.0.0` publishes a stable release.
+on:
+  push:
+    tags: ["v*"]
+
+# Least privilege: read by default; only the packing/checksum jobs get write (below).
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Lockstep with the `velopack` crate pin in Cargo.toml — a crate/CLI mismatch breaks the
+  # update protocol (see the release plan).
+  VPK_VERSION: "1.2.0"
+
+jobs:
+  # Same fmt/clippy/build/test + cargo-deny that gate every push, reused verbatim so packaging
+  # can never ship an unchecked tree.
+  gates:
+    uses: ./.github/workflows/ci.yml
+
+  linux-pack:
+    needs: gates
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # vpk upload creates/updates the GitHub release
+    # Build the distributed AppImage against glibc 2.35 so it runs on older distros; the
+    # `ubuntu-22.04` runner label is being retired, so pin the floor with a container instead.
+    container: ubuntu:22.04
+    steps:
+      # Container-only extras the ubuntu-latest runner ships preinstalled: git (for
+      # actions/checkout and cargo's git deps), curl/ca-certs (dotnet installer), a C++ toolchain,
+      # and libicu (.NET globalization). The shared capture deps come from the composite below.
+      - name: Prepare container
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates curl build-essential libicu70
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      # Same capture deps + Rust + cache as CI, via the shared composite (no duplicate list).
+      - uses: ./.github/actions/linux-build-deps
+
+      - name: Resolve and verify version
+        id: ver
+        shell: bash
+        run: bash .github/scripts/release-version.sh
+
+      # .NET is not in the bare container; the official script needs no third-party action.
+      - name: Install .NET + vpk
+        shell: bash
+        run: |
+          curl -fsSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 8.0
+          echo "$HOME/.dotnet" >> "$GITHUB_PATH"
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+          "$HOME/.dotnet/dotnet" tool install -g vpk --version "$VPK_VERSION"
+
+      - name: Build release binaries
+        # Injected only on the distributed release build (never in ci.yml): without them the
+        # shipped binary has an empty YouTube client and its login is disabled.
+        env:
+          REWYND_YT_CLIENT_ID: ${{ secrets.REWYND_YT_CLIENT_ID }}
+          REWYND_YT_CLIENT_SECRET: ${{ secrets.REWYND_YT_CLIENT_SECRET }}
+        run: cargo build --release --locked -p rewynd -p rewynd-recorder
+
+      - name: Pack and upload (AppImage)
+        shell: bash
+        env:
+          VPK_TOKEN: ${{ secrets.GITHUB_TOKEN }} # keeps the token off the command line
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          TAG: ${{ github.ref_name }}
+          PRE_FLAG: ${{ steps.ver.outputs.pre == 'true' && '--pre' || '' }}
+        run: |
+          # Stage a clean dir so vpk packs only the two binaries, not all of target/release.
+          mkdir -p pack
+          cp target/release/rewynd target/release/rewynd-recorder pack/
+          vpk download github --repoUrl "$REPO_URL" || true
+          vpk pack -u rewynd -v "$VERSION" -p pack -e rewynd -i packaging/logo-256.png
+          vpk upload github --repoUrl "$REPO_URL" \
+            --tag "$TAG" --releaseName "rewynd $VERSION" --publish $PRE_FLAG
+
+  windows-pack:
+    needs: gates
+    runs-on: windows-latest # .NET 8 is preinstalled here
+    permissions:
+      contents: write # vpk upload creates/updates the GitHub release
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: stable
+
+      - name: Resolve and verify version
+        id: ver
+        shell: bash
+        run: bash .github/scripts/release-version.sh
+
+      - name: Install vpk
+        shell: bash
+        run: dotnet tool install -g vpk --version "$VPK_VERSION"
+
+      - name: Build release binaries
+        env:
+          REWYND_YT_CLIENT_ID: ${{ secrets.REWYND_YT_CLIENT_ID }}
+          REWYND_YT_CLIENT_SECRET: ${{ secrets.REWYND_YT_CLIENT_SECRET }}
+        run: cargo build --release --locked -p rewynd -p rewynd-recorder
+
+      - name: Pack and upload (Setup.exe)
+        shell: bash
+        env:
+          VPK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          TAG: ${{ github.ref_name }}
+          PRE_FLAG: ${{ steps.ver.outputs.pre == 'true' && '--pre' || '' }}
+        run: |
+          mkdir -p pack
+          cp target/release/rewynd.exe target/release/rewynd-recorder.exe pack/
+          vpk download github --repoUrl "$REPO_URL" || true
+          vpk pack -u rewynd -v "$VERSION" -p pack -e rewynd.exe -i packaging/rewynd.ico
+          vpk upload github --repoUrl "$REPO_URL" \
+            --tag "$TAG" --releaseName "rewynd $VERSION" --publish $PRE_FLAG
+
+  # Attach a SHA256SUMS over every published asset so testers can verify their download
+  # (the beta ships unsigned; see the Defender/SmartScreen notes in the release plan).
+  checksums:
+    needs: [linux-pack, windows-pack]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # attach SHA256SUMS to the release
+    steps:
+      - name: Checksum the release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir dist && cd dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*' --skip-existing
+          sha256sum * > SHA256SUMS
+          gh release upload "$TAG" SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber

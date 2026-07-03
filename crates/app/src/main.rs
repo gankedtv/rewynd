@@ -19,12 +19,23 @@ mod overlay;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn main() -> anyhow::Result<()> {
+    // Must be first: on a packaged install this handles Velopack's install/update hook args and
+    // may exit or restart the process. A normal launch passes straight through, and it is inert
+    // (no hooks, no output) for dev/cargo runs, so the pristine-stdout probe below is unaffected.
+    velopack::VelopackApp::build().run();
+
     // `--probe-encoders`: enumerate this machine's encoders and print them as JSON, then exit.
     // The settings GUI (deliberately wgpu-free) spawns us for this to populate its device picker,
     // so it must do nothing else — no tracing, no lock, no config side effects.
     if std::env::args().any(|arg| arg == "--probe-encoders") {
         return probe::run();
     }
+
+    if std::env::args().any(|arg| arg == "--version") {
+        println!("rewynd-recorder {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // `--restart`: stop the recorder that's currently running (a config change such as the tray's
     // microphone toggle needs a fresh process to pick it up) before we take the single-instance
     // lock it still holds.

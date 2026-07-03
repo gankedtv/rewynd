@@ -184,6 +184,18 @@ const MIC_DEFAULT: &str = "System default";
 const BITS_PER_MBIT: u32 = 1_000_000;
 
 fn main() -> iced::Result {
+    // Must be first: Velopack's install/update hooks run here and may exit/restart the process.
+    // `on_restarted` fires after an update relaunch — the update flow stopped the recorder before
+    // applying, so bring it back on the new version. Inert for dev/cargo runs (no receipt).
+    velopack::VelopackApp::build()
+        .on_restarted(|_ver| spawn_recorder_detached())
+        .run();
+
+    if std::env::args().any(|arg| arg == "--version") {
+        println!("rewynd {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     tracing_subscriber::fmt::init();
 
     // Single-instance guard: a second window edits the same file, where its save clobbers the
@@ -391,6 +403,17 @@ enum Status {
     Error(String),
 }
 
+/// Where the nav-bar "Check for updates" affordance stands. Only shown in a Velopack install.
+#[derive(Default)]
+enum UpdateState {
+    #[default]
+    Idle,
+    /// Checking, downloading, or applying — the button is disabled meanwhile.
+    Working,
+    UpToDate,
+    Failed(String),
+}
+
 /// The window's top-level pages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum View {
@@ -450,6 +473,10 @@ struct App {
     encoder_probe: Option<config::EncoderProbe>,
     /// The recorder's live status (game/desktop/idle/failed), polled for the top-right pill.
     recorder_status: Option<config::RecorderStatus>,
+    /// True in a packaged Velopack install; gates the "Check for updates" affordance so dev,
+    /// cargo, and package-manager installs never show it.
+    is_velopack: bool,
+    update: UpdateState,
 }
 
 /// Where the ganked.tv device login stands. "Connected" is not a state here — it is derived from
@@ -548,6 +575,9 @@ enum Message {
     Save,
     Restart,
     Restarted(Result<(), String>),
+    /// Nav-bar update button: check for, download, and apply an update.
+    CheckForUpdates,
+    UpdateFinished(Result<(), String>),
     /// The window regained focus; refresh the library so clips saved meanwhile show up.
     WindowFocused,
     /// The clip-directory watcher fired (debounced); refresh the library.
@@ -621,6 +651,8 @@ impl App {
             last_save_ok: false,
             encoder_probe: None,
             recorder_status: None,
+            is_velopack: is_velopack_install(),
+            update: UpdateState::Idle,
         }
     }
 
@@ -1009,6 +1041,25 @@ impl App {
                     Err(e) => Status::Error(e),
                 };
             }
+            Message::CheckForUpdates => {
+                self.update = UpdateState::Working;
+                // Off the UI thread: the check/download/apply calls block, and a successful apply
+                // replaces this process (so the task only returns "up to date" or an error).
+                return Task::perform(
+                    async {
+                        tokio::task::spawn_blocking(run_update_flow)
+                            .await
+                            .unwrap_or_else(|e| Err(e.to_string()))
+                    },
+                    Message::UpdateFinished,
+                );
+            }
+            Message::UpdateFinished(result) => {
+                self.update = match result {
+                    Ok(()) => UpdateState::UpToDate,
+                    Err(e) => UpdateState::Failed(e),
+                };
+            }
             // Auto-refresh only matters while the library is on screen; entering it already
             // rescans, so a Settings-side event has nothing to do.
             Message::WindowFocused | Message::ClipsChanged => {
@@ -1132,7 +1183,16 @@ impl App {
             View::Settings => self.settings_view(),
             View::Onboarding => unreachable!("handled above"),
         };
-        column![nav_bar(self.view, self.recorder_status.as_ref()), body].into()
+        column![
+            nav_bar(
+                self.view,
+                self.recorder_status.as_ref(),
+                self.is_velopack,
+                &self.update,
+            ),
+            body
+        ]
+        .into()
     }
 
     /// Apply the wizard's choices, persist, and open the library. The recorder is restarted so it
@@ -1905,6 +1965,8 @@ fn brand_home() -> Element<'static, Message> {
 fn nav_bar(
     active: View,
     recorder_status: Option<&config::RecorderStatus>,
+    is_velopack: bool,
+    update: &UpdateState,
 ) -> Element<'static, Message> {
     let tab = |label: &'static str, view: View| {
         let is_active = view == active;
@@ -1922,6 +1984,7 @@ fn nav_bar(
             tab("Settings", View::Settings),
             iced::widget::Space::new().width(Length::Fill),
             status_pill(pill_label, pill_dot),
+            update_affordance(is_velopack, update),
         ]
         .spacing(10)
         .align_y(iced::Alignment::Center),
@@ -1939,6 +2002,45 @@ fn nav_bar(
             ..container::Style::default()
         });
     column![bar, divider].into()
+}
+
+/// Right side of the nav bar: the running version, plus (only in a Velopack install) a button to
+/// check for and apply an update.
+fn update_affordance(is_velopack: bool, update: &UpdateState) -> Element<'static, Message> {
+    let version = text(concat!("v", env!("CARGO_PKG_VERSION")))
+        .size(11)
+        .style(tinted(palette::TEXT_SECONDARY));
+    if !is_velopack {
+        return version.into();
+    }
+    let working = matches!(update, UpdateState::Working);
+    let label = if working {
+        "Checking…"
+    } else {
+        "Check for updates"
+    };
+    let mut check = button(text(label).size(11).font(UI_SEMIBOLD))
+        .padding([4, 10])
+        .style(move |_: &Theme, status| nav_link(false, status));
+    // No on_press while working leaves the button disabled (greyed, no re-entrancy).
+    if !working {
+        check = check.on_press(Message::CheckForUpdates);
+    }
+    let note: Element<'static, Message> = match update {
+        UpdateState::UpToDate => text("Up to date")
+            .size(11)
+            .style(tinted(palette::ACCENT))
+            .into(),
+        UpdateState::Failed(e) => text(e.clone())
+            .size(11)
+            .style(tinted(palette::DANGER))
+            .into(),
+        _ => text("").into(),
+    };
+    row![note, check, version]
+        .spacing(12)
+        .align_y(iced::Alignment::Center)
+        .into()
 }
 
 /// A nav link: mint text on the mint tint when active, quiet otherwise, 7px pill.
@@ -2026,6 +2128,71 @@ fn probe_encoders_via_recorder() -> Result<config::EncoderProbe, String> {
         return Err(format!("the encoder probe exited with {}", output.status));
     }
     config::EncoderProbe::from_json(String::from_utf8_lossy(&output.stdout).trim())
+}
+
+/// The GitHub repo whose Releases are the update feed.
+const UPDATE_REPO: &str = "https://github.com/gankedtv/rewynd";
+
+/// The update feed. Prereleases are offered only to a prerelease build, so a `1.0.0-beta.N`
+/// friend build tracks the beta line and later rolls into the `1.0.0` GA, while a stable build
+/// ignores future betas. Anonymous (no token): the public GitHub API is 60 req/h/IP, and one
+/// check per button press is nothing.
+fn update_source() -> velopack::sources::GithubSource {
+    velopack::sources::GithubSource::new(UPDATE_REPO, None, env!("CARGO_PKG_VERSION").contains('-'))
+}
+
+/// True only in a real Velopack install (a receipt exists). Dev/cargo runs and package-manager
+/// installs return false — `UpdateManager::new` errors without a receipt — which hides the update
+/// affordance so those installs never try to self-update.
+fn is_velopack_install() -> bool {
+    velopack::UpdateManager::new(update_source(), None, None).is_ok()
+}
+
+/// Check → download → stop the recorder → apply and restart. Blocking; runs on a spawn_blocking
+/// thread. A successful apply replaces this process, so this only returns for "up to date" or an
+/// error. The recorder is stopped first because Velopack force-kills any process in the install
+/// dir mid-apply, and a recorder mid-MP4-write must never die that way.
+fn run_update_flow() -> Result<(), String> {
+    let um =
+        velopack::UpdateManager::new(update_source(), None, None).map_err(|e| e.to_string())?;
+    if let velopack::UpdateCheck::UpdateAvailable(info) =
+        um.check_for_updates().map_err(|e| e.to_string())?
+    {
+        um.download_updates(&info, None)
+            .map_err(|e| e.to_string())?;
+        // Stop the recorder first and confirm it actually exited: Velopack force-kills any
+        // process left in the install dir mid-apply, and a recorder mid-MP4-write must never die
+        // that way. If it will not stop, abort rather than risk a corrupt clip.
+        match config::stop_recorder(
+            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(2),
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(
+                    "the recorder is still running; close it and try updating again".to_owned(),
+                );
+            }
+            Err(e) => return Err(format!("could not stop the recorder before updating: {e}")),
+        }
+        um.apply_updates_and_restart(&*info)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Launch a detached recorder — used to bring it back after an update relaunch. The child is
+/// reaped on a background thread so it never lingers as a zombie that would confuse the next stop.
+/// NOTE: inside an AppImage both binaries live in a per-invocation mount that is torn down when
+/// this GUI exits; the recorder's own AppImage lifecycle is verified on the dev box (release plan).
+fn spawn_recorder_detached() {
+    if let Some(rec) = recorder_path().filter(|p| p.is_file())
+        && let Ok(mut child) = std::process::Command::new(rec).spawn()
+    {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 /// Stop the running recorder (if any), wait for it to exit, then launch a fresh one so it picks
