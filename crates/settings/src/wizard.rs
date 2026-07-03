@@ -73,7 +73,12 @@ impl Step {
 enum TestState {
     Idle,
     Saving,
-    Saved(PathBuf),
+    /// A clip was saved; `encoder` is the recorder's active backend (`"cpu"` / `"gpu:<name>"`)
+    /// when known, so the step can flag the CPU fallback.
+    Saved {
+        path: PathBuf,
+        encoder: Option<String>,
+    },
     Failed(String),
 }
 
@@ -102,7 +107,7 @@ pub enum Message {
     StartRecording,
     RecordingStarted(Result<(), String>),
     SaveTestClip,
-    TestClipResult(Result<Option<PathBuf>, String>),
+    TestClipResult(Result<Option<(PathBuf, Option<String>)>, String>),
     Finish,
 }
 
@@ -179,7 +184,9 @@ impl Wizard {
                     Message::TestClipResult,
                 );
             }
-            Message::TestClipResult(Ok(Some(path))) => self.test = TestState::Saved(path),
+            Message::TestClipResult(Ok(Some((path, encoder)))) => {
+                self.test = TestState::Saved { path, encoder };
+            }
             Message::TestClipResult(Ok(None)) => {
                 self.test = TestState::Failed(
                     "No clip appeared yet. Give the recorder a moment to warm up, then try again."
@@ -350,14 +357,22 @@ impl Wizard {
     fn test_clip(&self) -> Element<'_, Message> {
         let action: Element<Message> = match &self.test {
             TestState::Saving => hint("Saving a test clip..."),
-            TestState::Saved(path) => column![
-                text("Saved a test clip.")
-                    .size(13)
-                    .style(tinted(palette::ACCENT)),
-                hint(path.display().to_string()),
-            ]
-            .spacing(8)
-            .into(),
+            TestState::Saved { path, encoder } => {
+                let mut saved = column![
+                    text("Saved a test clip.")
+                        .size(13)
+                        .style(tinted(palette::ACCENT)),
+                    hint(path.display().to_string()),
+                ]
+                .spacing(8);
+                if encoder.as_deref() == Some("cpu") {
+                    saved = saved.push(hint(
+                        "Your GPU can't encode video, so rewynd used its CPU encoder. Clips still \
+                         work, at the cost of more processor power.",
+                    ));
+                }
+                saved.into()
+            }
             _ => button(text("Save a test clip now").size(13).font(UI_BOLD))
                 .on_press(Message::SaveTestClip)
                 .style(primary_button)
@@ -457,7 +472,7 @@ fn spawn_recorder_capturing_desktop() -> Result<(), String> {
 
 /// Ask the recorder to save a clip and wait for a new one to appear under `dir`. `Ok(None)` means
 /// none showed up in time (the ring may still be filling); `Err` means the recorder isn't running.
-fn save_and_wait_for_clip(dir: &Path) -> Result<Option<PathBuf>, String> {
+fn save_and_wait_for_clip(dir: &Path) -> Result<Option<(PathBuf, Option<String>)>, String> {
     let before = rewynd_config::newest_clip_in(dir);
     let requested = rewynd_config::request_recorder_save().map_err(|e| e.to_string())?;
     if !requested {
@@ -469,8 +484,11 @@ fn save_and_wait_for_clip(dir: &Path) -> Result<Option<PathBuf>, String> {
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(400));
         let now = rewynd_config::newest_clip_in(dir);
-        if now.is_some() && now != before {
-            return Ok(now);
+        if let Some(path) = now
+            && Some(&path) != before.as_ref()
+        {
+            let encoder = rewynd_config::read_recorder_status().map(|s| s.encoder);
+            return Ok(Some((path, encoder)));
         }
     }
     Ok(None)
