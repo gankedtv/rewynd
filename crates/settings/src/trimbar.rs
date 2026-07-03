@@ -115,10 +115,17 @@ where
                 if let Some(pos) = cursor.position_over(bounds) {
                     let sx = self.pixel_of(self.start, bounds.x, bounds.width);
                     let ex = self.pixel_of(self.end, bounds.x, bounds.width);
-                    state.drag = Some(if nearer_is_start(pos.x, sx, ex) {
+                    let handle = if nearer_is_start(pos.x, sx, ex) {
                         Handle::Start
                     } else {
                         Handle::End
+                    };
+                    state.drag = Some(handle);
+                    // Snap the grabbed edge to the click, then the drag fine-tunes from there.
+                    let t = time_at(pos.x, bounds.x, bounds.width, self.dur);
+                    shell.publish(match handle {
+                        Handle::Start => (self.on_start)(t),
+                        Handle::End => (self.on_end)(t),
                     });
                     shell.capture_event();
                 }
