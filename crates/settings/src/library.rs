@@ -212,6 +212,8 @@ pub enum Message {
     PlayToggle,
     /// The next playback frame, with its position in the clip.
     PlayerFrame(iced::widget::image::Handle, Duration),
+    /// In-app playback has no decoder on this machine (ffmpeg missing).
+    PlayerUnavailable,
     /// Playback reached the end of the kept range.
     PlayerEnded,
 }
@@ -270,6 +272,8 @@ pub struct Library {
     play_frame: Option<iced::widget::image::Handle>,
     /// Where playback is (or paused), in seconds; resuming starts here.
     play_pos: Option<f32>,
+    /// Why in-app playback can't run on this machine, when it can't (ffmpeg missing).
+    play_error: Option<&'static str>,
     confirm_delete: bool,
     /// Trim in/out points for the open clip, in seconds; reset to the full span on open.
     trim_start: f32,
@@ -314,6 +318,7 @@ impl Library {
             play_range: None,
             play_frame: None,
             play_pos: None,
+            play_error: None,
             confirm_delete: false,
             trim_start: 0.0,
             trim_end: 0.0,
@@ -347,6 +352,7 @@ impl Library {
         self.play_range = None;
         self.play_frame = None;
         self.play_pos = None;
+        self.play_error = None;
     }
 
     /// The upload record for `entry` at `dest`, if the clip was uploaded there.
@@ -633,6 +639,7 @@ impl Library {
                         .play_pos
                         .filter(|p| (self.trim_start..self.trim_end - 0.1).contains(p))
                         .unwrap_or(self.trim_start);
+                    self.play_error = None;
                     self.play_range = Some((from, self.trim_end));
                 }
             }
@@ -641,6 +648,12 @@ impl Library {
                     self.play_frame = Some(handle);
                     self.play_pos = Some(pts.as_secs_f32());
                 }
+            }
+            Message::PlayerUnavailable => {
+                self.play_range = None;
+                self.play_pos = None;
+                self.play_error =
+                    Some("In-app preview needs ffmpeg installed; use Open in player.");
             }
             Message::PlayerEnded => {
                 self.play_range = None;
@@ -780,6 +793,7 @@ impl Library {
                 )
                 .map(|event| match event {
                     player::Event::Frame(handle, pts) => Message::PlayerFrame(handle, pts),
+                    player::Event::Unavailable => Message::PlayerUnavailable,
                     player::Event::Ended => Message::PlayerEnded,
                 }),
             );
@@ -1347,8 +1361,12 @@ impl Library {
 
         button(
             column![
-                // Clipped: Cover scales the frame past the card's box on mismatched aspects.
-                container(self.thumbnail(entry, 148.0)).clip(true),
+                container(
+                    layered([self.thumbnail(entry, 148.0)])
+                        .width(Length::Fill)
+                        .height(Length::Fixed(148.0)),
+                )
+                .clip(true),
                 container(info).padding([11, 12]),
             ]
             .spacing(0),
@@ -1414,14 +1432,17 @@ impl Library {
             .align_x(iced::Alignment::Center)
             .align_y(iced::Alignment::End)
             .padding(10);
-        let mut col = column![
-            container(iced::widget::stack![frame, overlay])
-                .clip(true)
-                .style(theme::card_style)
-        ]
-        .spacing(6);
+        // The frame sits above an empty base layer: iced only hard-clips layered stack
+        // children, so this keeps the Cover-scaled frame inside the box (see `layered`).
+        let stack = layered([frame, overlay.into()])
+            .width(Length::Fill)
+            .height(Length::Fixed(PREVIEW_HEIGHT));
+        let mut col = column![container(stack).clip(true).style(theme::card_style)].spacing(6);
         if playing {
             col = col.push(hint("Silent preview; use Open in player for sound."));
+        }
+        if let Some(reason) = self.play_error {
+            col = col.push(hint(reason));
         }
         col.into()
     }
@@ -1500,9 +1521,7 @@ impl Library {
             cells = cells.push(
                 container(content)
                     .width(Length::FillPortion(1))
-                    .height(Length::Fill)
-                    // Cover overflows the cell box on mismatched aspects; keep frames inside.
-                    .clip(true),
+                    .height(Length::Fill),
             );
         }
 
@@ -1514,7 +1533,10 @@ impl Library {
             Message::TrimEndChanged,
         )
         .playhead(self.play_range.and(self.play_pos));
-        container(iced::widget::stack![cells, bar])
+        let stack = layered([cells.into(), bar.into()])
+            .width(Length::Fill)
+            .height(Length::Fill);
+        container(stack)
             .width(Length::Fill)
             .height(Length::Fixed(64.0))
             .clip(true)
@@ -2309,8 +2331,21 @@ fn segment_style(
     }
 }
 
-/// A decoded frame styled like every clip image: full width, covering `height`. Callers clip
-/// the surrounding container (Cover overflows the box on mismatched aspects).
+/// A stack whose real content sits above an empty base layer. iced hard-clips only *layered*
+/// stack children (the base draws unlayered, and `container.clip` merely narrows a viewport
+/// hint that image drawing ignores), so this is what actually keeps Cover-scaled frames inside
+/// the box of the nearest `clip(true)` ancestor.
+fn layered<'a>(
+    content: impl IntoIterator<Item = Element<'a, Message>>,
+) -> iced::widget::Stack<'a, Message> {
+    content.into_iter().fold(
+        iced::widget::Stack::new().push(Space::new()),
+        |stack, layer| stack.push(layer),
+    )
+}
+
+/// A decoded frame styled like every clip image: full width, covering `height`. Callers wrap it
+/// in [`layered`] + a `clip(true)` container (Cover overflows the box on mismatched aspects).
 fn frame_image<'a>(handle: iced::widget::image::Handle, height: f32) -> Element<'a, Message> {
     iced::widget::image(handle)
         .width(Length::Fill)
