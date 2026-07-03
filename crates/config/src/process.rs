@@ -85,6 +85,35 @@ pub fn stop_recorder(term_wait: Duration, kill_wait: Duration) -> std::io::Resul
     }
 }
 
+/// Ask the running recorder to save a clip now, via SIGUSR1 — used by the onboarding wizard's
+/// test-clip step so the user need not press the just-configured hotkey. Verifies the pid is
+/// actually the recorder (its `/proc/<pid>/comm`) before signalling, so a reused pid is never hit.
+/// `Ok(true)` when a save was requested, `Ok(false)` when no recorder is running.
+#[cfg(unix)]
+pub fn request_recorder_save() -> std::io::Result<bool> {
+    let Some(pid) = read_recorder_pid() else {
+        return Ok(false);
+    };
+    let Ok(raw) = libc::pid_t::try_from(pid) else {
+        return Ok(false);
+    };
+    if raw <= 0 {
+        return Ok(false);
+    }
+    if !std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .is_ok_and(|comm| comm.trim() == "rewynd-recorder")
+    {
+        return Ok(false);
+    }
+    send_signal(raw, libc::SIGUSR1)
+}
+
+/// No per-process save signal on Windows; the wizard falls back to the hotkey there.
+#[cfg(not(unix))]
+pub fn request_recorder_save() -> std::io::Result<bool> {
+    Ok(false)
+}
+
 /// Name of the per-session stop event the recorder waits on — the Windows stand-in for
 /// SIGTERM. Signaling it asks the (single-instance) recorder to shut down cleanly.
 #[cfg(windows)]

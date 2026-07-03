@@ -12,6 +12,7 @@
 mod library;
 mod theme;
 mod thumbs;
+mod wizard;
 
 use std::fmt;
 
@@ -34,6 +35,18 @@ use crate::theme::{
 fn is_custom_url(stored: &str, default: &str) -> bool {
     let stored = stored.trim();
     !stored.is_empty() && stored != default
+}
+
+/// The view to open on. First run (no config file) or an explicit `--onboarding` starts in the
+/// onboarding wizard; otherwise the library.
+fn initial_view() -> View {
+    let requested = std::env::args().any(|arg| arg == "--onboarding");
+    let no_config = config::config_path().is_none_or(|path| !path.exists());
+    if requested || no_config {
+        View::Onboarding
+    } else {
+        View::default()
+    }
 }
 
 /// The settings scrollable's id, so a disclosure collapse can snap it back to the top.
@@ -278,11 +291,14 @@ enum View {
     #[default]
     Library,
     Settings,
+    /// First-run setup (no config yet) or a rerun from Settings.
+    Onboarding,
 }
 
 /// Editable application state: the loaded config plus text mirrors for the free-text fields.
 struct App {
     view: View,
+    wizard: wizard::Wizard,
     library: library::Library,
     config: Config,
     /// Mirror of the output directory for the text box (empty = "use the default").
@@ -365,6 +381,8 @@ struct YtStarted {
 enum Message {
     Tab(View),
     Library(library::Message),
+    Wizard(wizard::Message),
+    RerunOnboarding,
     MicGain(f32),
     SystemGain(f32),
     MicrophonePicked(String),
@@ -431,8 +449,10 @@ impl App {
         let mic_options = config::list_audio_inputs();
         #[cfg(not(target_os = "windows"))]
         let mic_options = Vec::new();
+        let wizard = wizard::Wizard::new(&config);
         Self {
-            view: View::default(),
+            view: initial_view(),
+            wizard,
             library: library::Library::new(),
             output_dir: config.output_directory().unwrap_or_default().to_owned(),
             hotkey: config.hotkey_trigger().to_owned(),
@@ -519,6 +539,18 @@ impl App {
                     .library
                     .update(message, &self.config)
                     .map(Message::Library);
+            }
+            Message::Wizard(wizard::Message::Finish) => return self.finish_onboarding(),
+            Message::Wizard(wizard::Message::SkipSetup) => return self.skip_onboarding(),
+            Message::Wizard(message) => {
+                return self
+                    .wizard
+                    .update(message, &self.config)
+                    .map(Message::Wizard);
+            }
+            Message::RerunOnboarding => {
+                self.wizard = wizard::Wizard::new(&self.config);
+                self.view = View::Onboarding;
             }
             Message::MicGain(v) => {
                 self.config.set_mic_gain(v);
@@ -940,11 +972,65 @@ impl App {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        // The wizard is full-screen (its own steps + Skip), with no nav bar to wander off into.
+        if self.view == View::Onboarding {
+            return self.wizard.view(&self.config).map(Message::Wizard);
+        }
         let body: Element<Message> = match self.view {
             View::Library => self.library.view(&self.config).map(Message::Library),
             View::Settings => self.settings_view(),
+            View::Onboarding => unreachable!("handled above"),
         };
         column![nav_bar(self.view), body].into()
+    }
+
+    /// Apply the wizard's choices, persist, and open the library. The recorder is restarted so it
+    /// captures with the real config (the wizard ran it in desktop-capture mode for the test clip).
+    fn finish_onboarding(&mut self) -> Task<Message> {
+        let trigger = self.wizard.hotkey().trim();
+        self.hotkey = if trigger.is_empty() {
+            config::DEFAULT_HOTKEY_TRIGGER.to_owned()
+        } else {
+            trigger.to_owned()
+        };
+        self.config
+            .set_buffer_seconds(u64::from(self.wizard.buffer_seconds()));
+        self.config.set_start_on_boot(self.wizard.start_on_boot());
+        self.save();
+        self.view = View::Library;
+        let refresh = self.library.refresh(&self.config).map(Message::Library);
+        let restart = Task::perform(
+            async {
+                tokio::task::spawn_blocking(restart_recorder)
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+            },
+            Message::Restarted,
+        );
+        Task::batch([refresh, restart])
+    }
+
+    /// Skip setup: persist the (default) config so the wizard doesn't reappear next launch, then
+    /// open the library. If the wizard had started the recorder (in desktop-capture mode for the
+    /// test clip), restart it so it applies the real config instead of continuing to record the
+    /// desktop.
+    fn skip_onboarding(&mut self) -> Task<Message> {
+        let started = self.wizard.recording_started();
+        self.save();
+        self.view = View::Library;
+        let refresh = self.library.refresh(&self.config).map(Message::Library);
+        if !started {
+            return refresh;
+        }
+        let restart = Task::perform(
+            async {
+                tokio::task::spawn_blocking(restart_recorder)
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+            },
+            Message::Restarted,
+        );
+        Task::batch([refresh, restart])
     }
 
     /// Live events that keep the library in step with what the recorder writes: the OS window
@@ -1420,6 +1506,10 @@ impl App {
                 "Most changes apply after Save + Restart rewynd now; the ganked.tv upload \
                  settings apply immediately.",
             ),
+            button(text("Run setup again").size(12).font(UI_SEMIBOLD))
+                .on_press(Message::RerunOnboarding)
+                .style(link_button)
+                .padding(0),
         ]
         .spacing(6)
         .align_x(iced::Alignment::Center)

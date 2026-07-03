@@ -51,7 +51,7 @@ pub use paths::{
 };
 #[cfg(windows)]
 pub use process::RecorderStopEvent;
-pub use process::{read_recorder_pid, stop_recorder};
+pub use process::{read_recorder_pid, request_recorder_save, stop_recorder};
 pub use schema::{
     AudioSettings, Config, DEFAULT_HOTKEY_TRIGGER, DEFAULT_TEMPLATE, DEFAULT_UPLOAD_API_URL,
     DEFAULT_UPLOAD_SHARE_URL, MAX_BUFFER_SECONDS, UploadSettings, VideoSettings, YouTubeSettings,

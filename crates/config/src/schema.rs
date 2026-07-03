@@ -322,6 +322,14 @@ impl Config {
     /// Apply `REWYND_*` environment overrides (highest precedence). A non-positive or
     /// unparseable numeric override is ignored, falling back to the config/default value.
     fn apply_env_overrides(&mut self, get: impl Fn(&str) -> Option<String>) {
+        /// Parse a boolean env override; unrecognized values are ignored (fall back to the file).
+        fn bool_of(v: &Option<String>) -> Option<bool> {
+            match v.as_deref()?.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => None,
+            }
+        }
         let u32_of = |key: &str| {
             get(key)
                 .and_then(|v| v.parse::<u32>().ok())
@@ -350,6 +358,11 @@ impl Config {
         }
         if let Some(dir) = get("REWYND_OUTPUT_DIR").filter(|s| !s.is_empty()) {
             self.output.directory = Some(dir);
+        }
+        // Force desktop capture regardless of the file's setting — the onboarding wizard uses this
+        // to make its test clip work while the user is on the desktop (not in a game).
+        if let Some(on) = bool_of(&get("REWYND_CAPTURE_DESKTOP")) {
+            self.capture.desktop = on;
         }
     }
 
@@ -1291,6 +1304,7 @@ mod tests {
             ("REWYND_IDR_PERIOD", "240"),
             ("REWYND_AUDIO_BITRATE_BPS", "0"), // non-positive → ignored
             ("REWYND_OUTPUT_DIR", "/tmp/over"),
+            ("REWYND_CAPTURE_DESKTOP", "1"),
         ]);
         c.apply_env_overrides(|k| env.get(k).map(|s| (*s).to_owned()));
         let v = c.video();
@@ -1308,11 +1322,21 @@ mod tests {
             "zero AUDIO_BITRATE_BPS ignored → file value"
         );
         assert_eq!(c.output_dir(), Some(PathBuf::from("/tmp/over")));
+        assert!(
+            c.capture_desktop(),
+            "CAPTURE_DESKTOP=1 forces desktop capture"
+        );
 
-        // An unparseable numeric override is ignored, leaving the file/default value intact.
-        let mut c2 = Config::from_toml_str("[video]\nwidth = 1600\n").expect("parses");
-        let bad = std::collections::HashMap::from([("REWYND_WIDTH", "not-a-number")]);
+        // An unparseable numeric override is ignored, leaving the file/default value intact; an
+        // unrecognized boolean likewise leaves the desktop-capture flag as the file has it.
+        let mut c2 = Config::from_toml_str("[video]\nwidth = 1600\n[capture]\ndesktop = true\n")
+            .expect("parses");
+        let bad = std::collections::HashMap::from([
+            ("REWYND_WIDTH", "not-a-number"),
+            ("REWYND_CAPTURE_DESKTOP", "maybe"),
+        ]);
         c2.apply_env_overrides(|k| bad.get(k).map(|s| (*s).to_owned()));
+        assert!(c2.capture_desktop(), "unrecognized bool → file value kept");
         assert_eq!(
             c2.video().width,
             1600,

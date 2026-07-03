@@ -1355,6 +1355,11 @@ mod linux {
             .context("installing the SIGTERM handler")?;
         let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
             .context("installing the SIGINT handler")?;
+        // SIGUSR1 = "save a clip now", used by the onboarding wizard's test-clip step to exercise
+        // the pipeline without the user having to press the (just-configured) hotkey.
+        let mut sigusr1 =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+                .context("installing the SIGUSR1 handler")?;
 
         let mut attempts: u32 = 0;
         loop {
@@ -1367,6 +1372,7 @@ mod linux {
                 &mut shutdown,
                 &mut sigterm,
                 &mut sigint,
+                &mut sigusr1,
             )
             .await
             {
@@ -1385,7 +1391,14 @@ mod linux {
                             "The shortcut stopped working; use the tray's Save clip now.",
                         )
                         .await;
-                        wait_for_shutdown(&mut shutdown, &mut sigterm, &mut sigint).await;
+                        wait_for_shutdown(
+                            &saver,
+                            &mut shutdown,
+                            &mut sigterm,
+                            &mut sigint,
+                            &mut sigusr1,
+                        )
+                        .await;
                         return Ok(());
                     }
                     let backoff = Duration::from_secs(2u64.pow(attempts));
@@ -1405,7 +1418,14 @@ mod linux {
                         "Clips can still be saved from the tray menu (Save clip now).",
                     )
                     .await;
-                    wait_for_shutdown(&mut shutdown, &mut sigterm, &mut sigint).await;
+                    wait_for_shutdown(
+                        &saver,
+                        &mut shutdown,
+                        &mut sigterm,
+                        &mut sigint,
+                        &mut sigusr1,
+                    )
+                    .await;
                     return Ok(());
                 }
             }
@@ -1428,6 +1448,7 @@ mod linux {
         shutdown: &mut tokio::sync::watch::Receiver<bool>,
         sigterm: &mut tokio::signal::unix::Signal,
         sigint: &mut tokio::signal::unix::Signal,
+        sigusr1: &mut tokio::signal::unix::Signal,
     ) -> Result<HotkeyExit> {
         let shortcuts = GlobalShortcuts::new().await?;
         let session = shortcuts.create_session(Default::default()).await?;
@@ -1490,11 +1511,12 @@ mod linux {
                         };
                         tracing::info!(shortcut_id = activation.shortcut_id(), "shortcut activated");
                         if activation.shortcut_id() == SHORTCUT_ID {
-                            // Blocking cut + mux off the runtime worker so activations keep flowing.
-                            let s = saver.clone();
-                            let saved = tokio::task::spawn_blocking(move || s.save()).await;
-                            toast_save_outcome(saved).await;
+                            save_and_toast(saver).await;
                         }
+                    }
+                    _ = sigusr1.recv() => {
+                        tracing::info!("SIGUSR1 received; saving a clip");
+                        save_and_toast(saver).await;
                     }
                     _ = shutdown.changed() => break HotkeyExit::Shutdown,
                     _ = sigterm.recv() => {
@@ -1515,16 +1537,30 @@ mod linux {
         result
     }
 
-    /// Park until shutdown is requested by the tray or a signal (degraded, tray-only mode).
+    /// Save a clip (off the runtime worker so the loop keeps running) and toast the outcome.
+    async fn save_and_toast(saver: &Arc<ClipSaver>) {
+        let s = saver.clone();
+        let saved = tokio::task::spawn_blocking(move || s.save()).await;
+        toast_save_outcome(saved).await;
+    }
+
+    /// Park until shutdown is requested by the tray or a signal (degraded, tray-only mode). A
+    /// SIGUSR1 here still saves a clip (the wizard's test-clip button works even when the hotkey
+    /// portal is unavailable) without ending the wait.
     async fn wait_for_shutdown(
+        saver: &Arc<ClipSaver>,
         shutdown: &mut tokio::sync::watch::Receiver<bool>,
         sigterm: &mut tokio::signal::unix::Signal,
         sigint: &mut tokio::signal::unix::Signal,
+        sigusr1: &mut tokio::signal::unix::Signal,
     ) {
-        tokio::select! {
-            _ = shutdown.changed() => {}
-            _ = sigterm.recv() => {}
-            _ = sigint.recv() => {}
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                _ = sigterm.recv() => return,
+                _ = sigint.recv() => return,
+                _ = sigusr1.recv() => save_and_toast(saver).await,
+            }
         }
     }
 
