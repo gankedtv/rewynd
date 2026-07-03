@@ -38,10 +38,20 @@ hierarchy and doesn't share credentials, consent screen, or quota (those are per
 
 ## Build vars
 
-`option_env!` is read at compile time. The `build.rs` in `rewynd-upload` marks these vars with
-`rerun-if-env-changed`, so a rebuild picks up new values without a `cargo clean`.
+`option_env!` is read at compile time. The `build.rs` in `rewynd-upload` forwards these vars as
+tracked rustc-env values, so a rebuild picks up new values without a `cargo clean`.
 
-Local build (fish shell — `env` because inline `VAR=val cmd` isn't fish syntax):
+**Local dev — a gitignored `.env` (easiest).** Drop a `.env` at the repo root; `build.rs` reads it
+(a real environment variable still wins). It's already in `.gitignore`; never commit it.
+
+```dotenv
+REWYND_YT_CLIENT_ID=xxxx.apps.googleusercontent.com
+REWYND_YT_CLIENT_SECRET=GOCSPX-yyyy
+```
+
+Then just `cargo build -p rewynd`.
+
+**Or export them for one build** (fish — `env`, because inline `VAR=val cmd` isn't fish syntax):
 
 ```fish
 env REWYND_YT_CLIENT_ID=xxxx.apps.googleusercontent.com \

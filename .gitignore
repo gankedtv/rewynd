@@ -8,5 +8,8 @@ vendor/mp4/target/
 *.swp
 .DS_Store
 
+# Local build secrets: the YouTube OAuth client for dev builds (build.rs reads it). Never commit.
+/.env
+
 # Local Claude Code working notes / progress tracking (not shared)
 .claude/
