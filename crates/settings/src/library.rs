@@ -1269,7 +1269,7 @@ impl Library {
         if self.strip.is_empty() {
             return Space::new().into();
         }
-        let mut cells = row![].width(Length::Fill);
+        let mut cells = row![].width(Length::Fill).height(Length::Fill);
         for cell in &self.strip {
             let content: Element<Message> = match cell {
                 StripCell::Ready(handle) => iced::widget::image(handle.clone())
@@ -1286,7 +1286,11 @@ impl Library {
                     })
                     .into(),
             };
-            cells = cells.push(container(content).width(Length::FillPortion(1)));
+            cells = cells.push(
+                container(content)
+                    .width(Length::FillPortion(1))
+                    .height(Length::Fill),
+            );
         }
 
         let (left, mid, right) = range_portions(self.trim_start, self.trim_end, self.open_dur);
@@ -1314,7 +1318,9 @@ impl Library {
                 },
                 ..container::Style::default()
             });
-        let overlay = row![scrim(left), kept, scrim(right)].width(Length::Fill);
+        let overlay = row![scrim(left), kept, scrim(right)]
+            .width(Length::Fill)
+            .height(Length::Fill);
 
         container(iced::widget::stack![cells, overlay])
             .width(Length::Fill)
