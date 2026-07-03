@@ -252,6 +252,13 @@ impl Library {
         }
     }
 
+    /// Leave any open clip's detail and return to the grid (the nav "Library" tab / brand logo).
+    pub fn show_grid(&mut self) {
+        self.open = None;
+        self.confirm_delete = false;
+        self.action_error = None;
+    }
+
     /// The upload record for `entry` at `dest`, if the clip was uploaded there.
     fn record_for(&self, entry: &ClipEntry, dest: Dest) -> Option<&UploadRecord> {
         let key = clip_key(entry)?;

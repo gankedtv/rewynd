@@ -527,10 +527,11 @@ impl App {
         // Any edit invalidates a prior "Saved" state.
         match message {
             Message::Tab(view) => {
-                let entered_library = view == View::Library && self.view != View::Library;
                 self.view = view;
-                // Refresh on view-enter, so clips saved while the user was in Settings appear.
-                if entered_library {
+                // The Library tab / brand logo is a home action: leave any open clip's detail for
+                // the grid, and refresh so clips saved while away appear.
+                if view == View::Library {
+                    self.library.show_grid();
                     return self.library.refresh(&self.config).map(Message::Library);
                 }
             }
@@ -1109,7 +1110,7 @@ impl App {
         // way to a hint (turning the mic off opens no mic stream at all — a privacy choice).
         let mic_enabled = self.config.mic_enabled();
         let mic_controls: Element<Message> = if mic_enabled {
-            let mut items: Vec<Element<Message>> = vec![
+            column![
                 microphone,
                 setting(
                     "Microphone volume",
@@ -1118,10 +1119,40 @@ impl App {
                         .step(0.05)
                         .style(arena_slider),
                 ),
-                disclosure(self.audio_advanced_open, Message::AudioAdvancedToggled),
-            ];
+            ]
+            .spacing(18)
+            .into()
+        } else {
+            hint("The microphone is off; turn it on to pick a device or set its level.")
+        };
+        let mut audio_items: Vec<Element<Message>> = vec![
+            checkbox(mic_enabled)
+                .label("Record microphone")
+                .on_toggle(Message::MicEnabled)
+                .style(arena_check)
+                .into(),
+            mic_controls,
+            setting(
+                "System volume",
+                format!("{:.2}x", self.config.system_gain()),
+                slider(
+                    0.0..=GAIN_MAX,
+                    self.config.system_gain(),
+                    Message::SystemGain,
+                )
+                .step(0.05)
+                .style(arena_slider),
+            ),
+        ];
+        // Advanced sits at the bottom of the card, and only while the mic is on (its one option,
+        // the separate track, needs a recording mic to mean anything).
+        if mic_enabled {
+            audio_items.push(disclosure(
+                self.audio_advanced_open,
+                Message::AudioAdvancedToggled,
+            ));
             if self.audio_advanced_open {
-                items.push(
+                audio_items.push(
                     column![
                         checkbox(self.config.separate_mic_track())
                             .label("Keep the microphone on a separate audio track")
@@ -1136,34 +1167,8 @@ impl App {
                     .into(),
                 );
             }
-            column(items).spacing(18).into()
-        } else {
-            hint(
-                "The microphone is off; turn it on to pick a device, set its level, or split it onto its own track.",
-            )
-        };
-        let audio = card(
-            "AUDIO",
-            column![
-                checkbox(mic_enabled)
-                    .label("Record microphone")
-                    .on_toggle(Message::MicEnabled)
-                    .style(arena_check),
-                mic_controls,
-                setting(
-                    "System volume",
-                    format!("{:.2}x", self.config.system_gain()),
-                    slider(
-                        0.0..=GAIN_MAX,
-                        self.config.system_gain(),
-                        Message::SystemGain
-                    )
-                    .step(0.05)
-                    .style(arena_slider),
-                ),
-            ]
-            .spacing(18),
-        );
+        }
+        let audio = card("AUDIO", column(audio_items).spacing(18));
 
         let recording = card(
             "RECORDING",
@@ -1241,19 +1246,38 @@ impl App {
         // ScreenCast-portal detail (Windows records the active game by default) that only applies
         // while desktop capture is on.
         let capture_desktop = self.config.capture_desktop();
-        let output_capture = output_capture.push(
-            column![
-                checkbox(capture_desktop)
-                    .label("Record the whole desktop, not just the active game")
-                    .on_toggle(Message::CaptureDesktop)
+        let output_capture = output_capture
+            .push(
+                column![
+                    checkbox(capture_desktop)
+                        .label("Record the whole desktop, not just the active game")
+                        .on_toggle(Message::CaptureDesktop)
+                        .style(arena_check),
+                    hint(
+                        "Off records only the game you're playing (fullscreen or \
+                         borderless), keeping other windows out of your clips.",
+                    ),
+                ]
+                .spacing(6),
+            )
+            .push(
+                column![
+                    checkbox(self.config.game_folders())
+                        .label("Sort clips into a folder per game")
+                        .on_toggle(Message::GameFolders)
+                        .style(arena_check),
+                    hint("Saved clips land in a subfolder named after the game, when known."),
+                ]
+                .spacing(6),
+            )
+            .push(
+                checkbox(self.config.start_on_boot())
+                    .label("Start rewynd when I log in")
+                    .on_toggle(Message::StartOnBoot)
                     .style(arena_check),
-                hint(
-                    "Off records only the game you're playing (fullscreen or \
-                     borderless), keeping other windows out of your clips.",
-                ),
-            ]
-            .spacing(6),
-        );
+            );
+        // Advanced sits at the bottom of the card (the per-start monitor prompt is a Linux-only,
+        // rarely-used detail).
         #[cfg(target_os = "linux")]
         let output_capture = {
             let mut oc = output_capture.push(disclosure(
@@ -1282,25 +1306,7 @@ impl App {
             }
             oc
         };
-        let output_capture = output_capture.push(
-            column![
-                checkbox(self.config.game_folders())
-                    .label("Sort clips into a folder per game")
-                    .on_toggle(Message::GameFolders)
-                    .style(arena_check),
-                hint("Saved clips land in a subfolder named after the game, when known."),
-            ]
-            .spacing(6),
-        );
-        let output = card(
-            "OUTPUT & CAPTURE",
-            output_capture.push(
-                checkbox(self.config.start_on_boot())
-                    .label("Start rewynd when I log in")
-                    .on_toggle(Message::StartOnBoot)
-                    .style(arena_check),
-            ),
-        );
+        let output = card("OUTPUT & CAPTURE", output_capture);
 
         // Account area: a one-click browser login (device grant); the key it mints is stored
         // invisibly. Connectedness is simply "a key is present".
@@ -1395,10 +1401,13 @@ impl App {
             upload_items.push(
                 column![
                     checkbox(self.config.upload_enabled())
-                        .label("Upload clips to ganked.tv")
+                        .label("Show the ganked.tv upload option")
                         .on_toggle(Message::UploadEnabled)
                         .style(arena_check),
-                    hint("Adds an \"Upload last clip\" shortcut to the tray menu."),
+                    hint(
+                        "Adds an \"Upload last clip\" button to the tray and the upload panel here. \
+                         You choose which clips to send — nothing uploads on its own.",
+                    ),
                 ]
                 .spacing(6)
                 .into(),
