@@ -49,20 +49,6 @@ fn initial_view() -> View {
     }
 }
 
-/// The settings scrollable's id, so a disclosure collapse can snap it back to the top.
-fn settings_scroll_id() -> iced::widget::Id {
-    iced::widget::Id::new("settings-scroll")
-}
-
-/// Snap the settings form back to the top: used when a disclosure collapses, so the shorter form
-/// is shown rather than a stale scroll offset that hides the change.
-fn collapse_scroll() -> Task<Message> {
-    iced::widget::operation::snap_to(
-        settings_scroll_id(),
-        iced::widget::scrollable::RelativeOffset::START,
-    )
-}
-
 /// How long to wait after the first filesystem event before refreshing, so a burst (one clip
 /// write touches the `.part` file, the rename, and the directory) collapses into one rescan.
 const WATCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
@@ -322,8 +308,14 @@ struct App {
     /// would actually apply something.
     last_save_ok: bool,
     /// Whether the ganked.tv card shows its self-hosting fields (API server, share links, API
-    /// key). UI-only state; collapsed by default because login covers the common case.
+    /// key) plus the upload toggle. UI-only state; collapsed by default because login covers the
+    /// common case.
     advanced_open: bool,
+    /// Whether the audio card shows its advanced options (the separate mic track). UI-only.
+    audio_advanced_open: bool,
+    /// Whether the capture card shows its advanced options (the per-start monitor prompt). UI-only.
+    #[cfg(target_os = "linux")]
+    capture_advanced_open: bool,
     login: LoginState,
     /// Mirror of the YouTube OAuth client id override (empty = the compiled-in default).
     yt_client_id: String,
@@ -387,6 +379,7 @@ enum Message {
     SystemGain(f32),
     MicEnabled(bool),
     SeparateMicTrack(bool),
+    AudioAdvancedToggled,
     MicrophonePicked(String),
     BufferSeconds(u32),
     ResolutionPicked(Resolution),
@@ -398,6 +391,8 @@ enum Message {
     HotkeyEdited(String),
     #[cfg(target_os = "linux")]
     AlwaysPrompt(bool),
+    #[cfg(target_os = "linux")]
+    CaptureAdvancedToggled,
     CaptureDesktop(bool),
     GameFolders(bool),
     StartOnBoot(bool),
@@ -468,6 +463,9 @@ impl App {
             // the ganked.tv defaults, spelled out, are not a custom setup.
             advanced_open: is_custom_url(config.upload_api_url(), config::DEFAULT_UPLOAD_API_URL)
                 || is_custom_url(config.upload_share_url(), config::DEFAULT_UPLOAD_SHARE_URL),
+            audio_advanced_open: false,
+            #[cfg(target_os = "linux")]
+            capture_advanced_open: false,
             yt_client_id: config.youtube_client_id().to_owned(),
             yt_client_secret: config.youtube_client_secret().to_owned(),
             // A stored OAuth-client override stays visible instead of hiding behind the
@@ -529,10 +527,11 @@ impl App {
         // Any edit invalidates a prior "Saved" state.
         match message {
             Message::Tab(view) => {
-                let entered_library = view == View::Library && self.view != View::Library;
                 self.view = view;
-                // Refresh on view-enter, so clips saved while the user was in Settings appear.
-                if entered_library {
+                // The Library tab / brand logo is a home action: leave any open clip's detail for
+                // the grid, and refresh so clips saved while away appear.
+                if view == View::Library {
+                    self.library.show_grid();
                     return self.library.refresh(&self.config).map(Message::Library);
                 }
             }
@@ -661,13 +660,13 @@ impl App {
                 self.config.set_upload_visibility(v.as_str().to_owned());
                 self.touch();
             }
-            // No touch(): opening the disclosure edits nothing. Collapsing snaps the (now
-            // shorter) form back to the top so the change is visible even when scrolled down.
-            Message::AdvancedToggled => {
-                self.advanced_open = !self.advanced_open;
-                if !self.advanced_open {
-                    return collapse_scroll();
-                }
+            // No touch(): opening or closing the disclosure edits nothing. The scroll offset stays
+            // put and clamps to the shorter form, rather than jumping the whole view to the top.
+            Message::AdvancedToggled => self.advanced_open = !self.advanced_open,
+            Message::AudioAdvancedToggled => self.audio_advanced_open = !self.audio_advanced_open,
+            #[cfg(target_os = "linux")]
+            Message::CaptureAdvancedToggled => {
+                self.capture_advanced_open = !self.capture_advanced_open;
             }
             Message::LoginPressed => {
                 let base = self.effective_api_url();
@@ -752,12 +751,7 @@ impl App {
                 self.touch();
             }
             // No touch(): opening the disclosure edits nothing.
-            Message::YtAdvancedToggled => {
-                self.yt_advanced_open = !self.yt_advanced_open;
-                if !self.yt_advanced_open {
-                    return collapse_scroll();
-                }
-            }
+            Message::YtAdvancedToggled => self.yt_advanced_open = !self.yt_advanced_open,
             Message::YtLoginPressed => {
                 let (client_id, client_secret) = self.effective_yt_client();
                 // Google's installed-app token exchange needs both halves; catching a
@@ -1125,40 +1119,56 @@ impl App {
                         .step(0.05)
                         .style(arena_slider),
                 ),
-                checkbox(self.config.separate_mic_track())
-                    .label("Keep the microphone on a separate audio track")
-                    .on_toggle(Message::SeparateMicTrack)
-                    .style(arena_check),
             ]
             .spacing(18)
             .into()
         } else {
-            hint(
-                "The microphone is off; turn it on to pick a device, set its level, or split it onto its own track.",
-            )
+            hint("The microphone is off; turn it on to pick a device or set its level.")
         };
-        let audio = card(
-            "AUDIO",
-            column![
-                checkbox(mic_enabled)
-                    .label("Record microphone")
-                    .on_toggle(Message::MicEnabled)
-                    .style(arena_check),
-                mic_controls,
-                setting(
-                    "System volume",
-                    format!("{:.2}x", self.config.system_gain()),
-                    slider(
-                        0.0..=GAIN_MAX,
-                        self.config.system_gain(),
-                        Message::SystemGain
-                    )
-                    .step(0.05)
-                    .style(arena_slider),
-                ),
-            ]
-            .spacing(18),
-        );
+        let mut audio_items: Vec<Element<Message>> = vec![
+            checkbox(mic_enabled)
+                .label("Record microphone")
+                .on_toggle(Message::MicEnabled)
+                .style(arena_check)
+                .into(),
+            mic_controls,
+            setting(
+                "System volume",
+                format!("{:.2}x", self.config.system_gain()),
+                slider(
+                    0.0..=GAIN_MAX,
+                    self.config.system_gain(),
+                    Message::SystemGain,
+                )
+                .step(0.05)
+                .style(arena_slider),
+            ),
+        ];
+        // Advanced sits at the bottom of the card, and only while the mic is on (its one option,
+        // the separate track, needs a recording mic to mean anything).
+        if mic_enabled {
+            audio_items.push(disclosure(
+                self.audio_advanced_open,
+                Message::AudioAdvancedToggled,
+            ));
+            if self.audio_advanced_open {
+                audio_items.push(
+                    column![
+                        checkbox(self.config.separate_mic_track())
+                            .label("Keep the microphone on a separate audio track")
+                            .on_toggle(Message::SeparateMicTrack)
+                            .style(arena_check),
+                        hint(
+                            "Records the mic as its own track so you can adjust or mute it later \
+                             in an editor, instead of mixing it into the game audio.",
+                        ),
+                    ]
+                    .spacing(6)
+                    .into(),
+                );
+            }
+        }
+        let audio = card("AUDIO", column(audio_items).spacing(18));
 
         let recording = card(
             "RECORDING",
@@ -1232,47 +1242,71 @@ impl App {
             )),
         ]
         .spacing(18);
-        // The monitor picker is the ScreenCast portal's (Linux); Windows records the
-        // active game by default, with the whole desktop as the opt-in.
-        #[cfg(target_os = "linux")]
-        let output_capture = output_capture.push(
-            checkbox(self.config.always_prompt())
-                .label("Ask which monitor to record every time rewynd starts")
-                .on_toggle(Message::AlwaysPrompt)
-                .style(arena_check),
-        );
-        let output_capture = output_capture.push(
-            column![
-                checkbox(self.config.capture_desktop())
-                    .label("Record the whole desktop, not just the active game")
-                    .on_toggle(Message::CaptureDesktop)
-                    .style(arena_check),
-                hint(
-                    "Off records only the game you're playing (fullscreen or \
-                     borderless), keeping other windows out of your clips.",
-                ),
-            ]
-            .spacing(6),
-        );
-        let output_capture = output_capture.push(
-            column![
-                checkbox(self.config.game_folders())
-                    .label("Sort clips into a folder per game")
-                    .on_toggle(Message::GameFolders)
-                    .style(arena_check),
-                hint("Saved clips land in a subfolder named after the game, when known."),
-            ]
-            .spacing(6),
-        );
-        let output = card(
-            "OUTPUT & CAPTURE",
-            output_capture.push(
+        // Desktop capture is the primary choice; the per-start monitor prompt below is a Linux-only
+        // ScreenCast-portal detail (Windows records the active game by default) that only applies
+        // while desktop capture is on.
+        let capture_desktop = self.config.capture_desktop();
+        let output_capture = output_capture
+            .push(
+                column![
+                    checkbox(capture_desktop)
+                        .label("Record the whole desktop, not just the active game")
+                        .on_toggle(Message::CaptureDesktop)
+                        .style(arena_check),
+                    hint(
+                        "Off records only the game you're playing (fullscreen or \
+                         borderless), keeping other windows out of your clips.",
+                    ),
+                ]
+                .spacing(6),
+            )
+            .push(
+                column![
+                    checkbox(self.config.game_folders())
+                        .label("Sort clips into a folder per game")
+                        .on_toggle(Message::GameFolders)
+                        .style(arena_check),
+                    hint("Saved clips land in a subfolder named after the game, when known."),
+                ]
+                .spacing(6),
+            )
+            .push(
                 checkbox(self.config.start_on_boot())
                     .label("Start rewynd when I log in")
                     .on_toggle(Message::StartOnBoot)
                     .style(arena_check),
-            ),
-        );
+            );
+        // Advanced sits at the bottom of the card (the per-start monitor prompt is a Linux-only,
+        // rarely-used detail).
+        #[cfg(target_os = "linux")]
+        let output_capture = {
+            let mut oc = output_capture.push(disclosure(
+                self.capture_advanced_open,
+                Message::CaptureAdvancedToggled,
+            ));
+            if self.capture_advanced_open {
+                // No on_toggle when desktop capture is off: the prompt has no effect there, so the
+                // checkbox is greyed out and unclickable rather than silently doing nothing.
+                let mut monitor = checkbox(self.config.always_prompt())
+                    .label("Ask which monitor to record every time rewynd starts")
+                    .style(arena_check);
+                if capture_desktop {
+                    monitor = monitor.on_toggle(Message::AlwaysPrompt);
+                }
+                oc = oc.push(
+                    column![
+                        monitor,
+                        hint(
+                            "Only applies to desktop capture: rewynd asks which monitor to grab \
+                             each time it starts, instead of reusing your last pick.",
+                        ),
+                    ]
+                    .spacing(6),
+                );
+            }
+            oc
+        };
+        let output = card("OUTPUT & CAPTURE", output_capture);
 
         // Account area: a one-click browser login (device grant); the key it mints is stored
         // invisibly. Connectedness is simply "a key is present".
@@ -1343,15 +1377,11 @@ impl App {
             }
         };
 
-        // The self-hosting fields hide behind a disclosure: with the browser login covering the
-        // common case, "API server" and "share links" only confuse an average user.
+        // The upload toggle and self-hosting fields hide behind a disclosure: uploading a raw clip
+        // straight from here skips the trimming step, and "API server" / "share links" only
+        // confuse an average user. Login covers the common case and turns uploads on by itself.
         let mut upload_items: Vec<Element<Message>> = vec![
             account,
-            checkbox(self.config.upload_enabled())
-                .label("Enable uploads (tray: Upload last clip)")
-                .on_toggle(Message::UploadEnabled)
-                .style(arena_check)
-                .into(),
             setting(
                 "Visibility",
                 rewynd_upload::Visibility::parse(self.config.upload_visibility()).to_string(),
@@ -1365,21 +1395,23 @@ impl App {
                 .style(arena_pick)
                 .width(Length::Fill),
             ),
-            button(
-                text(if self.advanced_open {
-                    "Hide advanced options"
-                } else {
-                    "Advanced options"
-                })
-                .size(11)
-                .font(UI_SEMIBOLD),
-            )
-            .on_press(Message::AdvancedToggled)
-            .style(link_button)
-            .padding(0)
-            .into(),
+            disclosure(self.advanced_open, Message::AdvancedToggled),
         ];
         if self.advanced_open {
+            upload_items.push(
+                column![
+                    checkbox(self.config.upload_enabled())
+                        .label("Show the ganked.tv upload option")
+                        .on_toggle(Message::UploadEnabled)
+                        .style(arena_check),
+                    hint(
+                        "Adds an \"Upload last clip\" button to the tray and the upload panel here. \
+                         You choose which clips to send — nothing uploads on its own.",
+                    ),
+                ]
+                .spacing(6)
+                .into(),
+            );
             upload_items.extend([
                 field(
                     "API server",
@@ -1593,9 +1625,9 @@ impl App {
         // The scrollable is a safety net for small windows and the opened Advanced disclosure;
         // the default window size is chosen (by eye — iced has no pre-layout measure) so the
         // collapsed form fits without it. The body caps at 880, so on a wider window center it
-        // rather than leaving the slack on one side. The id lets a disclosure collapse snap the
-        // view back to the top, so the shorter form is never stranded below a stale scroll offset.
-        container(scrollable(container(body).center_x(Length::Fill)).id(settings_scroll_id()))
+        // rather than leaving the slack on one side. Collapsing a disclosure keeps the current
+        // scroll offset (clamped to the shorter form) instead of jumping the view to the top.
+        container(scrollable(container(body).center_x(Length::Fill)))
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
@@ -1620,6 +1652,44 @@ fn normalize(c: &mut Config) {
     c.set_video(v);
 }
 
+/// An "Advanced options" disclosure toggle, link-styled and labelled by its open state.
+fn disclosure(open: bool, msg: Message) -> Element<'static, Message> {
+    button(
+        text(if open {
+            "Hide advanced options"
+        } else {
+            "Advanced options"
+        })
+        .size(11)
+        .font(UI_SEMIBOLD),
+    )
+    .on_press(msg)
+    .style(link_button)
+    .padding(0)
+    .into()
+}
+
+/// The brand mark + wordmark as a home button: clicking it returns to the library, the way a
+/// logo doubles as "go to the front page" on most sites.
+fn brand_home() -> Element<'static, Message> {
+    button(
+        row![logo(23.0), text("REWYND").size(17).font(DISPLAY_BLACK)]
+            .spacing(10)
+            .align_y(iced::Alignment::Center),
+    )
+    .on_press(Message::Tab(View::Library))
+    .style(|_: &Theme, status| button::Style {
+        background: None,
+        text_color: match status {
+            button::Status::Hovered | button::Status::Pressed => palette::ACCENT,
+            _ => palette::TEXT,
+        },
+        ..button::Style::default()
+    })
+    .padding(0)
+    .into()
+}
+
 /// The top navigation, Arena style: the brand on the left, then the Library/Settings links
 /// (accent-on-tint pill when active), on a raised bar over a hairline divider.
 fn nav_bar(active: View) -> Element<'static, Message> {
@@ -1632,8 +1702,7 @@ fn nav_bar(active: View) -> Element<'static, Message> {
     };
     let bar = container(
         row![
-            logo(23.0),
-            text("REWYND").size(17).font(DISPLAY_BLACK),
+            brand_home(),
             iced::widget::Space::new().width(8),
             tab("Library", View::Library),
             tab("Settings", View::Settings),

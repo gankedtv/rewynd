@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use iced::widget::{
-    Space, button, column, container, pick_list, row, scrollable, text, text_input,
+    Space, button, column, container, pick_list, row, scrollable, slider, text, text_input,
 };
 use iced::{Background, Border, Element, Length, Task, Theme};
 
@@ -20,8 +20,8 @@ use rewynd_upload::youtube::{
 use rewynd_upload::{GankedClient, Visibility, default_title, user_facing_upload_error};
 
 use crate::theme::{
-    self, DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, accent_chip, card, field_label, hint, link_button,
-    palette, primary_button, secondary_button, tinted,
+    self, DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, accent_button_style, accent_chip, card, field_label,
+    hint, link_button, palette, primary_button, secondary_button, setting, tinted, value_row,
 };
 use crate::thumbs;
 
@@ -164,6 +164,13 @@ pub enum Message {
     DeleteCancelled,
     DeleteConfirmed,
     Deleted(Result<PathBuf, String>),
+    TrimStartChanged(f32),
+    TrimEndChanged(f32),
+    TrimSave,
+    TrimSaved {
+        src: PathBuf,
+        result: Result<PathBuf, String>,
+    },
     TitleEdited(String),
     DestPicked(Dest),
     VisibilityPicked(Visibility),
@@ -176,6 +183,14 @@ pub enum Message {
     Verified(PathBuf, Dest, Result<bool, String>),
     OpenLink(String),
     CopyLink(String),
+}
+
+/// Where the open clip's trim stands.
+enum TrimState {
+    Idle,
+    Saving,
+    Saved(PathBuf),
+    Failed(String),
 }
 
 pub struct Library {
@@ -194,6 +209,12 @@ pub struct Library {
     /// The clip whose detail page is open, if any.
     open: Option<PathBuf>,
     confirm_delete: bool,
+    /// Trim in/out points for the open clip, in seconds; reset to the full span on open.
+    trim_start: f32,
+    trim_end: f32,
+    /// The open clip's duration in seconds (read from its header on open), the trim range's ceiling.
+    open_dur: f32,
+    trim: TrimState,
     /// Play / show-in-folder / delete failure for the open clip.
     action_error: Option<String>,
     title: String,
@@ -220,6 +241,10 @@ impl Library {
             game_filter: None,
             open: None,
             confirm_delete: false,
+            trim_start: 0.0,
+            trim_end: 0.0,
+            open_dur: 0.0,
+            trim: TrimState::Idle,
             action_error: None,
             title: String::new(),
             title_hint: String::new(),
@@ -228,6 +253,13 @@ impl Library {
             upload: UploadState::Idle,
             history: upload_history::load(),
         }
+    }
+
+    /// Leave any open clip's detail and return to the grid (the nav "Library" tab / brand logo).
+    pub fn show_grid(&mut self) {
+        self.open = None;
+        self.confirm_delete = false;
+        self.action_error = None;
     }
 
     /// The upload record for `entry` at `dest`, if the clip was uploaded there.
@@ -293,6 +325,12 @@ impl Library {
                 return self.start_pending_decodes();
             }
             Message::Open(path) => {
+                // Reset the trim to the clip's full span (its duration comes from the file header).
+                self.open_dur =
+                    rewynd_mux::read::clip_summary(&path).map_or(0.0, |s| s.duration.as_secs_f32());
+                self.trim_start = 0.0;
+                self.trim_end = self.open_dur;
+                self.trim = TrimState::Idle;
                 self.open = Some(path);
                 self.confirm_delete = false;
                 self.action_error = None;
@@ -361,6 +399,59 @@ impl Library {
             }
             Message::Deleted(Err(e)) => {
                 self.action_error = Some(format!("Could not delete the clip: {e}"));
+            }
+            Message::TrimStartChanged(v) => {
+                // Keep at least a small gap below the end.
+                self.trim_start = v.clamp(0.0, (self.trim_end - 0.2).max(0.0));
+                self.trim = TrimState::Idle;
+            }
+            Message::TrimEndChanged(v) => {
+                let hi = self.open_duration();
+                self.trim_end = v.clamp(self.trim_start + 0.2, hi.max(0.2));
+                self.trim = TrimState::Idle;
+            }
+            Message::TrimSave => {
+                let Some(src) = self.open.clone() else {
+                    return Task::none();
+                };
+                let start = Duration::from_secs_f32(self.trim_start);
+                let end = Duration::from_secs_f32(self.trim_end);
+                self.trim = TrimState::Saving;
+                let work_src = src.clone();
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let dst = unique_trim_path(&work_src);
+                            rewynd_mux::read::trim_clip(&work_src, &dst, start, end)
+                                .map(|_| dst)
+                                .map_err(|e| e.to_string())
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()))
+                    },
+                    move |result| Message::TrimSaved {
+                        src: src.clone(),
+                        result,
+                    },
+                );
+            }
+            Message::TrimSaved { src, result } => {
+                // The trim may finish after the user opened another clip; only stamp the result on
+                // its own detail page. The rescan still runs so the new clip shows up regardless.
+                let current = self.open.as_deref() == Some(src.as_path());
+                match result {
+                    Ok(path) => {
+                        if current {
+                            self.trim = TrimState::Saved(path);
+                        }
+                        return self.refresh(config);
+                    }
+                    Err(e) if current => {
+                        self.trim =
+                            TrimState::Failed(format!("Could not save the trimmed clip: {e}"));
+                    }
+                    Err(_) => {}
+                }
             }
             Message::TitleEdited(s) => self.title = s,
             Message::DestPicked(dest) => {
@@ -1025,9 +1116,77 @@ impl Library {
         ]
         .spacing(20);
 
-        column![back, top, self.upload_panel(entry, ganked, youtube),]
-            .spacing(20)
-            .into()
+        column![
+            back,
+            top,
+            self.trim_panel(),
+            self.upload_panel(entry, ganked, youtube),
+        ]
+        .spacing(20)
+        .into()
+    }
+
+    /// The open clip's duration in seconds (read from its header on open), the trim ceiling.
+    fn open_duration(&self) -> f32 {
+        self.open_dur
+    }
+
+    /// The trim panel: a start/end range over the clip, and a lossless "save a trimmed copy" action.
+    fn trim_panel(&self) -> Element<'_, Message> {
+        let dur = self.open_dur.max(0.2);
+        let start = self.trim_start.clamp(0.0, dur);
+        let end = self.trim_end.clamp(0.0, dur);
+        let length = (end - start).max(0.0);
+
+        let panel = column![
+            setting(
+                "Start",
+                secs_label(start),
+                slider(0.0..=dur, start, Message::TrimStartChanged)
+                    .step(0.1f32)
+                    .style(theme::arena_slider),
+            ),
+            setting(
+                "End",
+                secs_label(end),
+                slider(0.0..=dur, end, Message::TrimEndChanged)
+                    .step(0.1f32)
+                    .style(theme::arena_slider),
+            ),
+            value_row("Trimmed length", secs_label(length)),
+            hint(
+                "The start snaps back to the nearest keyframe (about a second), so the cut is \
+                 instant and lossless. The trimmed clip is saved as a new file.",
+            ),
+        ]
+        .spacing(14);
+
+        let busy = matches!(self.trim, TrimState::Saving);
+        let mut save = button(text("Save trimmed clip").size(13).font(UI_BOLD))
+            .style(primary_button)
+            .padding([11, 24]);
+        if !busy && length >= 0.2 {
+            save = save.on_press(Message::TrimSave);
+        }
+        let panel = panel.push(row![save].spacing(10));
+
+        let panel = match &self.trim {
+            TrimState::Idle => panel,
+            TrimState::Saving => panel.push(hint("Saving the trimmed clip...")),
+            TrimState::Saved(path) => panel.push(
+                column![
+                    text("Saved a trimmed clip.")
+                        .size(12)
+                        .style(tinted(palette::ACCENT)),
+                    hint(path.display().to_string()),
+                ]
+                .spacing(6),
+            ),
+            TrimState::Failed(e) => {
+                panel.push(text(e.clone()).size(12).style(tinted(palette::DANGER)))
+            }
+        };
+        card("TRIM", panel)
     }
 
     /// Play / show in folder / delete, with the delete confirm inline (no OS dialog).
@@ -1093,12 +1252,13 @@ impl Library {
 
         let seg = |label: &'static str, dest: Dest, ready: bool| {
             let active = self.dest == dest;
+            let (accent, ink) = dest_accent(dest);
             let b = button(
                 container(text(label).size(11).font(UI_SEMIBOLD))
                     .center_x(Length::Fill)
                     .padding([2, 0]),
             )
-            .style(move |theme: &Theme, status| segment_style(theme, status, active))
+            .style(move |theme: &Theme, status| segment_style(theme, status, active, accent, ink))
             .width(Length::Fill)
             .padding([5, 15]);
             if ready && !busy {
@@ -1157,6 +1317,13 @@ impl Library {
         // Once a clip is on a destination, the primary action becomes "Upload again", which
         // verifies the remote copy still exists before it lets a duplicate through.
         let already_uploaded = self.record_for(entry, self.dest).is_some();
+        // The action button takes the destination's brand accent: mint for ganked.tv, red for
+        // YouTube, so the whole panel reads as "this clip is headed to YouTube".
+        let (accent, ink) = dest_accent(self.dest);
+        let accent_hover = match self.dest {
+            Dest::Ganked => palette::ACCENT_HOVER,
+            Dest::YouTube => palette::YOUTUBE_HOVER,
+        };
         let mut send = button(
             text(if already_uploaded {
                 "Upload again".to_owned()
@@ -1166,7 +1333,7 @@ impl Library {
             .size(13)
             .font(UI_BOLD),
         )
-        .style(primary_button)
+        .style(move |_theme: &Theme, status| accent_button_style(status, accent, accent_hover, ink))
         .padding([11, 24]);
         if dest_ready && !busy {
             send = send.on_press(if already_uploaded {
@@ -1582,20 +1749,49 @@ fn clip_card_style(
 }
 
 /// One segment of the destination control: mint fill + ink when active, quiet otherwise.
+/// A `m:ss` label for a number of seconds.
+fn secs_label(seconds: f32) -> String {
+    let s = seconds.max(0.0).round() as u32;
+    format!("{}:{:02}", s / 60, s % 60)
+}
+
+/// A fresh sibling path for a trimmed copy of `src` (`<stem>-trim.<ext>`, bumping a counter when
+/// taken), so re-trimming never overwrites an earlier trim and the copy lands beside the original
+/// (same per-game folder).
+fn unique_trim_path(src: &Path) -> PathBuf {
+    let parent = src.parent().unwrap_or_else(|| Path::new("."));
+    let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("clip");
+    let ext = src.extension().and_then(|s| s.to_str()).unwrap_or("mp4");
+    let mut candidate = parent.join(format!("{stem}-trim.{ext}"));
+    let mut n = 2;
+    while candidate.exists() {
+        candidate = parent.join(format!("{stem}-trim-{n}.{ext}"));
+        n += 1;
+    }
+    candidate
+}
+
+/// The brand accent and its ink for an upload destination: mint for ganked.tv, red for YouTube.
+fn dest_accent(dest: Dest) -> (iced::Color, iced::Color) {
+    match dest {
+        Dest::Ganked => (palette::ACCENT, palette::INK_ON_ACCENT),
+        Dest::YouTube => (palette::YOUTUBE, palette::INK_ON_YOUTUBE),
+    }
+}
+
 fn segment_style(
     _theme: &Theme,
     status: iced::widget::button::Status,
     active: bool,
+    accent: iced::Color,
+    ink: iced::Color,
 ) -> iced::widget::button::Style {
     use iced::widget::button::{Status, Style};
     let (background, text_color) = if active {
-        (
-            Some(Background::Color(palette::ACCENT)),
-            palette::INK_ON_ACCENT,
-        )
+        (Some(Background::Color(accent)), ink)
     } else {
         match status {
-            Status::Hovered | Status::Pressed => (None, palette::ACCENT),
+            Status::Hovered | Status::Pressed => (None, accent),
             Status::Disabled => (None, palette::MUTED),
             _ => (None, palette::TEXT_SECONDARY),
         }

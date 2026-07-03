@@ -5,7 +5,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use rewynd_buffer::{EncodedAudioChunk, EncodedChunk};
 use thiserror::Error;
+
+use crate::{AudioTrack, Mp4Muxer};
 
 /// Errors from reading a clip back.
 #[derive(Debug, Error)]
@@ -121,6 +124,252 @@ pub fn clip_preview_at(path: &Path, position: f32) -> Result<(ClipSummary, Vec<u
         let sample_id = keyframe_sample_near(&reader, track_id, position);
         let keyframe = keyframe_at(&mut reader, track_id, sample_id)?;
         Ok((summary, keyframe))
+    })
+}
+
+/// Errors from [`trim_clip`].
+#[derive(Debug, Error)]
+pub enum TrimError {
+    /// The source could not be read (missing, corrupt, or no video track).
+    #[error(transparent)]
+    Read(#[from] ReadError),
+    /// Writing the trimmed clip failed.
+    #[error("writing the trimmed clip failed: {0}")]
+    Mux(#[from] crate::MuxError),
+    /// The requested window selected no frames (empty, reversed, or past the clip's end).
+    #[error("the trim range is empty")]
+    EmptyRange,
+}
+
+/// What a completed trim produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrimSummary {
+    /// Duration of the trimmed clip, from its (keyframe-aligned) start to the last kept frame.
+    pub duration: Duration,
+}
+
+/// Losslessly trim the clip at `src` to the `[start, end]` window, writing a new MP4 at `dst`.
+///
+/// The start snaps back to the nearest keyframe at or before `start`, so the cut needs no re-encode
+/// and the result stays decodable; every video frame through `end` is kept, and the audio packets in
+/// the same window ride along. Timestamps rebase to zero, so the trimmed clip plays from its own
+/// start. Keyframe granularity is the recorder's IDR interval (about one second at the defaults).
+pub fn trim_clip(
+    src: &Path,
+    dst: &Path,
+    start: Duration,
+    end: Duration,
+) -> Result<TrimSummary, TrimError> {
+    if end <= start {
+        return Err(TrimError::EmptyRange);
+    }
+    // The vendored reader `unwrap`s on inconsistent metadata; contain a hostile file as an error.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        trim_inner(src, dst, start, end)
+    }))
+    .unwrap_or(Err(TrimError::Read(ReadError::Corrupt)))
+}
+
+fn trim_inner(
+    src: &Path,
+    dst: &Path,
+    start: Duration,
+    end: Duration,
+) -> Result<TrimSummary, TrimError> {
+    let mut reader = open(src)?;
+    let video_id = video_track(&reader)?;
+
+    // All track metadata up front, so the immutable borrows are dropped before the &mut read_sample
+    // loops below.
+    struct VideoMeta {
+        timescale: f64,
+        prefix: usize,
+        sps: Vec<u8>,
+        pps: Vec<u8>,
+        count: u32,
+        width: u32,
+        height: u32,
+        duration: Duration,
+    }
+    struct AudioMeta {
+        id: u32,
+        channels: u8,
+        sample_rate: u32,
+        count: u32,
+    }
+    let (vmeta, ameta) = {
+        let vt = &reader.tracks()[&video_id];
+        let vmeta = VideoMeta {
+            timescale: f64::from(vt.timescale().max(1)),
+            prefix: nal_length_size(vt)?,
+            sps: vt
+                .sequence_parameter_set()
+                .map_err(ReadError::from)?
+                .to_vec(),
+            pps: vt
+                .picture_parameter_set()
+                .map_err(ReadError::from)?
+                .to_vec(),
+            count: vt.sample_count(),
+            width: u32::from(vt.width()),
+            height: u32::from(vt.height()),
+            duration: vt.duration(),
+        };
+        // Opus audio tracks, in track-id order (the recorder writes the mix as track 1, the mic as
+        // track 2); preserve that order in the trimmed clip.
+        let mut ameta: Vec<AudioMeta> = reader
+            .tracks()
+            .iter()
+            .filter(|(_, t)| t.media_type().is_ok_and(|m| m == mp4::MediaType::OPUS))
+            .map(|(id, t)| AudioMeta {
+                id: *id,
+                channels: t
+                    .trak
+                    .mdia
+                    .minf
+                    .stbl
+                    .stsd
+                    .opus
+                    .as_ref()
+                    .map_or(2, |o| o.dops.output_channel_count.max(1)),
+                sample_rate: t.timescale().max(1),
+                count: t.sample_count(),
+            })
+            .collect();
+        ameta.sort_by_key(|a| a.id);
+        (vmeta, ameta)
+    };
+
+    // The muxer only uses the frame rate for the final frame's duration; estimate it from the source.
+    let fps = if vmeta.duration.as_secs_f64() > 0.0 {
+        (f64::from(vmeta.count) / vmeta.duration.as_secs_f64())
+            .round()
+            .clamp(1.0, 240.0) as u32
+    } else {
+        60
+    };
+    let frame = Duration::from_secs_f64(1.0 / f64::from(fps));
+
+    // Read every video sample: its presentation time, sync flag, and Annex-B bytes.
+    struct Vid {
+        pts: Duration,
+        sync: bool,
+        annexb: Vec<u8>,
+    }
+    let mut vids: Vec<Vid> = Vec::with_capacity(vmeta.count as usize);
+    for id in 1..=vmeta.count {
+        let Some(sample) = reader.read_sample(video_id, id).map_err(ReadError::from)? else {
+            break;
+        };
+        let pts_units =
+            (sample.start_time as i64 + i64::from(sample.rendering_offset)).max(0) as f64;
+        let mut annexb = Vec::new();
+        avcc_to_annexb(&sample.bytes, vmeta.prefix, &mut annexb)?;
+        vids.push(Vid {
+            pts: Duration::from_secs_f64(pts_units / vmeta.timescale),
+            sync: sample.is_sync,
+            annexb,
+        });
+    }
+    if vids.is_empty() {
+        return Err(TrimError::EmptyRange);
+    }
+
+    // Start on the last keyframe at or before `start` (else the first keyframe); end on the last
+    // frame at or before `end`.
+    let in_idx = vids
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.sync && v.pts <= start)
+        .map(|(i, _)| i)
+        .next_back()
+        .or_else(|| vids.iter().position(|v| v.sync))
+        .unwrap_or(0);
+
+    // A window that starts at or after the clip's end selects nothing: reject it rather than
+    // emit the trailing GOP.
+    let clip_end = vids.last().map_or(Duration::ZERO, |v| v.pts + frame);
+    if start >= clip_end {
+        return Err(TrimError::EmptyRange);
+    }
+    let Some(out_idx) = vids
+        .iter()
+        .enumerate()
+        .filter(|(i, v)| *i >= in_idx && v.pts <= end)
+        .map(|(i, _)| i)
+        .next_back()
+    else {
+        return Err(TrimError::EmptyRange);
+    };
+
+    let in_pts = vids[in_idx].pts;
+    let out_pts = vids[out_idx].pts;
+    let audio_hi = out_pts + frame;
+
+    // The first kept video chunk must carry SPS/PPS inline: the writer reads them there to build the
+    // avcC. Subsequent chunks are the sample NALs as-is.
+    let mut video_chunks: Vec<EncodedChunk> = Vec::with_capacity(out_idx - in_idx + 1);
+    for (i, v) in vids.iter().enumerate().take(out_idx + 1).skip(in_idx) {
+        let bytes = if i == in_idx {
+            let mut b = Vec::with_capacity(v.annexb.len() + vmeta.sps.len() + vmeta.pps.len() + 8);
+            append_nal(&mut b, &vmeta.sps);
+            append_nal(&mut b, &vmeta.pps);
+            b.extend_from_slice(&v.annexb);
+            b
+        } else {
+            v.annexb.clone()
+        };
+        video_chunks.push(EncodedChunk {
+            bytes: bytes.into(),
+            is_keyframe: v.sync,
+            pts: v.pts,
+        });
+    }
+
+    // Audio packets whose presentation time lands in the same window as the kept video.
+    let mut audio_store: Vec<Vec<EncodedAudioChunk>> = Vec::with_capacity(ameta.len());
+    for a in &ameta {
+        let mut chunks = Vec::new();
+        for id in 1..=a.count {
+            let Some(sample) = reader.read_sample(a.id, id).map_err(ReadError::from)? else {
+                break;
+            };
+            let pts = Duration::from_secs_f64(sample.start_time as f64 / f64::from(a.sample_rate));
+            if pts > audio_hi {
+                break;
+            }
+            if pts < in_pts {
+                continue;
+            }
+            chunks.push(EncodedAudioChunk {
+                bytes: sample.bytes.to_vec().into(),
+                frames: sample.duration,
+                pts,
+            });
+        }
+        audio_store.push(chunks);
+    }
+    let audio_tracks: Vec<AudioTrack> = ameta
+        .iter()
+        .zip(&audio_store)
+        // A mid-stream cut has no encoder priming at its first packet, so pre_skip is 0.
+        .map(|(a, chunks)| AudioTrack {
+            chunks,
+            channels: a.channels,
+            sample_rate: a.sample_rate,
+            pre_skip: 0,
+        })
+        .collect();
+
+    let muxer = Mp4Muxer::new(vmeta.width, vmeta.height, fps);
+    if audio_tracks.iter().all(|t| t.chunks.is_empty()) {
+        muxer.write_mp4(&video_chunks, dst)?;
+    } else {
+        muxer.write_mp4_with_audio_tracks(&video_chunks, &audio_tracks, dst)?;
+    }
+
+    Ok(TrimSummary {
+        duration: out_pts.saturating_sub(in_pts) + frame,
     })
 }
 
@@ -712,5 +961,168 @@ mod tests {
             source: std::io::Error::other("boom"),
         };
         assert!(io.to_string().contains("/x"));
+    }
+
+    /// A ten-frame video (keyframes at 0/4/8) plus one Opus track of 20 ms packets, for trim tests.
+    fn av_clip() -> TempMp4 {
+        let video: Vec<_> = (0..10u64)
+            .map(|i| {
+                let tag = i as u8;
+                if i % 4 == 0 {
+                    chunk(annexb(&[&SPS, &PPS, &[0x65, 0x88, tag]]), true, i * 16_667)
+                } else {
+                    chunk(annexb(&[&[0x41, 0x9a, tag]]), false, i * 16_667)
+                }
+            })
+            .collect();
+        let audio: Vec<EncodedAudioChunk> = (0..8u64)
+            .map(|i| EncodedAudioChunk {
+                bytes: vec![0xFC, 0xFF, 0xFE].into(),
+                frames: 960,
+                pts: Duration::from_micros(i * 20_000),
+            })
+            .collect();
+        let track = AudioTrack {
+            chunks: &audio,
+            channels: 2,
+            sample_rate: 48_000,
+            pre_skip: 0,
+        };
+        let out = TempMp4::new();
+        Mp4Muxer::new(1920, 1080, 60)
+            .write_mp4_with_audio(&video, &track, &out.0)
+            .expect("write av clip");
+        out
+    }
+
+    #[test]
+    fn trim_snaps_start_back_to_the_enclosing_keyframe() {
+        let clip = multi_keyframe_clip();
+        let out = TempMp4::new();
+        // Start at 70 ms (past the 66.7 ms keyframe at frame 4) through 120 ms: the start snaps back
+        // to that keyframe, and the last kept frame is the one at or before 120 ms.
+        let summary = trim_clip(
+            &clip.0,
+            &out.0,
+            Duration::from_millis(70),
+            Duration::from_millis(120),
+        )
+        .expect("trim");
+
+        let frame = first_keyframe_annexb(&out.0).expect("keyframe");
+        assert!(
+            contains(&frame, &[0x65, 0x88, 4]),
+            "snapped to frame 4's keyframe"
+        );
+        assert!(
+            !contains(&frame, &[0x65, 0x88, 0]),
+            "not the original first keyframe"
+        );
+        // Frames 4..=7 kept ⇒ about four 16.67 ms frames.
+        assert!(
+            summary.duration >= Duration::from_millis(60)
+                && summary.duration <= Duration::from_millis(72),
+            "duration {:?}",
+            summary.duration
+        );
+    }
+
+    #[test]
+    fn trim_from_the_start_keeps_the_first_keyframe() {
+        let clip = multi_keyframe_clip();
+        let out = TempMp4::new();
+        let summary =
+            trim_clip(&clip.0, &out.0, Duration::ZERO, Duration::from_millis(40)).expect("trim");
+        let frame = first_keyframe_annexb(&out.0).expect("keyframe");
+        // Starts on an IDR from the first GOP (tag byte omitted: frame 0's is 0x00, which the write
+        // side strips as NAL trailing padding), and not the 66.7 ms keyframe at frame 4.
+        assert!(contains(&frame, &[0x65, 0x88]), "starts on a keyframe");
+        assert!(
+            !contains(&frame, &[0x65, 0x88, 4]),
+            "not frame 4's keyframe"
+        );
+        // Frames 0..=2 kept ⇒ about three 16.67 ms frames.
+        assert!(
+            summary.duration <= Duration::from_millis(56),
+            "duration {:?}",
+            summary.duration
+        );
+    }
+
+    #[test]
+    fn trim_rejects_an_empty_or_reversed_range() {
+        let clip = multi_keyframe_clip();
+        let out = TempMp4::new();
+        assert!(matches!(
+            trim_clip(
+                &clip.0,
+                &out.0,
+                Duration::from_millis(80),
+                Duration::from_millis(20)
+            ),
+            Err(TrimError::EmptyRange)
+        ));
+        assert!(matches!(
+            trim_clip(
+                &clip.0,
+                &out.0,
+                Duration::from_millis(50),
+                Duration::from_millis(50)
+            ),
+            Err(TrimError::EmptyRange)
+        ));
+    }
+
+    #[test]
+    fn trim_window_past_the_clip_end_is_empty() {
+        // The ten-frame clip is ~0.17 s; a window well past that selects no frame.
+        let clip = multi_keyframe_clip();
+        let out = TempMp4::new();
+        assert!(matches!(
+            trim_clip(
+                &clip.0,
+                &out.0,
+                Duration::from_millis(500),
+                Duration::from_millis(600),
+            ),
+            Err(TrimError::EmptyRange)
+        ));
+    }
+
+    #[test]
+    fn trim_missing_source_is_a_read_error() {
+        let out = TempMp4::new();
+        assert!(matches!(
+            trim_clip(
+                Path::new("/nonexistent/clip.mp4"),
+                &out.0,
+                Duration::ZERO,
+                Duration::from_millis(50),
+            ),
+            Err(TrimError::Read(ReadError::Io { .. }))
+        ));
+    }
+
+    #[test]
+    fn trim_carries_the_audio_track_along() {
+        let clip = av_clip();
+        let out = TempMp4::new();
+        trim_clip(
+            &clip.0,
+            &out.0,
+            Duration::from_millis(70),
+            Duration::from_millis(140),
+        )
+        .expect("trim");
+
+        let reader = open(&out.0).expect("open trimmed");
+        let has_opus = reader
+            .tracks()
+            .values()
+            .any(|t| t.media_type().is_ok_and(|m| m == mp4::MediaType::OPUS));
+        assert!(has_opus, "the trimmed clip keeps its Opus track");
+        // And the video still starts on the enclosing keyframe.
+        let frame = first_keyframe_annexb(&out.0).expect("keyframe");
+        assert!(contains(&frame, &[0x65, 0x88, 4]));
     }
 }

@@ -50,12 +50,13 @@ pub fn config_path() -> Option<PathBuf> {
     })
 }
 
-/// The default directory for saved clips when none is configured: the user's **Videos** folder
-/// (XDG user-dirs on Linux, the Known Folder on Windows). `None` if it can't be resolved, in
-/// which case the caller falls back (e.g. the temp dir).
+/// The default directory for saved clips when none is configured: a `rewynd` subfolder of the
+/// user's **Videos** folder (XDG user-dirs on Linux, the Known Folder on Windows). The subfolder
+/// keeps clips together instead of loose among the user's existing videos. `None` if Videos can't
+/// be resolved, in which case the caller falls back (e.g. the temp dir).
 #[must_use]
 pub fn default_output_dir() -> Option<PathBuf> {
-    dirs::video_dir()
+    dirs::video_dir().map(|v| v.join("rewynd"))
 }
 
 /// A resolved per-user instance dir, plus whether it fell back under the shared temp dir.
