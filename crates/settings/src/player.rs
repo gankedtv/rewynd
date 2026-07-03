@@ -3,13 +3,17 @@
 //! The bundled openh264 decoder only speaks Constrained Baseline, and the recorder's NVENC
 //! stream is High profile: keyframes happen to decode (thumbnails, scrubbing) but delta frames
 //! do not, so full playback needs a real decoder. ffmpeg is spawned per play with a raw RGBA
-//! pipe; when it is not installed, the stream reports that and the UI points at the system
-//! player instead. Video only. Dropping the stream (the subscription) cancels playback: the
-//! dead channel stops the reader thread, which kills the child.
+//! pipe for video and an f32 PCM pipe for audio (played through rodio); when it is not
+//! installed, the stream reports that and the UI points at the system player instead. Dropping
+//! the stream (the subscription) cancels playback: the dead channel stops the reader thread,
+//! which kills the children.
 
 use std::io::Read;
+use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use iced::futures::Stream;
@@ -28,9 +32,12 @@ pub enum Event {
     Ended,
 }
 
-/// Frames cross to the UI at this width (the preview pane is ~470 logical px; 2x for hidpi).
-/// The scrub preview reuses it so paused and playing frames match.
+/// Frames cross to the UI at this width in the normal detail pane (~470 logical px; 2x for
+/// hidpi). The scrub preview reuses it so paused and playing frames match.
 pub const PREVIEW_WIDTH: u32 = 960;
+
+/// Decode width while the preview is fullscreen.
+pub const FULLSCREEN_WIDTH: u32 = 1920;
 
 /// The preview's fixed frame rate. The recorder's capture is damage-driven (variable rate, with
 /// bursts far above the display rate), so ffmpeg resamples to constant-rate output; that also
@@ -41,15 +48,30 @@ const PREVIEW_FPS: u32 = 60;
 /// playback slows down rather than freezing or drifting when decode can't keep up.
 const LATE_BUDGET: Duration = Duration::from_millis(80);
 
-/// Stream the `[start, end]` range of the clip at `path` as paced [`Event`]s.
-pub fn stream(path: PathBuf, start: Duration, end: Duration) -> impl Stream<Item = Event> {
+/// Preview audio format: what ffmpeg is asked to emit and what the sink is fed.
+const AUDIO_RATE: u32 = 48_000;
+const AUDIO_CHANNELS: u16 = 2;
+
+/// How far ahead of the wall clock audio may be queued into the sink. Small enough that a
+/// pause stops sound promptly-ish while the queue drains... it does not: pause tears the sink
+/// down, so this only bounds memory.
+const AUDIO_LEAD: Duration = Duration::from_secs(1);
+
+/// Stream the `[start, end]` range of the clip at `path` as paced [`Event`]s, decoding video
+/// at most `width` px wide.
+pub fn stream(
+    path: PathBuf,
+    start: Duration,
+    end: Duration,
+    width: u32,
+) -> impl Stream<Item = Event> {
     iced::stream::channel(
         4,
         move |mut output: iced::futures::channel::mpsc::Sender<Event>| async move {
             use iced::futures::SinkExt;
 
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(2);
-            std::thread::spawn(move || decode_loop(&path, start, end, &tx));
+            std::thread::spawn(move || decode_loop(&path, start, end, width, &tx));
             while let Some(event) = rx.recv().await {
                 if output.send(event).await.is_err() {
                     // The subscription was dropped; the dead channel stops the reader thread.
@@ -60,18 +82,25 @@ pub fn stream(path: PathBuf, start: Duration, end: Duration) -> impl Stream<Item
     )
 }
 
-/// Decode the range with a spawned ffmpeg and forward paced frames until the range ends or the
-/// receiver goes away. Always terminates the child process before returning.
-fn decode_loop(path: &Path, start: Duration, end: Duration, tx: &tokio::sync::mpsc::Sender<Event>) {
+/// Decode the range with spawned ffmpeg processes (video paced here, audio on its own thread)
+/// and forward frames until the range ends or the receiver goes away. Always terminates the
+/// children before returning.
+fn decode_loop(
+    path: &Path,
+    start: Duration,
+    end: Duration,
+    width: u32,
+    tx: &tokio::sync::mpsc::Sender<Event>,
+) {
     let Ok(summary) = rewynd_mux::read::clip_summary(path) else {
         let _ = tx.blocking_send(Event::Ended);
         return;
     };
-    let (width, height) = thumbs::scaled_dims(summary.width, summary.height, PREVIEW_WIDTH);
+    let (width, height) = thumbs::scaled_dims(summary.width, summary.height, width);
     // Raw RGBA frames carry no timestamps; the forced constant output rate defines them.
     let frame_time = Duration::from_secs(1) / PREVIEW_FPS;
 
-    let mut child = match spawn_ffmpeg(path, start, end, width, height) {
+    let mut child = match spawn_video_ffmpeg(path, start, end, width, height) {
         Ok(child) => child,
         Err(e) => {
             tracing::warn!(error = %e, "ffmpeg unavailable; no in-app playback");
@@ -79,24 +108,60 @@ fn decode_loop(path: &Path, start: Duration, end: Duration, tx: &tokio::sync::mp
             return;
         }
     };
+    // Audio rides on its own thread and clock; the stop flag ends it when video ends or the
+    // subscription is dropped. A clip without an audio track just plays silent.
+    let stop = Arc::new(AtomicBool::new(false));
+    let audio = std::thread::spawn({
+        let path = path.to_path_buf();
+        let stop = Arc::clone(&stop);
+        move || audio_loop(&path, start, end, &stop)
+    });
+
     if let Some(stdout) = child.stdout.take() {
         read_frames(stdout, start, end, width, height, frame_time, tx);
     }
     let _ = child.kill();
     let _ = child.wait();
+    stop.store(true, Ordering::Relaxed);
+    let _ = audio.join();
     let _ = tx.blocking_send(Event::Ended);
 }
 
 /// ffmpeg decoding `[start, end]` of the clip to raw RGBA frames of `width`x`height` on stdout.
 /// `-ss` before `-i` seeks to the enclosing keyframe, the same granularity as the trim itself.
-fn spawn_ffmpeg(
+fn spawn_video_ffmpeg(
     path: &Path,
     start: Duration,
     end: Duration,
     width: u32,
     height: u32,
 ) -> std::io::Result<Child> {
-    Command::new("ffmpeg")
+    let mut command = ffmpeg_range(path, start, end);
+    command
+        .args(["-vf", &format!("scale={width}:{height}")])
+        .args(["-r", &PREVIEW_FPS.to_string()])
+        .args(["-f", "rawvideo", "-pix_fmt", "rgba"])
+        .arg("pipe:1");
+    command.spawn()
+}
+
+/// ffmpeg decoding the same range's default audio track (the recorder's mix) to interleaved
+/// f32 PCM on stdout.
+fn spawn_audio_ffmpeg(path: &Path, start: Duration, end: Duration) -> std::io::Result<Child> {
+    let mut command = ffmpeg_range(path, start, end);
+    command
+        .arg("-vn")
+        .args(["-f", "f32le"])
+        .args(["-ac", &AUDIO_CHANNELS.to_string()])
+        .args(["-ar", &AUDIO_RATE.to_string()])
+        .arg("pipe:1");
+    command.spawn()
+}
+
+/// The shared ffmpeg invocation prefix for one `[start, end]` range of a clip.
+fn ffmpeg_range(path: &Path, start: Duration, end: Duration) -> Command {
+    let mut command = Command::new("ffmpeg");
+    command
         .arg("-hide_banner")
         .args(["-loglevel", "error", "-nostdin"])
         .args(["-ss", &format!("{:.3}", start.as_secs_f64())])
@@ -106,14 +171,10 @@ fn spawn_ffmpeg(
             "-t",
             &format!("{:.3}", (end - start).as_secs_f64().max(0.0)),
         ])
-        .args(["-vf", &format!("scale={width}:{height}")])
-        .args(["-r", &PREVIEW_FPS.to_string()])
-        .args(["-f", "rawvideo", "-pix_fmt", "rgba"])
-        .arg("pipe:1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    command
 }
 
 /// Read raw frames off the pipe and send them paced to their nominal times. Returns when the
@@ -149,4 +210,108 @@ fn read_frames(
             return;
         }
     }
+}
+
+/// Decode the range's audio and feed it to the default output device until the pipe ends or
+/// `stop` is raised. Queues at most [`AUDIO_LEAD`] ahead of the wall clock; rodio's own clock
+/// plays it out. Any failure (no audio track, no output device) just means a silent preview.
+fn audio_loop(path: &Path, start: Duration, end: Duration, stop: &AtomicBool) {
+    let Ok(mut child) = spawn_audio_ffmpeg(path, start, end) else {
+        return;
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    };
+    let (channels, rate) = (
+        NonZero::new(AUDIO_CHANNELS).expect("nonzero"),
+        NonZero::new(AUDIO_RATE).expect("nonzero"),
+    );
+    // The sink owns the device stream; it must outlive the player. Failure to open one (no
+    // sound server) silently skips audio.
+    let Ok(mut sink) = rodio::DeviceSinkBuilder::open_default_sink() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    };
+    sink.log_on_drop(false);
+    let player = rodio::Player::connect_new(sink.mixer());
+
+    let started = Instant::now();
+    let mut queued = Duration::ZERO;
+    let mut pending: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 32 * 1024];
+    while !stop.load(Ordering::Relaxed) {
+        let n = match stdout.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        pending.extend_from_slice(&chunk[..n]);
+        // Whole interleaved sample frames only; a partial one carries to the next read.
+        let usable = pending.len() - pending.len() % (4 * AUDIO_CHANNELS as usize);
+        if usable == 0 {
+            continue;
+        }
+        let samples: Vec<f32> = pending[..usable]
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        pending.drain(..usable);
+        queued += Duration::from_secs_f64(
+            samples.len() as f64 / f64::from(AUDIO_CHANNELS) / f64::from(AUDIO_RATE),
+        );
+        player.append(rodio::buffer::SamplesBuffer::new(channels, rate, samples));
+        while !stop.load(Ordering::Relaxed) && queued > started.elapsed() + AUDIO_LEAD {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    player.stop();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Per-bucket audio peaks (`0.0..=1.0`) across the whole clip, decoded by ffmpeg at a low
+/// mono rate, for the timeline's waveform lane. `None` when there is no audio (or no ffmpeg).
+pub fn waveform(path: &Path, buckets: usize) -> Option<Vec<f32>> {
+    let mut command = Command::new("ffmpeg");
+    command
+        .arg("-hide_banner")
+        .args(["-loglevel", "error", "-nostdin"])
+        .arg("-i")
+        .arg(path)
+        .arg("-vn")
+        .args(["-f", "f32le", "-ac", "1", "-ar", "8000"])
+        .arg("pipe:1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().ok()?;
+    let mut bytes = Vec::new();
+    let read = child
+        .stdout
+        .take()?
+        .read_to_end(&mut bytes)
+        .map(|_| ())
+        .ok();
+    let _ = child.wait();
+    read?;
+
+    let samples: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]).abs())
+        .collect();
+    if samples.is_empty() || buckets == 0 {
+        return None;
+    }
+    let per = samples.len().div_ceil(buckets);
+    let peaks: Vec<f32> = samples
+        .chunks(per)
+        .map(|bucket| bucket.iter().copied().fold(0.0, f32::max))
+        .collect();
+    let max = peaks.iter().copied().fold(0.0, f32::max);
+    if max <= f32::EPSILON {
+        return None;
+    }
+    Some(peaks.iter().map(|p| p / max).collect())
 }

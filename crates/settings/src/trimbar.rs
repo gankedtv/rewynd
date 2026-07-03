@@ -29,6 +29,9 @@ pub struct TrimBar<'a, Message> {
     dur: f32,
     /// Playback position to mark with a vertical line, when the preview is playing.
     playhead: Option<f32>,
+    /// Normalized audio peaks (`0.0..=1.0`) drawn as a lane along the bottom, so speech and
+    /// action are visible while picking the range.
+    waveform: Option<&'a [f32]>,
     on_start: Box<dyn Fn(f32) -> Message + 'a>,
     on_end: Box<dyn Fn(f32) -> Message + 'a>,
 }
@@ -47,6 +50,7 @@ impl<'a, Message> TrimBar<'a, Message> {
             // A zero duration would divide by zero when placing the handles.
             dur: dur.max(f32::EPSILON),
             playhead: None,
+            waveform: None,
             on_start: Box::new(on_start),
             on_end: Box::new(on_end),
         }
@@ -55,6 +59,12 @@ impl<'a, Message> TrimBar<'a, Message> {
     /// Mark the playback position with a vertical line.
     pub fn playhead(mut self, secs: Option<f32>) -> Self {
         self.playhead = secs;
+        self
+    }
+
+    /// Draw an audio-peak lane along the bottom of the bar.
+    pub fn waveform(mut self, peaks: Option<&'a [f32]>) -> Self {
+        self.waveform = peaks;
         self
     }
 
@@ -171,6 +181,25 @@ where
         let b = layout.bounds();
         let sx = self.pixel_of(self.start, b.x, b.width);
         let ex = self.pixel_of(self.end, b.x, b.width);
+        // The audio lane first, so the scrim dims it outside the kept window like the frames.
+        if let Some(peaks) = self.waveform
+            && !peaks.is_empty()
+        {
+            let lane = b.height * 0.45;
+            let step = b.width / peaks.len() as f32;
+            let tint = Color {
+                a: 0.55,
+                ..palette::ACCENT
+            };
+            for (i, peak) in peaks.iter().enumerate() {
+                let h = (peak * lane).max(1.0);
+                fill(
+                    renderer,
+                    rect(b.x + i as f32 * step, b.y + b.height - h, step, h),
+                    tint,
+                );
+            }
+        }
         // The scrim over everything outside the kept window, so what stays lit is what is kept.
         let scrim = Color {
             a: 0.55,

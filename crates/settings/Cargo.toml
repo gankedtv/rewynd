@@ -61,6 +61,9 @@ dirs = "6"
 notify = "8"
 # Local-time "saved at" labels on the library cards.
 jiff.workspace = true
+# Preview-playback audio out (PCM decoded by the spawned ffmpeg): just the cpal playback
+# backend, none of rodio's own decoders.
+rodio = { version = "0.22.2", default-features = false, features = ["playback"] }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -1046,6 +1046,11 @@ impl App {
     fn subscription(&self) -> iced::Subscription<Message> {
         let focus = iced::event::listen_with(|event, _status, _id| match event {
             iced::Event::Window(iced::window::Event::Focused) => Some(Message::WindowFocused),
+            // Escape leaves the fullscreen preview (a no-op otherwise).
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                ..
+            }) => Some(Message::Library(library::Message::FullscreenExit)),
             _ => None,
         });
         let dir = config::clips_dir(self.config.output_dir().as_deref())

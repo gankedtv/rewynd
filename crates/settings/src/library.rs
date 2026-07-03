@@ -46,6 +46,9 @@ const FILMSTRIP_CELL_WIDTH: u32 = 120;
 /// Logical height of the detail page's preview pane.
 const PREVIEW_HEIGHT: f32 = 240.0;
 
+/// Buckets in the timeline's audio-peak lane.
+const WAVEFORM_BUCKETS: usize = 300;
+
 /// An upload destination the detail page can send a clip to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dest {
@@ -216,6 +219,12 @@ pub enum Message {
     PlayerUnavailable,
     /// Playback reached the end of the kept range.
     PlayerEnded,
+    /// The open clip's audio peaks arrived for the timeline lane (`None`: no audio/ffmpeg).
+    WaveformDone(PathBuf, Option<Vec<f32>>),
+    /// Grow the preview to fill the window, or shrink it back.
+    FullscreenToggle,
+    /// Leave the fullscreen preview (Escape).
+    FullscreenExit,
 }
 
 /// What a trim save does with the result.
@@ -274,6 +283,10 @@ pub struct Library {
     play_pos: Option<f32>,
     /// Why in-app playback can't run on this machine, when it can't (ffmpeg missing).
     play_error: Option<&'static str>,
+    /// Whether the preview fills the whole window.
+    fullscreen: bool,
+    /// The open clip's normalized audio peaks for the timeline lane.
+    waveform: Option<Vec<f32>>,
     confirm_delete: bool,
     /// Trim in/out points for the open clip, in seconds; reset to the full span on open.
     trim_start: f32,
@@ -319,6 +332,8 @@ impl Library {
             play_frame: None,
             play_pos: None,
             play_error: None,
+            fullscreen: false,
+            waveform: None,
             confirm_delete: false,
             trim_start: 0.0,
             trim_end: 0.0,
@@ -353,6 +368,7 @@ impl Library {
         self.play_frame = None;
         self.play_pos = None;
         self.play_error = None;
+        self.fullscreen = false;
     }
 
     /// The upload record for `entry` at `dest`, if the clip was uploaded there.
@@ -443,7 +459,7 @@ impl Library {
                     Dest::Ganked
                 };
                 self.visibility = self.default_visibility(config);
-                return self.build_strip(path);
+                return self.load_open_media(path);
             }
             Message::Back => {
                 self.open = None;
@@ -659,6 +675,13 @@ impl Library {
                 self.play_range = None;
                 self.play_pos = None;
             }
+            Message::WaveformDone(path, peaks) => {
+                if self.strip_path.as_deref() == Some(path.as_path()) {
+                    self.waveform = peaks;
+                }
+            }
+            Message::FullscreenToggle => self.set_fullscreen(!self.fullscreen),
+            Message::FullscreenExit => self.set_fullscreen(false),
             Message::OpenLink(url) => {
                 if let Err(e) = open::that_detached(&url) {
                     tracing::warn!(error = %e, url, "could not open the link");
@@ -742,7 +765,47 @@ impl Library {
         self.trim_start = 0.0;
         self.trim_end = self.open_dur;
         self.reset_preview();
-        self.build_strip(path)
+        self.load_open_media(path)
+    }
+
+    /// (Re)build the open clip's timeline media: the filmstrip cells and the audio-peak lane.
+    fn load_open_media(&mut self, path: PathBuf) -> Task<Message> {
+        self.waveform = None;
+        let wave_path = path.clone();
+        let wave = Task::perform(
+            async move {
+                let peaks = tokio::task::spawn_blocking({
+                    let path = wave_path.clone();
+                    move || player::waveform(&path, WAVEFORM_BUCKETS)
+                })
+                .await
+                .unwrap_or(None);
+                (wave_path, peaks)
+            },
+            |(path, peaks)| Message::WaveformDone(path, peaks),
+        );
+        Task::batch([self.build_strip(path), wave])
+    }
+
+    /// Grow or shrink the preview; a running playback restarts from its current position so the
+    /// decode width follows the pane size.
+    fn set_fullscreen(&mut self, on: bool) {
+        if self.fullscreen == on {
+            return;
+        }
+        self.fullscreen = on;
+        if let (Some((_, end)), Some(pos)) = (self.play_range, self.play_pos) {
+            self.play_range = Some((pos.min(end), end));
+        }
+    }
+
+    /// The decode width for scrub frames and playback, matching the pane the preview fills.
+    fn preview_width(&self) -> u32 {
+        if self.fullscreen {
+            player::FULLSCREEN_WIDTH
+        } else {
+            player::PREVIEW_WIDTH
+        }
     }
 
     /// Decode the frame at `secs` into the big preview (the trim handle being dragged). One
@@ -757,11 +820,12 @@ impl Library {
         }
         self.scrub_busy = true;
         let position = secs / self.open_dur.max(f32::EPSILON);
+        let width = self.preview_width();
         Task::perform(
             async move {
                 let result = tokio::task::spawn_blocking({
                     let path = path.clone();
-                    move || thumbs::load_at(&path, position, player::PREVIEW_WIDTH)
+                    move || thumbs::load_at(&path, position, width)
                 })
                 .await
                 .unwrap_or_else(|e| Err(e.to_string()));
@@ -783,12 +847,13 @@ impl Library {
                 path.clone(),
                 Duration::from_secs_f32(start.max(0.0)),
                 Duration::from_secs_f32(end.max(0.0)),
+                self.preview_width(),
             );
             subs.push(
                 iced::Subscription::run_with(
                     key,
-                    |(path, start, end): &(PathBuf, Duration, Duration)| {
-                        player::stream(path.clone(), *start, *end)
+                    |(path, start, end, width): &(PathBuf, Duration, Duration, u32)| {
+                        player::stream(path.clone(), *start, *end, *width)
                     },
                 )
                 .map(|event| match event {
@@ -801,12 +866,13 @@ impl Library {
         iced::Subscription::batch(subs)
     }
 
-    /// Drop the filmstrip for whatever clip was open (free the decoded frames).
+    /// Drop the filmstrip and waveform for whatever clip was open (free the decoded frames).
     fn clear_strip(&mut self) {
         self.strip_path = None;
         self.strip.clear();
         self.strip_pending.clear();
         self.strip_decoding = 0;
+        self.waveform = None;
     }
 
     /// Queue all filmstrip cells for `path` and kick off the first decodes.
@@ -1137,7 +1203,14 @@ impl Library {
     }
 
     pub fn view(&self, config: &Config) -> Element<'_, Message> {
-        let body: Element<Message> = match self.open.as_ref().and_then(|p| self.entry(p)) {
+        let open = self.open.as_ref().and_then(|p| self.entry(p));
+        // Fullscreen preview bypasses the page shell (no width cap, no scroll).
+        if self.fullscreen
+            && let Some(entry) = open
+        {
+            return self.fullscreen_view(entry);
+        }
+        let body: Element<Message> = match open {
             Some(entry) => self.detail(entry, dest_statuses(config)),
             None => self.grid(),
         };
@@ -1410,41 +1483,118 @@ impl Library {
         }
     }
 
-    /// The big detail preview: the live playback frame, else the frame under the trim handle
-    /// last dragged, else the clip's thumbnail, with the play control on top.
+    /// The moving preview frame, when there is one: the live playback frame, else the frame
+    /// under the trim handle last dragged.
+    fn moving_frame(&self) -> Option<iced::widget::image::Handle> {
+        self.play_frame.clone().or_else(|| self.scrub_frame.clone())
+    }
+
+    /// The big detail preview: the moving frame (else the thumbnail), the brand mark as the
+    /// centred play control, click-anywhere pause, and the fullscreen toggle.
     fn preview<'a>(&'a self, entry: &'a ClipEntry) -> Element<'a, Message> {
-        let frame: Element<Message> = match self.play_frame.as_ref().or(self.scrub_frame.as_ref()) {
-            Some(handle) => frame_image(handle.clone(), PREVIEW_HEIGHT),
+        let frame: Element<Message> = match self.moving_frame() {
+            Some(handle) => frame_image(handle, PREVIEW_HEIGHT),
             None => self.thumbnail(entry, PREVIEW_HEIGHT),
         };
         let playing = self.play_range.is_some();
-        let toggle = button(
-            text(if playing { "Pause" } else { "Play" })
-                .size(12)
-                .font(UI_BOLD),
-        )
-        .on_press(Message::PlayToggle)
-        .style(primary_button)
-        .padding([8, 22]);
-        let overlay = container(toggle)
+        let mut layers: Vec<Element<Message>> = vec![
+            iced::widget::mouse_area(frame)
+                .on_press(Message::PlayToggle)
+                .into(),
+        ];
+        if !playing {
+            layers.push(
+                container(logo_play_button(56.0))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(iced::Alignment::Center)
+                    .align_y(iced::Alignment::Center)
+                    .into(),
+            );
+        }
+        layers.push(
+            container(
+                button(text("Fullscreen").size(11).font(UI_SEMIBOLD))
+                    .on_press(Message::FullscreenToggle)
+                    .style(secondary_button)
+                    .padding([5, 10]),
+            )
             .width(Length::Fill)
             .height(Length::Fill)
-            .align_x(iced::Alignment::Center)
+            .align_x(iced::Alignment::End)
             .align_y(iced::Alignment::End)
-            .padding(10);
-        // The frame sits above an empty base layer: iced only hard-clips layered stack
-        // children, so this keeps the Cover-scaled frame inside the box (see `layered`).
-        let stack = layered([frame, overlay.into()])
+            .padding(8)
+            .into(),
+        );
+        // Layered above an empty base: iced only hard-clips layered stack children, so this
+        // keeps the Cover-scaled frame inside the box (see `layered`).
+        let stack = layered(layers)
             .width(Length::Fill)
             .height(Length::Fixed(PREVIEW_HEIGHT));
         let mut col = column![container(stack).clip(true).style(theme::card_style)].spacing(6);
-        if playing {
-            col = col.push(hint("Silent preview; use Open in player for sound."));
-        }
         if let Some(reason) = self.play_error {
             col = col.push(hint(reason));
         }
         col.into()
+    }
+
+    /// The fullscreen preview: the video filling the window (letterboxed, never cropped), the
+    /// timeline underneath so trimming keeps working, and an exit control (also Escape).
+    fn fullscreen_view<'a>(&'a self, entry: &'a ClipEntry) -> Element<'a, Message> {
+        let frame: Element<Message> = match self.moving_frame() {
+            Some(handle) => iced::widget::image(handle)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .content_fit(iced::ContentFit::Contain)
+                .into(),
+            None => self.thumbnail(entry, 400.0),
+        };
+        let playing = self.play_range.is_some();
+        let mut layers: Vec<Element<Message>> = vec![
+            iced::widget::mouse_area(frame)
+                .on_press(Message::PlayToggle)
+                .into(),
+        ];
+        if !playing {
+            layers.push(
+                container(logo_play_button(96.0))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(iced::Alignment::Center)
+                    .align_y(iced::Alignment::Center)
+                    .into(),
+            );
+        }
+        let video = layered(layers).width(Length::Fill).height(Length::Fill);
+
+        let stat = |label: &'static str, secs: f32| {
+            text(format!("{label} {}", secs_label(secs)))
+                .size(12)
+                .font(UI_SEMIBOLD)
+                .style(tinted(palette::TEXT_SECONDARY))
+        };
+        let controls = row![
+            stat("Start", self.trim_start),
+            stat("End", self.trim_end),
+            stat("Length", (self.trim_end - self.trim_start).max(0.0)),
+            Space::new().width(Length::Fill),
+            button(text("Exit fullscreen").size(11).font(UI_SEMIBOLD))
+                .on_press(Message::FullscreenExit)
+                .style(secondary_button)
+                .padding([6, 12]),
+        ]
+        .spacing(16)
+        .align_y(iced::Alignment::Center);
+
+        column![
+            container(video).width(Length::Fill).height(Length::Fill),
+            self.filmstrip(),
+            controls,
+        ]
+        .spacing(12)
+        .padding(16)
+        .height(Length::Fill)
+        .into()
     }
 
     /// The detail page for one clip: preview, facts, actions, and the upload panel.
@@ -1469,7 +1619,7 @@ impl Library {
             hint(entry.path.display().to_string()),
         ]
         .spacing(10);
-        facts = facts.push(container(self.actions()).center_x(Length::Fill));
+        facts = facts.push(self.actions());
         if let Some(e) = &self.action_error {
             facts = facts.push(text(e.clone()).size(12).style(tinted(palette::DANGER)));
         }
@@ -1532,7 +1682,8 @@ impl Library {
             Message::TrimStartChanged,
             Message::TrimEndChanged,
         )
-        .playhead(self.play_range.and(self.play_pos));
+        .playhead(self.play_range.and(self.play_pos))
+        .waveform(self.waveform.as_deref());
         let stack = layered([cells.into(), bar.into()])
             .width(Length::Fill)
             .height(Length::Fill);
@@ -2342,6 +2493,15 @@ fn layered<'a>(
         iced::widget::Stack::new().push(Space::new()),
         |stack, layer| stack.push(layer),
     )
+}
+
+/// The brand mark as a bare play control (it is a play button), centred over the preview.
+fn logo_play_button<'a>(size: f32) -> Element<'a, Message> {
+    button(theme::logo(size))
+        .on_press(Message::PlayToggle)
+        .style(|_: &Theme, _| iced::widget::button::Style::default())
+        .padding(0)
+        .into()
 }
 
 /// A decoded frame styled like every clip image: full width, covering `height`. Callers wrap it
