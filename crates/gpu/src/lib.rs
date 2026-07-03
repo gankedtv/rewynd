@@ -86,9 +86,10 @@ pub struct GpuContext {
 // only exists where Vulkan does (Windows + non-Apple unixes); macOS is out of scope.
 #[cfg(vulkan)]
 impl GpuContext {
-    /// Create the shared device on the first Vulkan adapter that can encode H.264, enabling
-    /// whichever external-memory features the adapter advertises (so the capture-import path
-    /// can import DMA-BUF / D3D11 memory zero-copy).
+    /// Create the shared device on the best Vulkan adapter that can encode H.264 (discrete GPU
+    /// preferred over integrated, software rasterizers last), enabling whichever external-memory
+    /// features the adapter advertises (so the capture-import path can import DMA-BUF / D3D11
+    /// memory zero-copy).
     pub async fn new() -> Result<Self, GpuError> {
         use gpu_video::VideoAdapterExt;
 
@@ -99,11 +100,12 @@ impl GpuContext {
         }
         let adapter = adapters
             .into_iter()
-            .find(|adapter| {
+            .filter(|adapter| {
                 adapter
                     .video_adapter_info()
                     .is_some_and(|info| info.encode_capabilities.h264.is_some())
             })
+            .min_by_key(|adapter| adapter_rank(adapter.get_info().device_type))
             .ok_or(GpuError::NoEncodeAdapter)?;
         let (device, queue) = request_video_device(&adapter)?;
         Ok(Self { device, queue })
@@ -137,11 +139,13 @@ impl GpuContext {
     /// must be requested explicitly here.
     pub async fn new_render_only() -> Result<Self, GpuError> {
         let instance = vulkan_instance();
+        // Prefer a real GPU (discrete, then integrated); a software rasterizer ranks last but
+        // is still usable if it's the only Vulkan adapter present.
         let adapter = instance
             .enumerate_adapters(wgpu::Backends::VULKAN)
             .await
             .into_iter()
-            .next()
+            .min_by_key(|adapter| adapter_rank(adapter.get_info().device_type))
             .ok_or(GpuError::NoVulkanAdapter)?;
         let features = wgpu::Features::IMMEDIATES
             | wgpu::Features::TEXTURE_FORMAT_NV12
@@ -168,7 +172,7 @@ impl GpuContext {
         use gpu_video::VideoAdapterExt;
 
         let instance = vulkan_instance();
-        instance
+        let mut adapters: Vec<AdapterEncodeInfo> = instance
             .enumerate_adapters(wgpu::Backends::VULKAN)
             .await
             .into_iter()
@@ -197,7 +201,24 @@ impl GpuContext {
                     max_height,
                 }
             })
-            .collect()
+            .collect();
+        // Best-first (discrete GPU preferred), so auto selection and the GUI list agree on the
+        // preferred device. Stable, so equal-rank adapters keep enumeration order.
+        adapters.sort_by_key(|a| adapter_rank(a.device_type));
+        adapters
+    }
+}
+
+/// Adapter preference for deterministic selection: a discrete GPU first, then integrated, then
+/// virtual/other, with a software (CPU) rasterizer last.
+#[cfg(vulkan)]
+fn adapter_rank(device_type: wgpu::DeviceType) -> u8 {
+    match device_type {
+        wgpu::DeviceType::DiscreteGpu => 0,
+        wgpu::DeviceType::IntegratedGpu => 1,
+        wgpu::DeviceType::VirtualGpu => 2,
+        wgpu::DeviceType::Other => 3,
+        wgpu::DeviceType::Cpu => 4,
     }
 }
 

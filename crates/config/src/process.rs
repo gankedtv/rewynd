@@ -118,15 +118,40 @@ pub(crate) fn recorder_alive(pid: u32) -> bool {
         .is_ok_and(|comm| comm.trim() == "rewynd-recorder")
 }
 
+/// The file name of `handle`'s process image (the Windows analog of `/proc/<pid>/comm`), or
+/// `None` if the query fails. Shared by [`recorder_alive`] and [`stop_process`] so the identity
+/// FFI lives in one place.
+#[cfg(windows)]
+fn process_image_file_name(handle: windows::Win32::Foundation::HANDLE) -> Option<String> {
+    use windows::Win32::System::Threading::{PROCESS_NAME_WIN32, QueryFullProcessImageNameW};
+    use windows::core::PWSTR;
+
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: FFI; `buf`/`len` describe a valid buffer and `handle` is a live process handle.
+    if unsafe {
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+    }
+    .is_err()
+    {
+        return None;
+    }
+    let full = String::from_utf16_lossy(&buf[..len as usize]);
+    std::path::Path::new(&full)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
 #[cfg(windows)]
 pub(crate) fn recorder_alive(pid: u32) -> bool {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-        QueryFullProcessImageNameW,
-    };
-    use windows::core::PWSTR;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
     // SAFETY: FFI; a failed open (process gone / no access) reads as not-alive.
     let Ok(handle) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
@@ -135,19 +160,7 @@ pub(crate) fn recorder_alive(pid: u32) -> bool {
     // SAFETY: `OpenProcess` succeeded, so `handle` is a valid handle we own.
     let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
     let raw = HANDLE(handle.as_raw_handle());
-    let mut buf = [0u16; 1024];
-    let mut len = buf.len() as u32;
-    // SAFETY: FFI; `buf`/`len` describe a valid buffer.
-    if unsafe {
-        QueryFullProcessImageNameW(raw, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len)
-    }
-    .is_err()
-    {
-        return false;
-    }
-    let image = String::from_utf16_lossy(&buf[..len as usize]);
-    std::path::Path::new(&image)
-        .file_name()
+    process_image_file_name(raw)
         .is_some_and(|name| name.eq_ignore_ascii_case("rewynd-recorder.exe"))
 }
 
@@ -255,10 +268,9 @@ fn stop_process(
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
     use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-        PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        TerminateProcess, WaitForSingleObject,
     };
-    use windows::core::PWSTR;
 
     // SAFETY: FFI; a failed open (process gone, or a reused pid we lack access to)
     // means there is nothing of ours to stop.
@@ -277,20 +289,8 @@ fn stop_process(
 
     // Identity check: a reused pid must never be signalled. The image's file name is
     // the Windows analog of /proc/<pid>/comm.
-    let mut buf = [0u16; 1024];
-    let mut len = buf.len() as u32;
-    // SAFETY: FFI; `buf`/`len` describe a valid buffer.
-    if unsafe {
-        QueryFullProcessImageNameW(raw, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len)
-    }
-    .is_err()
-    {
-        return Ok(true);
-    }
-    let image = String::from_utf16_lossy(&buf[..len as usize]);
-    let is_ours = std::path::Path::new(&image)
-        .file_name()
-        .is_some_and(|name| name.eq_ignore_ascii_case(expected_image));
+    let is_ours =
+        process_image_file_name(raw).is_some_and(|name| name.eq_ignore_ascii_case(expected_image));
     if !is_ours {
         return Ok(true);
     }

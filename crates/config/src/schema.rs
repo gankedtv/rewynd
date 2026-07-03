@@ -160,11 +160,12 @@ impl EncoderPreference {
     #[must_use]
     pub fn parse(value: &str) -> Self {
         let trimmed = value.trim();
-        if let Some(name) = trimmed
-            .strip_prefix("gpu:")
-            .or_else(|| trimmed.strip_prefix("GPU:"))
+        // Case-insensitive `gpu:` prefix; the adapter name after it keeps its casing (it must
+        // match wgpu's reported name exactly).
+        if let Some(prefix) = trimmed.get(..4)
+            && prefix.eq_ignore_ascii_case("gpu:")
         {
-            return Self::Gpu(name.trim().to_owned());
+            return Self::Gpu(trimmed[4..].trim().to_owned());
         }
         match trimmed.to_ascii_lowercase().as_str() {
             "" | "auto" => Self::Auto,
@@ -1095,6 +1096,29 @@ pub fn ensure_default_file() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoder_preference_parses_all_forms() {
+        assert_eq!(EncoderPreference::parse(""), EncoderPreference::Auto);
+        assert_eq!(EncoderPreference::parse("  AUTO "), EncoderPreference::Auto);
+        assert_eq!(EncoderPreference::parse("Cpu"), EncoderPreference::Cpu);
+        assert_eq!(
+            EncoderPreference::parse("nonsense"),
+            EncoderPreference::Auto
+        );
+        // The `gpu:` prefix is case-insensitive; the adapter name keeps its casing.
+        for form in ["gpu:RTX 3080 Ti", "GPU:RTX 3080 Ti", "Gpu: RTX 3080 Ti "] {
+            assert_eq!(
+                EncoderPreference::parse(form),
+                EncoderPreference::Gpu("RTX 3080 Ti".to_owned()),
+                "{form:?}"
+            );
+        }
+        assert_eq!(
+            EncoderPreference::Gpu("RTX 3080 Ti".to_owned()).as_config_value(),
+            "gpu:RTX 3080 Ti"
+        );
+    }
 
     #[test]
     fn empty_toml_is_all_defaults() {

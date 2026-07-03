@@ -668,9 +668,9 @@ mod linux {
             "encode parameters"
         );
 
-        // Pick the encoder backend up front (issue #115): probe the machine's adapters, honour
-        // the config override, and log both. The capture thread builds the actual encoder from
-        // this; a mid-run GPU-init failure still falls back to the CPU inside that thread.
+        // Pick the encoder backend up front: probe the machine's adapters, honour the config
+        // override, and log both. The capture thread builds the actual encoder from this; a
+        // mid-run GPU-init failure still falls back to the CPU inside that thread.
         let adapters = crate::probe::adapter_list();
         let (encoder_choice, encoder_warning) =
             config::choose_encoder(&config.encoder_preference(), &adapters);
@@ -1714,9 +1714,9 @@ mod windows {
             "encode parameters"
         );
 
-        // Pick the encoder backend up front (issue #115): probe adapters, honour the config
-        // override, log both. The capture thread builds the actual encoder, falling back to the
-        // CPU there if the chosen GPU device/encoder can't be created.
+        // Pick the encoder backend up front: probe adapters, honour the config override, log
+        // both. The capture thread builds the actual encoder, falling back to the CPU there if
+        // the chosen GPU device/encoder can't be created.
         let adapters = crate::probe::adapter_list();
         let (encoder_choice, encoder_warning) =
             config::choose_encoder(&config.encoder_preference(), &adapters);
