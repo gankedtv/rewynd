@@ -39,6 +39,17 @@ fn is_custom_url(stored: &str, default: &str) -> bool {
     !stored.is_empty() && stored != default
 }
 
+/// The stored URL when it's a genuine custom endpoint, else empty — so the built-in default is
+/// only ever a placeholder in the custom-connector fields, never a value the user seems to have
+/// typed.
+fn custom_url_or_empty(stored: &str, default: &str) -> String {
+    if is_custom_url(stored, default) {
+        stored.trim().to_owned()
+    } else {
+        String::new()
+    }
+}
+
 /// The view to open on. First run (no config file) or an explicit `--onboarding` starts in the
 /// onboarding wizard; otherwise the library.
 fn initial_view() -> View {
@@ -451,8 +462,15 @@ impl App {
             hotkey: config.hotkey_trigger().to_owned(),
             mic_options,
             api_key: config.upload_api_key().to_owned(),
-            api_url: config.upload_api_url().to_owned(),
-            share_url: config.upload_share_url().to_owned(),
+            // Show the custom-connector fields empty unless a genuinely custom endpoint is set:
+            // the built-in default is a placeholder, never a pre-filled value the user didn't
+            // type. An older config that stored the spelled-out default is blanked here and
+            // rewritten empty on the next Save (`upload()` falls back to the default anyway).
+            api_url: custom_url_or_empty(config.upload_api_url(), config::DEFAULT_UPLOAD_API_URL),
+            share_url: custom_url_or_empty(
+                config.upload_share_url(),
+                config::DEFAULT_UPLOAD_SHARE_URL,
+            ),
             applied_on_boot: config.start_on_boot(),
             // A saved self-hosting setup stays visible instead of hiding behind the disclosure
             // (a key alone is just "logged in" — the badge already shows that). URLs stored as
