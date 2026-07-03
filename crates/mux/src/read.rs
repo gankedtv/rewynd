@@ -285,13 +285,22 @@ fn trim_inner(
         .next_back()
         .or_else(|| vids.iter().position(|v| v.sync))
         .unwrap_or(0);
-    let out_idx = vids
+
+    // A window that starts at or after the clip's end selects nothing: reject it rather than
+    // emit the trailing GOP.
+    let clip_end = vids.last().map_or(Duration::ZERO, |v| v.pts + frame);
+    if start >= clip_end {
+        return Err(TrimError::EmptyRange);
+    }
+    let Some(out_idx) = vids
         .iter()
         .enumerate()
         .filter(|(i, v)| *i >= in_idx && v.pts <= end)
         .map(|(i, _)| i)
         .next_back()
-        .unwrap_or(in_idx);
+    else {
+        return Err(TrimError::EmptyRange);
+    };
 
     let in_pts = vids[in_idx].pts;
     let out_pts = vids[out_idx].pts;
@@ -1059,6 +1068,22 @@ mod tests {
                 &out.0,
                 Duration::from_millis(50),
                 Duration::from_millis(50)
+            ),
+            Err(TrimError::EmptyRange)
+        ));
+    }
+
+    #[test]
+    fn trim_window_past_the_clip_end_is_empty() {
+        // The ten-frame clip is ~0.17 s; a window well past that selects no frame.
+        let clip = multi_keyframe_clip();
+        let out = TempMp4::new();
+        assert!(matches!(
+            trim_clip(
+                &clip.0,
+                &out.0,
+                Duration::from_millis(500),
+                Duration::from_millis(600),
             ),
             Err(TrimError::EmptyRange)
         ));

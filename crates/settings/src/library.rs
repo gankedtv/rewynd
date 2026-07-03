@@ -167,7 +167,10 @@ pub enum Message {
     TrimStartChanged(f32),
     TrimEndChanged(f32),
     TrimSave,
-    TrimSaved(Result<PathBuf, String>),
+    TrimSaved {
+        src: PathBuf,
+        result: Result<PathBuf, String>,
+    },
     TitleEdited(String),
     DestPicked(Dest),
     VisibilityPicked(Visibility),
@@ -414,27 +417,41 @@ impl Library {
                 let start = Duration::from_secs_f32(self.trim_start);
                 let end = Duration::from_secs_f32(self.trim_end);
                 self.trim = TrimState::Saving;
+                let work_src = src.clone();
                 return Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
-                            let dst = unique_trim_path(&src);
-                            rewynd_mux::read::trim_clip(&src, &dst, start, end)
+                            let dst = unique_trim_path(&work_src);
+                            rewynd_mux::read::trim_clip(&work_src, &dst, start, end)
                                 .map(|_| dst)
                                 .map_err(|e| e.to_string())
                         })
                         .await
                         .unwrap_or_else(|e| Err(e.to_string()))
                     },
-                    Message::TrimSaved,
+                    move |result| Message::TrimSaved {
+                        src: src.clone(),
+                        result,
+                    },
                 );
             }
-            Message::TrimSaved(Ok(path)) => {
-                self.trim = TrimState::Saved(path);
-                // Rescan so the new trimmed clip appears in the library.
-                return self.refresh(config);
-            }
-            Message::TrimSaved(Err(e)) => {
-                self.trim = TrimState::Failed(format!("Could not save the trimmed clip: {e}"));
+            Message::TrimSaved { src, result } => {
+                // The trim may finish after the user opened another clip; only stamp the result on
+                // its own detail page. The rescan still runs so the new clip shows up regardless.
+                let current = self.open.as_deref() == Some(src.as_path());
+                match result {
+                    Ok(path) => {
+                        if current {
+                            self.trim = TrimState::Saved(path);
+                        }
+                        return self.refresh(config);
+                    }
+                    Err(e) if current => {
+                        self.trim =
+                            TrimState::Failed(format!("Could not save the trimmed clip: {e}"));
+                    }
+                    Err(_) => {}
+                }
             }
             Message::TitleEdited(s) => self.title = s,
             Message::DestPicked(dest) => {
