@@ -38,11 +38,9 @@ futures-util.workspace = true
 ksni = "0.3"
 notify-rust = "4"
 image.workspace = true
-# ganked.tv upload from the tray (docs/adr/0009).
-rewynd-upload.workspace = true
 
 # Windows wiring: WGC capture + D3D11 import + a RegisterHotKey message loop, with
-# the tray (tray-icon pumps on the same thread) and the ganked.tv upload menu.
+# the tray (tray-icon pumps on the same thread).
 [target.'cfg(target_os = "windows")'.dependencies]
 rewynd-capture.workspace = true
 rewynd-gpu.workspace = true
@@ -53,7 +51,6 @@ notify-rust = "4"
 # System tray icon + menu (tauri's tray-icon; MIT/Apache). PNG decode for the icon.
 tray-icon = "0.24"
 image.workspace = true
-rewynd-upload.workspace = true
 windows = { workspace = true, features = [
     # The in-game save badge (layered window, GDI-drawn) + chime (PlaySound).
     "Win32_Graphics_Gdi",

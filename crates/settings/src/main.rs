@@ -39,6 +39,28 @@ fn is_custom_url(stored: &str, default: &str) -> bool {
     !stored.is_empty() && stored != default
 }
 
+/// Cap a microphone label so a long PipeWire description doesn't run past the dropdown; the ellipsis
+/// signals it was shortened. Counts by `char` so a multi-byte name is never split mid-codepoint.
+fn truncate_mic_label(label: &str) -> String {
+    const MAX_CHARS: usize = 38;
+    if label.chars().count() <= MAX_CHARS {
+        return label.to_owned();
+    }
+    let head: String = label.chars().take(MAX_CHARS - 1).collect();
+    format!("{head}…")
+}
+
+/// The stored URL when it's a genuine custom endpoint, else empty — so the built-in default is
+/// only ever a placeholder in the custom-connector fields, never a value the user seems to have
+/// typed.
+fn custom_url_or_empty(stored: &str, default: &str) -> String {
+    if is_custom_url(stored, default) {
+        stored.trim().to_owned()
+    } else {
+        String::new()
+    }
+}
+
 /// The view to open on. First run (no config file) or an explicit `--onboarding` starts in the
 /// onboarding wizard; otherwise the library.
 fn initial_view() -> View {
@@ -293,9 +315,9 @@ struct App {
     output_dir: String,
     /// Mirror of the hotkey trigger for the text box.
     hotkey: String,
-    /// Active input devices for the microphone picker (Windows enumerates them at
-    /// startup; empty elsewhere, where the control is a free-text node name).
-    mic_options: Vec<String>,
+    /// Active input devices for the microphone picker (Windows WASAPI endpoints, Linux PipeWire
+    /// sources); empty when enumeration finds nothing, where the control is a free-text name.
+    mic_options: Vec<config::AudioInput>,
     /// Mirror of the ganked.tv API key.
     api_key: String,
     /// Mirror of the ganked.tv API base URL (empty = "use the default").
@@ -309,9 +331,8 @@ struct App {
     /// Whether the last Save wrote the file — the Restart button only appears when restarting
     /// would actually apply something.
     last_save_ok: bool,
-    /// Whether the ganked.tv card shows its self-hosting fields (API server, share links, API
-    /// key) plus the upload toggle. UI-only state; collapsed by default because login covers the
-    /// common case.
+    /// Whether the CUSTOM CONNECTOR card shows its fields (API server, share links, API key).
+    /// UI-only state; collapsed by default because a normal user never needs it.
     advanced_open: bool,
     /// Whether the audio card shows its advanced options (the separate mic track). UI-only.
     audio_advanced_open: bool,
@@ -398,7 +419,6 @@ enum Message {
     CaptureDesktop(bool),
     GameFolders(bool),
     StartOnBoot(bool),
-    UploadEnabled(bool),
     ApiKeyEdited(String),
     ApiUrlEdited(String),
     ShareUrlEdited(String),
@@ -409,7 +429,6 @@ enum Message {
     LoginDone(Result<String, String>),
     LoginCancelled,
     LogoutPressed,
-    YouTubeEnabled(bool),
     YtClientIdEdited(String),
     YtClientSecretEdited(String),
     YtAdvancedToggled,
@@ -444,10 +463,7 @@ impl App {
         // while the file keeps a different one). Resolution and the keyframe interval are left
         // alone — a custom resolution is shown verbatim, and the GOP is only retuned with the fps.
         normalize(&mut config);
-        #[cfg(target_os = "windows")]
         let mic_options = config::list_audio_inputs();
-        #[cfg(not(target_os = "windows"))]
-        let mic_options = Vec::new();
         let wizard = wizard::Wizard::new(&config);
         Self {
             view: initial_view(),
@@ -457,8 +473,15 @@ impl App {
             hotkey: config.hotkey_trigger().to_owned(),
             mic_options,
             api_key: config.upload_api_key().to_owned(),
-            api_url: config.upload_api_url().to_owned(),
-            share_url: config.upload_share_url().to_owned(),
+            // Show the custom-connector fields empty unless a genuinely custom endpoint is set:
+            // the built-in default is a placeholder, never a pre-filled value the user didn't
+            // type. An older config that stored the spelled-out default is blanked here and
+            // rewritten empty on the next Save (`upload()` falls back to the default anyway).
+            api_url: custom_url_or_empty(config.upload_api_url(), config::DEFAULT_UPLOAD_API_URL),
+            share_url: custom_url_or_empty(
+                config.upload_share_url(),
+                config::DEFAULT_UPLOAD_SHARE_URL,
+            ),
             applied_on_boot: config.start_on_boot(),
             // A saved self-hosting setup stays visible instead of hiding behind the disclosure
             // (a key alone is just "logged in" — the badge already shows that). URLs stored as
@@ -572,12 +595,9 @@ impl App {
                 self.touch();
             }
             Message::MicrophonePicked(mic) => {
-                // The picker's "System default" row maps to the empty stored value.
-                self.config.set_microphone(if mic == MIC_DEFAULT {
-                    String::new()
-                } else {
-                    mic
-                });
+                // The picker's "System default" row carries the empty id; free text is stored
+                // verbatim. Either way the stored value is what the capture backend resolves.
+                self.config.set_microphone(mic);
                 self.touch();
             }
             Message::BufferSeconds(s) => {
@@ -640,10 +660,6 @@ impl App {
             }
             Message::StartOnBoot(on) => {
                 self.config.set_start_on_boot(on);
-                self.touch();
-            }
-            Message::UploadEnabled(on) => {
-                self.config.set_upload_enabled(on);
                 self.touch();
             }
             Message::ApiKeyEdited(s) => {
@@ -739,10 +755,6 @@ impl App {
                 // A pending device login must not keep polling after an explicit logout.
                 self.abort_login();
                 self.save();
-            }
-            Message::YouTubeEnabled(on) => {
-                self.config.set_youtube_enabled(on);
-                self.touch();
             }
             Message::YtClientIdEdited(s) => {
                 self.yt_client_id = s;
@@ -1002,6 +1014,8 @@ impl App {
         self.config
             .set_buffer_seconds(u64::from(self.wizard.buffer_seconds()));
         self.config.set_start_on_boot(self.wizard.start_on_boot());
+        self.config
+            .set_capture_desktop(self.wizard.capture_desktop());
         self.save();
         self.view = View::Library;
         let refresh = self.library.refresh(&self.config).map(Message::Library);
@@ -1084,9 +1098,9 @@ impl App {
             / 8;
         let est_mb = est_bytes.saturating_add(500_000) / 1_000_000;
 
-        // The microphone picker: a dropdown of the active input devices on Windows
-        // (also usable when the OS sound settings are locked), a free-text PipeWire
-        // node name elsewhere. Stored value empty = the system default.
+        // The microphone picker: a dropdown of the active input devices (Windows WASAPI
+        // endpoints, Linux PipeWire sources), or a free-text device name when enumeration
+        // found nothing. Stored value empty = the system default.
         let mic_value = self.config.microphone().unwrap_or_default().to_owned();
         let microphone: Element<Message> = if self.mic_options.is_empty() {
             column![
@@ -1099,23 +1113,38 @@ impl App {
             .spacing(8)
             .into()
         } else {
-            let mut options = vec![MIC_DEFAULT.to_owned()];
+            // The default row is stored as the empty value.
+            let default = config::AudioInput {
+                id: String::new(),
+                label: MIC_DEFAULT.to_owned(),
+            };
+            let mut options = vec![default.clone()];
             // Keep a configured-but-offline device visible instead of silently
             // snapping the selection to the default.
-            if !mic_value.is_empty() && !self.mic_options.contains(&mic_value) {
-                options.push(mic_value.clone());
+            if !mic_value.is_empty() && !self.mic_options.iter().any(|o| o.id == mic_value) {
+                options.push(config::AudioInput {
+                    id: mic_value.clone(),
+                    label: mic_value.clone(),
+                });
             }
             options.extend(self.mic_options.iter().cloned());
-            let selected = if mic_value.is_empty() {
-                MIC_DEFAULT.to_owned()
-            } else {
-                mic_value
-            };
+            // PipeWire descriptions can be long enough to overrun the dropdown; cap the visible
+            // label. The stored id (used for matching and persistence) is left untouched.
+            for o in &mut options {
+                o.label = truncate_mic_label(&o.label);
+            }
+            let selected = options
+                .iter()
+                .find(|o| o.id == mic_value)
+                .cloned()
+                .unwrap_or(default);
             column![
                 field_label("Microphone"),
-                pick_list(options, Some(selected), Message::MicrophonePicked)
-                    .style(arena_pick)
-                    .width(Length::Fill),
+                pick_list(options, Some(selected), |o: config::AudioInput| {
+                    Message::MicrophonePicked(o.id)
+                })
+                .style(arena_pick)
+                .width(Length::Fill),
             ]
             .spacing(8)
             .into()
@@ -1226,15 +1255,19 @@ impl App {
             .spacing(18),
         );
 
-        let placeholder = config::default_output_dir().map_or_else(
-            || "Leave empty for the system temp folder".to_owned(),
-            |p| format!("Leave empty for {}", p.display()),
+        // The full default path is too long to read as a placeholder, so the box just says
+        // "Leave empty for default" and the resolved location is spelled out on its own line.
+        // With no Videos folder, clips fall back to a private rewynd-clips dir under the temp
+        // dir (then ~/.rewynd-clips) — describe that rather than implying a shared temp folder.
+        let default_location = config::default_output_dir().map_or_else(
+            || "a private rewynd-clips folder under your temp directory".to_owned(),
+            |p| p.display().to_string(),
         );
         let output_capture = column![
             column![
                 field_label("Save clips to"),
                 row![
-                    text_input(&placeholder, &self.output_dir)
+                    text_input("Leave empty for default", &self.output_dir)
                         .on_input(Message::OutputDirEdited)
                         .style(arena_input),
                     button(text("Browse").size(12).font(UI_SEMIBOLD))
@@ -1243,6 +1276,7 @@ impl App {
                         .padding([10, 16]),
                 ]
                 .spacing(8),
+                hint(format!("Default location: {default_location}")),
             ]
             .spacing(8),
             field(
@@ -1391,71 +1425,29 @@ impl App {
             }
         };
 
-        // The upload toggle and self-hosting fields hide behind a disclosure: uploading a raw clip
-        // straight from here skips the trimming step, and "API server" / "share links" only
-        // confuse an average user. Login covers the common case and turns uploads on by itself.
-        let mut upload_items: Vec<Element<Message>> = vec![
-            account,
-            setting(
-                "Visibility",
-                rewynd_upload::Visibility::parse(self.config.upload_visibility()).to_string(),
-                pick_list(
-                    &rewynd_upload::Visibility::ALL[..],
-                    Some(rewynd_upload::Visibility::parse(
-                        self.config.upload_visibility(),
-                    )),
-                    Message::VisibilityPicked,
-                )
-                .style(arena_pick)
-                .width(Length::Fill),
-            ),
-            disclosure(self.advanced_open, Message::AdvancedToggled),
-        ];
-        if self.advanced_open {
-            upload_items.push(
-                column![
-                    checkbox(self.config.upload_enabled())
-                        .label("Show the ganked.tv upload option")
-                        .on_toggle(Message::UploadEnabled)
-                        .style(arena_check),
-                    hint(
-                        "Adds an \"Upload last clip\" button to the tray and the upload panel here. \
-                         You choose which clips to send — nothing uploads on its own.",
-                    ),
-                ]
-                .spacing(6)
-                .into(),
-            );
-            upload_items.extend([
-                field(
-                    "API server",
-                    text_input(config::DEFAULT_UPLOAD_API_URL, &self.api_url)
-                        .on_input(Message::ApiUrlEdited)
-                        .style(arena_input),
-                )
-                .into(),
-                field(
-                    "Share links",
-                    text_input(config::DEFAULT_UPLOAD_SHARE_URL, &self.share_url)
-                        .on_input(Message::ShareUrlEdited)
-                        .style(arena_input),
-                )
-                .push(hint(
-                    "Leave both empty for ganked.tv. Self-hosting? An API key can be \
-                     pasted below.",
-                ))
-                .into(),
-                field(
-                    "API key",
-                    text_input("gtv_...", &self.api_key)
-                        .secure(true)
-                        .on_input(Message::ApiKeyEdited)
-                        .style(arena_input),
-                )
-                .into(),
-            ]);
-        }
-        let upload = card("GANKED.TV", column(upload_items).spacing(18));
+        // The GANKED.TV card is just the account state and the default upload visibility now:
+        // login covers the common case and turns uploads on by itself. The self-hosting fields
+        // moved to the generic CUSTOM CONNECTOR card at the bottom, out of a normal user's way.
+        let upload = card(
+            "GANKED.TV",
+            column![
+                account,
+                setting(
+                    "Visibility",
+                    rewynd_upload::Visibility::parse(self.config.upload_visibility()).to_string(),
+                    pick_list(
+                        &rewynd_upload::Visibility::ALL[..],
+                        Some(rewynd_upload::Visibility::parse(
+                            self.config.upload_visibility(),
+                        )),
+                        Message::VisibilityPicked,
+                    )
+                    .style(arena_pick)
+                    .width(Length::Fill),
+                ),
+            ]
+            .spacing(18),
+        );
 
         // YouTube account area, mirroring the ganked.tv login. Google grants no username with
         // the upload-only scope, so connectedness is simply "a refresh token is stored".
@@ -1527,16 +1519,13 @@ impl App {
                 .into(),
             }
         };
+        // Login turns uploads on by itself, so the YouTube card is the account state plus the
+        // Google-only OAuth advanced fields. Clips are sent from the library, per clip.
         let mut youtube_items: Vec<Element<Message>> = vec![
             yt_account,
-            checkbox(self.config.youtube_enabled())
-                .label("Enable YouTube uploads (tray: Upload last clip to YouTube)")
-                .on_toggle(Message::YouTubeEnabled)
-                .style(arena_check)
-                .into(),
             hint(
-                "Clips use the visibility chosen above. YouTube's built-in quota allows \
-                 only a handful of uploads per day.",
+                "Clips use the visibility chosen above and are sent from your library. \
+                 YouTube's built-in quota allows only a handful of uploads per day.",
             ),
             button(
                 text(if self.yt_advanced_open {
@@ -1576,6 +1565,46 @@ impl App {
             ]);
         }
         let youtube = card("YOUTUBE", column(youtube_items).spacing(18));
+
+        // A generic escape hatch for pointing rewynd at your own upload server (a self-hosted or
+        // otherwise compatible service) instead of the built-in one. Deliberately plain and
+        // collapsed by default — a normal user never needs it, so it stays out of the way.
+        let mut connector_items: Vec<Element<Message>> = vec![
+            hint(
+                "Advanced: send clips to your own upload server instead of the built-in one. \
+                 Leave this alone unless you run a compatible service.",
+            ),
+            disclosure(self.advanced_open, Message::AdvancedToggled),
+        ];
+        if self.advanced_open {
+            connector_items.extend([
+                field(
+                    "API server",
+                    text_input("https://api.example.com", &self.api_url)
+                        .on_input(Message::ApiUrlEdited)
+                        .style(arena_input),
+                )
+                .into(),
+                field(
+                    "Share links",
+                    text_input("https://example.com", &self.share_url)
+                        .on_input(Message::ShareUrlEdited)
+                        .style(arena_input),
+                )
+                .push(hint("Leave both empty to use the built-in server."))
+                .into(),
+                field(
+                    "API key",
+                    text_input("API key", &self.api_key)
+                        .secure(true)
+                        .on_input(Message::ApiKeyEdited)
+                        .style(arena_input),
+                )
+                .push(hint("Authenticates rewynd with your server."))
+                .into(),
+            ]);
+        }
+        let connector = card("CUSTOM CONNECTOR", column(connector_items).spacing(18));
 
         let header = column![
             logo(46.0),
@@ -1622,16 +1651,22 @@ impl App {
         .center_x(Length::Fill);
 
         // Two columns so everything fits in a landscape window without scrolling: Recording and
-        // Audio on the left, Output and Upload on the right.
+        // Audio on the left, Output on the right.
         let columns = row![
             column![recording, audio].spacing(20).width(Length::Fill),
-            column![output, upload, youtube]
-                .spacing(20)
-                .width(Length::Fill),
+            column![output].spacing(20).width(Length::Fill),
         ]
         .spacing(20);
 
-        let body = column![header, columns, save]
+        // The two upload connectors sit side by side as a symmetric pair, each filling half the
+        // width, so neither column runs long and empty against the other.
+        let connectors = row![
+            column![upload].width(Length::Fill),
+            column![youtube].width(Length::Fill),
+        ]
+        .spacing(20);
+
+        let body = column![header, columns, connectors, connector, save]
             .spacing(20)
             .padding(28)
             .max_width(880);

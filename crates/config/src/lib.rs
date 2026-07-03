@@ -22,7 +22,6 @@
 
 mod clips;
 mod desktop;
-#[cfg(windows)]
 mod devices;
 mod lock;
 mod paths;
@@ -37,8 +36,7 @@ pub use clips::{
 #[cfg(windows)]
 pub use desktop::register_toast_identity;
 pub use desktop::{BRAND_ICONS, install_autostart, refresh_autostart, remove_autostart};
-#[cfg(windows)]
-pub use devices::list_audio_inputs;
+pub use devices::{AudioInput, list_audio_inputs};
 // XDG desktop entries / hicolor icons exist only on unix desktops; Windows autostart is
 // a Run-key value behind the same install/remove/refresh surface above.
 #[cfg(unix)]

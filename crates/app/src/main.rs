@@ -281,136 +281,6 @@ mod audio_pipeline {
 /// Upload wiring (ganked.tv + YouTube) shared by the platform trays; the platform module owns
 /// the toast/task plumbing around it.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-mod uploads {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    /// A toast `(title, body)` explaining why nothing will upload.
-    pub(crate) type UploadRefusal = (&'static str, String);
-
-    /// ganked.tv upload wiring, built from the config at the moment of use.
-    pub(crate) struct Uploader {
-        pub(crate) client: rewynd_upload::GankedClient,
-        pub(crate) visibility: rewynd_upload::Visibility,
-        pub(crate) share_base: String,
-    }
-
-    /// YouTube upload wiring, built from the config at the moment of use.
-    pub(crate) struct YtUploader {
-        pub(crate) client: rewynd_upload::youtube::YouTubeClient,
-        pub(crate) visibility: rewynd_upload::Visibility,
-    }
-
-    /// Log an unrecognized visibility (parse() fails closed to private; still tell the user
-    /// their config has a typo) and return the parsed value.
-    fn checked_visibility(vis: &str) -> rewynd_upload::Visibility {
-        let vis = vis.trim();
-        if !rewynd_upload::Visibility::is_recognized(vis) {
-            tracing::warn!(visibility = vis, "unknown upload visibility; using private");
-        }
-        rewynd_upload::Visibility::parse(vis)
-    }
-
-    pub(crate) fn build_uploader(
-        settings: rewynd_config::UploadSettings,
-    ) -> Result<Uploader, UploadRefusal> {
-        if !settings.enabled {
-            return Err((
-                "Upload not configured",
-                "Enable uploads and log in with ganked.tv in the settings.".to_owned(),
-            ));
-        }
-        match rewynd_upload::GankedClient::new(&settings.api_url, &settings.api_key) {
-            Ok(client) => Ok(Uploader {
-                client,
-                visibility: checked_visibility(&settings.visibility),
-                share_base: settings.share_url,
-            }),
-            Err(e) => {
-                tracing::warn!(error = %e, "uploads unavailable: could not build the ganked.tv client");
-                Err((
-                    "Upload misconfigured",
-                    format!("The API server URL in the settings is invalid: {e}"),
-                ))
-            }
-        }
-    }
-
-    pub(crate) fn build_youtube_uploader(
-        settings: rewynd_config::YouTubeSettings,
-    ) -> Result<YtUploader, UploadRefusal> {
-        use rewynd_upload::youtube::{DEFAULT_CLIENT_ID, DEFAULT_CLIENT_SECRET, YouTubeClient};
-        if !settings.enabled {
-            return Err((
-                "YouTube upload not configured",
-                "Enable YouTube uploads and log in with YouTube in the settings.".to_owned(),
-            ));
-        }
-        let client_id = rewynd_config::non_empty_or(&settings.client_id, DEFAULT_CLIENT_ID);
-        let client_secret =
-            rewynd_config::non_empty_or(&settings.client_secret, DEFAULT_CLIENT_SECRET);
-        // The token exchange needs both halves of the OAuth client.
-        if client_id.is_empty() || client_secret.is_empty() {
-            return Err((
-                "YouTube upload unavailable",
-                "No Google OAuth client is configured; set its id and secret in the settings \
-                 (Advanced options)."
-                    .to_owned(),
-            ));
-        }
-        match YouTubeClient::new(client_id, client_secret, &settings.refresh_token) {
-            Ok(client) => Ok(YtUploader {
-                client,
-                visibility: checked_visibility(&settings.visibility),
-            }),
-            Err(e) => {
-                tracing::warn!(error = %e, "uploads unavailable: could not build the YouTube client");
-                Err(("YouTube upload unavailable", e.to_string()))
-            }
-        }
-    }
-
-    /// Decide what an "Upload last clip" click should do: the uploader + clip to send, or the
-    /// refusal to toast. On `Ok` the busy flag has been taken — the upload path must release it
-    /// ([`BusyGuard`]), or the caller must put it back if the upload fails to even start. The
-    /// flag is shared by all destinations, so only one upload runs at a time.
-    pub(crate) fn plan_upload<U>(
-        uploader: Result<U, UploadRefusal>,
-        last_clip: Option<std::path::PathBuf>,
-        busy: &AtomicBool,
-    ) -> Result<(U, std::path::PathBuf), UploadRefusal> {
-        let up = uploader?;
-        let Some(path) = last_clip else {
-            return Err((
-                "No clip yet",
-                "Save a clip first, then upload it.".to_owned(),
-            ));
-        };
-        if busy.swap(true, Ordering::SeqCst) {
-            return Err((
-                "Upload already running",
-                "Wait for the current upload to finish.".to_owned(),
-            ));
-        }
-        Ok((up, path))
-    }
-
-    /// Clears the upload-busy flag on drop, so a panicking upload task can't wedge the tray's
-    /// "Upload last clip" in the busy state.
-    pub(crate) struct BusyGuard(pub(crate) Arc<AtomicBool>);
-
-    impl Drop for BusyGuard {
-        fn drop(&mut self) {
-            self.0.store(false, Ordering::SeqCst);
-        }
-    }
-
-    // The user-facing error copy lives in rewynd-upload (shared with the settings library
-    // view); re-exported so the platform modules keep one import path for upload wiring.
-    pub(crate) use rewynd_upload::user_facing_upload_error;
-    pub(crate) use rewynd_upload::youtube::user_facing_youtube_error;
-}
-
 /// The shared reaction to game-focus changes (both platforms): mirror the gate into
 /// the `recording` flag, keep the saver's per-game folder current, and start each
 /// recorded stretch with cleared rings so a clip never spans a gated-off gap (the
@@ -560,10 +430,6 @@ mod linux {
     use crate::audio_pipeline::{AUDIO_SETTLE, SharedMixer, run_audio_mixer, spawn_audio_capture};
     use crate::params::{audio_encode_params, encode_params};
     use crate::tray;
-    use crate::uploads::{
-        BusyGuard, Uploader, YtUploader, build_uploader, build_youtube_uploader, plan_upload,
-        user_facing_upload_error, user_facing_youtube_error,
-    };
     use rewynd_buffer::{AudioRingBuffer, EncodedChunk, RingBuffer};
     use rewynd_gpu::{DmabufImport, GpuContext};
 
@@ -573,8 +439,6 @@ mod linux {
     /// Stable id for our one shortcut; the compositor binds a trigger to it.
     const SHORTCUT_ID: &str = "save-clip";
 
-    /// How long Quit waits for an in-flight upload before abandoning it.
-    const QUIT_UPLOAD_GRACE: Duration = Duration::from_secs(5);
     /// Rebind attempts before the hotkey is declared gone (the recorder keeps running).
     const HOTKEY_REBIND_ATTEMPTS: u32 = 3;
 
@@ -1035,7 +899,6 @@ mod linux {
                 return;
             }
         };
-        let upload_busy = Arc::new(AtomicBool::new(false));
         loop {
             tokio::select! {
                 event = events.recv() => {
@@ -1063,56 +926,10 @@ mod linux {
                             let saved = tokio::task::spawn_blocking(move || s.save()).await;
                             toast_save_outcome(saved).await;
                         }
-                        tray::TrayCmd::UploadClip => {
-                            // Fresh config each click: enabling uploads or changing the key in
-                            // the settings works without restarting the recorder.
-                            let plan = plan_upload(
-                                build_uploader(config::load().upload()),
-                                saver.last_clip(),
-                                &upload_busy,
-                            );
-                            match plan {
-                                // Its own task so a slow upload never stalls the tray menu.
-                                Ok((up, path)) => {
-                                    tokio::spawn(upload_and_toast(up, path, upload_busy.clone()));
-                                }
-                                Err((title, body)) => tray::toast(title, &body).await,
-                            }
-                        }
-                        tray::TrayCmd::UploadYouTube => {
-                            // Fresh config each click, like the ganked.tv path.
-                            let plan = plan_upload(
-                                build_youtube_uploader(config::load().youtube()),
-                                saver.last_clip(),
-                                &upload_busy,
-                            );
-                            match plan {
-                                Ok((up, path)) => {
-                                    tokio::spawn(upload_youtube_and_toast(up, path, upload_busy.clone()));
-                                }
-                                Err((title, body)) => tray::toast(title, &body).await,
-                            }
-                        }
                         tray::TrayCmd::ToggleMic => toggle_mic_and_restart().await,
                         tray::TrayCmd::OpenSettings => open_settings().await,
                         tray::TrayCmd::Quit => {
                             tracing::info!("quit requested from the tray");
-                            if upload_busy.load(Ordering::SeqCst) {
-                                tray::toast("Finishing upload", "rewynd quits when it completes (a few seconds at most).").await;
-                                let waited = Instant::now();
-                                while upload_busy.load(Ordering::SeqCst)
-                                    && waited.elapsed() < QUIT_UPLOAD_GRACE
-                                {
-                                    tokio::time::sleep(Duration::from_millis(200)).await;
-                                }
-                                if upload_busy.load(Ordering::SeqCst) {
-                                    tray::toast(
-                                        "Upload abandoned",
-                                        "rewynd quit while an upload was still running.",
-                                    )
-                                    .await;
-                                }
-                            }
                             let _ = shutdown.send(true);
                             break;
                         }
@@ -1213,129 +1030,6 @@ mod linux {
                     &format!("{}: {e}", settings.display()),
                 )
                 .await;
-            }
-        }
-    }
-
-    /// Upload `path` and toast the outcome, releasing `busy` when done. Runs as its own task so
-    /// nothing else waits on it.
-    /// How often to poll ganked.tv processing status after a tray upload, and for how long
-    /// (≈5 minutes) — long enough to catch a server-side failure that only surfaces after
-    /// "processing", short enough not to poll forever.
-    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-    const POLL_MAX_READS: u32 = 60;
-
-    /// Remember a successful upload in the shared history file, so the library shows an "uploaded"
-    /// badge and the duplicate guard applies to clips sent from the tray too.
-    fn record_upload(
-        path: &std::path::Path,
-        destination: &str,
-        remote_id: String,
-        url: Option<String>,
-    ) {
-        use rewynd_config::upload_history::{ClipKey, UploadRecord, record};
-        let Ok(meta) = std::fs::metadata(path) else {
-            return;
-        };
-        let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-        let Some(key) = ClipKey::new(path, meta.len(), modified) else {
-            return;
-        };
-        let entry = UploadRecord {
-            file_name: key.file_name,
-            size_bytes: key.size_bytes,
-            modified_millis: key.modified_millis,
-            destination: destination.to_owned(),
-            remote_id,
-            url,
-            uploaded_millis: ClipKey::now_millis(),
-        };
-        if let Err(e) = record(entry) {
-            tracing::warn!(error = %e, "could not record the upload");
-        }
-    }
-
-    async fn upload_and_toast(up: Uploader, path: PathBuf, busy: Arc<AtomicBool>) {
-        use rewynd_config::upload_history::GANKED;
-        let title = rewynd_upload::default_title();
-        tray::toast("Uploading clip", "Sending to ganked.tv...").await;
-
-        // Hold the one-upload-at-a-time flag only for the transfer; the status poll below is
-        // passive and must not block the next upload for minutes.
-        let busy_guard = BusyGuard(busy);
-        let clip_id = match up.client.upload(&path, &title, up.visibility).await {
-            Ok(clip) if clip.failed() => {
-                tracing::error!(clip_id = %clip.id, "server rejected the clip after upload");
-                tray::toast(
-                    "Upload failed",
-                    "ganked.tv could not process the clip (check its length and format).",
-                )
-                .await;
-                None
-            }
-            Ok(clip) => {
-                let link = clip.share_url(&up.share_base);
-                record_upload(&path, GANKED, clip.id.clone(), link.clone());
-                tracing::info!(clip_id = %clip.id, "clip uploaded");
-                tray::toast(
-                    "Clip uploaded",
-                    &link.unwrap_or_else(|| "Processing on ganked.tv".to_owned()),
-                )
-                .await;
-                Some(clip.id)
-            }
-            Err(e) => {
-                tracing::error!(error = %e, path = %path.display(), "upload failed");
-                tray::toast("Upload failed", &user_facing_upload_error(&e)).await;
-                None
-            }
-        };
-        drop(busy_guard);
-
-        // Watch server-side processing so a failure that appears after "processing" reaches the
-        // user (the fault this milestone's companion server fix + this poll close together).
-        if let Some(clip_id) = clip_id
-            && let Ok(report) = up
-                .client
-                .poll_status(&clip_id, POLL_INTERVAL, POLL_MAX_READS)
-                .await
-        {
-            if report.failed() {
-                tray::toast(
-                    "ganked.tv couldn't process the clip",
-                    &report.failure_message(),
-                )
-                .await;
-            } else if report.is_ready()
-                && let Some(url) = report.share_url(&up.share_base)
-            {
-                record_upload(&path, GANKED, clip_id, Some(url));
-            }
-        }
-    }
-
-    /// Upload `path` to YouTube and toast the outcome (the youtu.be link on success),
-    /// releasing `busy` when done. Runs as its own task so nothing else waits on it.
-    async fn upload_youtube_and_toast(up: YtUploader, path: PathBuf, busy: Arc<AtomicBool>) {
-        use rewynd_config::upload_history::YOUTUBE;
-        let _busy = BusyGuard(busy);
-        let title = rewynd_upload::default_title();
-        tray::toast("Uploading clip", "Sending to YouTube...").await;
-        match up.client.upload(&path, &title, up.visibility).await {
-            Ok(video) => {
-                record_upload(&path, YOUTUBE, video.id.clone(), video.watch_url());
-                tracing::info!(video_id = %video.id, "clip uploaded to YouTube");
-                tray::toast(
-                    "Clip uploaded to YouTube",
-                    &video
-                        .watch_url()
-                        .unwrap_or_else(|| "Processing on YouTube".to_owned()),
-                )
-                .await;
-            }
-            Err(e) => {
-                tracing::error!(error = %e, path = %path.display(), "YouTube upload failed");
-                tray::toast("YouTube upload failed", &user_facing_youtube_error(&e)).await;
             }
         }
     }
@@ -1729,18 +1423,12 @@ mod windows {
     use crate::audio_pipeline::{AUDIO_SETTLE, SharedMixer, run_audio_mixer, spawn_audio_capture};
     use crate::overlay;
     use crate::params::{audio_encode_params, encode_params};
-    use crate::uploads::{
-        BusyGuard, Uploader, YtUploader, build_uploader, build_youtube_uploader, plan_upload,
-        user_facing_upload_error, user_facing_youtube_error,
-    };
 
     /// Our one thread-queue hotkey registration.
     const HOTKEY_ID: i32 = 1;
     /// How often the hotkey message pump wakes to drain its queue and check the stop
     /// flag — the worst-case added latency on a press, well under perception.
     const HOTKEY_POLL: Duration = Duration::from_millis(30);
-    /// How long Quit waits for an in-flight upload before abandoning it.
-    const QUIT_UPLOAD_GRACE: Duration = Duration::from_secs(5);
 
     pub fn run() -> Result<()> {
         tracing_subscriber::fmt::init();
@@ -1988,8 +1676,6 @@ mod windows {
         // Every exit path funnels through this channel: tray Quit, the settings
         // restart's stop event, and Ctrl+C all send the shutdown reason here.
         let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<&'static str>();
-        // Raised while a ganked.tv upload runs; Quit waits briefly on it (as on Linux).
-        let upload_busy = Arc::new(AtomicBool::new(false));
 
         // The tray and the global hotkey share one thread: RegisterHotKey delivers
         // WM_HOTKEY to the registering thread's queue, tray-icon needs the same
@@ -1997,7 +1683,6 @@ mod windows {
         let tray_saver = saver.clone();
         let tray_stop = stop.clone();
         let tray_shutdown = shutdown_tx.clone();
-        let tray_busy = upload_busy.clone();
         let trigger = config.hotkey_trigger().to_owned();
         let hotkey = std::thread::Builder::new()
             .name("rewynd-tray".to_owned())
@@ -2007,7 +1692,6 @@ mod windows {
                     &tray_saver,
                     &tray_stop,
                     &tray_shutdown,
-                    &tray_busy,
                     mic_enabled,
                 )
             })
@@ -2083,19 +1767,6 @@ mod windows {
             .recv()
             .unwrap_or("all shutdown waiters died; shutting down");
         tracing::info!(reason, "shutting down");
-
-        // Give an in-flight upload a moment to finish rather than cutting it off
-        // mid-transfer (mirrors the Linux tray's quit grace).
-        if upload_busy.load(Ordering::SeqCst) {
-            toast(
-                "Finishing upload",
-                "rewynd quits when it completes (a few seconds at most).",
-            );
-            let waited = Instant::now();
-            while upload_busy.load(Ordering::SeqCst) && waited.elapsed() < QUIT_UPLOAD_GRACE {
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        }
 
         // Join in the order the pipeline requires (the Linux Recorder::shutdown mirror):
         // the audio captures must stop adding to the mixer before `captures_done`
@@ -2256,14 +1927,11 @@ mod windows {
         saver: &Arc<ClipSaver>,
         stop: &Arc<AtomicBool>,
         shutdown: &std::sync::mpsc::Sender<&'static str>,
-        upload_busy: &Arc<AtomicBool>,
         mic_enabled: bool,
     ) {
         use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 
         let save_item = MenuItem::new("Save clip now", true, None);
-        let upload_item = MenuItem::new("Upload last clip", true, None);
-        let youtube_item = MenuItem::new("Upload last clip to YouTube", true, None);
         let mic_item = CheckMenuItem::new("Record microphone", true, mic_enabled, None);
         let settings_item = MenuItem::new("Open settings", true, None);
         let quit_item = MenuItem::new("Quit rewynd", true, None);
@@ -2271,8 +1939,6 @@ mod windows {
         let _tray = match menu
             .append_items(&[
                 &save_item,
-                &upload_item,
-                &youtube_item,
                 &mic_item,
                 &settings_item,
                 &PredefinedMenuItem::separator(),
@@ -2342,10 +2008,6 @@ mod windows {
                 let id = event.id();
                 if id == save_item.id() {
                     save_and_toast(saver);
-                } else if id == upload_item.id() {
-                    spawn_upload(saver, upload_busy);
-                } else if id == youtube_item.id() {
-                    spawn_youtube_upload(saver, upload_busy);
                 } else if id == mic_item.id() {
                     toggle_mic_and_restart();
                 } else if id == settings_item.id() {
@@ -2436,122 +2098,6 @@ mod windows {
                     "Could not open settings",
                     &format!("{}: {e}", settings.display()),
                 );
-            }
-        }
-    }
-
-    /// Upload the last clip on its own thread (fresh config each click, so enabling
-    /// uploads in the settings works without restarting the recorder), guarding
-    /// against concurrent uploads with `busy`.
-    fn spawn_upload(saver: &Arc<ClipSaver>, busy: &Arc<AtomicBool>) {
-        match plan_upload(
-            build_uploader(config::load().upload()),
-            saver.last_clip(),
-            busy,
-        ) {
-            Ok((up, path)) => {
-                let thread_busy = busy.clone();
-                let spawned = std::thread::Builder::new()
-                    .name("rewynd-upload".to_owned())
-                    .spawn(move || {
-                        let _busy = BusyGuard(thread_busy);
-                        upload_and_toast(&up, &path);
-                    });
-                if spawned.is_err() {
-                    busy.store(false, Ordering::SeqCst);
-                    toast("Upload failed", "Could not start the upload thread.");
-                }
-            }
-            Err((title, body)) => toast(title, &body),
-        }
-    }
-
-    /// Upload `path` and toast the outcome. Blocking — runs on the upload thread with
-    /// its own small runtime (the client is async).
-    fn upload_and_toast(up: &Uploader, path: &std::path::Path) {
-        let title = rewynd_upload::default_title();
-        toast("Uploading clip", "Sending to ganked.tv...");
-        let outcome = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())
-            .map(|rt| rt.block_on(up.client.upload(path, &title, up.visibility)));
-        match outcome {
-            Ok(Ok(clip)) if clip.failed() => {
-                tracing::error!(clip_id = %clip.id, "server rejected the clip after upload");
-                toast(
-                    "Upload failed",
-                    "ganked.tv could not process the clip (check its length and format).",
-                );
-            }
-            Ok(Ok(clip)) => {
-                let body = clip
-                    .share_url(&up.share_base)
-                    .unwrap_or_else(|| "Processing on ganked.tv".to_owned());
-                tracing::info!(clip_id = %clip.id, "clip uploaded");
-                toast("Clip uploaded", &body);
-            }
-            Ok(Err(e)) => {
-                tracing::error!(error = %e, path = %path.display(), "upload failed");
-                toast("Upload failed", &user_facing_upload_error(&e));
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "could not build the upload runtime");
-                toast("Upload failed", "Could not start the upload runtime.");
-            }
-        }
-    }
-
-    /// The YouTube twin of [`spawn_upload`]: fresh config per click, same busy flag (one
-    /// upload at a time, whichever the destination).
-    fn spawn_youtube_upload(saver: &Arc<ClipSaver>, busy: &Arc<AtomicBool>) {
-        match plan_upload(
-            build_youtube_uploader(config::load().youtube()),
-            saver.last_clip(),
-            busy,
-        ) {
-            Ok((up, path)) => {
-                let thread_busy = busy.clone();
-                let spawned = std::thread::Builder::new()
-                    .name("rewynd-upload".to_owned())
-                    .spawn(move || {
-                        let _busy = BusyGuard(thread_busy);
-                        upload_youtube_and_toast(&up, &path);
-                    });
-                if spawned.is_err() {
-                    busy.store(false, Ordering::SeqCst);
-                    toast("Upload failed", "Could not start the upload thread.");
-                }
-            }
-            Err((title, body)) => toast(title, &body),
-        }
-    }
-
-    /// Upload `path` to YouTube and toast the outcome (the youtu.be link on success).
-    /// Blocking — runs on the upload thread with its own small runtime.
-    fn upload_youtube_and_toast(up: &YtUploader, path: &std::path::Path) {
-        let title = rewynd_upload::default_title();
-        toast("Uploading clip", "Sending to YouTube...");
-        let outcome = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())
-            .map(|rt| rt.block_on(up.client.upload(path, &title, up.visibility)));
-        match outcome {
-            Ok(Ok(video)) => {
-                let body = video
-                    .watch_url()
-                    .unwrap_or_else(|| "Processing on YouTube".to_owned());
-                tracing::info!(video_id = %video.id, "clip uploaded to YouTube");
-                toast("Clip uploaded to YouTube", &body);
-            }
-            Ok(Err(e)) => {
-                tracing::error!(error = %e, path = %path.display(), "YouTube upload failed");
-                toast("YouTube upload failed", &user_facing_youtube_error(&e));
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "could not build the upload runtime");
-                toast("Upload failed", "Could not start the upload runtime.");
             }
         }
     }

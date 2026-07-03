@@ -1,60 +1,282 @@
-//! Audio-device discovery for the settings UI (Windows). A twin of the small COM
-//! walk the capture backend uses to *resolve* a configured name — kept separate so
-//! the GPU-free settings app never links the capture stack.
+//! Audio-input discovery for the settings' microphone picker. Windows walks the WASAPI capture
+//! endpoints; Linux asks PipeWire (via `pw-dump`) for its audio sources. Both are best-effort — a
+//! failure yields an empty list and the picker falls back to a free-text device name. Kept out of
+//! the capture stack so the GPU-free settings app never links it.
 
-use windows::Win32::Foundation::PROPERTYKEY;
-use windows::Win32::Media::Audio::{
-    DEVICE_STATE_ACTIVE, IMMDeviceEnumerator, MMDeviceEnumerator, eCapture,
-};
-use windows::Win32::System::Com::{
-    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize, STGM_READ,
-};
-use windows::core::GUID;
+use std::fmt;
 
-/// `PKEY_Device_FriendlyName`: the endpoint name the sound settings show.
-const PKEY_DEVICE_FRIENDLY_NAME: PROPERTYKEY = PROPERTYKEY {
-    fmtid: GUID::from_u128(0xa45c254e_df1c_4efd_8020_67d146a850e0),
-    pid: 14,
-};
-
-/// The friendly names of all active capture (input) endpoints, for the microphone
-/// picker. Best-effort: an unreadable device is skipped, a COM failure yields an
-/// empty list (the picker then falls back to free text).
-#[must_use]
-pub fn list_audio_inputs() -> Vec<String> {
-    // SAFETY: FFI; paired with `CoUninitialize` below. S_FALSE (already
-    // initialized on this thread) is fine.
-    if unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_err() {
-        return Vec::new();
-    }
-    let names = list_inner();
-    // SAFETY: FFI; pairs the successful init.
-    unsafe { CoUninitialize() };
-    names
+/// A selectable audio input for the microphone picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioInput {
+    /// The value stored in the config and matched by the capture backend: the WASAPI endpoint's
+    /// friendly name on Windows, the PipeWire `node.name` on Linux.
+    pub id: String,
+    /// A human-friendly label shown in the picker (the friendly name on Windows, the PipeWire
+    /// `node.description` on Linux).
+    pub label: String,
 }
 
-fn list_inner() -> Vec<String> {
-    // SAFETY: FFI (all calls below); indices stay within the collection's count.
-    unsafe {
-        let Ok(enumerator): windows::core::Result<IMMDeviceEnumerator> =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-        else {
+impl fmt::Display for AudioInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+pub use imp::list_audio_inputs;
+
+#[cfg(windows)]
+mod imp {
+    use super::AudioInput;
+    use windows::Win32::Foundation::PROPERTYKEY;
+    use windows::Win32::Media::Audio::{
+        DEVICE_STATE_ACTIVE, IMMDeviceEnumerator, MMDeviceEnumerator, eCapture,
+    };
+    use windows::Win32::System::Com::{
+        CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+        STGM_READ,
+    };
+    use windows::core::GUID;
+
+    /// `PKEY_Device_FriendlyName`: the endpoint name the sound settings show.
+    const PKEY_DEVICE_FRIENDLY_NAME: PROPERTYKEY = PROPERTYKEY {
+        fmtid: GUID::from_u128(0xa45c254e_df1c_4efd_8020_67d146a850e0),
+        pid: 14,
+    };
+
+    /// All active capture (input) endpoints, for the microphone picker. Best-effort: an
+    /// unreadable device is skipped, a COM failure yields an empty list.
+    #[must_use]
+    pub fn list_audio_inputs() -> Vec<AudioInput> {
+        // SAFETY: FFI; paired with `CoUninitialize` below. S_FALSE (already
+        // initialized on this thread) is fine.
+        if unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_err() {
+            return Vec::new();
+        }
+        let names = list_inner();
+        // SAFETY: FFI; pairs the successful init.
+        unsafe { CoUninitialize() };
+        names
+    }
+
+    fn list_inner() -> Vec<AudioInput> {
+        // SAFETY: FFI (all calls below); indices stay within the collection's count.
+        unsafe {
+            let Ok(enumerator): windows::core::Result<IMMDeviceEnumerator> =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+            else {
+                return Vec::new();
+            };
+            let Ok(devices) = enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE) else {
+                return Vec::new();
+            };
+            let Ok(count) = devices.GetCount() else {
+                return Vec::new();
+            };
+            (0..count)
+                .filter_map(|i| {
+                    let device = devices.Item(i).ok()?;
+                    let store = device.OpenPropertyStore(STGM_READ).ok()?;
+                    let value = store.GetValue(&PKEY_DEVICE_FRIENDLY_NAME).ok()?;
+                    let name = value.to_string();
+                    // The friendly name is both what the picker shows and what the capture
+                    // backend resolves, so the id and label are the same on Windows.
+                    (!name.is_empty()).then(|| AudioInput {
+                        id: name.clone(),
+                        label: name,
+                    })
+                })
+                .collect()
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod imp {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    use super::AudioInput;
+
+    /// How long to wait for `pw-dump` before giving up. It normally returns in well under a
+    /// second; the cap keeps a wedged PipeWire from hanging the settings window at startup.
+    const PW_DUMP_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// The PipeWire audio sources, for the microphone picker. Best-effort: if `pw-dump` is
+    /// missing, fails, or does not finish within [`PW_DUMP_TIMEOUT`], the list is empty and the
+    /// picker falls back to free text. The stored value is the `node.name` (what the capture
+    /// backend matches via `target.object`); the label is the friendlier `node.description`.
+    #[must_use]
+    pub fn list_audio_inputs() -> Vec<AudioInput> {
+        run_pw_dump(PW_DUMP_TIMEOUT).map_or_else(Vec::new, |json| parse_pw_dump(&json))
+    }
+
+    /// Run `pw-dump` with a bounded wait, returning its stdout on a clean exit or `None` on
+    /// spawn failure, a non-zero exit, or the timeout. A reader thread drains stdout so a large
+    /// dump can't dead-lock on a full pipe while we wait, and the child is killed on timeout.
+    fn run_pw_dump(timeout: Duration) -> Option<Vec<u8>> {
+        let mut child = Command::new("pw-dump")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut stdout = child.stdout.take()?;
+        let reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf);
+            buf
+        });
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    return None;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = reader.join();
+                    return None;
+                }
+            }
+        };
+        let buf = reader.join().ok()?;
+        status.success().then_some(buf)
+    }
+
+    /// Extract the audio sources from a `pw-dump` JSON payload. Split from the process call so the
+    /// parsing (the part with the branches) is testable without a live PipeWire session.
+    fn parse_pw_dump(json: &[u8]) -> Vec<AudioInput> {
+        let Ok(dump) = serde_json::from_slice::<serde_json::Value>(json) else {
             return Vec::new();
         };
-        let Ok(devices) = enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE) else {
+        let Some(objects) = dump.as_array() else {
             return Vec::new();
         };
-        let Ok(count) = devices.GetCount() else {
-            return Vec::new();
-        };
-        (0..count)
-            .filter_map(|i| {
-                let device = devices.Item(i).ok()?;
-                let store = device.OpenPropertyStore(STGM_READ).ok()?;
-                let value = store.GetValue(&PKEY_DEVICE_FRIENDLY_NAME).ok()?;
-                let name = value.to_string();
-                (!name.is_empty()).then_some(name)
-            })
-            .collect()
+        let mut inputs: Vec<AudioInput> = Vec::new();
+        for obj in objects {
+            if obj.get("type").and_then(serde_json::Value::as_str)
+                != Some("PipeWire:Interface:Node")
+            {
+                continue;
+            }
+            let Some(props) = obj.pointer("/info/props") else {
+                continue;
+            };
+            // "Audio/Source" (and its "/Virtual" variants) are real capture endpoints; sink
+            // monitors are "Audio/Sink" and are excluded, matching the mic-capture path.
+            let class = props
+                .get("media.class")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if !class.starts_with("Audio/Source") {
+                continue;
+            }
+            let Some(id) = props
+                .get("node.name")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let label = props
+                .get("node.description")
+                .or_else(|| props.get("node.nick"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(id)
+                .to_owned();
+            // A device can appear more than once in a dump (state churn); keep the first.
+            if inputs.iter().any(|i| i.id == id) {
+                continue;
+            }
+            inputs.push(AudioInput {
+                id: id.to_owned(),
+                label,
+            });
+        }
+        inputs
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{AudioInput, list_audio_inputs, parse_pw_dump};
+
+        #[test]
+        fn parses_sources_labels_and_skips_non_sources() {
+            let json = br#"[
+                {"type":"PipeWire:Interface:Node","info":{"props":{
+                    "media.class":"Audio/Source",
+                    "node.name":"alsa_input.usb-mic",
+                    "node.description":"USB Microphone"}}},
+                {"type":"PipeWire:Interface:Node","info":{"props":{
+                    "media.class":"Audio/Sink",
+                    "node.name":"alsa_output.speakers",
+                    "node.description":"Speakers"}}},
+                {"type":"PipeWire:Interface:Node","info":{"props":{
+                    "media.class":"Audio/Source/Virtual",
+                    "node.name":"virtual.source",
+                    "node.nick":"Nick Only"}}},
+                {"type":"PipeWire:Interface:Node","info":{"props":{
+                    "media.class":"Audio/Source",
+                    "node.name":"bare.name"}}},
+                {"type":"PipeWire:Interface:Node","info":{"props":{
+                    "media.class":"Audio/Source",
+                    "node.name":"alsa_input.usb-mic",
+                    "node.description":"Duplicate"}}},
+                {"type":"PipeWire:Interface:Client","info":{"props":{
+                    "media.class":"Audio/Source","node.name":"not.a.node"}}}
+            ]"#;
+            let got = parse_pw_dump(json);
+            assert_eq!(
+                got,
+                vec![
+                    AudioInput {
+                        id: "alsa_input.usb-mic".to_owned(),
+                        label: "USB Microphone".to_owned(),
+                    },
+                    // Falls back to node.nick when there's no description.
+                    AudioInput {
+                        id: "virtual.source".to_owned(),
+                        label: "Nick Only".to_owned(),
+                    },
+                    // Falls back to node.name when neither description nor nick is present.
+                    AudioInput {
+                        id: "bare.name".to_owned(),
+                        label: "bare.name".to_owned(),
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn malformed_payloads_yield_nothing() {
+            assert!(parse_pw_dump(b"not json").is_empty());
+            assert!(parse_pw_dump(b"{}").is_empty());
+            assert!(parse_pw_dump(b"[]").is_empty());
+            // A node with no props is skipped, not a panic.
+            assert!(parse_pw_dump(br#"[{"type":"PipeWire:Interface:Node"}]"#).is_empty());
+        }
+
+        #[test]
+        fn listing_never_panics() {
+            // pw-dump may be absent in CI; the call must degrade to an empty list.
+            let _ = list_audio_inputs();
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+mod imp {
+    use super::AudioInput;
+
+    /// No enumeration on other platforms: the picker falls back to a free-text device name.
+    #[must_use]
+    pub fn list_audio_inputs() -> Vec<AudioInput> {
+        Vec::new()
     }
 }

@@ -31,16 +31,18 @@ pub enum Step {
     Hotkey,
     ReplayLength,
     TestClip,
+    CaptureMode,
     Finish,
 }
 
 impl Step {
-    const ORDER: [Step; 6] = [
+    const ORDER: [Step; 7] = [
         Step::Welcome,
         Step::ScreenShare,
         Step::Hotkey,
         Step::ReplayLength,
         Step::TestClip,
+        Step::CaptureMode,
         Step::Finish,
     ];
 
@@ -80,6 +82,8 @@ pub struct Wizard {
     hotkey: String,
     buffer_seconds: u32,
     start_on_boot: bool,
+    /// Whether to record the whole desktop instead of only the active game (the capture-mode step).
+    capture_desktop: bool,
     /// Whether the recorder has been asked to start (so the test-clip step can proceed).
     recording_started: bool,
     recording_error: Option<String>,
@@ -94,6 +98,7 @@ pub enum Message {
     HotkeyEdited(String),
     BufferChanged(u32),
     StartOnBoot(bool),
+    CaptureDesktop(bool),
     StartRecording,
     RecordingStarted(Result<(), String>),
     SaveTestClip,
@@ -112,6 +117,7 @@ impl Wizard {
                 .clamp(u64::from(BUFFER_MIN_S), u64::from(BUFFER_MAX_S))
                 as u32,
             start_on_boot: config.start_on_boot(),
+            capture_desktop: config.capture_desktop(),
             recording_started: false,
             recording_error: None,
             test: TestState::Idle,
@@ -127,6 +133,9 @@ impl Wizard {
     }
     pub fn start_on_boot(&self) -> bool {
         self.start_on_boot
+    }
+    pub fn capture_desktop(&self) -> bool {
+        self.capture_desktop
     }
 
     /// Whether the wizard started the recorder (in desktop-capture mode for the test clip), so the
@@ -144,6 +153,7 @@ impl Wizard {
             Message::HotkeyEdited(s) => self.hotkey = s,
             Message::BufferChanged(s) => self.buffer_seconds = s.clamp(BUFFER_MIN_S, BUFFER_MAX_S),
             Message::StartOnBoot(on) => self.start_on_boot = on,
+            Message::CaptureDesktop(on) => self.capture_desktop = on,
             Message::StartRecording => {
                 self.recording_error = None;
                 return Task::perform(
@@ -208,6 +218,7 @@ impl Wizard {
             Step::Hotkey => self.hotkey_step(),
             Step::ReplayLength => self.replay_length(config),
             Step::TestClip => self.test_clip(),
+            Step::CaptureMode => self.capture_mode(),
             Step::Finish => self.finish(),
         };
 
@@ -371,6 +382,25 @@ impl Wizard {
         step_card("Save a test clip", col)
     }
 
+    fn capture_mode(&self) -> Element<'_, Message> {
+        step_card(
+            "What to record",
+            column![
+                hint(
+                    "By default rewynd records only the game you're playing (fullscreen or \
+                     borderless), so other windows stay out of your clips. Turn this on to record \
+                     your whole desktop instead."
+                ),
+                checkbox(self.capture_desktop)
+                    .label("Record my whole desktop, not just the active game")
+                    .on_toggle(Message::CaptureDesktop)
+                    .style(arena_check),
+                hint("You can change this any time under Settings."),
+            ]
+            .spacing(14),
+        )
+    }
+
     fn finish(&self) -> Element<'_, Message> {
         step_card(
             "You're set",
@@ -459,6 +489,7 @@ mod tests {
             Step::Hotkey,
             Step::ReplayLength,
             Step::TestClip,
+            Step::CaptureMode,
             Step::Finish,
         ] {
             s = s.next();
@@ -466,7 +497,7 @@ mod tests {
         }
         assert_eq!(s.next(), Step::Finish, "clamped at the end");
         assert!(s.is_last());
-        assert_eq!(Step::Finish.back(), Step::TestClip);
+        assert_eq!(Step::Finish.back(), Step::CaptureMode);
     }
 
     #[test]
