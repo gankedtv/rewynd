@@ -4528,7 +4528,6 @@ dependencies = [
  "rewynd-config",
  "rewynd-encode",
  "rewynd-gpu",
- "rewynd-upload",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -27,8 +27,14 @@ pub mod palette {
     /// THE accent: mint. Primary buttons, active/focus states, values, links.
     pub const ACCENT: Color = Color::from_rgb8(0x00, 0xe5, 0xa0);
     /// Error text — the one deviation from the one-accent rule: a failure must
-    /// never read as success-mint.
+    /// never read as success-mint. Also the destructive-action red (delete).
     pub const DANGER: Color = Color::from_rgb8(0xff, 0x5a, 0x5f);
+    /// Destructive-button hover (a touch brighter than `DANGER`).
+    pub const DANGER_HOVER: Color = Color::from_rgb8(0xff, 0x73, 0x77);
+    /// A faint danger wash for an outline destructive button's hover fill.
+    pub const DANGER_BG: Color = Color::from_rgba(1.0, 0.353, 0.373, 0.12);
+    /// Text/icon color on a danger-filled surface.
+    pub const INK_ON_DANGER: Color = Color::from_rgb8(0xff, 0xff, 0xff);
     /// Primary-button hover (brightness(1.06) over the accent).
     pub const ACCENT_HOVER: Color = Color::from_rgb8(0x0d, 0xf3, 0xab);
     pub const ACCENT_BG: Color = Color::from_rgba(0.0, 0.898, 0.627, 0.08);
@@ -174,6 +180,38 @@ pub fn accent_button_style(
     }
 }
 
+/// Filled destructive button (the delete confirmation): solid danger red with white ink, so the
+/// irreversible click is unmistakable. Same shape as `primary_button`, in red.
+pub fn danger_button(_theme: &Theme, status: button::Status) -> button::Style {
+    accent_button_style(
+        status,
+        palette::DANGER,
+        palette::DANGER_HOVER,
+        palette::INK_ON_DANGER,
+    )
+}
+
+/// Outline destructive button (the delete trigger): transparent with a red hairline and red text,
+/// hover fills a faint red. Reads as dangerous without shouting before the confirm step.
+pub fn danger_outline_button(_theme: &Theme, status: button::Status) -> button::Style {
+    let background = match status {
+        button::Status::Hovered | button::Status::Pressed => {
+            Some(Background::Color(palette::DANGER_BG))
+        }
+        _ => None,
+    };
+    button::Style {
+        background,
+        text_color: palette::DANGER,
+        border: Border {
+            color: palette::DANGER,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        ..button::Style::default()
+    }
+}
+
 /// OAuth sign-in shell: unlike `primary_button` the fill stays a dark well so the gradient
 /// mark carries the brand; hover tints it mint.
 pub fn oauth_button(_theme: &Theme, status: button::Status) -> button::Style {
@@ -216,6 +254,34 @@ pub fn secondary_button(_theme: &Theme, status: button::Status) -> button::Style
     };
     button::Style {
         background: None,
+        text_color,
+        border: Border {
+            color: border_color,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        ..button::Style::default()
+    }
+}
+
+/// Overlay control (the fullscreen toggle sitting on top of the video preview): a solid dark
+/// scrim with bright text so it stays legible over any frame, unlike the transparent secondary
+/// button that all but vanished against busy footage. Hover turns mint.
+pub fn overlay_button(_theme: &Theme, status: button::Status) -> button::Style {
+    let (background, border_color, text_color) = match status {
+        button::Status::Hovered | button::Status::Pressed => (
+            iced::Color::from_rgba(0.0, 0.0, 0.0, 0.80),
+            palette::ACCENT,
+            palette::ACCENT,
+        ),
+        _ => (
+            iced::Color::from_rgba(0.0, 0.0, 0.0, 0.62),
+            palette::BORDER_STRONG,
+            palette::TEXT,
+        ),
+    };
+    button::Style {
+        background: Some(Background::Color(background)),
         text_color,
         border: Border {
             color: border_color,

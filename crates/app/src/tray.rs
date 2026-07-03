@@ -11,8 +11,6 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 /// What a tray menu click asks the recorder to do.
 pub enum TrayCmd {
     SaveClip,
-    UploadClip,
-    UploadYouTube,
     OpenSettings,
     /// Flip the microphone on/off and restart the recorder to apply it.
     ToggleMic,
@@ -87,22 +85,6 @@ impl Tray for RewyndTray {
                 label: "Save clip now".to_owned(),
                 activate: Box::new(|t: &mut Self| {
                     let _ = t.tx.send(TrayCmd::SaveClip);
-                }),
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: "Upload last clip".to_owned(),
-                activate: Box::new(|t: &mut Self| {
-                    let _ = t.tx.send(TrayCmd::UploadClip);
-                }),
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: "Upload last clip to YouTube".to_owned(),
-                activate: Box::new(|t: &mut Self| {
-                    let _ = t.tx.send(TrayCmd::UploadYouTube);
                 }),
                 ..Default::default()
             }

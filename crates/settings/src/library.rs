@@ -1541,16 +1541,16 @@ impl Library {
         }
         layers.push(
             container(
-                button(text("Fullscreen").size(11).font(UI_SEMIBOLD))
+                button(text("Fullscreen").size(12).font(UI_SEMIBOLD))
                     .on_press(Message::FullscreenToggle)
-                    .style(secondary_button)
-                    .padding([5, 10]),
+                    .style(theme::overlay_button)
+                    .padding([7, 13]),
             )
             .width(Length::Fill)
             .height(Length::Fill)
             .align_x(iced::Alignment::End)
             .align_y(iced::Alignment::End)
-            .padding(8)
+            .padding(10)
             .into(),
         );
         // Layered above an empty base: iced only hard-clips layered stack children, so this
@@ -1805,7 +1805,7 @@ impl Library {
                     .style(tinted(palette::TEXT)),
                 button(text("Yes, delete").size(11).font(UI_SEMIBOLD))
                     .on_press(Message::DeleteConfirmed)
-                    .style(secondary_button)
+                    .style(theme::danger_button)
                     .padding([7, 14]),
                 button(text("Keep it").size(11).font(UI_SEMIBOLD))
                     .on_press(Message::DeleteCancelled)
@@ -1827,7 +1827,7 @@ impl Library {
                 .padding([9, 14]),
             button(text("Delete").size(11).font(UI_SEMIBOLD))
                 .on_press(Message::DeleteRequested)
-                .style(secondary_button)
+                .style(theme::danger_outline_button)
                 .padding([9, 14]),
         ]
         .spacing(10)
@@ -2095,50 +2095,41 @@ fn anyway_button(label: &'static str) -> Element<'static, Message> {
         .into()
 }
 
-/// Whether one upload destination can actually receive a clip: logged in (key / refresh
-/// token present) AND switched on in the config — the same bar the tray applies before it
-/// builds an uploader.
+/// Whether one upload destination can actually receive a clip. Being logged in (an API key /
+/// refresh token is present) is the whole bar now: login turns uploads on by itself, and clips
+/// are sent per-clip from here, so there is no separate enable switch to satisfy.
 #[derive(Debug, Clone, Copy)]
 struct DestStatus {
     logged_in: bool,
-    enabled: bool,
 }
 
 impl DestStatus {
     fn ready(self) -> bool {
-        self.logged_in && self.enabled
+        self.logged_in
     }
 
     /// Why `dest` can't be uploaded to right now, in words the user can act on.
     fn blocker(self, dest: Dest) -> Option<String> {
-        if !self.logged_in {
-            Some(match dest {
-                Dest::Ganked => "Log in to ganked.tv under Settings first.".to_owned(),
-                Dest::YouTube => "Log in with YouTube under Settings first.".to_owned(),
-            })
-        } else if !self.enabled {
-            Some(format!(
-                "{} uploads are switched off in Settings; enable them there first.",
-                dest.label()
-            ))
-        } else {
-            None
+        if self.logged_in {
+            return None;
         }
+        Some(match dest {
+            Dest::Ganked => "Log in to ganked.tv under Settings first.".to_owned(),
+            Dest::YouTube => "Log in with YouTube under Settings first.".to_owned(),
+        })
     }
 }
 
-/// Both destinations' status, from the same validated config the tray uploads read.
+/// Both destinations' status, from the same validated config the uploads read.
 fn dest_statuses(config: &Config) -> (DestStatus, DestStatus) {
     let up = config.upload();
     let yt = config.youtube();
     (
         DestStatus {
             logged_in: !up.api_key.is_empty(),
-            enabled: up.enabled,
         },
         DestStatus {
             logged_in: !yt.refresh_token.is_empty(),
-            enabled: yt.enabled,
         },
     )
 }
@@ -2657,27 +2648,14 @@ mod tests {
     }
 
     #[test]
-    fn dest_status_gates_on_login_and_enabled() {
-        let ready = DestStatus {
-            logged_in: true,
-            enabled: true,
-        };
+    fn dest_status_gates_on_login() {
+        let ready = DestStatus { logged_in: true };
         assert!(ready.ready());
         assert_eq!(ready.blocker(Dest::Ganked), None);
-        let logged_out = DestStatus {
-            logged_in: false,
-            enabled: false,
-        };
+        let logged_out = DestStatus { logged_in: false };
         assert!(!logged_out.ready());
         let blocker = logged_out.blocker(Dest::YouTube).expect("blocked");
         assert!(blocker.contains("Log in"), "{blocker}");
-        let disabled = DestStatus {
-            logged_in: true,
-            enabled: false,
-        };
-        assert!(!disabled.ready());
-        let blocker = disabled.blocker(Dest::Ganked).expect("blocked");
-        assert!(blocker.contains("switched off"), "{blocker}");
     }
 
     #[test]
