@@ -2160,10 +2160,21 @@ fn run_update_flow() -> Result<(), String> {
     {
         um.download_updates(&info, None)
             .map_err(|e| e.to_string())?;
-        let _ = config::stop_recorder(
+        // Stop the recorder first and confirm it actually exited: Velopack force-kills any
+        // process left in the install dir mid-apply, and a recorder mid-MP4-write must never die
+        // that way. If it will not stop, abort rather than risk a corrupt clip.
+        match config::stop_recorder(
             std::time::Duration::from_secs(3),
             std::time::Duration::from_secs(2),
-        );
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(
+                    "the recorder is still running; close it and try updating again".to_owned(),
+                );
+            }
+            Err(e) => return Err(format!("could not stop the recorder before updating: {e}")),
+        }
         um.apply_updates_and_restart(&*info)
             .map_err(|e| e.to_string())?;
     }

@@ -17,8 +17,10 @@ runs:
     - name: Install system dependencies
       shell: bash
       run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends \
+        # Runners run as non-root (sudo present); the release container runs as root (no sudo).
+        sudo=""; command -v sudo >/dev/null 2>&1 && sudo=sudo
+        $sudo apt-get update
+        $sudo apt-get install -y --no-install-recommends \
           pkg-config libpipewire-0.3-dev clang libclang-dev libopus-dev libxkbcommon-dev libasound2-dev
 
     - name: Install Rust (stable)

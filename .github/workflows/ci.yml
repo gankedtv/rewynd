@@ -6,6 +6,10 @@ on:
   pull_request:
   workflow_call: # lets the tag-triggered release workflow gate on these exact checks
 
+# Read-only: none of these jobs write to the repo.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 

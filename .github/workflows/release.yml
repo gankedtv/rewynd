@@ -6,8 +6,9 @@ on:
   push:
     tags: ["v*"]
 
+# Least privilege: read by default; only the packing/checksum jobs get write (below).
 permissions:
-  contents: write # create the GitHub release and upload assets
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,32 +25,27 @@ jobs:
   linux-pack:
     needs: gates
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # vpk upload creates/updates the GitHub release
     # Build the distributed AppImage against glibc 2.35 so it runs on older distros; the
     # `ubuntu-22.04` runner label is being retired, so pin the floor with a container instead.
     container: ubuntu:22.04
     steps:
-      # The bare container has no git, which actions/checkout needs, nor curl/ca-certs for the
-      # dotnet installer — install them before anything else runs.
+      # Container-only extras the ubuntu-latest runner ships preinstalled: git (for
+      # actions/checkout and cargo's git deps), curl/ca-certs (dotnet installer), a C++ toolchain,
+      # and libicu (.NET globalization). The shared capture deps come from the composite below.
       - name: Prepare container
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends git ca-certificates curl
+          apt-get install -y --no-install-recommends \
+            git ca-certificates curl build-essential libicu70
 
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
 
-      # The capture/build deps (same set as CI) plus libicu for .NET globalization.
-      - name: Install build dependencies
-        run: |
-          apt-get install -y --no-install-recommends \
-            build-essential libicu70 \
-            pkg-config libpipewire-0.3-dev clang libclang-dev libopus-dev libxkbcommon-dev libasound2-dev
-
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
-        with:
-          toolchain: stable
+      # Same capture deps + Rust + cache as CI, via the shared composite (no duplicate list).
+      - uses: ./.github/actions/linux-build-deps
 
       - name: Resolve and verify version
         id: ver
@@ -93,6 +89,8 @@ jobs:
   windows-pack:
     needs: gates
     runs-on: windows-latest # .NET 8 is preinstalled here
+    permissions:
+      contents: write # vpk upload creates/updates the GitHub release
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
@@ -139,6 +137,8 @@ jobs:
   checksums:
     needs: [linux-pack, windows-pack]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # attach SHA256SUMS to the release
     steps:
       - name: Checksum the release assets
         env:

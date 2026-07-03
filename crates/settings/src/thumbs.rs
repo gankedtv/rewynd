@@ -9,6 +9,8 @@
 //! thumbnails stay in-memory only for the run.
 
 use std::path::{Path, PathBuf};
+// Only the unix openh264 decode path uses a one-time init guard.
+#[cfg(unix)]
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
