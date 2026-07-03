@@ -358,6 +358,10 @@ impl Wizard {
                 "Let's make sure it works. This saves a clip right now, the same as pressing your \
                  hotkey would."
             ),
+            hint(
+                "For this test rewynd records your whole desktop, so it works even with no game \
+                 open. While you're playing, it records just the game."
+            ),
             action,
         ]
         .spacing(16);

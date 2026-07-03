@@ -35,6 +35,13 @@ pub mod palette {
     pub const ACCENT_BORDER: Color = Color::from_rgba(0.0, 0.898, 0.627, 0.25);
     /// Text/icon color on mint-filled surfaces.
     pub const INK_ON_ACCENT: Color = Color::from_rgb8(0x08, 0x12, 0x0e);
+
+    // YouTube's brand red, for the upload panel when YouTube is the chosen destination. The one
+    // place the app steps off its single mint accent, so the widget reads as "this goes to
+    // YouTube". Softened from pure #FF0000 to sit on the dark surface; white ink on top.
+    pub const YOUTUBE: Color = Color::from_rgb8(0xff, 0x33, 0x33);
+    pub const YOUTUBE_HOVER: Color = Color::from_rgb8(0xff, 0x4d, 0x4d);
+    pub const INK_ON_YOUTUBE: Color = Color::from_rgb8(0xff, 0xff, 0xff);
 }
 
 /// Display face for headings: Barlow Condensed, always uppercase per the design.
@@ -124,17 +131,33 @@ pub fn card_style(_theme: &Theme) -> container::Style {
 
 /// Primary (mint) button per the Arena spec: filled accent, ink text, 8px radius.
 pub fn primary_button(_theme: &Theme, status: button::Status) -> button::Style {
+    accent_button_style(
+        status,
+        palette::ACCENT,
+        palette::ACCENT_HOVER,
+        palette::INK_ON_ACCENT,
+    )
+}
+
+/// A filled primary button in an arbitrary brand accent (mint by default via `primary_button`, red
+/// for the YouTube upload destination). Same shape as `primary_button`, just parameterized.
+pub fn accent_button_style(
+    status: button::Status,
+    accent: iced::Color,
+    accent_hover: iced::Color,
+    ink: iced::Color,
+) -> button::Style {
     let background = match status {
-        button::Status::Hovered | button::Status::Pressed => palette::ACCENT_HOVER,
+        button::Status::Hovered | button::Status::Pressed => accent_hover,
         button::Status::Disabled => palette::HIGH,
-        _ => palette::ACCENT,
+        _ => accent,
     };
     button::Style {
         background: Some(Background::Color(background)),
         text_color: if matches!(status, button::Status::Disabled) {
             palette::MUTED
         } else {
-            palette::INK_ON_ACCENT
+            ink
         },
         border: Border {
             radius: 8.0.into(),

@@ -20,8 +20,8 @@ use rewynd_upload::youtube::{
 use rewynd_upload::{GankedClient, Visibility, default_title, user_facing_upload_error};
 
 use crate::theme::{
-    self, DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, accent_chip, card, field_label, hint, link_button,
-    palette, primary_button, secondary_button, tinted,
+    self, DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, accent_button_style, accent_chip, card, field_label,
+    hint, link_button, palette, primary_button, secondary_button, tinted,
 };
 use crate::thumbs;
 
@@ -1093,12 +1093,13 @@ impl Library {
 
         let seg = |label: &'static str, dest: Dest, ready: bool| {
             let active = self.dest == dest;
+            let (accent, ink) = dest_accent(dest);
             let b = button(
                 container(text(label).size(11).font(UI_SEMIBOLD))
                     .center_x(Length::Fill)
                     .padding([2, 0]),
             )
-            .style(move |theme: &Theme, status| segment_style(theme, status, active))
+            .style(move |theme: &Theme, status| segment_style(theme, status, active, accent, ink))
             .width(Length::Fill)
             .padding([5, 15]);
             if ready && !busy {
@@ -1157,6 +1158,13 @@ impl Library {
         // Once a clip is on a destination, the primary action becomes "Upload again", which
         // verifies the remote copy still exists before it lets a duplicate through.
         let already_uploaded = self.record_for(entry, self.dest).is_some();
+        // The action button takes the destination's brand accent: mint for ganked.tv, red for
+        // YouTube, so the whole panel reads as "this clip is headed to YouTube".
+        let (accent, ink) = dest_accent(self.dest);
+        let accent_hover = match self.dest {
+            Dest::Ganked => palette::ACCENT_HOVER,
+            Dest::YouTube => palette::YOUTUBE_HOVER,
+        };
         let mut send = button(
             text(if already_uploaded {
                 "Upload again".to_owned()
@@ -1166,7 +1174,7 @@ impl Library {
             .size(13)
             .font(UI_BOLD),
         )
-        .style(primary_button)
+        .style(move |_theme: &Theme, status| accent_button_style(status, accent, accent_hover, ink))
         .padding([11, 24]);
         if dest_ready && !busy {
             send = send.on_press(if already_uploaded {
@@ -1582,20 +1590,27 @@ fn clip_card_style(
 }
 
 /// One segment of the destination control: mint fill + ink when active, quiet otherwise.
+/// The brand accent and its ink for an upload destination: mint for ganked.tv, red for YouTube.
+fn dest_accent(dest: Dest) -> (iced::Color, iced::Color) {
+    match dest {
+        Dest::Ganked => (palette::ACCENT, palette::INK_ON_ACCENT),
+        Dest::YouTube => (palette::YOUTUBE, palette::INK_ON_YOUTUBE),
+    }
+}
+
 fn segment_style(
     _theme: &Theme,
     status: iced::widget::button::Status,
     active: bool,
+    accent: iced::Color,
+    ink: iced::Color,
 ) -> iced::widget::button::Style {
     use iced::widget::button::{Status, Style};
     let (background, text_color) = if active {
-        (
-            Some(Background::Color(palette::ACCENT)),
-            palette::INK_ON_ACCENT,
-        )
+        (Some(Background::Color(accent)), ink)
     } else {
         match status {
-            Status::Hovered | Status::Pressed => (None, palette::ACCENT),
+            Status::Hovered | Status::Pressed => (None, accent),
             Status::Disabled => (None, palette::MUTED),
             _ => (None, palette::TEXT_SECONDARY),
         }
