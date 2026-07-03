@@ -83,7 +83,7 @@ impl Mp4Muxer {
     /// slice, so the muxer rebases timestamps against the first chunk's PTS: the
     /// written clip starts at PTS zero.
     pub fn write_mp4(&self, chunks: &[EncodedChunk], path: &Path) -> Result<(), MuxError> {
-        self.write(chunks, None, path)
+        self.write(chunks, &[], path)
     }
 
     /// Mux a video clip plus a synced Opus audio track into an MP4 at `path`.
@@ -98,13 +98,25 @@ impl Mp4Muxer {
         audio: &AudioTrack,
         path: &Path,
     ) -> Result<(), MuxError> {
-        self.write(video, Some(audio), path)
+        self.write(video, std::slice::from_ref(audio), path)
+    }
+
+    /// Like [`write_mp4_with_audio`] but with several audio tracks (e.g. the system+mic mix as
+    /// track 1 and the mic on its own as track 2). Empty tracks are skipped, and the remaining
+    /// ones become MP4 audio tracks in order. All rebase against the same clip base.
+    pub fn write_mp4_with_audio_tracks(
+        &self,
+        video: &[EncodedChunk],
+        audio: &[AudioTrack],
+        path: &Path,
+    ) -> Result<(), MuxError> {
+        self.write(video, audio, path)
     }
 
     fn write(
         &self,
         video: &[EncodedChunk],
-        audio: Option<&AudioTrack>,
+        audio: &[AudioTrack],
         path: &Path,
     ) -> Result<(), MuxError> {
         let first = video.first().ok_or(MuxError::NotKeyframeStart)?;
@@ -116,8 +128,9 @@ impl Mp4Muxer {
         let sps = find_nal(&first.bytes, NAL_SPS).ok_or(MuxError::MissingParameterSets)?;
         let pps = find_nal(&first.bytes, NAL_PPS).ok_or(MuxError::MissingParameterSets)?;
 
-        // Only advertise an audio track / Opus brand when there's actually audio.
-        let has_audio = audio.is_some_and(|a| !a.chunks.is_empty());
+        // Only advertise audio tracks / the Opus brand for tracks that carry packets.
+        let audio: Vec<&AudioTrack> = audio.iter().filter(|a| !a.chunks.is_empty()).collect();
+        let has_audio = !audio.is_empty();
 
         let mut compatible_brands = vec![
             FourCC::from(*b"isom"),
@@ -179,9 +192,10 @@ impl Mp4Muxer {
                 )?;
             }
 
-            if has_audio {
-                let audio = audio.expect("has_audio implies Some");
-                write_audio_track(&mut writer, audio, base)?;
+            // Audio tracks follow the video track: the first `add_track` above took id 1, so the
+            // audio tracks are ids 2, 3, … in the order written.
+            for (i, track) in audio.iter().enumerate() {
+                write_audio_track(&mut writer, track, base, 2 + i as u32)?;
             }
 
             writer.write_end()?;
@@ -209,6 +223,7 @@ fn write_audio_track<W: std::io::Write + std::io::Seek>(
     writer: &mut Mp4Writer<W>,
     audio: &AudioTrack,
     base: Duration,
+    track_id: u32,
 ) -> Result<(), MuxError> {
     writer.add_track(&TrackConfig {
         track_type: TrackType::Audio,
@@ -221,17 +236,17 @@ fn write_audio_track<W: std::io::Write + std::io::Seek>(
         }),
     })?;
 
-    // Track 2 is the second `add_track`. Packets are written back-to-back: each sample's
-    // duration is its real Opus frame length (so the audio sample clock stays exact), and the
-    // cumulative durations form the timeline; `start_time` is informational (the writer uses
-    // only `duration`). This assumes contiguous capture — a mid-clip gap (a sink that
-    // suspends mid-session) would collapse, presenting later audio early. Continuous monitor
-    // capture doesn't produce such gaps; reconstructing one (silence fill / multi-edit elst)
-    // is a future refinement.
+    // `track_id` is this track's `add_track` order (2 for the first audio track, 3 for the
+    // next). Packets are written back-to-back: each sample's duration is its real Opus frame
+    // length (so the audio sample clock stays exact), and the cumulative durations form the
+    // timeline; `start_time` is informational (the writer uses only `duration`). This assumes
+    // contiguous capture — a mid-clip gap (a sink that suspends mid-session) would collapse,
+    // presenting later audio early. Continuous monitor capture doesn't produce such gaps;
+    // reconstructing one (silence fill / multi-edit elst) is a future refinement.
     let mut cumulative: u64 = 0;
     for chunk in audio.chunks {
         writer.write_sample(
-            2,
+            track_id,
             &Mp4Sample {
                 start_time: cumulative,
                 duration: chunk.frames,
@@ -261,7 +276,7 @@ fn write_audio_track<W: std::io::Write + std::io::Seek>(
             edits.push((offset_movie, -1));
         }
         edits.push((trim_movie, pre_skip as i64));
-        writer.set_track_edit_list(2, &edits)?;
+        writer.set_track_edit_list(track_id, &edits)?;
     }
 
     Ok(())
@@ -681,6 +696,95 @@ mod tests {
                 0x00, 0x00, 0x01, 0x38, // media_time = 312 (pre-skip, 48 kHz samples)
                 0x00, 0x01, 0x00, 0x00, // media_rate = 1.0
             ]
+        );
+    }
+
+    #[test]
+    fn writes_video_plus_two_opus_tracks() {
+        let sps = [0x67, 0x42, 0x00, 0x1f];
+        let pps = [0x68, 0xCE, 0x3c, 0x80];
+        let key = annexb(&[&sps, &pps, &[0x65, 0x88, 0x84]]);
+        let video = [
+            chunk(key, true, 1_000),
+            chunk(annexb(&[&[0x41, 0x9a, 0x00]]), false, 17_667),
+        ];
+        let mix = [audio_chunk(10_000), audio_chunk(30_000)];
+        let mic = [
+            audio_chunk(12_000),
+            audio_chunk(32_000),
+            audio_chunk(52_000),
+        ];
+        let tracks = [
+            AudioTrack {
+                chunks: &mix,
+                channels: 2,
+                sample_rate: 48_000,
+                pre_skip: 0,
+            },
+            AudioTrack {
+                chunks: &mic,
+                channels: 2,
+                sample_rate: 48_000,
+                pre_skip: 0,
+            },
+        ];
+
+        let out = TempMp4::new();
+        Mp4Muxer::new(1920, 1080, 60)
+            .write_mp4_with_audio_tracks(&video, &tracks, &out.0)
+            .expect("write");
+
+        let file = std::fs::File::open(&out.0).unwrap();
+        let size = file.metadata().unwrap().len();
+        let reader = mp4::Mp4Reader::read_header(std::io::BufReader::new(file), size).unwrap();
+
+        assert_eq!(reader.tracks().len(), 3, "video + two audio tracks");
+        assert_eq!(reader.tracks()[&1].track_type().unwrap(), TrackType::Video);
+        assert_eq!(
+            reader.tracks()[&2].media_type().unwrap(),
+            mp4::MediaType::OPUS
+        );
+        assert_eq!(reader.tracks()[&2].sample_count(), 2, "the mix track");
+        assert_eq!(
+            reader.tracks()[&3].media_type().unwrap(),
+            mp4::MediaType::OPUS
+        );
+        assert_eq!(reader.tracks()[&3].sample_count(), 3, "the mic-only track");
+    }
+
+    #[test]
+    fn empty_audio_tracks_are_dropped_leaving_only_the_populated_one() {
+        let sps = [0x67, 0x42, 0x00, 0x1f];
+        let pps = [0x68, 0xCE, 0x3c, 0x80];
+        let key = annexb(&[&sps, &pps, &[0x65, 0x88, 0x84]]);
+        let video = [chunk(key, true, 0)];
+        let mix = [audio_chunk(1_000)];
+        // The mic track is empty (mic off / no separate track) — it must not become an MP4 track.
+        let tracks = [
+            AudioTrack {
+                chunks: &mix,
+                channels: 2,
+                sample_rate: 48_000,
+                pre_skip: 0,
+            },
+            AudioTrack {
+                chunks: &[],
+                channels: 2,
+                sample_rate: 48_000,
+                pre_skip: 0,
+            },
+        ];
+        let out = TempMp4::new();
+        Mp4Muxer::new(640, 360, 60)
+            .write_mp4_with_audio_tracks(&video, &tracks, &out.0)
+            .expect("write");
+        let file = std::fs::File::open(&out.0).unwrap();
+        let size = file.metadata().unwrap().len();
+        let reader = mp4::Mp4Reader::read_header(std::io::BufReader::new(file), size).unwrap();
+        assert_eq!(
+            reader.tracks().len(),
+            2,
+            "video + the one non-empty audio track"
         );
     }
 

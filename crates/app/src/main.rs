@@ -19,6 +19,15 @@ mod overlay;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn main() -> anyhow::Result<()> {
+    // `--restart`: stop the recorder that's currently running (a config change such as the tray's
+    // microphone toggle needs a fresh process to pick it up) before we take the single-instance
+    // lock it still holds.
+    if std::env::args().any(|arg| arg == "--restart") {
+        let _ = rewynd_config::stop_recorder(
+            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(2),
+        );
+    }
     #[cfg(target_os = "linux")]
     let result = linux::run();
     #[cfg(target_os = "windows")]
@@ -87,6 +96,7 @@ mod audio_pipeline {
         audio_params: AudioEncodeParams,
         gain: f32,
         mixer: SharedMixer,
+        also_mixer: Option<SharedMixer>,
         stop: &Arc<AtomicBool>,
         epoch: Instant,
         on_system_failure: Option<Box<dyn FnOnce(String) + Send>>,
@@ -155,6 +165,11 @@ mod audio_pipeline {
                                 AudioSource::SinkMonitor => pcm,
                             };
                             lock_unpoisoned(&mixer).add(prepared, pts);
+                            // The mic's separate-track path: feed the same centred+gained mic PCM
+                            // into its own mixer, so it becomes a second, mic-only Opus track.
+                            if let Some(also) = &also_mixer {
+                                lock_unpoisoned(also).add(prepared, pts);
+                            }
                         }));
                         match outcome {
                             Ok(()) => ControlFlow::Continue(()),
@@ -413,6 +428,7 @@ mod game_gate {
     /// Invoked with `Some` on game focus/switch, `None` on unfocus or detector death.
     pub(crate) type GameReaction = Box<dyn Fn(Option<&GameInfo>) + Send + Sync>;
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn reaction(
         game_only: bool,
         game_folders: bool,
@@ -420,6 +436,7 @@ mod game_gate {
         saver: Arc<ClipSaver>,
         buffer: SharedBuffer,
         audio: SharedAudioBuffer,
+        mic_audio: Option<SharedAudioBuffer>,
     ) -> GameReaction {
         // The app id whose footage the rings currently hold (while recording).
         let held = Mutex::new(None::<String>);
@@ -447,6 +464,9 @@ mod game_gate {
                             // opens, so no frame lands in between.
                             lock_unpoisoned(&buffer).clear();
                             lock_unpoisoned(&audio).clear();
+                            if let Some(mic) = &mic_audio {
+                                lock_unpoisoned(mic).clear();
+                            }
                             *held = Some(game.app_id.clone());
                         }
                     }
@@ -573,6 +593,8 @@ mod linux {
         system_audio: Option<std::thread::JoinHandle<()>>,
         mic_audio: Option<std::thread::JoinHandle<()>>,
         audio_mixer: Option<std::thread::JoinHandle<()>>,
+        /// The mic-only mixer thread, present only when the separate-mic-track option is on.
+        mic_audio_mixer: Option<std::thread::JoinHandle<()>>,
         capture: Option<std::thread::JoinHandle<()>>,
         flush_hook: Option<std::thread::JoinHandle<()>>,
     }
@@ -597,6 +619,9 @@ mod linux {
             }
             self.captures_done.store(true, Ordering::Relaxed);
             if let Some(h) = self.audio_mixer.take() {
+                let _ = h.join();
+            }
+            if let Some(h) = self.mic_audio_mixer.take() {
                 let _ = h.join();
             }
             if let Some(h) = self.flush_hook.take() {
@@ -666,14 +691,34 @@ mod linux {
         )));
         // Raised by a clip save so the mixer drains its in-flight tail before the audio cut.
         let audio_drain_now = Arc::new(AtomicBool::new(false));
+
+        // The separate-mic-track option: a second ring + mixer + drain flag feed a mic-only Opus
+        // track. `separate_mic_track` is already gated on the mic being enabled.
+        let mic_enabled = config.mic_enabled();
+        let separate_mic = config.separate_mic_track();
+        let (mic_audio_buffer, mic_mixer, mic_drain_now) = if separate_mic {
+            let ring: SharedAudioBuffer = Arc::new(Mutex::new(AudioRingBuffer::new(buffer_window)));
+            let mx: SharedMixer = Arc::new(Mutex::new(AudioMixer::new(
+                audio_params.sample_rate,
+                audio_params.channels,
+                AUDIO_SETTLE,
+            )));
+            (Some(ring), Some(mx), Some(Arc::new(AtomicBool::new(false))))
+        } else {
+            (None, None, None)
+        };
+
+        let mut drains = vec![audio_drain_now.clone()];
+        drains.extend(mic_drain_now.clone());
         let saver = ClipSaver::new(
             buffer.clone(),
             audio_buffer.clone(),
+            mic_audio_buffer.clone(),
             params,
             audio_params,
             buffer_window,
             output_dir,
-            Some(audio_drain_now.clone()),
+            drains,
         );
 
         // Game detection (ADR 0012): the focus watcher gates the buffer on a focused
@@ -698,6 +743,7 @@ mod linux {
                 saver.clone(),
                 buffer.clone(),
                 audio_buffer.clone(),
+                mic_audio_buffer.clone(),
             );
             match rewynd_capture::linux::FocusWatcher::spawn(Some(reaction)) {
                 Ok(watcher) => Some(watcher),
@@ -780,6 +826,7 @@ mod linux {
             system_audio: None,
             mic_audio: None,
             audio_mixer: None,
+            mic_audio_mixer: None,
             capture: None,
             flush_hook: None,
         };
@@ -801,6 +848,7 @@ mod linux {
                 audio_params,
                 config.system_gain(),
                 mixer.clone(),
+                None,
                 &stop,
                 epoch,
                 Some(Box::new({
@@ -810,19 +858,23 @@ mod linux {
                     }
                 })),
             )?);
-            // The mic is optional: with no input device the mixer simply never receives mic
-            // samples (the stream idles until shutdown), so clips are system-only.
-            recorder.mic_audio = Some(spawn_audio_capture(
-                "rewynd-audio-mic",
-                AudioSource::Microphone,
-                config.microphone().map(str::to_owned),
-                audio_params,
-                config.mic_gain(),
-                mixer.clone(),
-                &stop,
-                epoch,
-                None,
-            )?);
+            // The mic is optional AND toggleable: when disabled no stream is opened at all
+            // (privacy), so clips are system-only. When the separate-track option is on, the
+            // capture also feeds the mic-only mixer.
+            if mic_enabled {
+                recorder.mic_audio = Some(spawn_audio_capture(
+                    "rewynd-audio-mic",
+                    AudioSource::Microphone,
+                    config.microphone().map(str::to_owned),
+                    audio_params,
+                    config.mic_gain(),
+                    mixer.clone(),
+                    mic_mixer.clone(),
+                    &stop,
+                    epoch,
+                    None,
+                )?);
+            }
 
             let mixer_buffer = audio_buffer.clone();
             let mixer_mixer = mixer.clone();
@@ -847,6 +899,35 @@ mod linux {
                     })
                     .context("spawning the audio mixer thread")?,
             );
+
+            // The mic-only mixer thread, when the separate-track option is on: drains the
+            // mic-only mixer into its own Opus encoder + ring, gated by the same `recording` flag.
+            if let (Some(mic_mixer), Some(mic_buffer), Some(mic_drain)) = (
+                mic_mixer.clone(),
+                mic_audio_buffer.clone(),
+                mic_drain_now.clone(),
+            ) {
+                let mic_done = captures_done.clone();
+                let mic_recording = recording.clone();
+                recorder.mic_audio_mixer = Some(
+                    std::thread::Builder::new()
+                        .name("rewynd-audio-mic-mixer".to_owned())
+                        .spawn(move || {
+                            if let Err(e) = run_audio_mixer(
+                                epoch,
+                                audio_params,
+                                mic_mixer,
+                                mic_buffer,
+                                &mic_done,
+                                &mic_drain,
+                                Some(mic_recording),
+                            ) {
+                                tracing::error!(error = %e, "mic audio mixer loop stopped");
+                            }
+                        })
+                        .context("spawning the mic audio mixer thread")?,
+                );
+            }
 
             // Fill the video ring on its own thread: the PipeWire loop blocks, and the GPU
             // pipeline lives there start to finish (so it also tears down there, in order).
@@ -919,7 +1000,12 @@ mod linux {
         // Tray icon + menu on a background task of the same runtime (no GTK, no extra event
         // loop). It owns all user-visible state: menu commands, pipeline-failure tooltips,
         // upload orchestration.
-        runtime.spawn(run_tray(saver.clone(), events_rx, shutdown_tx.clone()));
+        runtime.spawn(run_tray(
+            saver.clone(),
+            events_rx,
+            shutdown_tx.clone(),
+            mic_enabled,
+        ));
 
         // Drive the hotkey until shutdown is requested (or the session is gone for good).
         let result = runtime.block_on(run_hotkey_loop(
@@ -940,8 +1026,9 @@ mod linux {
         saver: Arc<ClipSaver>,
         mut events: tokio::sync::mpsc::UnboundedReceiver<RecorderEvent>,
         shutdown: tokio::sync::watch::Sender<bool>,
+        mic_enabled: bool,
     ) {
-        let (handle, mut rx) = match tray::spawn().await {
+        let (handle, mut rx) = match tray::spawn(mic_enabled).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "tray unavailable; continuing without it");
@@ -1006,6 +1093,7 @@ mod linux {
                                 Err((title, body)) => tray::toast(title, &body).await,
                             }
                         }
+                        tray::TrayCmd::ToggleMic => toggle_mic_and_restart().await,
                         tray::TrayCmd::OpenSettings => open_settings().await,
                         tray::TrayCmd::Quit => {
                             tracing::info!("quit requested from the tray");
@@ -1051,6 +1139,48 @@ mod linux {
                 tray::toast(
                     "Could not save the clip",
                     "The save task crashed; see the logs.",
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Flip the microphone on/off in the config file and restart the recorder to apply it (the
+    /// recorder reads audio config once at startup). Errors are toasted, never fatal.
+    async fn toggle_mic_and_restart() {
+        let Some(path) = config::config_path() else {
+            tray::toast("Microphone", "Could not find the config file.").await;
+            return;
+        };
+        let mut cfg = config::load_file();
+        let now_on = !cfg.mic_enabled();
+        cfg.set_mic_enabled(now_on);
+        if let Err(e) = cfg.save_to(&path) {
+            tracing::warn!(error = %e, "could not save the microphone toggle");
+            tray::toast("Microphone", "Could not save the change.").await;
+            return;
+        }
+        // A fresh recorder (`--restart` stops this one first) picks up the new setting.
+        let bin =
+            config::sibling_binary("rewynd-recorder").or_else(|| std::env::current_exe().ok());
+        match bin.and_then(|bin| {
+            std::process::Command::new(bin)
+                .arg("--restart")
+                .spawn()
+                .ok()
+        }) {
+            Some(_) => {
+                let body = if now_on {
+                    "Microphone on. Restarting to apply."
+                } else {
+                    "Microphone off. Restarting to apply."
+                };
+                tray::toast("Microphone", body).await;
+            }
+            None => {
+                tray::toast(
+                    "Microphone",
+                    "Saved, but could not restart. Restart rewynd to apply.",
                 )
                 .await;
             }
@@ -1682,14 +1812,34 @@ mod windows {
         )));
         // Raised by a clip save so the mixer drains its in-flight tail before the audio cut.
         let audio_drain_now = Arc::new(AtomicBool::new(false));
+
+        // The separate-mic-track option: a second ring + mixer + drain flag feed a mic-only Opus
+        // track. `separate_mic_track` is already gated on the mic being enabled.
+        let mic_enabled = config.mic_enabled();
+        let separate_mic = config.separate_mic_track();
+        let (mic_audio_buffer, mic_mixer, mic_drain_now) = if separate_mic {
+            let ring: SharedAudioBuffer = Arc::new(Mutex::new(AudioRingBuffer::new(buffer_window)));
+            let mx: SharedMixer = Arc::new(Mutex::new(AudioMixer::new(
+                audio_params.sample_rate,
+                audio_params.channels,
+                AUDIO_SETTLE,
+            )));
+            (Some(ring), Some(mx), Some(Arc::new(AtomicBool::new(false))))
+        } else {
+            (None, None, None)
+        };
+
+        let mut drains = vec![audio_drain_now.clone()];
+        drains.extend(mic_drain_now.clone());
         let saver = ClipSaver::new(
             buffer.clone(),
             audio_buffer.clone(),
+            mic_audio_buffer.clone(),
             params,
             audio_params,
             buffer_window,
             output_dir,
-            Some(audio_drain_now.clone()),
+            drains,
         );
 
         // Game gating (mirrors Linux, ADR 0012): in game-only mode the WGC session
@@ -1708,6 +1858,7 @@ mod windows {
                 saver.clone(),
                 buffer.clone(),
                 audio_buffer.clone(),
+                mic_audio_buffer.clone(),
             ))
         };
 
@@ -1727,6 +1878,7 @@ mod windows {
             audio_params,
             config.system_gain(),
             mixer.clone(),
+            None,
             &stop,
             epoch,
             Some(Box::new(|e: String| {
@@ -1736,19 +1888,25 @@ mod windows {
                 );
             })),
         )?;
-        // The mic is optional: with no input device the mixer simply never receives mic
-        // samples, so clips are system-only.
-        let mic_audio = spawn_audio_capture(
-            "rewynd-audio-mic",
-            AudioSource::Microphone,
-            config.microphone().map(str::to_owned),
-            audio_params,
-            config.mic_gain(),
-            mixer.clone(),
-            &stop,
-            epoch,
-            None,
-        )?;
+        // The mic is optional AND toggleable: when disabled no stream is opened at all
+        // (privacy), so clips are system-only. With the separate-track option on, the capture
+        // also feeds the mic-only mixer.
+        let mic_audio = if mic_enabled {
+            Some(spawn_audio_capture(
+                "rewynd-audio-mic",
+                AudioSource::Microphone,
+                config.microphone().map(str::to_owned),
+                audio_params,
+                config.mic_gain(),
+                mixer.clone(),
+                mic_mixer.clone(),
+                &stop,
+                epoch,
+                None,
+            )?)
+        } else {
+            None
+        };
         let mixer_buffer = audio_buffer.clone();
         let mixer_mixer = mixer.clone();
         let mixer_done = captures_done.clone();
@@ -1770,6 +1928,36 @@ mod windows {
                 }
             })
             .context("spawning the audio mixer thread")?;
+
+        // The mic-only mixer thread, when the separate-track option is on.
+        let mic_audio_mixer = if let (Some(mic_mixer), Some(mic_buffer), Some(mic_drain)) = (
+            mic_mixer.clone(),
+            mic_audio_buffer.clone(),
+            mic_drain_now.clone(),
+        ) {
+            let mic_done = captures_done.clone();
+            let mic_recording = recording.clone();
+            Some(
+                std::thread::Builder::new()
+                    .name("rewynd-audio-mic-mixer".to_owned())
+                    .spawn(move || {
+                        if let Err(e) = run_audio_mixer(
+                            epoch,
+                            audio_params,
+                            mic_mixer,
+                            mic_buffer,
+                            &mic_done,
+                            &mic_drain,
+                            Some(mic_recording),
+                        ) {
+                            tracing::error!(error = %e, "mic audio mixer loop stopped");
+                        }
+                    })
+                    .context("spawning the mic audio mixer thread")?,
+            )
+        } else {
+            None
+        };
 
         // Fill the video ring on its own thread: the WGC watchdog loop blocks, and the
         // GPU pipeline lives (and tears down) there.
@@ -1820,6 +2008,7 @@ mod windows {
                     &tray_stop,
                     &tray_shutdown,
                     &tray_busy,
+                    mic_enabled,
                 )
             })
             .context("spawning the tray thread")?;
@@ -1914,9 +2103,14 @@ mod windows {
         stop.store(true, Ordering::Relaxed);
         let _ = capture.join();
         let _ = system_audio.join();
-        let _ = mic_audio.join();
+        if let Some(h) = mic_audio {
+            let _ = h.join();
+        }
         captures_done.store(true, Ordering::Relaxed);
         let _ = audio_mixer.join();
+        if let Some(h) = mic_audio_mixer {
+            let _ = h.join();
+        }
         let _ = hotkey.join();
         if let Some(h) = flush_hook {
             let _ = h.join();
@@ -2063,12 +2257,14 @@ mod windows {
         stop: &Arc<AtomicBool>,
         shutdown: &std::sync::mpsc::Sender<&'static str>,
         upload_busy: &Arc<AtomicBool>,
+        mic_enabled: bool,
     ) {
-        use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+        use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 
         let save_item = MenuItem::new("Save clip now", true, None);
         let upload_item = MenuItem::new("Upload last clip", true, None);
         let youtube_item = MenuItem::new("Upload last clip to YouTube", true, None);
+        let mic_item = CheckMenuItem::new("Record microphone", true, mic_enabled, None);
         let settings_item = MenuItem::new("Open settings", true, None);
         let quit_item = MenuItem::new("Quit rewynd", true, None);
         let menu = Menu::new();
@@ -2077,6 +2273,7 @@ mod windows {
                 &save_item,
                 &upload_item,
                 &youtube_item,
+                &mic_item,
                 &settings_item,
                 &PredefinedMenuItem::separator(),
                 &quit_item,
@@ -2149,6 +2346,8 @@ mod windows {
                     spawn_upload(saver, upload_busy);
                 } else if id == youtube_item.id() {
                     spawn_youtube_upload(saver, upload_busy);
+                } else if id == mic_item.id() {
+                    toggle_mic_and_restart();
                 } else if id == settings_item.id() {
                     open_settings();
                 } else if id == quit_item.id() {
@@ -2179,6 +2378,44 @@ mod windows {
 
     /// Launch the sibling settings binary, reaping the child in the background (an
     /// unwaited child stays a zombie for the recorder's whole lifetime).
+    /// Flip the microphone on/off in the config file and restart the recorder to apply it (the
+    /// recorder reads audio config once at startup).
+    fn toggle_mic_and_restart() {
+        let Some(path) = config::config_path() else {
+            toast("Microphone", "Could not find the config file.");
+            return;
+        };
+        let mut cfg = config::load_file();
+        let now_on = !cfg.mic_enabled();
+        cfg.set_mic_enabled(now_on);
+        if let Err(e) = cfg.save_to(&path) {
+            tracing::warn!(error = %e, "could not save the microphone toggle");
+            toast("Microphone", "Could not save the change.");
+            return;
+        }
+        let bin =
+            config::sibling_binary("rewynd-recorder").or_else(|| std::env::current_exe().ok());
+        match bin.and_then(|bin| {
+            std::process::Command::new(bin)
+                .arg("--restart")
+                .spawn()
+                .ok()
+        }) {
+            Some(_) => toast(
+                "Microphone",
+                if now_on {
+                    "Microphone on. Restarting to apply."
+                } else {
+                    "Microphone off. Restarting to apply."
+                },
+            ),
+            None => toast(
+                "Microphone",
+                "Saved, but could not restart. Restart rewynd to apply.",
+            ),
+        }
+    }
+
     fn open_settings() {
         let Some(settings) = config::sibling_binary("rewynd") else {
             toast(

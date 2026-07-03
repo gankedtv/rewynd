@@ -385,6 +385,8 @@ enum Message {
     RerunOnboarding,
     MicGain(f32),
     SystemGain(f32),
+    MicEnabled(bool),
+    SeparateMicTrack(bool),
     MicrophonePicked(String),
     BufferSeconds(u32),
     ResolutionPicked(Resolution),
@@ -558,6 +560,14 @@ impl App {
             }
             Message::SystemGain(v) => {
                 self.config.set_system_gain(v);
+                self.touch();
+            }
+            Message::MicEnabled(on) => {
+                self.config.set_mic_enabled(on);
+                self.touch();
+            }
+            Message::SeparateMicTrack(on) => {
+                self.config.set_separate_mic_track(on);
                 self.touch();
             }
             Message::MicrophonePicked(mic) => {
@@ -1102,8 +1112,10 @@ impl App {
             .spacing(8)
             .into()
         };
-        let audio = card(
-            "AUDIO",
+        // The mic controls only make sense while the mic is recording; when it's off they give
+        // way to a hint (turning the mic off opens no mic stream at all — a privacy choice).
+        let mic_enabled = self.config.mic_enabled();
+        let mic_controls: Element<Message> = if mic_enabled {
             column![
                 microphone,
                 setting(
@@ -1113,6 +1125,26 @@ impl App {
                         .step(0.05)
                         .style(arena_slider),
                 ),
+                checkbox(self.config.separate_mic_track())
+                    .label("Keep the microphone on a separate audio track")
+                    .on_toggle(Message::SeparateMicTrack)
+                    .style(arena_check),
+            ]
+            .spacing(18)
+            .into()
+        } else {
+            hint(
+                "The microphone is off; turn it on to pick a device, set its level, or split it onto its own track.",
+            )
+        };
+        let audio = card(
+            "AUDIO",
+            column![
+                checkbox(mic_enabled)
+                    .label("Record microphone")
+                    .on_toggle(Message::MicEnabled)
+                    .style(arena_check),
+                mic_controls,
                 setting(
                     "System volume",
                     format!("{:.2}x", self.config.system_gain()),

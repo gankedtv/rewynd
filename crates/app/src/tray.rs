@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::sync::LazyLock;
 
-use ksni::menu::{MenuItem, StandardItem};
+use ksni::menu::{CheckmarkItem, MenuItem, StandardItem};
 use ksni::{Handle, Icon, ToolTip, Tray, TrayMethods};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -14,6 +14,8 @@ pub enum TrayCmd {
     UploadClip,
     UploadYouTube,
     OpenSettings,
+    /// Flip the microphone on/off and restart the recorder to apply it.
+    ToggleMic,
     Quit,
 }
 
@@ -42,6 +44,9 @@ pub struct RewyndTray {
     tx: UnboundedSender<TrayCmd>,
     /// One-line pipeline status shown as the tooltip title; the recorder updates it on failures.
     pub status: String,
+    /// Whether the microphone is recording, for the menu checkmark (read at spawn; the toggle
+    /// restarts the recorder, so a fresh tray reflects the new value).
+    mic_enabled: bool,
 }
 
 impl Tray for RewyndTray {
@@ -102,6 +107,15 @@ impl Tray for RewyndTray {
                 ..Default::default()
             }
             .into(),
+            CheckmarkItem {
+                label: "Record microphone".to_owned(),
+                checked: self.mic_enabled,
+                activate: Box::new(|t: &mut Self| {
+                    let _ = t.tx.send(TrayCmd::ToggleMic);
+                }),
+                ..Default::default()
+            }
+            .into(),
             StandardItem {
                 label: "Open rewynd".to_owned(),
                 activate: Box::new(|t: &mut Self| {
@@ -125,11 +139,14 @@ impl Tray for RewyndTray {
 
 /// Register the tray on the current tokio runtime, returning the command receiver. The returned
 /// `Handle` keeps the icon alive — hold it for as long as the tray should show.
-pub async fn spawn() -> anyhow::Result<(Handle<RewyndTray>, UnboundedReceiver<TrayCmd>)> {
+pub async fn spawn(
+    mic_enabled: bool,
+) -> anyhow::Result<(Handle<RewyndTray>, UnboundedReceiver<TrayCmd>)> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let tray = RewyndTray {
         tx,
         status: "rewynd is recording".to_owned(),
+        mic_enabled,
     };
     let handle = tray.spawn().await?;
     Ok((handle, rx))
