@@ -1052,7 +1052,13 @@ impl App {
         let clips = iced::Subscription::run_with(dir, |dir| {
             clip_watch_stream(std::path::PathBuf::from(dir))
         });
-        iced::Subscription::batch([focus, clips])
+        let mut subs = vec![focus, clips];
+        // Drive the accent fade only while one is running: iced re-diffs subscriptions after each
+        // update, so when the fade clears this is dropped and the software renderer goes idle.
+        if self.library.animating() {
+            subs.push(iced::window::frames().map(|at| Message::Library(library::Message::Tick(at))));
+        }
+        iced::Subscription::batch(subs)
     }
 
     fn settings_view(&self) -> Element<'_, Message> {

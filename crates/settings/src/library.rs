@@ -183,6 +183,8 @@ pub enum Message {
     Verified(PathBuf, Dest, Result<bool, String>),
     OpenLink(String),
     CopyLink(String),
+    /// A frame tick while an accent fade is running (carries the frame instant).
+    Tick(Instant),
 }
 
 /// Where the open clip's trim stands.
@@ -338,6 +340,7 @@ impl Library {
                 self.confirm_delete = false;
                 self.action_error = None;
                 self.upload = UploadState::Idle;
+                self.accent_fade = None;
                 self.title_hint = default_title();
                 self.title = self.title_hint.clone();
                 let (ganked, youtube) = dest_statuses(config);
@@ -459,8 +462,15 @@ impl Library {
             Message::TitleEdited(s) => self.title = s,
             Message::DestPicked(dest) => {
                 if self.dest != dest {
+                    let from = self.current_accent();
                     self.dest = dest;
                     self.visibility = self.default_visibility(config);
+                    self.accent_fade = Some(AccentFade {
+                        from,
+                        to: dest_accent(dest),
+                        start: None,
+                        progress: 0.0,
+                    });
                 }
             }
             Message::VisibilityPicked(v) => self.visibility = v,
@@ -480,6 +490,7 @@ impl Library {
             Message::Verified(path, dest, result) => {
                 return self.verified(path, dest, result, config);
             }
+            Message::Tick(now) => self.advance_fade(now),
             Message::OpenLink(url) => {
                 if let Err(e) = open::that_detached(&url) {
                     tracing::warn!(error = %e, url, "could not open the link");
@@ -826,6 +837,16 @@ impl Library {
     /// Whether an accent fade is running (drives the frame subscription in `main`).
     pub fn animating(&self) -> bool {
         self.accent_fade.is_some()
+    }
+
+    /// Advance any running accent fade to frame time `now`, dropping it once complete so the
+    /// frame subscription in `main` stops (no idle redraw).
+    fn advance_fade(&mut self, now: Instant) {
+        if let Some(fade) = &mut self.accent_fade
+            && fade.advance(now)
+        {
+            self.accent_fade = None;
+        }
     }
 
     pub fn view(&self, config: &Config) -> Element<'_, Message> {
