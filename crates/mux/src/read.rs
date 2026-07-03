@@ -127,6 +127,112 @@ pub fn clip_preview_at(path: &Path, position: f32) -> Result<(ClipSummary, Vec<u
     })
 }
 
+/// One video sample ready for a raw H.264 decoder: its presentation time and Annex-B bytes.
+/// The first sample an iterator yields carries the track's SPS/PPS inline, so decoding can
+/// start there without any other setup.
+#[derive(Debug, Clone)]
+pub struct VideoFrame {
+    pub pts: Duration,
+    pub annexb: Vec<u8>,
+}
+
+/// A streaming reader over a clip's video samples, from the sync sample at or before a
+/// requested time to the end of the track (in-app playback wants exactly this: a valid decode
+/// chain without reading the whole clip up front). Corrupt data ends the iteration.
+pub struct VideoFrames {
+    reader: Reader,
+    track_id: u32,
+    timescale: f64,
+    prefix: usize,
+    /// SPS/PPS, prepended to the first yielded sample then taken.
+    header: Option<Vec<u8>>,
+    next: u32,
+    count: u32,
+}
+
+/// Open the clip at `path` for streaming video reads starting at the sync sample at or before
+/// `start`.
+pub fn video_frames_from(path: &Path, start: Duration) -> Result<VideoFrames, ReadError> {
+    catch_reader_panics(|| {
+        let reader = open(path)?;
+        let track_id = video_track(&reader)?;
+        let (timescale, prefix, header, next, count) = {
+            let track = &reader.tracks()[&track_id];
+            let timescale = f64::from(track.timescale().max(1));
+            let mut header = Vec::new();
+            append_nal(&mut header, track.sequence_parameter_set()?);
+            append_nal(&mut header, track.picture_parameter_set()?);
+            (
+                timescale,
+                nal_length_size(track)?,
+                header,
+                sync_at_or_before(track, start, timescale),
+                track.sample_count(),
+            )
+        };
+        Ok(VideoFrames {
+            reader,
+            track_id,
+            timescale,
+            prefix,
+            header: Some(header),
+            next,
+            count,
+        })
+    })
+}
+
+/// The last sync-sample id whose decode time is at or before `start` (else the first sync
+/// sample, else sample 1). The stss table is ordered, so the scan can stop past `start`.
+fn sync_at_or_before(track: &mp4::Mp4Track, start: Duration, timescale: f64) -> u32 {
+    let Some(syncs) = track.sync_sample_ids() else {
+        return 1;
+    };
+    let mut best = *syncs.first().unwrap_or(&1);
+    for &id in syncs {
+        let Ok((time, _)) = track.sample_time(id) else {
+            continue;
+        };
+        if time as f64 / timescale <= start.as_secs_f64() {
+            best = id;
+        } else {
+            break;
+        }
+    }
+    best
+}
+
+impl Iterator for VideoFrames {
+    type Item = VideoFrame;
+
+    fn next(&mut self) -> Option<VideoFrame> {
+        if self.next > self.count {
+            return None;
+        }
+        let id = self.next;
+        self.next += 1;
+        // The vendored reader panics on inconsistent metadata; end the stream instead.
+        let sample = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.reader.read_sample(self.track_id, id)
+        }));
+        let Ok(Ok(Some(sample))) = sample else {
+            self.next = self.count + 1;
+            return None;
+        };
+        let pts_units =
+            (sample.start_time as i64 + i64::from(sample.rendering_offset)).max(0) as f64;
+        let mut annexb = self.header.take().unwrap_or_default();
+        if avcc_to_annexb(&sample.bytes, self.prefix, &mut annexb).is_err() {
+            self.next = self.count + 1;
+            return None;
+        }
+        Some(VideoFrame {
+            pts: Duration::from_secs_f64(pts_units / self.timescale),
+            annexb,
+        })
+    }
+}
+
 /// Errors from [`trim_clip`].
 #[derive(Debug, Error)]
 pub enum TrimError {
@@ -993,6 +1099,52 @@ mod tests {
             .write_mp4_with_audio(&video, &track, &out.0)
             .expect("write av clip");
         out
+    }
+
+    #[test]
+    fn video_frames_start_on_the_enclosing_keyframe() {
+        let clip = multi_keyframe_clip();
+        // 70 ms is past the 66.7 ms keyframe at frame 4: the stream starts there.
+        let frames: Vec<_> = video_frames_from(&clip.0, Duration::from_millis(70))
+            .expect("open")
+            .collect();
+        assert_eq!(frames.len(), 6, "samples 5..=10");
+        assert!(
+            contains(&frames[0].annexb, &SPS),
+            "SPS/PPS on the first frame"
+        );
+        assert!(
+            contains(&frames[0].annexb, &[0x65, 0x88, 4]),
+            "frame 4's IDR"
+        );
+        assert!(!contains(&frames[1].annexb, &SPS), "header only once");
+        assert!(
+            frames.windows(2).all(|w| w[0].pts < w[1].pts),
+            "presentation times increase"
+        );
+    }
+
+    #[test]
+    fn video_frames_from_zero_cover_the_whole_clip() {
+        let clip = multi_keyframe_clip();
+        let frames: Vec<_> = video_frames_from(&clip.0, Duration::ZERO)
+            .expect("open")
+            .collect();
+        assert_eq!(frames.len(), 10);
+        assert!(contains(&frames[0].annexb, &SPS));
+    }
+
+    #[test]
+    fn video_frames_errors_and_empties_are_contained() {
+        assert!(matches!(
+            video_frames_from(Path::new("/nonexistent/clip.mp4"), Duration::ZERO),
+            Err(ReadError::Io { .. })
+        ));
+        let empty = raw_video_mp4(&[]);
+        let frames: Vec<_> = video_frames_from(&empty.0, Duration::ZERO)
+            .expect("open")
+            .collect();
+        assert!(frames.is_empty(), "no samples yields nothing, no panic");
     }
 
     #[test]

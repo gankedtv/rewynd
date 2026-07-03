@@ -151,7 +151,7 @@ fn decode_first_frame(annexb: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
         .ok_or_else(|| "the decoder produced no frame".to_owned())
 }
 
-fn rgb_of(yuv: &openh264::decoder::DecodedYUV<'_>) -> (u32, u32, Vec<u8>) {
+pub(crate) fn rgb_of(yuv: &openh264::decoder::DecodedYUV<'_>) -> (u32, u32, Vec<u8>) {
     use openh264::formats::YUVSource;
     let (width, height) = yuv.dimensions();
     let mut rgb = vec![0u8; width * height * 3];
@@ -240,7 +240,7 @@ fn thumb_dims(width: u32, height: u32) -> (u32, u32) {
 
 /// Dimensions capped at `cap` px wide, keeping the aspect ratio; smaller frames stay as they
 /// are. Degenerate input collapses to 1x1 so the result is always drawable.
-fn scaled_dims(width: u32, height: u32, cap: u32) -> (u32, u32) {
+pub(crate) fn scaled_dims(width: u32, height: u32, cap: u32) -> (u32, u32) {
     if width <= cap || width == 0 {
         return (width.max(1), height.max(1));
     }

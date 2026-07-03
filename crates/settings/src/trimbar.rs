@@ -27,6 +27,8 @@ pub struct TrimBar<'a, Message> {
     start: f32,
     end: f32,
     dur: f32,
+    /// Playback position to mark with a vertical line, when the preview is playing.
+    playhead: Option<f32>,
     on_start: Box<dyn Fn(f32) -> Message + 'a>,
     on_end: Box<dyn Fn(f32) -> Message + 'a>,
 }
@@ -44,9 +46,16 @@ impl<'a, Message> TrimBar<'a, Message> {
             end,
             // A zero duration would divide by zero when placing the handles.
             dur: dur.max(f32::EPSILON),
+            playhead: None,
             on_start: Box::new(on_start),
             on_end: Box::new(on_end),
         }
+    }
+
+    /// Mark the playback position with a vertical line.
+    pub fn playhead(mut self, secs: Option<f32>) -> Self {
+        self.playhead = secs;
+        self
     }
 
     /// The x pixel for clip time `secs`, within a bar spanning `[left, left + width]`.
@@ -186,6 +195,19 @@ where
             },
             Background::Color(Color::TRANSPARENT),
         );
+        if let Some(secs) = self.playhead {
+            let x = self.pixel_of(secs, b.x, b.width);
+            fill(
+                renderer,
+                rect(
+                    (x - 1.0).clamp(b.x, b.x + b.width - 2.0),
+                    b.y,
+                    2.0,
+                    b.height,
+                ),
+                palette::TEXT,
+            );
+        }
         handle(renderer, sx, b);
         handle(renderer, ex, b);
     }

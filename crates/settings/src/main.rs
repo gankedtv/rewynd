@@ -10,6 +10,7 @@
 //! helpers are unit-tested.
 
 mod library;
+mod player;
 mod theme;
 mod thumbs;
 mod trimbar;
@@ -1053,15 +1054,14 @@ impl App {
         let clips = iced::Subscription::run_with(dir, |dir| {
             clip_watch_stream(std::path::PathBuf::from(dir))
         });
-        let mut subs = vec![focus, clips];
-        // Drive the accent fade only while one is running: iced re-diffs subscriptions after each
-        // update, so when the fade clears this is dropped and the software renderer goes idle.
-        if self.library.animating() {
-            subs.push(
-                iced::window::frames().map(|at| Message::Library(library::Message::Tick(at))),
-            );
-        }
-        iced::Subscription::batch(subs)
+        // The library adds its own conditional subscriptions (accent-fade ticks, preview
+        // playback); iced re-diffs after each update, so they vanish when idle and the software
+        // renderer stops redrawing.
+        iced::Subscription::batch([
+            focus,
+            clips,
+            self.library.subscription().map(Message::Library),
+        ])
     }
 
     fn settings_view(&self) -> Element<'_, Message> {
