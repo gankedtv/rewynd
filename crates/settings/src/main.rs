@@ -10,8 +10,10 @@
 //! helpers are unit-tested.
 
 mod library;
+mod player;
 mod theme;
 mod thumbs;
+mod trimbar;
 mod wizard;
 
 use std::fmt;
@@ -1044,6 +1046,11 @@ impl App {
     fn subscription(&self) -> iced::Subscription<Message> {
         let focus = iced::event::listen_with(|event, _status, _id| match event {
             iced::Event::Window(iced::window::Event::Focused) => Some(Message::WindowFocused),
+            // Escape leaves the fullscreen preview (a no-op otherwise).
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                ..
+            }) => Some(Message::Library(library::Message::FullscreenExit)),
             _ => None,
         });
         let dir = config::clips_dir(self.config.output_dir().as_deref())
@@ -1052,7 +1059,14 @@ impl App {
         let clips = iced::Subscription::run_with(dir, |dir| {
             clip_watch_stream(std::path::PathBuf::from(dir))
         });
-        iced::Subscription::batch([focus, clips])
+        // The library adds its own conditional subscriptions (accent-fade ticks, preview
+        // playback); iced re-diffs after each update, so they vanish when idle and the software
+        // renderer stops redrawing.
+        iced::Subscription::batch([
+            focus,
+            clips,
+            self.library.subscription().map(Message::Library),
+        ])
     }
 
     fn settings_view(&self) -> Element<'_, Message> {

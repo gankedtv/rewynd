@@ -660,11 +660,17 @@ pub fn user_facing_upload_error(e: &UploadError) -> String {
     }
 }
 
-/// The default title every upload surface stamps on a clip: "rewynd YYYY-MM-DD HH:MM"
-/// in local time.
+/// The suggested title for a clip from `name` (the detected game, or the app itself):
+/// "Name YYYY-MM-DD HH:MM" in local time.
+#[must_use]
+pub fn titled(name: &str) -> String {
+    format!("{name} {}", jiff::Zoned::now().strftime("%Y-%m-%d %H:%M"))
+}
+
+/// The default title every upload surface stamps on a clip when no game is known.
 #[must_use]
 pub fn default_title() -> String {
-    format!("rewynd {}", jiff::Zoned::now().strftime("%Y-%m-%d %H:%M"))
+    titled("rewynd")
 }
 
 /// The clip's container duration, when parseable. Lenient by design: an unreadable or exotic

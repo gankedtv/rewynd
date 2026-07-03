@@ -99,13 +99,20 @@ pub fn window_icon() -> Option<iced::window::Icon> {
 }
 
 /// A grouped card, Arena style: raised panel, hairline border, 8px radius, with the
-/// title as a small uppercase eyebrow (accent, like the design's active wizard cards).
+/// title as a small uppercase eyebrow in the accent (mint by default).
 pub fn card<'a, M: 'a>(title: &'a str, content: impl Into<Element<'a, M>>) -> Element<'a, M> {
+    card_accent(title, palette::ACCENT, content)
+}
+
+/// [`card`] with an explicit eyebrow accent, for the upload panel whose colour follows the
+/// chosen destination (mint for ganked.tv, red for YouTube).
+pub fn card_accent<'a, M: 'a>(
+    title: &'a str,
+    accent: iced::Color,
+    content: impl Into<Element<'a, M>>,
+) -> Element<'a, M> {
     let inner = column![
-        text(title)
-            .size(10)
-            .font(UI_BOLD)
-            .style(tinted(palette::ACCENT)),
+        text(title).size(10).font(UI_BOLD).style(tinted(accent)),
         content.into(),
     ]
     .spacing(14);

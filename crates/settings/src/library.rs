@@ -5,10 +5,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use iced::widget::{
-    Space, button, column, container, pick_list, row, scrollable, slider, text, text_input,
+    Space, button, column, container, pick_list, row, scrollable, text, text_input,
 };
 use iced::{Background, Border, Element, Length, Task, Theme};
 
@@ -17,13 +17,15 @@ use rewynd_config::{ClipEntry, Config};
 use rewynd_upload::youtube::{
     DEFAULT_CLIENT_ID, DEFAULT_CLIENT_SECRET, YouTubeClient, user_facing_youtube_error,
 };
-use rewynd_upload::{GankedClient, Visibility, default_title, user_facing_upload_error};
+use rewynd_upload::{GankedClient, Visibility, default_title, titled, user_facing_upload_error};
 
+use crate::player;
 use crate::theme::{
     self, DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, accent_button_style, accent_chip, card, field_label,
-    hint, link_button, palette, primary_button, secondary_button, setting, tinted, value_row,
+    hint, link_button, palette, primary_button, secondary_button, tinted, value_row,
 };
 use crate::thumbs;
+use crate::trimbar;
 
 /// Cards per grid row (the body column is width-capped, so a fixed count stays balanced).
 const GRID_COLUMNS: usize = 3;
@@ -34,6 +36,18 @@ const ROOT_GROUP: &str = "Desktop";
 /// Thumbnail decodes running at once. Each holds a full decoded frame briefly, so a big
 /// library must stream through a small pool instead of decoding every stale clip at once.
 const MAX_DECODES: usize = 4;
+
+/// Keyframe thumbnails shown across the trim filmstrip.
+const FILMSTRIP_FRAMES: usize = 12;
+
+/// Decoded width of one filmstrip cell (~2x its ~60px logical size for hidpi sharpness).
+const FILMSTRIP_CELL_WIDTH: u32 = 120;
+
+/// Logical height of the detail page's preview pane.
+const PREVIEW_HEIGHT: f32 = 240.0;
+
+/// Buckets in the timeline's audio-peak lane.
+const WAVEFORM_BUCKETS: usize = 300;
 
 /// An upload destination the detail page can send a clip to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +71,13 @@ impl Dest {
             Dest::YouTube => upload_history::YOUTUBE,
         }
     }
+}
+
+/// One filmstrip cell for the open clip: a decoded keyframe, still decoding, or undecodable.
+enum StripCell {
+    Loading,
+    Ready(iced::widget::image::Handle),
+    Failed,
 }
 
 /// One clip's thumbnail slot, keyed by path; `modified` is the freshness check.
@@ -151,7 +172,6 @@ const POLL_MAX_READS: u32 = 60;
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Refresh,
     SearchEdited(String),
     GameFilterPicked(Option<String>),
     Scanned(Vec<ClipEntry>),
@@ -166,9 +186,10 @@ pub enum Message {
     Deleted(Result<PathBuf, String>),
     TrimStartChanged(f32),
     TrimEndChanged(f32),
-    TrimSave,
+    TrimSave(SaveMode),
     TrimSaved {
         src: PathBuf,
+        mode: SaveMode,
         result: Result<PathBuf, String>,
     },
     TitleEdited(String),
@@ -183,13 +204,47 @@ pub enum Message {
     Verified(PathBuf, Dest, Result<bool, String>),
     OpenLink(String),
     CopyLink(String),
+    /// A frame tick while an accent fade is running (carries the frame instant).
+    Tick(Instant),
+    /// A filmstrip cell finished decoding: (clip path, cell index, decoded frame or error).
+    StripDone(PathBuf, usize, Result<iced::widget::image::Handle, String>),
+    /// A scrub decode finished: the frame at the trim handle the user dragged.
+    ScrubDone(PathBuf, Result<iced::widget::image::Handle, String>),
+    /// Start or pause the in-app preview playback of the kept range.
+    PlayToggle,
+    /// The next playback frame, with its position in the clip.
+    PlayerFrame(iced::widget::image::Handle, Duration),
+    /// In-app playback has no decoder on this machine (ffmpeg missing).
+    PlayerUnavailable,
+    /// Playback reached the end of the kept range.
+    PlayerEnded,
+    /// The open clip's audio peaks arrived for the timeline lane (`None`: no audio/ffmpeg).
+    WaveformDone(PathBuf, Option<Vec<f32>>),
+    /// Grow the preview to fill the window, or shrink it back.
+    FullscreenToggle,
+    /// Leave the fullscreen preview (Escape).
+    FullscreenExit,
+    /// Move the playhead to this time (a press/drag between the trim edges).
+    Seek(f32),
+    /// A timeline drag was released; playback resumes here if seeking paused it.
+    TrimDragEnd,
+}
+
+/// What a trim save does with the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveMode {
+    /// Replace the original clip in place, so the open detail page (and the upload below it) act
+    /// on the trimmed clip.
+    Overwrite,
+    /// Keep the original and write the trim to a new file.
+    Copy,
 }
 
 /// Where the open clip's trim stands.
 enum TrimState {
     Idle,
     Saving,
-    Saved(PathBuf),
+    Saved { overwrite: bool, path: PathBuf },
     Failed(String),
 }
 
@@ -208,6 +263,35 @@ pub struct Library {
     game_filter: Option<String>,
     /// The clip whose detail page is open, if any.
     open: Option<PathBuf>,
+    /// The clip the filmstrip cells belong to (guards a late `StripDone` for a since-closed clip).
+    strip_path: Option<PathBuf>,
+    /// One slot per [`FILMSTRIP_FRAMES`] position for the open clip; empty when no clip is open.
+    strip: Vec<StripCell>,
+    /// Cells not yet decoding, drained into flight as slots free up: (cell index, position).
+    strip_pending: VecDeque<(usize, f32)>,
+    /// How many strip decodes are in flight (capped at [`MAX_DECODES`]).
+    strip_decoding: usize,
+    /// The frame under the trim handle last dragged, shown in the big preview.
+    scrub_frame: Option<iced::widget::image::Handle>,
+    /// Whether a scrub decode is in flight (one at a time; the latest request wins).
+    scrub_busy: bool,
+    /// The newest scrub time requested while a decode was in flight, in seconds.
+    scrub_pending: Option<f32>,
+    /// The `[start, end]` seconds the preview is playing, when playback runs (drives the
+    /// playback subscription; `None` = stopped).
+    play_range: Option<(f32, f32)>,
+    /// The playback frame on screen.
+    play_frame: Option<iced::widget::image::Handle>,
+    /// Where playback is (or paused), in seconds; resuming starts here.
+    play_pos: Option<f32>,
+    /// Why in-app playback can't run on this machine, when it can't (ffmpeg missing).
+    play_error: Option<&'static str>,
+    /// Whether seeking paused a running playback; releasing the drag resumes it.
+    seek_resume: bool,
+    /// Whether the preview fills the whole window.
+    fullscreen: bool,
+    /// The open clip's normalized audio peaks for the timeline lane.
+    waveform: Option<Vec<f32>>,
     confirm_delete: bool,
     /// Trim in/out points for the open clip, in seconds; reset to the full span on open.
     trim_start: f32,
@@ -222,6 +306,8 @@ pub struct Library {
     /// `view()` would make the placeholder's minute stamp tick while the page sits open).
     title_hint: String,
     dest: Dest,
+    /// An in-flight destination-accent fade, or `None` when the panel sits on a fixed brand.
+    accent_fade: Option<AccentFade>,
     visibility: Visibility,
     upload: UploadState,
     /// Remembered successful uploads (per clip, per destination), for badges + the duplicate
@@ -240,6 +326,20 @@ impl Library {
             search: String::new(),
             game_filter: None,
             open: None,
+            strip_path: None,
+            strip: Vec::new(),
+            strip_pending: VecDeque::new(),
+            strip_decoding: 0,
+            scrub_frame: None,
+            scrub_busy: false,
+            scrub_pending: None,
+            play_range: None,
+            play_frame: None,
+            play_pos: None,
+            play_error: None,
+            seek_resume: false,
+            fullscreen: false,
+            waveform: None,
             confirm_delete: false,
             trim_start: 0.0,
             trim_end: 0.0,
@@ -249,6 +349,7 @@ impl Library {
             title: String::new(),
             title_hint: String::new(),
             dest: Dest::Ganked,
+            accent_fade: None,
             visibility: Visibility::default(),
             upload: UploadState::Idle,
             history: upload_history::load(),
@@ -260,6 +361,21 @@ impl Library {
         self.open = None;
         self.confirm_delete = false;
         self.action_error = None;
+        self.clear_strip();
+        self.reset_preview();
+    }
+
+    /// Drop the scrub frame and stop any preview playback (leaving a clip, or its file changed).
+    fn reset_preview(&mut self) {
+        self.scrub_frame = None;
+        self.scrub_busy = false;
+        self.scrub_pending = None;
+        self.play_range = None;
+        self.play_frame = None;
+        self.play_pos = None;
+        self.play_error = None;
+        self.seek_resume = false;
+        self.fullscreen = false;
     }
 
     /// The upload record for `entry` at `dest`, if the clip was uploaded there.
@@ -298,7 +414,6 @@ impl Library {
 
     pub fn update(&mut self, message: Message, config: &Config) -> Task<Message> {
         match message {
-            Message::Refresh => return self.refresh(config),
             Message::SearchEdited(q) => self.search = q,
             Message::GameFilterPicked(game) => self.game_filter = game,
             Message::Scanned(entries) => return self.scanned(entries),
@@ -331,11 +446,17 @@ impl Library {
                 self.trim_start = 0.0;
                 self.trim_end = self.open_dur;
                 self.trim = TrimState::Idle;
-                self.open = Some(path);
+                self.reset_preview();
+                // The suggested title leads with the game when one was detected.
+                self.title_hint = match self.entry(&path).and_then(|e| e.game.as_deref()) {
+                    Some(game) => titled(game),
+                    None => default_title(),
+                };
+                self.open = Some(path.clone());
                 self.confirm_delete = false;
                 self.action_error = None;
                 self.upload = UploadState::Idle;
-                self.title_hint = default_title();
+                self.accent_fade = None;
                 self.title = self.title_hint.clone();
                 let (ganked, youtube) = dest_statuses(config);
                 self.dest = if !ganked.ready() && youtube.ready() {
@@ -344,11 +465,14 @@ impl Library {
                     Dest::Ganked
                 };
                 self.visibility = self.default_visibility(config);
+                return self.load_open_media(path);
             }
             Message::Back => {
                 self.open = None;
                 self.confirm_delete = false;
                 self.action_error = None;
+                self.clear_strip();
+                self.reset_preview();
             }
             Message::Play => {
                 if let Some(path) = &self.open
@@ -394,6 +518,8 @@ impl Library {
                 self.pending_thumbs.retain(|(p, _)| p != &path);
                 if self.open == Some(path) {
                     self.open = None;
+                    self.clear_strip();
+                    self.reset_preview();
                 }
                 self.action_error = None;
             }
@@ -404,13 +530,24 @@ impl Library {
                 // Keep at least a small gap below the end.
                 self.trim_start = v.clamp(0.0, (self.trim_end - 0.2).max(0.0));
                 self.trim = TrimState::Idle;
+                // Editing the range pauses playback; the preview scrubs to the handle instead.
+                self.play_range = None;
+                self.play_frame = None;
+                self.play_pos = None;
+                self.seek_resume = false;
+                return self.scrub(self.trim_start);
             }
             Message::TrimEndChanged(v) => {
                 let hi = self.open_duration();
                 self.trim_end = v.clamp(self.trim_start + 0.2, hi.max(0.2));
                 self.trim = TrimState::Idle;
+                self.play_range = None;
+                self.play_frame = None;
+                self.play_pos = None;
+                self.seek_resume = false;
+                return self.scrub(self.trim_end);
             }
-            Message::TrimSave => {
+            Message::TrimSave(mode) => {
                 let Some(src) = self.open.clone() else {
                     return Task::none();
                 };
@@ -420,31 +557,34 @@ impl Library {
                 let work_src = src.clone();
                 return Task::perform(
                     async move {
-                        tokio::task::spawn_blocking(move || {
-                            let dst = unique_trim_path(&work_src);
-                            rewynd_mux::read::trim_clip(&work_src, &dst, start, end)
-                                .map(|_| dst)
-                                .map_err(|e| e.to_string())
-                        })
-                        .await
-                        .unwrap_or_else(|e| Err(e.to_string()))
+                        tokio::task::spawn_blocking(move || save_trim(&work_src, mode, start, end))
+                            .await
+                            .unwrap_or_else(|e| Err(e.to_string()))
                     },
                     move |result| Message::TrimSaved {
                         src: src.clone(),
+                        mode,
                         result,
                     },
                 );
             }
-            Message::TrimSaved { src, result } => {
+            Message::TrimSaved { src, mode, result } => {
                 // The trim may finish after the user opened another clip; only stamp the result on
                 // its own detail page. The rescan still runs so the new clip shows up regardless.
                 let current = self.open.as_deref() == Some(src.as_path());
                 match result {
                     Ok(path) => {
+                        let overwrite = matches!(mode, SaveMode::Overwrite);
                         if current {
-                            self.trim = TrimState::Saved(path);
+                            self.trim = TrimState::Saved { overwrite, path };
                         }
-                        return self.refresh(config);
+                        let mut tasks = vec![self.refresh(config)];
+                        // Overwrite replaced the open clip in place: reload its span + filmstrip so
+                        // the panel (and the upload below) work on the now-trimmed content.
+                        if current && overwrite {
+                            tasks.push(self.refresh_open_after_trim());
+                        }
+                        return Task::batch(tasks);
                     }
                     Err(e) if current => {
                         self.trim =
@@ -456,8 +596,15 @@ impl Library {
             Message::TitleEdited(s) => self.title = s,
             Message::DestPicked(dest) => {
                 if self.dest != dest {
+                    let from = self.current_accent();
                     self.dest = dest;
                     self.visibility = self.default_visibility(config);
+                    self.accent_fade = Some(AccentFade {
+                        from,
+                        to: dest_accent(dest),
+                        start: None,
+                        progress: 0.0,
+                    });
                 }
             }
             Message::VisibilityPicked(v) => self.visibility = v,
@@ -476,6 +623,94 @@ impl Library {
             Message::StatusPolled(path, result) => return self.status_polled(&path, result),
             Message::Verified(path, dest, result) => {
                 return self.verified(path, dest, result, config);
+            }
+            Message::Tick(now) => self.advance_fade(now),
+            Message::StripDone(path, index, result) => {
+                if self.strip_path.as_deref() == Some(path.as_path()) {
+                    self.strip_decoding = self.strip_decoding.saturating_sub(1);
+                    if let Some(cell) = self.strip.get_mut(index) {
+                        *cell = match result {
+                            Ok(handle) => StripCell::Ready(handle),
+                            Err(e) => {
+                                tracing::warn!(path = %path.display(), index, error = %e, "no filmstrip frame");
+                                StripCell::Failed
+                            }
+                        };
+                    }
+                    return self.start_strip_decodes();
+                }
+            }
+            Message::ScrubDone(path, result) => {
+                if self.open.as_deref() == Some(path.as_path()) {
+                    self.scrub_busy = false;
+                    if let Ok(handle) = result {
+                        self.scrub_frame = Some(handle);
+                    }
+                    if let Some(secs) = self.scrub_pending.take() {
+                        return self.scrub(secs);
+                    }
+                }
+            }
+            Message::PlayToggle => {
+                if self.play_range.is_some() {
+                    // Pause: the position sticks, so the next press resumes there.
+                    self.play_range = None;
+                } else {
+                    // Resume from where playback paused when that is still inside the kept
+                    // range, else start the range over. The paused frame stays up until the
+                    // first new frame lands, so resuming never flashes an older image.
+                    let from = self
+                        .play_pos
+                        .filter(|p| (self.trim_start..self.trim_end - 0.1).contains(p))
+                        .unwrap_or(self.trim_start);
+                    self.play_error = None;
+                    self.play_range = Some((from, self.trim_end));
+                }
+            }
+            Message::PlayerFrame(handle, pts) => {
+                if self.play_range.is_some() {
+                    self.play_frame = Some(handle);
+                    self.play_pos = Some(pts.as_secs_f32());
+                }
+            }
+            Message::PlayerUnavailable => {
+                self.play_range = None;
+                self.play_pos = None;
+                self.play_error =
+                    Some("In-app preview needs ffmpeg installed; use Open in player.");
+            }
+            Message::PlayerEnded => {
+                self.play_range = None;
+                self.play_pos = None;
+            }
+            Message::WaveformDone(path, peaks) => {
+                if self.strip_path.as_deref() == Some(path.as_path()) {
+                    self.waveform = peaks;
+                }
+            }
+            Message::FullscreenToggle => self.set_fullscreen(!self.fullscreen),
+            Message::FullscreenExit => self.set_fullscreen(false),
+            Message::Seek(secs) => {
+                let secs = secs.clamp(self.trim_start, self.trim_end.max(self.trim_start));
+                self.play_pos = Some(secs);
+                // Seeking scrubs (one ffmpeg per pixel would be a process storm); a paused
+                // playback resumes from here when the drag lets go.
+                if self.play_range.is_some() {
+                    self.seek_resume = true;
+                    self.play_range = None;
+                }
+                self.play_frame = None;
+                return self.scrub(secs);
+            }
+            Message::TrimDragEnd => {
+                if self.seek_resume {
+                    self.seek_resume = false;
+                    let from = self
+                        .play_pos
+                        .unwrap_or(self.trim_start)
+                        .clamp(self.trim_start, (self.trim_end - 0.05).max(self.trim_start));
+                    self.play_range = Some((from, self.trim_end));
+                }
             }
             Message::OpenLink(url) => {
                 if let Err(e) = open::that_detached(&url) {
@@ -544,6 +779,168 @@ impl Library {
                     (path, modified, result)
                 },
                 |(path, modified, result)| Message::ThumbDone(path, modified, result),
+            ));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Reload the open clip's trim span and filmstrip after an in-place overwrite: its duration
+    /// and frames changed, so reset the range to the new full span and re-decode the strip.
+    fn refresh_open_after_trim(&mut self) -> Task<Message> {
+        let Some(path) = self.open.clone() else {
+            return Task::none();
+        };
+        self.open_dur =
+            rewynd_mux::read::clip_summary(&path).map_or(0.0, |s| s.duration.as_secs_f32());
+        self.trim_start = 0.0;
+        self.trim_end = self.open_dur;
+        self.reset_preview();
+        self.load_open_media(path)
+    }
+
+    /// (Re)build the open clip's timeline media: the filmstrip cells and the audio-peak lane.
+    fn load_open_media(&mut self, path: PathBuf) -> Task<Message> {
+        self.waveform = None;
+        let wave_path = path.clone();
+        let wave = Task::perform(
+            async move {
+                let peaks = tokio::task::spawn_blocking({
+                    let path = wave_path.clone();
+                    move || player::waveform(&path, WAVEFORM_BUCKETS)
+                })
+                .await
+                .unwrap_or(None);
+                (wave_path, peaks)
+            },
+            |(path, peaks)| Message::WaveformDone(path, peaks),
+        );
+        Task::batch([self.build_strip(path), wave])
+    }
+
+    /// Grow or shrink the preview; a running playback restarts from its current position so the
+    /// decode width follows the pane size.
+    fn set_fullscreen(&mut self, on: bool) {
+        if self.fullscreen == on {
+            return;
+        }
+        self.fullscreen = on;
+        if let (Some((_, end)), Some(pos)) = (self.play_range, self.play_pos) {
+            self.play_range = Some((pos.min(end), end));
+        }
+    }
+
+    /// The decode width for scrub frames and playback, matching the pane the preview fills.
+    fn preview_width(&self) -> u32 {
+        if self.fullscreen {
+            player::FULLSCREEN_WIDTH
+        } else {
+            player::PREVIEW_WIDTH
+        }
+    }
+
+    /// Decode the frame at `secs` into the big preview (the trim handle being dragged). One
+    /// decode at a time; while one runs the newest request waits in `scrub_pending`.
+    fn scrub(&mut self, secs: f32) -> Task<Message> {
+        let Some(path) = self.open.clone() else {
+            return Task::none();
+        };
+        if self.scrub_busy {
+            self.scrub_pending = Some(secs);
+            return Task::none();
+        }
+        self.scrub_busy = true;
+        let position = secs / self.open_dur.max(f32::EPSILON);
+        let width = self.preview_width();
+        Task::perform(
+            async move {
+                let result = tokio::task::spawn_blocking({
+                    let path = path.clone();
+                    move || thumbs::load_at(&path, position, width)
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
+                (path, result)
+            },
+            |(path, result)| Message::ScrubDone(path, result),
+        )
+    }
+
+    /// Frame ticks while the accent fades, plus the preview-playback stream while it runs. The
+    /// playback subscription is keyed by (clip, range); dropping it cancels the decode thread.
+    pub fn subscription(&self) -> iced::Subscription<Message> {
+        let mut subs = Vec::new();
+        if self.animating() {
+            subs.push(iced::window::frames().map(Message::Tick));
+        }
+        if let (Some(path), Some((start, end))) = (&self.open, self.play_range) {
+            let key = (
+                path.clone(),
+                Duration::from_secs_f32(start.max(0.0)),
+                Duration::from_secs_f32(end.max(0.0)),
+                self.preview_width(),
+            );
+            subs.push(
+                iced::Subscription::run_with(
+                    key,
+                    |(path, start, end, width): &(PathBuf, Duration, Duration, u32)| {
+                        player::stream(path.clone(), *start, *end, *width)
+                    },
+                )
+                .map(|event| match event {
+                    player::Event::Frame(handle, pts) => Message::PlayerFrame(handle, pts),
+                    player::Event::Unavailable => Message::PlayerUnavailable,
+                    player::Event::Ended => Message::PlayerEnded,
+                }),
+            );
+        }
+        iced::Subscription::batch(subs)
+    }
+
+    /// Drop the filmstrip and waveform for whatever clip was open (free the decoded frames).
+    fn clear_strip(&mut self) {
+        self.strip_path = None;
+        self.strip.clear();
+        self.strip_pending.clear();
+        self.strip_decoding = 0;
+        self.waveform = None;
+    }
+
+    /// Queue all filmstrip cells for `path` and kick off the first decodes.
+    fn build_strip(&mut self, path: PathBuf) -> Task<Message> {
+        self.strip_path = Some(path);
+        self.strip = (0..FILMSTRIP_FRAMES).map(|_| StripCell::Loading).collect();
+        self.strip_pending = filmstrip_positions(FILMSTRIP_FRAMES)
+            .into_iter()
+            .enumerate()
+            .collect();
+        self.strip_decoding = 0;
+        self.start_strip_decodes()
+    }
+
+    /// Start queued strip decodes until [`MAX_DECODES`] are in flight; each is one blocking
+    /// `thumbs::load_at`. [`Message::StripDone`] frees a slot and returns here for the next.
+    fn start_strip_decodes(&mut self) -> Task<Message> {
+        let Some(path) = self.strip_path.clone() else {
+            return Task::none();
+        };
+        let mut tasks = Vec::new();
+        while self.strip_decoding < MAX_DECODES {
+            let Some((index, position)) = self.strip_pending.pop_front() else {
+                break;
+            };
+            self.strip_decoding += 1;
+            let path = path.clone();
+            tasks.push(Task::perform(
+                async move {
+                    let result = tokio::task::spawn_blocking({
+                        let path = path.clone();
+                        move || thumbs::load_at(&path, position, FILMSTRIP_CELL_WIDTH)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()));
+                    (path, index, result)
+                },
+                |(path, index, result)| Message::StripDone(path, index, result),
             ));
         }
         Task::batch(tasks)
@@ -812,8 +1209,38 @@ impl Library {
         self.entries.iter().find(|e| &e.path == path)
     }
 
+    /// The (fill, ink) accent the upload panel paints with right now: the destination brand,
+    /// or the interpolated value while a switch is fading.
+    fn current_accent(&self) -> (iced::Color, iced::Color) {
+        self.accent_fade
+            .as_ref()
+            .map_or_else(|| dest_accent(self.dest), AccentFade::accent)
+    }
+
+    /// Whether an accent fade is running (drives the frame subscription in `main`).
+    pub fn animating(&self) -> bool {
+        self.accent_fade.is_some()
+    }
+
+    /// Advance any running accent fade to frame time `now`, dropping it once complete so the
+    /// frame subscription in `main` stops (no idle redraw).
+    fn advance_fade(&mut self, now: Instant) {
+        if let Some(fade) = &mut self.accent_fade
+            && fade.advance(now)
+        {
+            self.accent_fade = None;
+        }
+    }
+
     pub fn view(&self, config: &Config) -> Element<'_, Message> {
-        let body: Element<Message> = match self.open.as_ref().and_then(|p| self.entry(p)) {
+        let open = self.open.as_ref().and_then(|p| self.entry(p));
+        // Fullscreen preview bypasses the page shell (no width cap, no scroll).
+        if self.fullscreen
+            && let Some(entry) = open
+        {
+            return self.fullscreen_view(entry);
+        }
+        let body: Element<Message> = match open {
             Some(entry) => self.detail(entry, dest_statuses(config)),
             None => self.grid(),
         };
@@ -845,6 +1272,7 @@ impl Library {
                 .style(tinted(palette::TEXT_SECONDARY)),
         ]
         .spacing(4);
+        // No manual refresh: the directory watcher and window focus already rescan.
         let header = row![
             title,
             Space::new().width(Length::Fill),
@@ -853,10 +1281,6 @@ impl Library {
             } else {
                 Space::new().into()
             },
-            button(text("Refresh").size(12).font(UI_SEMIBOLD))
-                .on_press(Message::Refresh)
-                .style(secondary_button)
-                .padding([8, 16]),
         ]
         .spacing(12)
         .align_y(iced::Alignment::Center);
@@ -1037,7 +1461,12 @@ impl Library {
 
         button(
             column![
-                self.thumbnail(entry, 148.0),
+                container(
+                    layered([self.thumbnail(entry, 148.0)])
+                        .width(Length::Fill)
+                        .height(Length::Fixed(148.0)),
+                )
+                .clip(true),
                 container(info).padding([11, 12]),
             ]
             .spacing(0),
@@ -1075,14 +1504,124 @@ impl Library {
     /// (or when the clip can't be decoded).
     fn thumbnail<'a>(&'a self, entry: &'a ClipEntry, height: f32) -> Element<'a, Message> {
         match self.thumbs.get(&entry.path) {
-            Some(Thumb::Ready { handle, .. }) => iced::widget::image(handle.clone())
-                .width(Length::Fill)
-                .height(height)
-                .content_fit(iced::ContentFit::Cover)
-                .into(),
+            Some(Thumb::Ready { handle, .. }) => frame_image(handle.clone(), height),
             Some(Thumb::Failed { .. }) => placeholder("No preview", height),
             _ => placeholder("Loading...", height),
         }
+    }
+
+    /// The moving preview frame, when there is one: the live playback frame, else the frame
+    /// under the trim handle last dragged.
+    fn moving_frame(&self) -> Option<iced::widget::image::Handle> {
+        self.play_frame.clone().or_else(|| self.scrub_frame.clone())
+    }
+
+    /// The big detail preview: the moving frame (else the thumbnail), the brand mark as the
+    /// centred play control, click-anywhere pause, and the fullscreen toggle.
+    fn preview<'a>(&'a self, entry: &'a ClipEntry) -> Element<'a, Message> {
+        let frame: Element<Message> = match self.moving_frame() {
+            Some(handle) => frame_image(handle, PREVIEW_HEIGHT),
+            None => self.thumbnail(entry, PREVIEW_HEIGHT),
+        };
+        let playing = self.play_range.is_some();
+        let mut layers: Vec<Element<Message>> = vec![
+            iced::widget::mouse_area(frame)
+                .on_press(Message::PlayToggle)
+                .into(),
+        ];
+        if !playing {
+            layers.push(
+                container(logo_play_button(56.0))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(iced::Alignment::Center)
+                    .align_y(iced::Alignment::Center)
+                    .into(),
+            );
+        }
+        layers.push(
+            container(
+                button(text("Fullscreen").size(11).font(UI_SEMIBOLD))
+                    .on_press(Message::FullscreenToggle)
+                    .style(secondary_button)
+                    .padding([5, 10]),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::Alignment::End)
+            .align_y(iced::Alignment::End)
+            .padding(8)
+            .into(),
+        );
+        // Layered above an empty base: iced only hard-clips layered stack children, so this
+        // keeps the Cover-scaled frame inside the box (see `layered`).
+        let stack = layered(layers)
+            .width(Length::Fill)
+            .height(Length::Fixed(PREVIEW_HEIGHT));
+        let mut col = column![container(stack).clip(true).style(theme::card_style)].spacing(6);
+        if let Some(reason) = self.play_error {
+            col = col.push(hint(reason));
+        }
+        col.into()
+    }
+
+    /// The fullscreen preview: the video filling the window (letterboxed, never cropped), the
+    /// timeline underneath so trimming keeps working, and an exit control (also Escape).
+    fn fullscreen_view<'a>(&'a self, entry: &'a ClipEntry) -> Element<'a, Message> {
+        let frame: Element<Message> = match self.moving_frame() {
+            Some(handle) => iced::widget::image(handle)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .content_fit(iced::ContentFit::Contain)
+                .into(),
+            None => self.thumbnail(entry, 400.0),
+        };
+        let playing = self.play_range.is_some();
+        let mut layers: Vec<Element<Message>> = vec![
+            iced::widget::mouse_area(frame)
+                .on_press(Message::PlayToggle)
+                .into(),
+        ];
+        if !playing {
+            layers.push(
+                container(logo_play_button(96.0))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(iced::Alignment::Center)
+                    .align_y(iced::Alignment::Center)
+                    .into(),
+            );
+        }
+        let video = layered(layers).width(Length::Fill).height(Length::Fill);
+
+        let stat = |label: &'static str, secs: f32| {
+            text(format!("{label} {}", secs_label(secs)))
+                .size(12)
+                .font(UI_SEMIBOLD)
+                .style(tinted(palette::TEXT_SECONDARY))
+        };
+        let controls = row![
+            stat("Start", self.trim_start),
+            stat("End", self.trim_end),
+            stat("Length", (self.trim_end - self.trim_start).max(0.0)),
+            Space::new().width(Length::Fill),
+            button(text("Exit fullscreen").size(11).font(UI_SEMIBOLD))
+                .on_press(Message::FullscreenExit)
+                .style(secondary_button)
+                .padding([6, 12]),
+        ]
+        .spacing(16)
+        .align_y(iced::Alignment::Center);
+
+        column![
+            container(video).width(Length::Fill).height(Length::Fill),
+            self.filmstrip(),
+            controls,
+        ]
+        .spacing(12)
+        .padding(16)
+        .height(Length::Fill)
+        .into()
     }
 
     /// The detail page for one clip: preview, facts, actions, and the upload panel.
@@ -1091,15 +1630,18 @@ impl Library {
         entry: &'a ClipEntry,
         (ganked, youtube): (DestStatus, DestStatus),
     ) -> Element<'a, Message> {
-        let back = button(text("Back to library").size(12).font(UI_SEMIBOLD))
+        let back = button(text("← Back to library").size(12).font(UI_SEMIBOLD))
             .on_press(Message::Back)
             .style(link_button)
             .padding(0);
 
+        // The heading leads with the game when one was detected.
+        let heading = match &entry.game {
+            Some(game) => format!("{game} · {}", saved_at_label(entry.saved_at)),
+            None => saved_at_label(entry.saved_at),
+        };
         let mut facts = column![
-            text(saved_at_label(entry.saved_at).to_uppercase())
-                .size(26)
-                .font(DISPLAY_BLACK),
+            text(heading.to_uppercase()).size(26).font(DISPLAY_BLACK),
             self.meta_row(entry, 11.0, palette::TEXT_SECONDARY),
             hint(entry.path.display().to_string()),
         ]
@@ -1109,9 +1651,8 @@ impl Library {
             facts = facts.push(text(e.clone()).size(12).style(tinted(palette::DANGER)));
         }
 
-        let preview = container(self.thumbnail(entry, 240.0)).style(theme::card_style);
         let top = row![
-            container(preview).width(Length::FillPortion(5)),
+            container(self.preview(entry)).width(Length::FillPortion(5)),
             container(facts).width(Length::FillPortion(4)),
         ]
         .spacing(20);
@@ -1131,6 +1672,58 @@ impl Library {
         self.open_dur
     }
 
+    /// A row of keyframe thumbnails across the whole clip, with the draggable [`TrimBar`] on top:
+    /// the kept `[start, end]` band stays lit with mint handles, the rest is scrimmed.
+    fn filmstrip(&self) -> Element<'_, Message> {
+        if self.strip.is_empty() {
+            return Space::new().into();
+        }
+        let mut cells = row![].width(Length::Fill).height(Length::Fill);
+        for cell in &self.strip {
+            let content: Element<Message> = match cell {
+                StripCell::Ready(handle) => iced::widget::image(handle.clone())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .content_fit(iced::ContentFit::Cover)
+                    .into(),
+                _ => container(Space::new())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(|_: &Theme| container::Style {
+                        background: Some(Background::Color(palette::HIGH)),
+                        ..container::Style::default()
+                    })
+                    .into(),
+            };
+            cells = cells.push(
+                container(content)
+                    .width(Length::FillPortion(1))
+                    .height(Length::Fill),
+            );
+        }
+
+        let bar = trimbar::TrimBar::new(
+            self.trim_start,
+            self.trim_end,
+            self.open_dur,
+            Message::TrimStartChanged,
+            Message::TrimEndChanged,
+        )
+        .playhead(self.play_pos)
+        .waveform(self.waveform.as_deref())
+        .on_seek(Message::Seek)
+        .on_released(Message::TrimDragEnd);
+        let stack = layered([cells.into(), bar.into()])
+            .width(Length::Fill)
+            .height(Length::Fill);
+        container(stack)
+            .width(Length::Fill)
+            .height(Length::Fixed(64.0))
+            .clip(true)
+            .style(theme::card_style)
+            .into()
+    }
+
     /// The trim panel: a start/end range over the clip, and a lossless "save a trimmed copy" action.
     fn trim_panel(&self) -> Element<'_, Message> {
         let dur = self.open_dur.max(0.2);
@@ -1139,43 +1732,57 @@ impl Library {
         let length = (end - start).max(0.0);
 
         let panel = column![
-            setting(
-                "Start",
-                secs_label(start),
-                slider(0.0..=dur, start, Message::TrimStartChanged)
-                    .step(0.1f32)
-                    .style(theme::arena_slider),
-            ),
-            setting(
-                "End",
-                secs_label(end),
-                slider(0.0..=dur, end, Message::TrimEndChanged)
-                    .step(0.1f32)
-                    .style(theme::arena_slider),
-            ),
+            self.filmstrip(),
+            value_row("Start", secs_label(start)),
+            value_row("End", secs_label(end)),
             value_row("Trimmed length", secs_label(length)),
             hint(
-                "The start snaps back to the nearest keyframe (about a second), so the cut is \
-                 instant and lossless. The trimmed clip is saved as a new file.",
+                "Drag the handles on the timeline to set the range. The start snaps back to the \
+                 nearest keyframe (about a second), so the cut is lossless. Save replaces this \
+                 clip; Save as copy keeps the original.",
             ),
         ]
         .spacing(14);
 
         let busy = matches!(self.trim, TrimState::Saving);
-        let mut save = button(text("Save trimmed clip").size(13).font(UI_BOLD))
+        // Saving an untouched range would only copy the clip; wait until a handle moved.
+        let changed = start > 0.05 || end < dur - 0.05;
+        let ready = !busy && length >= 0.2 && changed;
+        let mut save = button(text("Save").size(13).font(UI_BOLD))
             .style(primary_button)
             .padding([11, 24]);
-        if !busy && length >= 0.2 {
-            save = save.on_press(Message::TrimSave);
+        let mut save_copy = button(text("Save as copy").size(12).font(UI_SEMIBOLD))
+            .style(secondary_button)
+            .padding([11, 20]);
+        if ready {
+            save = save.on_press(Message::TrimSave(SaveMode::Overwrite));
+            save_copy = save_copy.on_press(Message::TrimSave(SaveMode::Copy));
         }
-        let panel = panel.push(row![save].spacing(10));
+        let panel = panel.push(
+            container(
+                row![save, save_copy]
+                    .spacing(10)
+                    .align_y(iced::Alignment::Center),
+            )
+            .center_x(Length::Fill),
+        );
 
         let panel = match &self.trim {
             TrimState::Idle => panel,
             TrimState::Saving => panel.push(hint("Saving the trimmed clip...")),
-            TrimState::Saved(path) => panel.push(
+            TrimState::Saved {
+                overwrite: true, ..
+            } => panel.push(
+                text("Trimmed. Ready to upload below.")
+                    .size(12)
+                    .style(tinted(palette::ACCENT)),
+            ),
+            TrimState::Saved {
+                overwrite: false,
+                path,
+            } => panel.push(
                 column![
-                    text("Saved a trimmed clip.")
+                    text("Saved a trimmed copy.")
                         .size(12)
                         .style(tinted(palette::ACCENT)),
                     hint(path.display().to_string()),
@@ -1210,10 +1817,10 @@ impl Library {
             .into();
         }
         row![
-            button(text("Play").size(12).font(UI_BOLD))
+            button(text("Open in player").size(11).font(UI_SEMIBOLD))
                 .on_press(Message::Play)
-                .style(primary_button)
-                .padding([9, 22]),
+                .style(secondary_button)
+                .padding([9, 14]),
             button(text("Show in folder").size(11).font(UI_SEMIBOLD))
                 .on_press(Message::ShowInFolder)
                 .style(secondary_button)
@@ -1252,7 +1859,11 @@ impl Library {
 
         let seg = |label: &'static str, dest: Dest, ready: bool| {
             let active = self.dest == dest;
-            let (accent, ink) = dest_accent(dest);
+            let (accent, ink) = if active {
+                self.current_accent()
+            } else {
+                dest_accent(dest)
+            };
             let b = button(
                 container(text(label).size(11).font(UI_SEMIBOLD))
                     .center_x(Length::Fill)
@@ -1319,7 +1930,8 @@ impl Library {
         let already_uploaded = self.record_for(entry, self.dest).is_some();
         // The action button takes the destination's brand accent: mint for ganked.tv, red for
         // YouTube, so the whole panel reads as "this clip is headed to YouTube".
-        let (accent, ink) = dest_accent(self.dest);
+        let (accent, ink) = self.current_accent();
+        // Hover tracks the destination target (a hover mid-fade is rare and cosmetic).
         let accent_hover = match self.dest {
             Dest::Ganked => palette::ACCENT_HOVER,
             Dest::YouTube => palette::YOUTUBE_HOVER,
@@ -1344,13 +1956,15 @@ impl Library {
         }
 
         let mut panel = column![title, destination, visibility].spacing(16);
-        panel = panel.push(row![send].spacing(10).align_y(iced::Alignment::Center));
-        panel = panel.push(self.upload_status(entry));
-        card("UPLOAD", panel)
+        panel = panel.push(container(send).center_x(Length::Fill));
+        panel = panel.push(self.upload_status(entry, accent));
+        theme::card_accent("UPLOAD", accent, panel)
     }
 
-    /// The status line under the upload button, for whatever upload concerns this clip.
-    fn upload_status(&self, entry: &ClipEntry) -> Element<'_, Message> {
+    /// The status line under the upload button, for whatever upload concerns this clip. `accent`
+    /// is the destination brand colour (mint/red, or the fading value), so success lines and
+    /// share links match the rest of the panel.
+    fn upload_status(&self, entry: &ClipEntry, accent: iced::Color) -> Element<'_, Message> {
         match &self.upload {
             UploadState::Uploading { path, dest, .. } if *path == entry.path => {
                 cancellable(format!("Uploading to {}...", dest.label()))
@@ -1370,7 +1984,7 @@ impl Library {
                 ]
                 .spacing(8);
                 if let Some(url) = link {
-                    col = col.push(link_actions(url));
+                    col = col.push(link_actions(url, accent));
                 }
                 col.push(anyway_button("Upload another copy")).into()
             }
@@ -1391,12 +2005,12 @@ impl Library {
                 let mut line = row![
                     text(format!("Uploaded to {}.", dest.label()))
                         .size(12)
-                        .style(tinted(palette::ACCENT))
+                        .style(tinted(accent))
                 ]
                 .spacing(12)
                 .align_y(iced::Alignment::Center);
                 line = match link {
-                    Some(url) => line.push(link_actions(url)),
+                    Some(url) => line.push(link_actions(url, accent)),
                     None => line.push(
                         text(note.clone())
                             .size(12)
@@ -1420,12 +2034,12 @@ impl Library {
                     let mut line = row![
                         text(format!("Already on {}.", self.dest.label()))
                             .size(12)
-                            .style(tinted(palette::ACCENT))
+                            .style(tinted(accent))
                     ]
                     .spacing(12)
                     .align_y(iced::Alignment::Center);
                     if let Some(url) = &record.url {
-                        line = line.push(link_actions(url));
+                        line = line.push(link_actions(url, accent));
                     }
                     line.into()
                 }
@@ -1435,13 +2049,13 @@ impl Library {
     }
 }
 
-/// A share/watch link with Open + Copy-link buttons, shared by the upload status lines.
-fn link_actions(url: &str) -> Element<'static, Message> {
+/// A share/watch link with Open + Copy-link buttons, in the destination's brand accent.
+fn link_actions(url: &str, accent: iced::Color) -> Element<'static, Message> {
     row![
         text(url.to_owned())
             .size(12)
             .font(UI_SEMIBOLD)
-            .style(tinted(palette::ACCENT)),
+            .style(tinted(accent)),
         button(text("Open").size(11).font(UI_SEMIBOLD))
             .on_press(Message::OpenLink(url.to_owned()))
             .style(secondary_button)
@@ -1771,6 +2385,96 @@ fn unique_trim_path(src: &Path) -> PathBuf {
     candidate
 }
 
+/// A sibling temp path in `src`'s directory (so the replace is a same-filesystem, atomic rename).
+fn overwrite_temp_path(src: &Path) -> PathBuf {
+    let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("clip");
+    src.with_file_name(format!(".{name}.trimming.{}.tmp", std::process::id()))
+}
+
+/// Trim `src` to `[start, end]`. [`SaveMode::Copy`] writes a fresh sibling file and returns it;
+/// [`SaveMode::Overwrite`] writes a temp then atomically renames it over `src` (leaving the
+/// original untouched if anything fails), returning `src`. Blocking.
+fn save_trim(
+    src: &Path,
+    mode: SaveMode,
+    start: Duration,
+    end: Duration,
+) -> Result<PathBuf, String> {
+    match mode {
+        SaveMode::Copy => {
+            let dst = unique_trim_path(src);
+            rewynd_mux::read::trim_clip(src, &dst, start, end)
+                .map(|_| dst)
+                .map_err(|e| e.to_string())
+        }
+        SaveMode::Overwrite => {
+            let temp = overwrite_temp_path(src);
+            let result = rewynd_mux::read::trim_clip(src, &temp, start, end)
+                .map_err(|e| e.to_string())
+                .and_then(|_| std::fs::rename(&temp, src).map_err(|e| e.to_string()))
+                .map(|()| src.to_path_buf());
+            if result.is_err() {
+                let _ = std::fs::remove_file(&temp);
+            }
+            result
+        }
+    }
+}
+
+/// `n` evenly spaced, centred sample positions in `0.0..1.0` (cell i samples its own midpoint),
+/// so the strip skips the very first and last frames.
+fn filmstrip_positions(n: usize) -> Vec<f32> {
+    (0..n).map(|i| (i as f32 + 0.5) / n as f32).collect()
+}
+
+/// How long the upload-panel accent takes to fade when the destination switches.
+const ACCENT_FADE: Duration = Duration::from_millis(220);
+
+/// An in-flight accent fade between two (fill, ink) brand pairs. `start` is anchored on the
+/// first tick, so all time comes from the frame subscription rather than `Instant::now()` in
+/// update.
+struct AccentFade {
+    from: (iced::Color, iced::Color),
+    to: (iced::Color, iced::Color),
+    start: Option<Instant>,
+    progress: f32,
+}
+
+impl AccentFade {
+    /// The interpolated (fill, ink) at the current progress.
+    fn accent(&self) -> (iced::Color, iced::Color) {
+        (
+            lerp_color(self.from.0, self.to.0, self.progress),
+            lerp_color(self.from.1, self.to.1, self.progress),
+        )
+    }
+
+    /// Advance to frame time `now`, anchoring the clock on the first call. Returns `true` once
+    /// the fade has reached its end (the caller then drops it).
+    fn advance(&mut self, now: Instant) -> bool {
+        let start = *self.start.get_or_insert(now);
+        let linear = now.duration_since(start).as_secs_f32() / ACCENT_FADE.as_secs_f32();
+        self.progress = ease(linear);
+        linear >= 1.0
+    }
+}
+
+/// Smoothstep easing, clamped to `0.0..=1.0`.
+fn ease(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Per-channel linear interpolation between two colours.
+fn lerp_color(a: iced::Color, b: iced::Color, t: f32) -> iced::Color {
+    iced::Color {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        a: a.a + (b.a - a.a) * t,
+    }
+}
+
 /// The brand accent and its ink for an upload destination: mint for ganked.tv, red for YouTube.
 fn dest_accent(dest: Dest) -> (iced::Color, iced::Color) {
     match dest {
@@ -1807,6 +2511,38 @@ fn segment_style(
     }
 }
 
+/// A stack whose real content sits above an empty base layer. iced hard-clips only *layered*
+/// stack children (the base draws unlayered, and `container.clip` merely narrows a viewport
+/// hint that image drawing ignores), so this is what actually keeps Cover-scaled frames inside
+/// the box of the nearest `clip(true)` ancestor.
+fn layered<'a>(
+    content: impl IntoIterator<Item = Element<'a, Message>>,
+) -> iced::widget::Stack<'a, Message> {
+    content.into_iter().fold(
+        iced::widget::Stack::new().push(Space::new()),
+        |stack, layer| stack.push(layer),
+    )
+}
+
+/// The brand mark as a bare play control (it is a play button), centred over the preview.
+fn logo_play_button<'a>(size: f32) -> Element<'a, Message> {
+    button(theme::logo(size))
+        .on_press(Message::PlayToggle)
+        .style(|_: &Theme, _| iced::widget::button::Style::default())
+        .padding(0)
+        .into()
+}
+
+/// A decoded frame styled like every clip image: full width, covering `height`. Callers wrap it
+/// in [`layered`] + a `clip(true)` container (Cover overflows the box on mismatched aspects).
+fn frame_image<'a>(handle: iced::widget::image::Handle, height: f32) -> Element<'a, Message> {
+    iced::widget::image(handle)
+        .width(Length::Fill)
+        .height(height)
+        .content_fit(iced::ContentFit::Cover)
+        .into()
+}
+
 /// A neutral thumbnail placeholder: a surface-high well with a muted caption.
 fn placeholder<'a>(label: &'a str, height: f32) -> Element<'a, Message> {
     container(text(label).size(11).style(tinted(palette::MUTED)))
@@ -1819,6 +2555,92 @@ fn placeholder<'a>(label: &'a str, height: f32) -> Element<'a, Message> {
             ..container::Style::default()
         })
         .into()
+}
+
+#[cfg(test)]
+mod filmstrip_tests {
+    use super::*;
+
+    #[test]
+    fn positions_are_centred_and_ordered() {
+        let p = filmstrip_positions(4);
+        assert_eq!(p.len(), 4);
+        assert!((p[0] - 0.125).abs() < 1e-6);
+        assert!((p[3] - 0.875).abs() < 1e-6);
+        assert!(p.windows(2).all(|w| w[0] < w[1]), "strictly increasing");
+        assert!(p.iter().all(|&x| x > 0.0 && x < 1.0), "inside (0,1)");
+        assert!(filmstrip_positions(0).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod accent_tests {
+    use super::*;
+    use iced::Color;
+    use std::time::{Duration, Instant};
+
+    fn approx(a: Color, b: Color) {
+        for (x, y) in [(a.r, b.r), (a.g, b.g), (a.b, b.b), (a.a, b.a)] {
+            assert!((x - y).abs() < 1e-4, "{x} vs {y}");
+        }
+    }
+
+    #[test]
+    fn lerp_color_hits_both_ends() {
+        let a = Color::from_rgb(0.0, 0.0, 0.0);
+        let b = Color::from_rgb(1.0, 0.5, 0.25);
+        approx(lerp_color(a, b, 0.0), a);
+        approx(lerp_color(a, b, 1.0), b);
+        approx(lerp_color(a, b, 0.5), Color::from_rgb(0.5, 0.25, 0.125));
+    }
+
+    #[test]
+    fn ease_is_clamped_and_smooth() {
+        assert_eq!(ease(0.0), 0.0);
+        assert_eq!(ease(1.0), 1.0);
+        assert_eq!(ease(-1.0), 0.0);
+        assert_eq!(ease(2.0), 1.0);
+        assert!((ease(0.5) - 0.5).abs() < 1e-6, "symmetric midpoint");
+    }
+
+    #[test]
+    fn fade_runs_from_source_to_target_then_ends() {
+        let from = (palette::ACCENT, palette::INK_ON_ACCENT);
+        let to = (palette::YOUTUBE, palette::INK_ON_YOUTUBE);
+        let mut fade = AccentFade {
+            from,
+            to,
+            start: None,
+            progress: 0.0,
+        };
+        let t0 = Instant::now();
+
+        // First tick anchors the clock; still fully at `from`.
+        assert!(!fade.advance(t0));
+        approx(fade.accent().0, from.0);
+
+        // Partway through: strictly between the endpoints.
+        assert!(!fade.advance(t0 + Duration::from_millis(90)));
+        let mid = fade.accent().0;
+        assert!(mid.r > from.0.r && mid.r < to.0.r + 1e-3);
+
+        // At/after the duration: reports done and sits on the target.
+        assert!(fade.advance(t0 + ACCENT_FADE));
+        approx(fade.accent().0, to.0);
+    }
+
+    #[test]
+    fn advance_fade_clears_when_complete() {
+        let mut fade = AccentFade {
+            from: (palette::ACCENT, palette::INK_ON_ACCENT),
+            to: (palette::YOUTUBE, palette::INK_ON_YOUTUBE),
+            start: None,
+            progress: 0.0,
+        };
+        let t0 = Instant::now();
+        assert!(!fade.advance(t0));
+        assert!(fade.advance(t0 + ACCENT_FADE + Duration::from_millis(1)));
+    }
 }
 
 #[cfg(test)]
