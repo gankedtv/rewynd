@@ -1,8 +1,27 @@
-# ADR 0006 — Settings UI: a standalone iced app (tiny-skia, no wgpu)
+# ADR 0006 — Settings UI: a standalone iced app
 
-- **Status:** Accepted (issue #17)
+- **Status:** Accepted (issue #17); **revised 2026-07-04** — the GUI now renders through iced's
+  **wgpu** backend, with `tiny-skia` kept only as the no-GPU fallback (see "Revision" below).
 - **Supersedes / superseded by:** none
 - **Relates to:** PLAN §6 (Phase 7 UX), §3.6/§9 (licensing, low footprint), ADR 0001 (wgpu pin), ADR 0005 (config), issue #17
+
+## Revision (2026-07-04) — GPU rendering with a software fallback
+
+Beta testing showed the tiny-skia **software** renderer is too slow for smooth scrolling on a
+high-refresh display, and it flickered when previewing video. The original decision assumed iced's
+wgpu backend "conflicts with the wgpu-v29 patch" (see the options table). **That assumption was
+wrong.** iced 0.14 requires `wgpu = "27"`; the `[patch.crates-io]` git wgpu is v29, which does
+**not** satisfy `^27`, so cargo simply resolves iced's wgpu from crates.io — a **second, independent
+wgpu** (27) alongside the recorder's pinned git wgpu (29). The two never share types (separate
+binaries), so they coexist cleanly; the whole workspace builds and `cargo-deny`'s single-wgpu
+tripwire is relaxed with a targeted skip of `wgpu@27` (deny.toml).
+
+So the GUI now enables `iced`'s `wgpu` feature (GPU rendering) **and** keeps `tiny-skia` as the
+automatic fallback for machines without a working GPU. Video preview uses a small custom
+`iced::widget::shader` primitive (`crates/settings/src/video.rs`) that owns one texture and rewrites
+it in place each frame — no per-frame image-atlas allocation, no flicker. Cost: the settings binary
+now carries its own wgpu/naga stack (bigger binary, longer build); worth it for a usable window. The
+rest of this ADR (iced choice, decoupling from the encode crate, folder picker) still holds.
 
 ## Context
 

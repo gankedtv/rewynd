@@ -62,13 +62,18 @@ allow = [
 [bans]
 multiple-versions = "allow"
 [[bans.deny]]
-# ADR 0001: wgpu must come from the single pinned git source, never crates.io. Cargo.lock also
-# carries a DORMANT crates.io wgpu 27 entry via iced_renderer's weak `iced_wgpu?` feature (see
-# the ADR 0001 note): it never resolves into a build graph today, and this ban is the tripwire
-# that fails CI if some future feature change activates it.
+# The recorder's GPU pipeline (gpu-video) requires the single pinned git wgpu (ADR 0001). The
+# settings GUI renders through iced's own released crates.io wgpu 27 (ADR 0006, revised) — a
+# second wgpu that is deliberately independent (separate binary, no shared wgpu types). Both are
+# skipped below; this ban is still the tripwire that fails CI if a THIRD wgpu ever creeps in.
 crate = "wgpu"
 wrappers = []
 deny-multiple-versions = true
+[[bans.skip]]
+# iced 0.14's wgpu backend (settings GUI): crates.io wgpu 27, deliberately independent of the
+# recorder's pinned git wgpu. Only THIS version is skipped; the pinned git wgpu stays the tracked
+# one, so a third wgpu creeping in still trips deny-multiple-versions above.
+crate = "wgpu@27"
 
 [sources]
 unknown-git = "deny"
