@@ -26,7 +26,7 @@ jobs:
     needs: gates
     runs-on: ubuntu-latest
     permissions:
-      contents: write # vpk upload creates/updates the GitHub release
+      contents: write # creates the GitHub release and uploads the AppImage
     # Build the distributed AppImage against glibc 2.35 so it runs on older distros; the
     # `ubuntu-22.04` runner label is being retired, so pin the floor with a container instead.
     container: ubuntu:22.04
@@ -79,28 +79,33 @@ jobs:
           REWYND_YT_CLIENT_SECRET: ${{ secrets.REWYND_YT_CLIENT_SECRET }}
         run: cargo build --release --locked -p rewynd -p rewynd-recorder
 
-      - name: Pack and upload (AppImage)
+      - name: Pack and publish (AppImage)
         shell: bash
         env:
-          VPK_TOKEN: ${{ secrets.GITHUB_TOKEN }} # keeps the token off the command line
-          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.ver.outputs.version }}
           TAG: ${{ github.ref_name }}
-          PRE_FLAG: ${{ steps.ver.outputs.pre == 'true' && '--pre' || '' }}
+          PRE_FLAG: ${{ steps.ver.outputs.pre == 'true' && '--prerelease' || '' }}
         run: |
           # Stage a clean dir so vpk packs only the two binaries, not all of target/release.
           mkdir -p pack
           cp target/release/rewynd target/release/rewynd-recorder pack/
-          vpk download github --repoUrl "$REPO_URL" || true
           vpk pack -u rewynd -v "$VERSION" -p pack -e rewynd -i packaging/logo-256.png
-          vpk upload github --repoUrl "$REPO_URL" \
-            --tag "$TAG" --releaseName "rewynd $VERSION" --publish $PRE_FLAG
+          # Linux runs first and owns the release; windows-pack (serialized after) appends to it.
+          # Publishing via gh, not `vpk upload`: two parallel `vpk upload --publish` calls both try
+          # to CREATE the release and the second fails ("release already exists").
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "rewynd $VERSION" --notes "rewynd $VERSION" $PRE_FLAG \
+            || echo "release already exists, reusing it"
+          gh release upload "$TAG" Releases/* --repo "$GITHUB_REPOSITORY" --clobber
 
   windows-pack:
-    needs: gates
+    # Serialized after linux-pack, which creates the release; this job only appends to it, so the
+    # two never race to create the same GitHub release.
+    needs: linux-pack
     runs-on: windows-latest # .NET 8 is preinstalled here
     permissions:
-      contents: write # vpk upload creates/updates the GitHub release
+      contents: write # gh release upload appends the Windows assets
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
@@ -129,18 +134,15 @@ jobs:
       - name: Pack and upload (Setup.exe)
         shell: bash
         env:
-          VPK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.ver.outputs.version }}
           TAG: ${{ github.ref_name }}
-          PRE_FLAG: ${{ steps.ver.outputs.pre == 'true' && '--pre' || '' }}
         run: |
           mkdir -p pack
           cp target/release/rewynd.exe target/release/rewynd-recorder.exe pack/
-          vpk download github --repoUrl "$REPO_URL" || true
           vpk pack -u rewynd -v "$VERSION" -p pack -e rewynd.exe -i packaging/rewynd.ico
-          vpk upload github --repoUrl "$REPO_URL" \
-            --tag "$TAG" --releaseName "rewynd $VERSION" --publish $PRE_FLAG
+          # The release already exists (linux-pack created it); append the Windows assets.
+          gh release upload "$TAG" Releases/* --repo "$GITHUB_REPOSITORY" --clobber
 
   # Attach a SHA256SUMS over every published asset so testers can verify their download
   # (the beta ships unsigned; see the Defender/SmartScreen notes in the release plan).
