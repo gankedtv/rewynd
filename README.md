@@ -9,8 +9,24 @@ to run while gaming.
 See [`PLAN.md`](PLAN.md) for the full design and rationale, and
 [`docs/adr/`](docs/adr) for architecture decisions.
 
-> **Status:** Phase 1 (foundations). This is the workspace scaffold — the pipeline
-> stages are stubbed and wired in across subsequent issues.
+## Install (beta)
+
+rewynd is in **beta** (`v1.0.0-beta.1`). Builds are unsigned, so Windows SmartScreen
+(and occasionally antivirus) may warn on first run — choose **More info → Run anyway**.
+
+**Linux** — any distro, via the self-updating AppImage:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gankedtv/rewynd/main/install.sh | sh
+```
+
+Or grab `rewynd.AppImage` from the [latest release](https://github.com/gankedtv/rewynd/releases),
+`chmod +x rewynd.AppImage`, and run it.
+
+**Windows** — download `rewynd-win-Setup.exe` from the
+[latest release](https://github.com/gankedtv/rewynd/releases) and run it (per-user, no admin).
+
+The app checks for updates on launch; one click updates both binaries in place.
 
 ## Workspace layout
 
