@@ -249,6 +249,14 @@ fn main() -> iced::Result {
         }
     }
 
+    // Setup already done (a config exists, so not first-run onboarding): make sure the recorder is
+    // up, so opening the app means it is buffering rather than silently doing nothing until the
+    // user hits Restart. Idempotent — a duplicate exits immediately on the recorder's single-
+    // instance lock. First run goes to onboarding, which starts the recorder itself at the end.
+    if initial_view() != View::Onboarding {
+        spawn_recorder_detached();
+    }
+
     iced::application(App::load, App::update, App::view)
         .title("rewynd")
         .theme(App::theme)
