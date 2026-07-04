@@ -46,6 +46,15 @@ jobs:
           # provides a current build; the AppImage uses the host libpipewire at runtime, so this
           # only affects the build. The composite below then installs the -dev package from it.
           add-apt-repository -y ppa:pipewire-debian/pipewire-upstream
+          # GitHub CLI is not in the bare container (unlike the ubuntu-latest runner); the release
+          # is published with `gh`, so install it from the official apt repo.
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+            > /etc/apt/sources.list.d/github-cli.list
+          apt-get update
+          apt-get install -y --no-install-recommends gh
 
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
