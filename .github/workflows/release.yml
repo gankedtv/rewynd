@@ -39,7 +39,8 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             git ca-certificates curl build-essential libicu70 \
-            software-properties-common gnupg
+            software-properties-common gnupg \
+            squashfs-tools zsync
           # ubuntu 22.04 ships libpipewire 0.3.48, too old for the pipewire crate's v0_3_65
           # feature (libspa-sys' C shim references spa symbols added later). The upstream PPA
           # provides a current build; the AppImage uses the host libpipewire at runtime, so this
@@ -59,10 +60,13 @@ jobs:
         run: bash .github/scripts/release-version.sh
 
       # .NET is not in the bare container; the official script needs no third-party action.
+      # DOTNET_ROOT must be exported so the vpk apphost can locate the runtime we install to
+      # a custom prefix (otherwise: "Failed to resolve libhostfxr.so").
       - name: Install .NET + vpk
         shell: bash
         run: |
           curl -fsSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 8.0
+          echo "DOTNET_ROOT=$HOME/.dotnet" >> "$GITHUB_ENV"
           echo "$HOME/.dotnet" >> "$GITHUB_PATH"
           echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
           "$HOME/.dotnet/dotnet" tool install -g vpk --version "$VPK_VERSION"
