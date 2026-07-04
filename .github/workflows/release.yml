@@ -38,7 +38,13 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            git ca-certificates curl build-essential libicu70
+            git ca-certificates curl build-essential libicu70 \
+            software-properties-common gnupg
+          # ubuntu 22.04 ships libpipewire 0.3.48, too old for the pipewire crate's v0_3_65
+          # feature (libspa-sys' C shim references spa symbols added later). The upstream PPA
+          # provides a current build; the AppImage uses the host libpipewire at runtime, so this
+          # only affects the build. The composite below then installs the -dev package from it.
+          add-apt-repository -y ppa:pipewire-debian/pipewire-upstream
 
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
