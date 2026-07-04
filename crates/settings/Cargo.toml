@@ -26,17 +26,21 @@ tokio.workspace = true
 # "Check for updates" button drives check → download → stop recorder → apply/restart.
 velopack.workspace = true
 
-# iced with the tiny-skia SOFTWARE renderer only (no wgpu): the workspace's wgpu-v29
-# [patch.crates-io] rewrite can't bite a tree with no wgpu, and a settings window doesn't need
-# the GPU. See docs/adr/0006. `wayland` + `x11` enable winit's and softbuffer's Linux backends
-# (dropping default features dropped them); `tokio` drives the rfd dialog future.
+# iced's `wgpu` backend renders the GUI on the GPU (smooth scrolling on high-refresh displays;
+# flicker-free video preview); `tiny-skia` stays as the software fallback for machines without a
+# working GPU. iced pulls its OWN released crates.io wgpu 27, independent of the recorder's pinned
+# git wgpu — a second wgpu that never shares types with it (separate binary). See docs/adr/0006
+# (revised). `wayland` + `x11` enable winit's Linux backends; `tokio` drives the rfd dialog future.
+# iced_wgpu (the same 0.14 iced pulls) re-exports the exact `wgpu` the custom video widget's shader
+# Primitive/Pipeline traits are defined over.
+iced_wgpu = "0.14"
 iced = { version = "0.14", default-features = false, features = [
     "tiny-skia",
+    "wgpu",
     "tokio",
     "wayland",
     "x11",
-    # The custom trim-bar widget (docs/adr 0006 keeps us on the software renderer) is built on
-    # `iced::advanced`.
+    # The custom trim-bar and video-frame widgets are built on `iced::advanced`.
     "advanced",
     # Raster brand mark. Deliberately NOT `svg`: iced's svg path (resvg) scans every system
     # font on the first draw, and NOT `image`: that turns on every codec in the image crate.

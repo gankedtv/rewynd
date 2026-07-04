@@ -17,15 +17,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use iced::futures::Stream;
-use iced::widget::image::Handle;
 
 use crate::thumbs;
+use crate::video;
 
 /// What the playback stream emits.
 #[derive(Debug, Clone)]
 pub enum Event {
     /// The next frame, with its position in the clip.
-    Frame(Handle, Duration),
+    Frame(video::Frame, Duration),
     /// No usable decoder on this machine (ffmpeg missing or broken).
     Unavailable,
     /// The end of the kept range (or a decode failure ended playback early).
@@ -36,8 +36,10 @@ pub enum Event {
 /// hidpi). The scrub preview reuses it so paused and playing frames match.
 pub const PREVIEW_WIDTH: u32 = 960;
 
-/// Decode width while the preview is fullscreen.
-pub const FULLSCREEN_WIDTH: u32 = 1920;
+/// Decode width while the preview is fullscreen. 1280 rather than full 1920 keeps the per-frame
+/// GPU texture upload light (the preview re-uploads every frame) while still looking crisp
+/// upscaled; the video widget renders it letterboxed.
+pub const FULLSCREEN_WIDTH: u32 = 1280;
 
 /// The preview's fixed frame rate. The recorder's capture is damage-driven (variable rate, with
 /// bursts far above the display rate), so ffmpeg resamples to constant-rate output; that also
@@ -221,8 +223,12 @@ fn read_frames(
             // Falling behind: re-anchor so playback slows instead of skipping everything.
             clock = Some((now, pts));
         }
-        let handle = Handle::from_rgba(width, height, buffer.clone());
-        if tx.blocking_send(Event::Frame(handle, pts)).is_err() {
+        let frame = video::Frame {
+            pixels: Arc::new(buffer.clone()),
+            width,
+            height,
+        };
+        if tx.blocking_send(Event::Frame(frame, pts)).is_err() {
             return false;
         }
     }

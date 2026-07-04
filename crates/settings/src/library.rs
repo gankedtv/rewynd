@@ -26,6 +26,7 @@ use crate::theme::{
 };
 use crate::thumbs;
 use crate::trimbar;
+use crate::video;
 
 /// Cards per grid row (the body column is width-capped, so a fixed count stays balanced).
 const GRID_COLUMNS: usize = 3;
@@ -213,7 +214,7 @@ pub enum Message {
     /// Start or pause the in-app preview playback of the kept range.
     PlayToggle,
     /// The next playback frame, with its position in the clip.
-    PlayerFrame(iced::widget::image::Handle, Duration),
+    PlayerFrame(crate::video::Frame, Duration),
     /// In-app playback has no decoder on this machine (ffmpeg missing).
     PlayerUnavailable,
     /// Playback reached the end of the kept range.
@@ -281,7 +282,7 @@ pub struct Library {
     /// playback subscription; `None` = stopped).
     play_range: Option<(f32, f32)>,
     /// The playback frame on screen.
-    play_frame: Option<iced::widget::image::Handle>,
+    play_frame: Option<crate::video::Frame>,
     /// Where playback is (or paused), in seconds; resuming starts here.
     play_pos: Option<f32>,
     /// Why in-app playback can't run on this machine, when it can't (ffmpeg missing).
@@ -1272,18 +1273,10 @@ impl Library {
                 .style(tinted(palette::TEXT_SECONDARY)),
         ]
         .spacing(4);
-        // No manual refresh: the directory watcher and window focus already rescan.
-        let header = row![
-            title,
-            Space::new().width(Length::Fill),
-            if self.scanning {
-                hint("Refreshing...")
-            } else {
-                Space::new().into()
-            },
-        ]
-        .spacing(12)
-        .align_y(iced::Alignment::Center);
+        // No manual refresh and no refresh indicator: the directory watcher and window focus
+        // rescan silently — a "Refreshing..." that flashed on every focus was more distracting
+        // than useful.
+        let header = row![title].spacing(12).align_y(iced::Alignment::Center);
 
         if self.entries.is_empty() {
             let empty = column![
@@ -1510,17 +1503,29 @@ impl Library {
         }
     }
 
-    /// The moving preview frame, when there is one: the live playback frame, else the frame
-    /// under the trim handle last dragged.
-    fn moving_frame(&self) -> Option<iced::widget::image::Handle> {
-        self.play_frame.clone().or_else(|| self.scrub_frame.clone())
+    /// The moving preview frame as an element, when there is one: the live playback frame (a GPU
+    /// video widget — updating one texture in place, so no per-frame image-atlas churn/flicker),
+    /// else the frame under the trim handle last dragged (a one-off still, fine as an image).
+    /// Both are letterboxed (`Contain`) to the box.
+    fn moving_frame<'a>(&self) -> Option<Element<'a, Message>> {
+        if let Some(frame) = &self.play_frame {
+            Some(video::video(frame.clone()))
+        } else {
+            self.scrub_frame.clone().map(|handle| {
+                iced::widget::image(handle)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .content_fit(iced::ContentFit::Contain)
+                    .into()
+            })
+        }
     }
 
     /// The big detail preview: the moving frame (else the thumbnail), the brand mark as the
     /// centred play control, click-anywhere pause, and the fullscreen toggle.
     fn preview<'a>(&'a self, entry: &'a ClipEntry) -> Element<'a, Message> {
         let frame: Element<Message> = match self.moving_frame() {
-            Some(handle) => frame_image(handle, PREVIEW_HEIGHT),
+            Some(element) => element,
             None => self.thumbnail(entry, PREVIEW_HEIGHT),
         };
         let playing = self.play_range.is_some();
@@ -1569,11 +1574,7 @@ impl Library {
     /// timeline underneath so trimming keeps working, and an exit control (also Escape).
     fn fullscreen_view<'a>(&'a self, entry: &'a ClipEntry) -> Element<'a, Message> {
         let frame: Element<Message> = match self.moving_frame() {
-            Some(handle) => iced::widget::image(handle)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .content_fit(iced::ContentFit::Contain)
-                .into(),
+            Some(element) => element,
             None => self.thumbnail(entry, 400.0),
         };
         let playing = self.play_range.is_some();

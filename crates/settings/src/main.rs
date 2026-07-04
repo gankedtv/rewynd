@@ -14,6 +14,7 @@ mod player;
 mod theme;
 mod thumbs;
 mod trimbar;
+mod video;
 mod wizard;
 
 use std::fmt;
@@ -1646,26 +1647,14 @@ impl App {
             }
         };
 
-        // The GANKED.TV card is just the account state and the default upload visibility now:
-        // login covers the common case and turns uploads on by itself. The self-hosting fields
-        // moved to the generic CUSTOM CONNECTOR card at the bottom, out of a normal user's way.
+        // The GANKED.TV card is just the account state now: login covers the common case and turns
+        // uploads on by itself. Visibility is shared with YouTube (the SHARING card above), and the
+        // self-hosting fields moved to the generic CUSTOM CONNECTOR card at the bottom.
         let upload = card(
             "GANKED.TV",
             column![
                 account,
-                setting(
-                    "Visibility",
-                    rewynd_upload::Visibility::parse(self.config.upload_visibility()).to_string(),
-                    pick_list(
-                        &rewynd_upload::Visibility::ALL[..],
-                        Some(rewynd_upload::Visibility::parse(
-                            self.config.upload_visibility(),
-                        )),
-                        Message::VisibilityPicked,
-                    )
-                    .style(arena_pick)
-                    .width(Length::Fill),
-                ),
+                hint("Clips use the visibility chosen above and are sent from your library."),
             ]
             .spacing(18),
         );
@@ -1879,6 +1868,29 @@ impl App {
         ]
         .spacing(20);
 
+        // One visibility for every upload, shared across both destinations (each card points here
+        // as "chosen above"), so a per-destination picker can't drift.
+        let visibility = card(
+            "SHARING",
+            column![
+                hint("The visibility used when a clip is uploaded to a connected destination."),
+                setting(
+                    "Visibility",
+                    rewynd_upload::Visibility::parse(self.config.upload_visibility()).to_string(),
+                    pick_list(
+                        &rewynd_upload::Visibility::ALL[..],
+                        Some(rewynd_upload::Visibility::parse(
+                            self.config.upload_visibility(),
+                        )),
+                        Message::VisibilityPicked,
+                    )
+                    .style(arena_pick)
+                    .width(Length::Fill),
+                ),
+            ]
+            .spacing(12),
+        );
+
         // The two upload connectors sit side by side as a symmetric pair, each filling half the
         // width, so neither column runs long and empty against the other.
         let connectors = row![
@@ -1887,7 +1899,7 @@ impl App {
         ]
         .spacing(20);
 
-        let body = column![header, columns, connectors, connector, save]
+        let body = column![header, columns, visibility, connectors, connector, save]
             .spacing(20)
             .padding(28)
             .max_width(880);
