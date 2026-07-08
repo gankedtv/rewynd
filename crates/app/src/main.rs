@@ -2035,8 +2035,11 @@ mod windows {
                 std::thread::Builder::new()
                     .name("rewynd-stop-event".to_owned())
                     .spawn(move || {
-                        stop_event.wait();
-                        let _ = tx.send("stop requested (settings restart)");
+                        if stop_event.wait() {
+                            let _ = tx.send("stop requested (settings restart)");
+                        } else {
+                            tracing::error!("stop-event wait failed; the stop waiter is exiting");
+                        }
                     })
                     .context("spawning the stop-event thread")?;
             }
@@ -2055,7 +2058,12 @@ mod windows {
                     .name("rewynd-save-event".to_owned())
                     .spawn(move || {
                         loop {
-                            save_event.wait();
+                            if !save_event.wait() {
+                                tracing::error!(
+                                    "save-event wait failed; the save waiter is exiting"
+                                );
+                                return;
+                            }
                             if save_stop.load(Ordering::Relaxed) {
                                 return;
                             }

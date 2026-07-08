@@ -221,15 +221,18 @@ impl NamedEvent {
         Ok(Self { handle })
     }
 
-    /// Block until the event is signaled. An auto-reset event also consumes the signal, so a
-    /// wait loop releases once per signal.
-    fn wait(&self) {
+    /// Block until the event is signaled, returning `true` on success. An auto-reset event also
+    /// consumes the signal, so a wait loop releases once per signal. Returns `false` if the wait
+    /// itself failed (`WAIT_FAILED`) so a caller looping on it can exit instead of spinning.
+    #[must_use]
+    fn wait(&self) -> bool {
         use std::os::windows::io::AsRawHandle;
-        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
         use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
 
         // SAFETY: FFI; the handle is valid for `self`'s lifetime.
-        let _ = unsafe { WaitForSingleObject(HANDLE(self.handle.as_raw_handle()), INFINITE) };
+        let result = unsafe { WaitForSingleObject(HANDLE(self.handle.as_raw_handle()), INFINITE) };
+        result == WAIT_OBJECT_0
     }
 }
 
@@ -274,9 +277,11 @@ impl RecorderStopEvent {
         Ok(Self(NamedEvent::create(name, true)?))
     }
 
-    /// Block until the event is signaled (a stop request arrives).
-    pub fn wait(&self) {
-        self.0.wait();
+    /// Block until the event is signaled (a stop request arrives). Returns `false` if the wait
+    /// failed, so the caller can exit rather than treat it as a stop request.
+    #[must_use]
+    pub fn wait(&self) -> bool {
+        self.0.wait()
     }
 }
 
@@ -294,10 +299,11 @@ impl RecorderSaveEvent {
         Ok(Self(NamedEvent::create(&save_event_name(), false)?))
     }
 
-    /// Block until a save is requested. Auto-reset consumes the signal, so a wait loop
-    /// fires once per request.
-    pub fn wait(&self) {
-        self.0.wait();
+    /// Block until a save is requested. Auto-reset consumes the signal, so a wait loop fires once
+    /// per request. Returns `false` if the wait failed, so the loop can exit instead of spinning.
+    #[must_use]
+    pub fn wait(&self) -> bool {
+        self.0.wait()
     }
 }
 
@@ -432,7 +438,7 @@ mod windows_tests {
             "an existing event reports it was signaled"
         );
         // Manual-reset + already signaled: returns immediately instead of blocking.
-        event.wait();
+        assert!(event.wait(), "a signaled event waits successfully");
     }
 
     #[test]
@@ -449,9 +455,9 @@ mod windows_tests {
         // Auto-reset: each signal releases exactly one wait, so repeated saves work.
         let event = NamedEvent::create(&name, false).expect("create");
         assert!(signal_named_event(&name).expect("signal"), "first request");
-        event.wait();
+        assert!(event.wait(), "first wait succeeds");
         assert!(signal_named_event(&name).expect("signal"), "second request");
-        event.wait();
+        assert!(event.wait(), "second wait succeeds");
     }
 
     /// Spawn a long-running `ping` child (a stable, always-present system binary).
