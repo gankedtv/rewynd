@@ -437,6 +437,29 @@ fn register_toast_identity_at(key_path: &str, icon: &Path) -> std::io::Result<()
         .map_err(registry_io_err)
 }
 
+/// Reconnect stdout/stderr to the launching console, if any. A windows-subsystem exe starts
+/// with no std handles, so `cargo run` / terminal launches would otherwise show no tracing
+/// output or `--version`. Inherited handles (e.g. the settings app's `--probe-encoders` pipes)
+/// are left untouched, and an Explorer launch (no parent console) is a no-op.
+#[cfg(windows)]
+pub fn attach_parent_console() {
+    use windows::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    // SAFETY: trivially safe FFI; a missing/invalid handle just means "not inherited".
+    let inherited = |which| unsafe { GetStdHandle(which) }.is_ok_and(|h| !h.is_invalid());
+    if inherited(STD_OUTPUT_HANDLE) || inherited(STD_ERROR_HANDLE) {
+        return;
+    }
+    // SAFETY: trivially safe FFI; failure (no parent console) leaves us detached, as launched.
+    let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
+/// No console attachment needed off Windows.
+#[cfg(not(windows))]
+pub fn attach_parent_console() {}
+
 // No autostart mechanism on other targets; the settings toggle surfaces the error.
 #[cfg(not(any(unix, windows)))]
 pub fn install_autostart(_exec: &Path) -> std::io::Result<()> {

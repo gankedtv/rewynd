@@ -37,7 +37,9 @@ pub use clips::{
 };
 #[cfg(windows)]
 pub use desktop::register_toast_identity;
-pub use desktop::{BRAND_ICONS, install_autostart, refresh_autostart, remove_autostart};
+pub use desktop::{
+    BRAND_ICONS, attach_parent_console, install_autostart, refresh_autostart, remove_autostart,
+};
 pub use devices::{AudioInput, list_audio_inputs};
 pub use encoders::{
     ENCODER_PROBE_VERSION, EncoderChoice, EncoderProbe, ProbeAdapter, choose_encoder,
@@ -53,7 +55,7 @@ pub use paths::{
     APP_ID, config_path, default_output_dir, recorder_pid_path, settings_lock_path, sibling_binary,
 };
 #[cfg(windows)]
-pub use process::RecorderStopEvent;
+pub use process::{RecorderSaveEvent, RecorderStopEvent};
 pub use process::{read_recorder_pid, request_recorder_save, stop_recorder};
 pub use schema::{
     AudioSettings, Config, DEFAULT_HOTKEY_TRIGGER, DEFAULT_TEMPLATE, DEFAULT_UPLOAD_API_URL,

@@ -9,6 +9,10 @@
 //! The window needs a display to run, so there is no headless test of `run`; the pure mapping
 //! helpers are unit-tested.
 
+// A windowed GUI should never pop a console. Windows-only (cfg_attr leaves Linux a console app);
+// `attach_parent_console` below reconnects stdout/stderr for terminal runs.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod library;
 mod player;
 mod theme;
@@ -191,6 +195,10 @@ fn main() -> iced::Result {
     velopack::VelopackApp::build()
         .on_restarted(|_ver| spawn_recorder_detached())
         .run();
+
+    // As a windows-subsystem exe we start with no console; reconnect to the launching one (if any)
+    // so a terminal launch still shows tracing output and `--version`. A no-op elsewhere.
+    config::attach_parent_console();
 
     if std::env::args().any(|arg| arg == "--version") {
         println!("rewynd {}", env!("CARGO_PKG_VERSION"));

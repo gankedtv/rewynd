@@ -11,6 +11,10 @@
 //! hotkey is a `RegisterHotKey` message loop, and Ctrl+C drives the same
 //! stop-flag-then-join shutdown (video-only for now; audio/tray/upload follow).
 
+// A background recorder should never pop a console. Windows-only (cfg_attr leaves Linux a
+// console app); `attach_parent_console` below reconnects stdout/stderr for terminal runs.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 #[cfg(target_os = "linux")]
 mod tray;
 
@@ -23,6 +27,11 @@ fn main() -> anyhow::Result<()> {
     // may exit or restart the process. A normal launch passes straight through, and it is inert
     // (no hooks, no output) for dev/cargo runs, so the pristine-stdout probe below is unaffected.
     velopack::VelopackApp::build().run();
+
+    // As a windows-subsystem exe we start with no console; reconnect to the launching one (if any)
+    // so `cargo run` / terminal launches still show tracing output and `--version`. A no-op when
+    // std handles were inherited (the settings app's --probe-encoders pipes) or there is no parent.
+    rewynd_config::attach_parent_console();
 
     // `--probe-encoders`: enumerate this machine's encoders and print them as JSON, then exit.
     // The settings GUI (deliberately wgpu-free) spawns us for this to populate its device picker,
@@ -2018,7 +2027,7 @@ mod windows {
 
         // Park until Ctrl+C or the named stop event (the settings app's restart request
         // — the Windows SIGTERM stand-in), then run the same stop-flag-then-join
-        // shutdown as the Linux recorder. Both waiter threads are detached: they hold
+        // shutdown as the Linux recorder. The waiter threads are detached: they hold
         // nothing that needs teardown and die with the process.
         match config::RecorderStopEvent::create() {
             Ok(stop_event) => {
@@ -2033,6 +2042,31 @@ mod windows {
             }
             // Without the event the settings restart falls back to terminating us.
             Err(e) => tracing::warn!(error = %e, "could not create the stop event"),
+        }
+
+        // The named save event — the Windows stand-in for SIGUSR1, so the onboarding
+        // wizard's test-clip step can trigger a save without the hotkey. Auto-reset, so
+        // each signal saves once; the same sync save path as the hotkey and tray menu.
+        match config::RecorderSaveEvent::create() {
+            Ok(save_event) => {
+                let save_saver = saver.clone();
+                let save_stop = stop.clone();
+                std::thread::Builder::new()
+                    .name("rewynd-save-event".to_owned())
+                    .spawn(move || {
+                        loop {
+                            save_event.wait();
+                            if save_stop.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            tracing::info!("save requested via the save event");
+                            save_and_toast(&save_saver);
+                        }
+                    })
+                    .context("spawning the save-event thread")?;
+            }
+            // Without the event the wizard's test-clip step reports the recorder as not running.
+            Err(e) => tracing::warn!(error = %e, "could not create the save event"),
         }
         {
             let tx = shutdown_tx;
