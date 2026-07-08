@@ -437,6 +437,54 @@ fn register_toast_identity_at(key_path: &str, icon: &Path) -> std::io::Result<()
         .map_err(registry_io_err)
 }
 
+/// Register the `rewynd://` URL protocol so a clickable "clip saved" toast can deep-link back
+/// into its clip: `HKCU\Software\Classes\rewynd` points its open command at `gui_exe`. Idempotent
+/// — call at every startup. The GUI path is passed in because the recorder (which registers this)
+/// is a sibling binary, not the launch target itself.
+#[cfg(windows)]
+pub fn register_clip_protocol(gui_exe: &Path) -> std::io::Result<()> {
+    let scheme = format!(r"Software\Classes\{}", crate::CLIP_URL_SCHEME);
+    let key = windows_registry::CURRENT_USER
+        .create(&scheme)
+        .map_err(registry_io_err)?;
+    // The default value + the "URL Protocol" marker are what make the shell treat this key as a
+    // launchable protocol handler.
+    key.set_string("", "URL:rewynd protocol")
+        .map_err(registry_io_err)?;
+    key.set_string("URL Protocol", "")
+        .map_err(registry_io_err)?;
+    let command = windows_registry::CURRENT_USER
+        .create(format!(r"{scheme}\shell\open\command"))
+        .map_err(registry_io_err)?;
+    // "%1" is the full rewynd://clip/<name> URL the shell hands us as argv.
+    command
+        .set_string("", format!("\"{}\" \"%1\"", gui_exe.display()))
+        .map_err(registry_io_err)
+}
+
+/// Reconnect stdout/stderr to the launching console, if any. A windows-subsystem exe starts
+/// with no std handles, so `cargo run` / terminal launches would otherwise show no tracing
+/// output or `--version`. Inherited handles (e.g. the settings app's `--probe-encoders` pipes)
+/// are left untouched, and an Explorer launch (no parent console) is a no-op.
+#[cfg(windows)]
+pub fn attach_parent_console() {
+    use windows::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    // SAFETY: trivially safe FFI; a missing/invalid handle just means "not inherited".
+    let inherited = |which| unsafe { GetStdHandle(which) }.is_ok_and(|h| !h.is_invalid());
+    if inherited(STD_OUTPUT_HANDLE) || inherited(STD_ERROR_HANDLE) {
+        return;
+    }
+    // SAFETY: trivially safe FFI; failure (no parent console) leaves us detached, as launched.
+    let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
+/// No console attachment needed off Windows.
+#[cfg(not(windows))]
+pub fn attach_parent_console() {}
+
 // No autostart mechanism on other targets; the settings toggle surfaces the error.
 #[cfg(not(any(unix, windows)))]
 pub fn install_autostart(_exec: &Path) -> std::io::Result<()> {

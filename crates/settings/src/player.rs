@@ -191,8 +191,21 @@ fn ffmpeg_range(path: &Path, start: Duration, end: Duration) -> Command {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    hide_console(&mut command);
     command
 }
+
+/// ffmpeg is a console-subsystem exe; without this, every preview/waveform spawn would flash a
+/// console window now that this GUI is a windows-subsystem app with none of its own.
+#[cfg(windows)]
+fn hide_console(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_console(_command: &mut Command) {}
 
 /// Read raw frames off the pipe and send them paced to their nominal times. Returns `true`
 /// when the pipe ended naturally (range done or ffmpeg died), `false` when the receiver is
@@ -320,6 +333,7 @@ pub fn waveform(path: &Path, buckets: usize) -> Option<Vec<f32>> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    hide_console(&mut command);
     let mut child = command.spawn().ok()?;
     let mut bytes = Vec::new();
     let read = child

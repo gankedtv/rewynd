@@ -103,8 +103,16 @@ pub fn request_recorder_save() -> std::io::Result<bool> {
     send_signal(raw, libc::SIGUSR1)
 }
 
-/// No per-process save signal on Windows; the wizard falls back to the hotkey there.
-#[cfg(not(unix))]
+/// Ask the running recorder to save a clip now, via its named save event — the Windows
+/// stand-in for the unix SIGUSR1 path. The event object lives exactly as long as the recorder
+/// holds its handle, so an absent event *is* the liveness check: `Ok(false)` means no recorder
+/// is running, `Ok(true)` means the save was requested.
+#[cfg(windows)]
+pub fn request_recorder_save() -> std::io::Result<bool> {
+    signal_named_event(&save_event_name())
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn request_recorder_save() -> std::io::Result<bool> {
     Ok(false)
 }
@@ -176,17 +184,88 @@ fn stop_event_name() -> String {
     format!("Local\\{}.stop", crate::paths::APP_ID)
 }
 
+/// Name of the per-session save event — the Windows stand-in for SIGUSR1. Signaling it asks
+/// the recorder to save a clip now (used by the onboarding wizard's test-clip step).
+#[cfg(windows)]
+fn save_event_name() -> String {
+    format!("Local\\{}.save", crate::paths::APP_ID)
+}
+
 #[cfg(windows)]
 fn wide(name: &str) -> Vec<u16> {
     name.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// A named kernel event this process created and can block on. The reset mode is fixed at
+/// creation: manual-reset latches a signal until it is reset (a stop request is never lost);
+/// auto-reset makes each successful wait consume one signal (each save request fires once).
+#[cfg(windows)]
+struct NamedEvent {
+    handle: std::os::windows::io::OwnedHandle,
+}
+
+#[cfg(windows)]
+impl NamedEvent {
+    /// Create (or open) the named event with the given reset semantics.
+    fn create(name: &str, manual_reset: bool) -> std::io::Result<Self> {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        use windows::Win32::System::Threading::CreateEventW;
+        use windows::core::PCWSTR;
+
+        let name = wide(name);
+        // SAFETY: FFI; `name` is NUL-terminated and outlives the call.
+        let handle = unsafe { CreateEventW(None, manual_reset, false, PCWSTR(name.as_ptr())) }
+            .map_err(std::io::Error::other)?;
+        // SAFETY: `CreateEventW` succeeded, so `handle` is a valid handle we own.
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+        Ok(Self { handle })
+    }
+
+    /// Block until the event is signaled, returning `true` on success. An auto-reset event also
+    /// consumes the signal, so a wait loop releases once per signal. Returns `false` if the wait
+    /// itself failed (`WAIT_FAILED`) so a caller looping on it can exit instead of spinning.
+    #[must_use]
+    fn wait(&self) -> bool {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+
+        // SAFETY: FFI; the handle is valid for `self`'s lifetime.
+        let result = unsafe { WaitForSingleObject(HANDLE(self.handle.as_raw_handle()), INFINITE) };
+        result == WAIT_OBJECT_0
+    }
+}
+
+/// Signal the event named `name`, if some process is keeping it alive. `Ok(true)` when it was
+/// signaled; `Ok(false)` when no such event exists (no recorder is running — not an error).
+#[cfg(windows)]
+fn signal_named_event(name: &str) -> std::io::Result<bool> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, HANDLE};
+    use windows::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+    use windows::core::{HRESULT, PCWSTR};
+
+    let name = wide(name);
+    // SAFETY: FFI; `name` is NUL-terminated and outlives the call.
+    let handle = match unsafe { OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(name.as_ptr())) } {
+        Ok(handle) => handle,
+        // Only a *missing* event means no recorder is waiting (not an error). Any other failure
+        // (access denied, a bad name) is real and propagates, so a genuine signaling failure is
+        // never mistaken for "no recorder is running".
+        Err(e) if e.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) => return Ok(false),
+        Err(e) => return Err(std::io::Error::other(e)),
+    };
+    // SAFETY: `OpenEventW` succeeded, so `handle` is a valid handle we now own.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+    // SAFETY: FFI; the owned handle is valid.
+    unsafe { SetEvent(HANDLE(handle.as_raw_handle())) }.map_err(std::io::Error::other)?;
+    Ok(true)
+}
+
 /// The recorder's stop event, created at startup and waited on for the settings app's
 /// restart request. Manual-reset, so a signal that lands early is never lost.
 #[cfg(windows)]
-pub struct RecorderStopEvent {
-    handle: std::os::windows::io::OwnedHandle,
-}
+pub struct RecorderStopEvent(NamedEvent);
 
 #[cfg(windows)]
 impl RecorderStopEvent {
@@ -198,50 +277,37 @@ impl RecorderStopEvent {
 
     /// The testable core of [`create`](Self::create).
     fn create_named(name: &str) -> std::io::Result<Self> {
-        use std::os::windows::io::{FromRawHandle, OwnedHandle};
-        use windows::Win32::System::Threading::CreateEventW;
-        use windows::core::PCWSTR;
-
-        let name = wide(name);
-        // SAFETY: FFI; `name` is NUL-terminated and outlives the call.
-        let handle = unsafe { CreateEventW(None, true, false, PCWSTR(name.as_ptr())) }
-            .map_err(std::io::Error::other)?;
-        // SAFETY: `CreateEventW` succeeded, so `handle` is a valid handle we own.
-        let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
-        Ok(Self { handle })
+        Ok(Self(NamedEvent::create(name, true)?))
     }
 
-    /// Block until the event is signaled (a stop request arrives).
-    pub fn wait(&self) {
-        use std::os::windows::io::AsRawHandle;
-        use windows::Win32::Foundation::HANDLE;
-        use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
-
-        // SAFETY: FFI; the handle is valid for `self`'s lifetime.
-        let _ = unsafe { WaitForSingleObject(HANDLE(self.handle.as_raw_handle()), INFINITE) };
+    /// Block until the event is signaled (a stop request arrives). Returns `false` if the wait
+    /// failed, so the caller can exit rather than treat it as a stop request.
+    #[must_use]
+    pub fn wait(&self) -> bool {
+        self.0.wait()
     }
 }
 
-/// Signal the stop event named `name`, if some process is keeping it alive (an absent
-/// event means no recorder is running — not an error).
+/// The recorder's save event — the Windows stand-in for SIGUSR1 ("save a clip now"), used by
+/// the onboarding wizard's test-clip step. Auto-reset, so each signal releases exactly one
+/// waiting save; signals that race a save already in flight coalesce into one save of the same
+/// buffer, which is the intended behavior.
 #[cfg(windows)]
-fn signal_stop_event_named(name: &str) -> std::io::Result<()> {
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
-    use windows::core::PCWSTR;
+pub struct RecorderSaveEvent(NamedEvent);
 
-    let name = wide(name);
-    // SAFETY: FFI; `name` is NUL-terminated and outlives the call.
-    let handle = match unsafe { OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(name.as_ptr())) } {
-        Ok(handle) => handle,
-        // No event object → no recorder waiting on it.
-        Err(_) => return Ok(()),
-    };
-    // SAFETY: `OpenEventW` succeeded, so `handle` is a valid handle we now own.
-    let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
-    // SAFETY: FFI; the owned handle is valid.
-    unsafe { SetEvent(HANDLE(handle.as_raw_handle())) }.map_err(std::io::Error::other)
+#[cfg(windows)]
+impl RecorderSaveEvent {
+    /// Create (or open) the named save event. Call once at recorder startup.
+    pub fn create() -> std::io::Result<Self> {
+        Ok(Self(NamedEvent::create(&save_event_name(), false)?))
+    }
+
+    /// Block until a save is requested. Auto-reset consumes the signal, so a wait loop fires once
+    /// per request. Returns `false` if the wait failed, so the loop can exit instead of spinning.
+    #[must_use]
+    pub fn wait(&self) -> bool {
+        self.0.wait()
+    }
 }
 
 /// Stop the running recorder, if any: signal its stop event and wait up to `term_wait`
@@ -249,7 +315,8 @@ fn signal_stop_event_named(name: &str) -> std::io::Result<()> {
 /// `Ok(true)` when it is gone (or none was running); `Ok(false)` when it survived both.
 #[cfg(windows)]
 pub fn stop_recorder(term_wait: Duration, kill_wait: Duration) -> std::io::Result<bool> {
-    signal_stop_event_named(&stop_event_name())?;
+    // An absent event (no recorder) is fine here — the pid check below still runs.
+    let _ = signal_named_event(&stop_event_name())?;
     match read_recorder_pid() {
         Some(pid) => stop_process(pid, "rewynd-recorder.exe", term_wait, kill_wait),
         None => Ok(true),
@@ -369,14 +436,31 @@ mod windows_tests {
     fn stop_event_signals_a_waiting_holder() {
         let name = unique_event("signal");
         let event = RecorderStopEvent::create_named(&name).expect("create");
-        signal_stop_event_named(&name).expect("signal");
+        assert!(
+            signal_named_event(&name).expect("signal"),
+            "an existing event reports it was signaled"
+        );
         // Manual-reset + already signaled: returns immediately instead of blocking.
-        event.wait();
+        assert!(event.wait(), "a signaled event waits successfully");
     }
 
     #[test]
-    fn signaling_an_absent_event_is_fine() {
-        signal_stop_event_named(&unique_event("absent")).expect("no recorder → Ok");
+    fn signaling_an_absent_event_reports_no_recorder() {
+        assert!(
+            !signal_named_event(&unique_event("absent")).expect("no recorder → Ok"),
+            "no event object → Ok(false)"
+        );
+    }
+
+    #[test]
+    fn save_event_roundtrip_consumes_each_signal() {
+        let name = unique_event("save");
+        // Auto-reset: each signal releases exactly one wait, so repeated saves work.
+        let event = NamedEvent::create(&name, false).expect("create");
+        assert!(signal_named_event(&name).expect("signal"), "first request");
+        assert!(event.wait(), "first wait succeeds");
+        assert!(signal_named_event(&name).expect("signal"), "second request");
+        assert!(event.wait(), "second wait succeeds");
     }
 
     /// Spawn a long-running `ping` child (a stable, always-present system binary).

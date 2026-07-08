@@ -9,6 +9,10 @@
 //! The window needs a display to run, so there is no headless test of `run`; the pure mapping
 //! helpers are unit-tested.
 
+// A windowed GUI should never pop a console. Windows-only (cfg_attr leaves Linux a console app);
+// `attach_parent_console` below reconnects stdout/stderr for terminal runs.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod library;
 mod player;
 mod theme;
@@ -72,6 +76,15 @@ fn initial_view() -> View {
     } else {
         View::default()
     }
+}
+
+/// The clip a `rewynd://clip/<name>` launch argument points at — a clicked desktop "clip saved"
+/// toast — resolved against the configured output directory. `None` when no such argument is
+/// present (or it fails validation).
+fn deeplink_clip(config: &Config) -> Option<std::path::PathBuf> {
+    std::env::args()
+        .find(|arg| arg.starts_with(config::CLIP_URL_PREFIX))
+        .and_then(|arg| config::clip_from_deeplink(&arg, config.output_dir().as_deref()))
 }
 
 /// How long to wait after the first filesystem event before refreshing, so a burst (one clip
@@ -191,6 +204,10 @@ fn main() -> iced::Result {
     velopack::VelopackApp::build()
         .on_restarted(|_ver| spawn_recorder_detached())
         .run();
+
+    // As a windows-subsystem exe we start with no console; reconnect to the launching one (if any)
+    // so a terminal launch still shows tracing output and `--version`. A no-op elsewhere.
+    config::attach_parent_console();
 
     if std::env::args().any(|arg| arg == "--version") {
         println!("rewynd {}", env!("CARGO_PKG_VERSION"));
@@ -608,7 +625,14 @@ impl App {
             },
             Message::EncodersProbed,
         );
-        (app, Task::batch([scan, probe]))
+        let mut tasks = vec![scan, probe];
+        // A rewynd://clip/<name> launch (a clicked desktop "clip saved" toast) opens that clip in
+        // the library; the detail view fills in once the scan lands.
+        if let Some(clip) = deeplink_clip(&app.config) {
+            app.view = View::Library;
+            tasks.push(Task::done(Message::Library(library::Message::Open(clip))));
+        }
+        (app, Task::batch(tasks))
     }
 
     fn new() -> Self {

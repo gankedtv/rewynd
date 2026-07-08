@@ -99,6 +99,35 @@ fn is_clip_name(name: &str) -> bool {
     name.starts_with("rewynd-") && name.ends_with(".mp4")
 }
 
+/// The URL scheme the clickable "clip saved" toast is activated through (see
+/// `register_clip_protocol`). [`CLIP_URL_PREFIX`] must start with it.
+pub const CLIP_URL_SCHEME: &str = "rewynd";
+
+/// The URL scheme + path a "clip saved" toast deep-links into (`rewynd://clip/<file name>`).
+/// Desktop clips live in the output-dir root with URL-safe names, so the bare file name is a
+/// complete link that [`clip_from_deeplink`] round-trips back against [`clips_dir`].
+pub const CLIP_URL_PREFIX: &str = "rewynd://clip/";
+
+/// The deep-link a clickable "clip saved" toast opens for `clip`, or `None` when the path has no
+/// clip-shaped file name.
+#[must_use]
+pub fn clip_deeplink(clip: &Path) -> Option<String> {
+    let name = clip.file_name()?.to_str()?;
+    is_clip_name(name).then(|| format!("{CLIP_URL_PREFIX}{name}"))
+}
+
+/// Resolve a `rewynd://clip/<name>` deep-link to a clip path under `configured` (the output dir).
+/// Only a bare, clip-shaped file name is accepted; a crafted argument with a path separator or
+/// `..` is rejected, so the link can never point outside the clip store.
+#[must_use]
+pub fn clip_from_deeplink(arg: &str, configured: Option<&Path>) -> Option<PathBuf> {
+    let name = arg.strip_prefix(CLIP_URL_PREFIX)?;
+    if !is_clip_name(name) || name.contains('/') || name.contains('\\') || name.contains("..") {
+        return None;
+    }
+    Some(clips_dir(configured).join(name))
+}
+
 /// The millisecond timestamp embedded in a `rewynd-<millis>-<seq>.mp4` name, if it parses.
 fn clip_stamp_millis(name: &str) -> Option<u64> {
     let rest = name.strip_prefix("rewynd-")?.strip_suffix(".mp4")?;
@@ -257,6 +286,36 @@ mod tests {
         assert_eq!(folder_name(""), None);
         let long = "x".repeat(200);
         assert!(folder_name(&long).unwrap().len() <= 80);
+    }
+
+    #[test]
+    fn clip_deeplink_round_trips_a_clip_name() {
+        let dir = Path::new("/clips");
+        let clip = dir.join("rewynd-1700000000123-0.mp4");
+        let link = clip_deeplink(&clip).expect("clip name → link");
+        assert_eq!(link, "rewynd://clip/rewynd-1700000000123-0.mp4");
+        assert_eq!(
+            clip_from_deeplink(&link, Some(dir)),
+            Some(clip),
+            "the link resolves back to the same path under the configured dir"
+        );
+    }
+
+    #[test]
+    fn clip_deeplink_rejects_non_clip_and_traversal() {
+        assert_eq!(clip_deeplink(Path::new("/clips/notes.txt")), None);
+        // A crafted link must never escape the clip store or name a non-clip.
+        assert_eq!(
+            clip_from_deeplink("rewynd://clip/rewynd-1-0.mp4", Some(Path::new("/clips"))),
+            Some(Path::new("/clips/rewynd-1-0.mp4").to_path_buf())
+        );
+        assert_eq!(clip_from_deeplink("rewynd://clip/passwd", None), None);
+        assert_eq!(
+            clip_from_deeplink(r"rewynd://clip/rewynd-..\evil.mp4", None),
+            None,
+            "a path separator / traversal is rejected"
+        );
+        assert_eq!(clip_from_deeplink("https://evil/clip", None), None);
     }
 
     #[test]

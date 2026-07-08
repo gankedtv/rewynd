@@ -32,12 +32,14 @@ mod status;
 pub mod upload_history;
 
 pub use clips::{
-    ClipEntry, clip_output_path, clips_dir, ensure_private_dir, folder_name, list_clips,
-    newest_clip_in,
+    CLIP_URL_PREFIX, CLIP_URL_SCHEME, ClipEntry, clip_deeplink, clip_from_deeplink,
+    clip_output_path, clips_dir, ensure_private_dir, folder_name, list_clips, newest_clip_in,
+};
+pub use desktop::{
+    BRAND_ICONS, attach_parent_console, install_autostart, refresh_autostart, remove_autostart,
 };
 #[cfg(windows)]
-pub use desktop::register_toast_identity;
-pub use desktop::{BRAND_ICONS, install_autostart, refresh_autostart, remove_autostart};
+pub use desktop::{register_clip_protocol, register_toast_identity};
 pub use devices::{AudioInput, list_audio_inputs};
 pub use encoders::{
     ENCODER_PROBE_VERSION, EncoderChoice, EncoderProbe, ProbeAdapter, choose_encoder,
@@ -53,7 +55,7 @@ pub use paths::{
     APP_ID, config_path, default_output_dir, recorder_pid_path, settings_lock_path, sibling_binary,
 };
 #[cfg(windows)]
-pub use process::RecorderStopEvent;
+pub use process::{RecorderSaveEvent, RecorderStopEvent};
 pub use process::{read_recorder_pid, request_recorder_save, stop_recorder};
 pub use schema::{
     AudioSettings, Config, DEFAULT_HOTKEY_TRIGGER, DEFAULT_TEMPLATE, DEFAULT_UPLOAD_API_URL,
