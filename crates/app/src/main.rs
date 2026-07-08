@@ -21,6 +21,9 @@ mod tray;
 #[cfg(target_os = "windows")]
 mod overlay;
 
+#[cfg(target_os = "windows")]
+mod toast;
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn main() -> anyhow::Result<()> {
     // Must be first: on a packaged install this handles Velopack's install/update hook args and
@@ -1705,6 +1708,17 @@ mod windows {
             tracing::warn!(error = %e, "could not register the toast identity");
         }
 
+        // Register the rewynd:// protocol at the GUI sibling, so a clickable desktop "clip saved"
+        // toast can deep-link back into its clip. Best-effort: without it the toast still shows,
+        // just not clickable.
+        if let Some(gui) = config::sibling_binary("rewynd")
+            .filter(|p| p.is_file())
+            .or_else(|| std::env::current_exe().ok())
+            && let Err(e) = config::register_clip_protocol(&gui)
+        {
+            tracing::warn!(error = %e, "could not register the rewynd:// clip protocol");
+        }
+
         // Single-instance guard (named mutex): two recorders would mean two WGC sessions
         // and two hotkey registrations fighting each other. Degraded start on IO error,
         // matching the Linux recorder.
@@ -1989,6 +2003,7 @@ mod windows {
                     &tray_stop,
                     &tray_shutdown,
                     mic_enabled,
+                    capture_desktop,
                 )
             })
             .context("spawning the tray thread")?;
@@ -2054,6 +2069,7 @@ mod windows {
             Ok(save_event) => {
                 let save_saver = saver.clone();
                 let save_stop = stop.clone();
+                let save_desktop = capture_desktop;
                 std::thread::Builder::new()
                     .name("rewynd-save-event".to_owned())
                     .spawn(move || {
@@ -2068,7 +2084,7 @@ mod windows {
                                 return;
                             }
                             tracing::info!("save requested via the save event");
-                            save_and_toast(&save_saver);
+                            save_and_toast(&save_saver, save_desktop);
                         }
                     })
                     .context("spawning the save-event thread")?;
@@ -2305,6 +2321,7 @@ mod windows {
         stop: &Arc<AtomicBool>,
         shutdown: &std::sync::mpsc::Sender<&'static str>,
         mic_enabled: bool,
+        capture_desktop: bool,
     ) {
         use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 
@@ -2372,7 +2389,7 @@ mod windows {
             while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
                 if msg.message == WM_HOTKEY && msg.wParam.0 == HOTKEY_ID as usize {
                     tracing::info!("hotkey activated");
-                    save_and_toast(saver);
+                    save_and_toast(saver, capture_desktop);
                 }
                 // tray-icon's internal window procs need the messages dispatched.
                 // SAFETY: FFI.
@@ -2384,7 +2401,7 @@ mod windows {
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 let id = event.id();
                 if id == save_item.id() {
-                    save_and_toast(saver);
+                    save_and_toast(saver, capture_desktop);
                 } else if id == mic_item.id() {
                     toggle_mic_and_restart();
                 } else if id == settings_item.id() {
@@ -2512,18 +2529,23 @@ mod windows {
         (1..=24).contains(&n).then(|| u32::from(VK_F1.0) + n - 1)
     }
 
-    /// Cut + mux a clip and confirm on every channel: toast (desktop), on-screen badge
-    /// + chime/beep (in a fullscreen game, where Windows suppresses toasts).
-    fn save_and_toast(saver: &Arc<ClipSaver>) {
-        let (accent, title, body) = match saver.save() {
+    /// Cut + mux a clip and confirm on every channel: toast (desktop), on-screen badge + chime
+    /// (in a fullscreen game, where Windows suppresses toasts). A successful desktop save gets a
+    /// clickable toast that deep-links back into the clip; game saves keep the plain toast, since
+    /// the in-game badge is their affordance and Windows suppresses toasts in fullscreen games.
+    fn save_and_toast(saver: &Arc<ClipSaver>, desktop: bool) {
+        let saved = saver.save();
+        let (accent, title, body) = match &saved {
             Ok(path) => (
                 overlay::Accent::Success,
                 "Clip saved",
                 path.display().to_string(),
             ),
-            Err(SaveError::Empty(reason)) => {
-                (overlay::Accent::Failure, "Nothing to save yet", reason)
-            }
+            Err(SaveError::Empty(reason)) => (
+                overlay::Accent::Failure,
+                "Nothing to save yet",
+                reason.clone(),
+            ),
             Err(e) => {
                 tracing::error!(error = %e, "clip save failed");
                 (
@@ -2535,6 +2557,18 @@ mod windows {
         };
         overlay::play(accent);
         overlay::show(accent, title);
+        // A desktop save gets a clickable toast that opens the clip in the GUI; otherwise (or if
+        // the clickable toast can't be built) the plain toast.
+        if let (true, Ok(path)) = (desktop, &saved)
+            && let Some(link) = config::clip_deeplink(path)
+        {
+            let name = path
+                .file_name()
+                .map_or_else(|| body.clone(), |n| n.to_string_lossy().into_owned());
+            if crate::toast::clip_saved(config::APP_ID, &name, &link).is_ok() {
+                return;
+            }
+        }
         toast(title, &body);
     }
 

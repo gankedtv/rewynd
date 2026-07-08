@@ -78,6 +78,15 @@ fn initial_view() -> View {
     }
 }
 
+/// The clip a `rewynd://clip/<name>` launch argument points at — a clicked desktop "clip saved"
+/// toast — resolved against the configured output directory. `None` when no such argument is
+/// present (or it fails validation).
+fn deeplink_clip(config: &Config) -> Option<std::path::PathBuf> {
+    std::env::args()
+        .find(|arg| arg.starts_with(config::CLIP_URL_PREFIX))
+        .and_then(|arg| config::clip_from_deeplink(&arg, config.output_dir().as_deref()))
+}
+
 /// How long to wait after the first filesystem event before refreshing, so a burst (one clip
 /// write touches the `.part` file, the rename, and the directory) collapses into one rescan.
 const WATCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
@@ -616,7 +625,14 @@ impl App {
             },
             Message::EncodersProbed,
         );
-        (app, Task::batch([scan, probe]))
+        let mut tasks = vec![scan, probe];
+        // A rewynd://clip/<name> launch (a clicked desktop "clip saved" toast) opens that clip in
+        // the library; the detail view fills in once the scan lands.
+        if let Some(clip) = deeplink_clip(&app.config) {
+            app.view = View::Library;
+            tasks.push(Task::done(Message::Library(library::Message::Open(clip))));
+        }
+        (app, Task::batch(tasks))
     }
 
     fn new() -> Self {

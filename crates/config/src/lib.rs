@@ -32,14 +32,14 @@ mod status;
 pub mod upload_history;
 
 pub use clips::{
-    ClipEntry, clip_output_path, clips_dir, ensure_private_dir, folder_name, list_clips,
-    newest_clip_in,
+    CLIP_URL_PREFIX, CLIP_URL_SCHEME, ClipEntry, clip_deeplink, clip_from_deeplink,
+    clip_output_path, clips_dir, ensure_private_dir, folder_name, list_clips, newest_clip_in,
 };
-#[cfg(windows)]
-pub use desktop::register_toast_identity;
 pub use desktop::{
     BRAND_ICONS, attach_parent_console, install_autostart, refresh_autostart, remove_autostart,
 };
+#[cfg(windows)]
+pub use desktop::{register_clip_protocol, register_toast_identity};
 pub use devices::{AudioInput, list_audio_inputs};
 pub use encoders::{
     ENCODER_PROBE_VERSION, EncoderChoice, EncoderProbe, ProbeAdapter, choose_encoder,

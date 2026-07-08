@@ -63,6 +63,9 @@ windows = { workspace = true, features = [
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+    # The clickable "clip saved" toast (WinRT ToastNotification + its XML document).
+    "Data_Xml_Dom",
+    "UI_Notifications",
 ] }
 
 # Embeds packaging/rewynd.ico as the exe icon (taskbar / Start / Explorer). Host-gated to

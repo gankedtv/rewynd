@@ -1,0 +1,66 @@
+name: Bump version and tag
+
+# Manually bump the workspace version and push the matching tag, which triggers the Release
+# workflow. A lighter alternative to release-plz: you pick the version, with no conventional-commit
+# requirement. The tag must equal the workspace version (release-version.sh enforces this), so
+# doing both here keeps them in lockstep.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "New version without a leading v (e.g. 1.0.0-beta.3)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # A PAT with contents:write lets the pushed tag trigger the Release workflow — the default
+          # GITHUB_TOKEN cannot trigger another workflow from a tag it pushes. Without the secret it
+          # falls back to GITHUB_TOKEN: the bump + tag still land, but you then push the tag yourself
+          # (git push origin vX.Y.Z) to start Release.
+          token: ${{ secrets.RELEASE_PAT || github.token }}
+          fetch-depth: 0
+
+      - name: Validate the version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::'$VERSION' is not a SemVer version (e.g. 1.0.0 or 1.0.0-beta.3)"
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::tag v$VERSION already exists"
+            exit 1
+          fi
+
+      - name: Bump the workspace version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Rewrite the first `version = "..."` line — the [workspace.package] one every crate
+          # inherits, and the same line release-version.sh checks the tag against.
+          sed -i -E "0,/^version = \".*\"/s//version = \"$VERSION\"/" Cargo.toml
+          grep -m1 -E '^version = "' Cargo.toml
+          # Sync just the workspace members in the lockfile to the new version.
+          cargo update --workspace
+
+      - name: Commit and tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "Release v$VERSION"
+          git tag "v$VERSION"
+          git push origin HEAD
+          git push origin "v$VERSION"
