@@ -30,6 +30,35 @@ pub(crate) fn data_home_from(get: impl Fn(&str) -> Option<OsString>) -> Option<P
         .filter(|p| p.is_absolute())
 }
 
+/// The user's cache home from an environment lookup: `$XDG_CACHE_HOME`, falling back to
+/// `$HOME/.cache`. Absolute-only, like [`config_home_from`]. Only unix consumes it (regenerable
+/// extracted assets such as the recorder's notification chime).
+#[cfg(unix)]
+pub(crate) fn cache_home_from(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    get("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| get("HOME").map(|h| Path::new(&h).join(".cache")))
+        .filter(|p| p.is_absolute())
+}
+
+/// Resolve `$XDG_CACHE_HOME/rewynd/<name>` from an environment lookup, falling back to
+/// `$HOME/.cache/rewynd/<name>`. `None` if the cache home can't be resolved. The testable core of
+/// [`cache_file`].
+#[cfg(unix)]
+fn cache_file_from(get: impl Fn(&str) -> Option<OsString>, name: &str) -> Option<PathBuf> {
+    Some(cache_home_from(get)?.join("rewynd").join(name))
+}
+
+/// A path under rewynd's cache dir (`$XDG_CACHE_HOME/rewynd/<name>`), for regenerable extracted
+/// assets like the notification chime the `sound-file` hint points at. `None` if the cache home
+/// can't be resolved. The caller creates the dir (this only resolves the path).
+#[cfg(unix)]
+#[must_use]
+pub fn cache_file(name: &str) -> Option<PathBuf> {
+    cache_file_from(|k| std::env::var_os(k), name)
+}
+
 /// Resolve the config file path from an environment lookup: `$XDG_CONFIG_HOME/rewynd/config.toml`,
 /// falling back to `$HOME/.config/rewynd/config.toml`. `None` if neither var is usable.
 pub(crate) fn config_path_from(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
@@ -241,6 +270,41 @@ mod tests {
         let rel = data_home_from(|k| (k == "XDG_DATA_HOME").then(|| OsString::from("rel")));
         assert_eq!(rel, None, "relative XDG_DATA_HOME without HOME is unusable");
         assert!(data_home_from(|_| None).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_home_prefers_xdg_then_home() {
+        let xdg = cache_home_from(|k| match k {
+            "XDG_CACHE_HOME" => Some(OsString::from("/xdg-cache")),
+            "HOME" => Some(OsString::from("/home/u")),
+            _ => None,
+        });
+        assert_eq!(xdg, Some(PathBuf::from("/xdg-cache")));
+
+        let home = cache_home_from(|k| (k == "HOME").then(|| OsString::from("/home/u")));
+        assert_eq!(home, Some(PathBuf::from("/home/u/.cache")));
+
+        let rel = cache_home_from(|k| (k == "XDG_CACHE_HOME").then(|| OsString::from("rel")));
+        assert_eq!(
+            rel, None,
+            "relative XDG_CACHE_HOME without HOME is unusable"
+        );
+        assert!(cache_home_from(|_| None).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_file_joins_the_rewynd_dir() {
+        let path = cache_file_from(
+            |k| (k == "XDG_CACHE_HOME").then(|| OsString::from("/xdg-cache")),
+            "clip-saved.wav",
+        );
+        assert_eq!(
+            path,
+            Some(PathBuf::from("/xdg-cache/rewynd/clip-saved.wav"))
+        );
+        assert!(cache_file_from(|_| None, "clip-saved.wav").is_none());
     }
 
     #[cfg(unix)]

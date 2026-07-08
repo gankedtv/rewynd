@@ -33,7 +33,7 @@ use rewynd_config::{self as config, Config};
 
 use crate::theme::{
     DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, arena_check, arena_input, arena_pick, arena_slider, card,
-    field, field_label, hint, link_button, logo, oauth_button, palette, primary_button,
+    card_fixed, field, field_label, hint, link_button, logo, oauth_button, palette, primary_button,
     secondary_button, setting, status_pill, tinted, value_row, window_icon,
 };
 
@@ -193,6 +193,10 @@ const BITRATE_MIN_MBPS: u32 = 1;
 const BITRATE_MAX_MBPS: u32 = 50;
 /// Frame-rate options offered in the dropdown.
 const FPS_OPTIONS: [u32; 4] = [30, 60, 120, 144];
+/// Height (logical px) the ganked.tv connector card is pinned to so it matches the YouTube card's
+/// collapsed height beside it. Tuned by eye to the YouTube card (account row + hint + the Advanced
+/// options toggle ganked.tv lacks); iced rows can't stretch a child to a sibling's height.
+const CONNECTOR_CARD_HEIGHT: f32 = 176.0;
 /// The microphone picker's "use the system default" row (stored as an empty value).
 const MIC_DEFAULT: &str = "System default";
 const BITS_PER_MBIT: u32 = 1_000_000;
@@ -582,7 +586,6 @@ enum Message {
     ApiKeyEdited(String),
     ApiUrlEdited(String),
     ShareUrlEdited(String),
-    VisibilityPicked(rewynd_upload::Visibility),
     AdvancedToggled,
     LoginPressed,
     LoginStarted(Result<rewynd_upload::DeviceLogin, String>),
@@ -870,10 +873,6 @@ impl App {
             }
             Message::ShareUrlEdited(s) => {
                 self.share_url = s;
-                self.touch();
-            }
-            Message::VisibilityPicked(v) => {
-                self.config.set_upload_visibility(v.as_str().to_owned());
                 self.touch();
             }
             // No touch(): opening or closing the disclosure edits nothing. The scroll offset stays
@@ -1680,13 +1679,16 @@ impl App {
         };
 
         // The GANKED.TV card is just the account state now: login covers the common case and turns
-        // uploads on by itself. Visibility is shared with YouTube (the SHARING card above), and the
-        // self-hosting fields moved to the generic CUSTOM CONNECTOR card at the bottom.
-        let upload = card(
+        // uploads on by itself. Visibility is chosen per clip at upload time, and the self-hosting
+        // fields moved to the generic CUSTOM CONNECTOR card at the bottom. Pinned to the YouTube
+        // card's height so the two connectors sit symmetric side by side (ganked.tv has no advanced
+        // settings, so it is otherwise the shorter of the pair).
+        let upload = card_fixed(
             "GANKED.TV",
+            CONNECTOR_CARD_HEIGHT,
             column![
                 account,
-                hint("Clips use the visibility chosen above and are sent from your library."),
+                hint("Clips are sent from your library, with the visibility you pick per clip."),
             ]
             .spacing(18),
         );
@@ -1766,7 +1768,7 @@ impl App {
         let mut youtube_items: Vec<Element<Message>> = vec![
             yt_account,
             hint(
-                "Clips use the visibility chosen above and are sent from your library. \
+                "Clips are sent from your library, with the visibility you pick per clip. \
                  YouTube's built-in quota allows only a handful of uploads per day.",
             ),
             button(
@@ -1900,38 +1902,16 @@ impl App {
         ]
         .spacing(20);
 
-        // One visibility for every upload, shared across both destinations (each card points here
-        // as "chosen above"), so a per-destination picker can't drift.
-        let visibility = card(
-            "SHARING",
-            column![
-                hint("The visibility used when a clip is uploaded to a connected destination."),
-                setting(
-                    "Visibility",
-                    rewynd_upload::Visibility::parse(self.config.upload_visibility()).to_string(),
-                    pick_list(
-                        &rewynd_upload::Visibility::ALL[..],
-                        Some(rewynd_upload::Visibility::parse(
-                            self.config.upload_visibility(),
-                        )),
-                        Message::VisibilityPicked,
-                    )
-                    .style(arena_pick)
-                    .width(Length::Fill),
-                ),
-            ]
-            .spacing(12),
-        );
-
-        // The two upload connectors sit side by side as a symmetric pair, each filling half the
-        // width, so neither column runs long and empty against the other.
+        // The two upload connectors sit side by side, each column filling half the width. GANKED.TV
+        // is pinned to the YouTube card's collapsed height (see CONNECTOR_CARD_HEIGHT) so the pair
+        // stays symmetric; opening YouTube's Advanced options grows only that card, which is fine.
         let connectors = row![
             column![upload].width(Length::Fill),
             column![youtube].width(Length::Fill),
         ]
         .spacing(20);
 
-        let body = column![header, columns, visibility, connectors, connector, save]
+        let body = column![header, columns, connectors, connector, save]
             .spacing(20)
             .padding(28)
             .max_width(880);

@@ -24,6 +24,12 @@ mod overlay;
 #[cfg(target_os = "windows")]
 mod toast;
 
+/// The clip-saved chime (generated two-note pling, mono 16-bit WAV), embedded once and shared by
+/// both platforms: Windows plays it from memory (`overlay::play_chime`), Linux extracts it to disk
+/// for the notification's `sound-file` hint.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) const CLIP_SAVED_WAV: &[u8] = include_bytes!("../assets/clip-saved.wav");
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn main() -> anyhow::Result<()> {
     // Must be first: on a packaged install this handles Velopack's install/update hook args and
@@ -565,7 +571,7 @@ mod status {
 mod linux {
     use std::cell::RefCell;
     use std::ops::ControlFlow;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1155,26 +1161,58 @@ mod linux {
         drop(handle); // removes the icon
     }
 
-    /// Toast a save outcome, including the failures a user can act on.
+    /// Toast a save outcome, including the failures a user can act on. Each carries a sound and
+    /// critical urgency (see `tray::notify`) so the confirmation lands over a fullscreen game.
     async fn toast_save_outcome(saved: Result<Result<PathBuf, SaveError>, tokio::task::JoinError>) {
         match saved {
-            Ok(Ok(path)) => tray::clip_saved_toast(&path).await,
+            Ok(Ok(path)) => {
+                let chime = chime_sound_file();
+                tray::clip_saved_toast(&path, chime.as_deref()).await;
+            }
             Ok(Err(SaveError::Empty(reason))) => {
-                tray::toast("Nothing to save yet", &reason).await;
+                tray::save_failed_toast("Nothing to save yet", &reason, "dialog-warning").await;
             }
             Ok(Err(e @ SaveError::Write { .. })) => {
                 tracing::error!(error = %e, "clip save failed");
-                tray::toast("Could not save the clip", &e.to_string()).await;
+                tray::save_failed_toast("Could not save the clip", &e.to_string(), "dialog-error")
+                    .await;
             }
             Err(e) => {
                 tracing::error!(error = %e, "save task failed");
-                tray::toast(
+                tray::save_failed_toast(
                     "Could not save the clip",
                     "The save task crashed; see the logs.",
+                    "dialog-error",
                 )
                 .await;
             }
         }
+    }
+
+    /// Path to the extracted clip-saved chime, written once so the "clip saved" notification's
+    /// `sound-file` hint can point at it. `None` (the confirmation still shows, just silently) if
+    /// the cache dir can't be resolved or the write fails.
+    fn chime_sound_file() -> Option<PathBuf> {
+        let path = config::cache_file("clip-saved.wav")?;
+        if let Err(e) = extract_once(&path, crate::CLIP_SAVED_WAV) {
+            tracing::warn!(error = %e, path = %path.display(), "could not write the notification chime");
+            return None;
+        }
+        Some(path)
+    }
+
+    /// Write `bytes` to `path` (creating parent dirs) only when the file is missing or a different
+    /// size, so repeated saves don't rewrite it. `bytes` is a fixed embedded asset that only
+    /// changes across builds (which changes its length in practice), so a same-size file on disk is
+    /// treated as already current.
+    fn extract_once(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        if std::fs::metadata(path).is_ok_and(|m| m.len() == bytes.len() as u64) {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, bytes)
     }
 
     /// Flip the microphone on/off in the config file and restart the recorder to apply it (the
@@ -1647,6 +1685,34 @@ mod linux {
 
     fn saver_window_secs(saver: &Arc<ClipSaver>) -> u64 {
         saver.window().as_secs()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::extract_once;
+
+        #[test]
+        fn extract_once_writes_then_skips() {
+            let dir = std::env::temp_dir().join(format!("rewynd-chime-{}", std::process::id()));
+            let path = dir.join("nested").join("clip-saved.wav");
+            let _ = std::fs::remove_dir_all(&dir);
+
+            // First call creates the parent dirs and writes the bytes.
+            extract_once(&path, b"abcd").expect("write");
+            assert_eq!(std::fs::read(&path).expect("read"), b"abcd");
+
+            // A same-size file is left untouched (idempotent): overwrite it out of band and
+            // confirm a second call with equal-length bytes does not rewrite it.
+            std::fs::write(&path, b"WXYZ").expect("clobber");
+            extract_once(&path, b"abcd").expect("skip");
+            assert_eq!(std::fs::read(&path).expect("read"), b"WXYZ");
+
+            // A different size forces a rewrite.
+            extract_once(&path, b"longer-bytes").expect("rewrite");
+            assert_eq!(std::fs::read(&path).expect("read"), b"longer-bytes");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
 

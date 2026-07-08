@@ -142,28 +142,81 @@ pub async fn spawn(
     Ok((handle, rx))
 }
 
+/// How long a save confirmation stays up before we close it ourselves; ~4s matches the Windows
+/// in-game badge.
+const DISMISS_AFTER: std::time::Duration = std::time::Duration::from_secs(4);
+
 /// Best-effort desktop notification. Async: the zbus backend's blocking `show()` would panic if
 /// called inside our tokio runtime, so it is sent via `show_async`.
-pub async fn toast(summary: &str, body: &str) {
+///
+/// `urgency` [`Critical`](notify_rust::Urgency::Critical) is what makes a save confirmation show
+/// over a fullscreen game: KWin/Plasma auto-enables Do-Not-Disturb while a window is fullscreen,
+/// which swallows normal-urgency notifications. Critical bypasses that, but KDE then holds the
+/// notification until dismissed (it ignores the expire timeout for critical urgency), so we close
+/// it ourselves after [`DISMISS_AFTER`] to keep repeated saves from stacking on screen. `sound`,
+/// when set, plays a chime/error tone through the server (a `sound-file` or `sound-name` hint).
+async fn notify(
+    summary: &str,
+    body: &str,
+    urgency: notify_rust::Urgency,
+    sound: Option<notify_rust::Hint>,
+) {
     // Notification bodies are markup on many servers (KDE renders a HTML subset); escape so
     // server-provided text (error details, share codes) can't inject tags.
     let body = body
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;");
-    if let Err(e) = notify_rust::Notification::new()
-        .summary(summary)
+    let mut note = notify_rust::Notification::new();
+    note.summary(summary)
         .body(&body)
         .icon(rewynd_config::APP_ID)
         .appname("rewynd")
-        .show_async()
-        .await
-    {
-        tracing::warn!(error = %e, summary, "could not show notification");
+        .urgency(urgency);
+    if let Some(hint) = sound {
+        note.hint(hint);
+    }
+    let handle = match note.show_async().await {
+        Ok(handle) => handle,
+        Err(e) => {
+            tracing::warn!(error = %e, summary, "could not show notification");
+            return;
+        }
+    };
+    if urgency == notify_rust::Urgency::Critical {
+        tokio::spawn(async move {
+            tokio::time::sleep(DISMISS_AFTER).await;
+            handle.close_async().await;
+        });
     }
 }
 
-/// "Clip saved" notification for a freshly written clip.
-pub async fn clip_saved_toast(path: &Path) {
-    toast("Clip saved", &path.display().to_string()).await;
+/// Best-effort desktop notification at normal urgency, no sound (mic toggle, config errors).
+pub async fn toast(summary: &str, body: &str) {
+    notify(summary, body, notify_rust::Urgency::Normal, None).await;
+}
+
+/// "Clip saved" notification for a freshly written clip: critical urgency so it surfaces over a
+/// fullscreen game, with the bundled chime (`sound-file`) when the chime could be extracted.
+pub async fn clip_saved_toast(path: &Path, chime: Option<&Path>) {
+    let sound = chime.map(|p| notify_rust::Hint::SoundFile(p.display().to_string()));
+    notify(
+        "Clip saved",
+        &path.display().to_string(),
+        notify_rust::Urgency::Critical,
+        sound,
+    )
+    .await;
+}
+
+/// A failed/empty save notification: critical (surfaces over a fullscreen game) with a themed
+/// freedesktop sound (`sound-name`, e.g. `dialog-error`), mirroring the Windows failure beep.
+pub async fn save_failed_toast(summary: &str, body: &str, sound_name: &str) {
+    notify(
+        summary,
+        body,
+        notify_rust::Urgency::Critical,
+        Some(notify_rust::Hint::SoundName(sound_name.to_owned())),
+    )
+    .await;
 }

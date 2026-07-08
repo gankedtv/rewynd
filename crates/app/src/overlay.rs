@@ -58,9 +58,6 @@ impl Accent {
     }
 }
 
-/// The clip-saved chime (see `assets/`): generated two-note pling, mono 16-bit WAV.
-static CHIME: &[u8] = include_bytes!("../assets/clip-saved.wav");
-
 /// The audible half of the feedback: the chime on success, the system error
 /// beep on failure — the confirmation channel that still works over exclusive
 /// fullscreen, where the badge can't show.
@@ -80,7 +77,7 @@ fn play_chime() {
     // SAFETY: trivially safe FFI; the buffer is 'static, outliving async playback.
     let ok = unsafe {
         PlaySoundW(
-            PCWSTR(CHIME.as_ptr().cast()),
+            PCWSTR(crate::CLIP_SAVED_WAV.as_ptr().cast()),
             None,
             SND_MEMORY | SND_ASYNC | SND_NODEFAULT,
         )
