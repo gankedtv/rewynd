@@ -1709,11 +1709,10 @@ mod windows {
         }
 
         // Register the rewynd:// protocol at the GUI sibling, so a clickable desktop "clip saved"
-        // toast can deep-link back into its clip. Best-effort: without it the toast still shows,
-        // just not clickable.
-        if let Some(gui) = config::sibling_binary("rewynd")
-            .filter(|p| p.is_file())
-            .or_else(|| std::env::current_exe().ok())
+        // toast can deep-link back into its clip. Only when the GUI binary is actually found —
+        // pointing the handler at the recorder itself would make a click a no-op. Best-effort:
+        // without it the toast still shows, just not clickable.
+        if let Some(gui) = config::sibling_binary("rewynd").filter(|p| p.is_file())
             && let Err(e) = config::register_clip_protocol(&gui)
         {
             tracing::warn!(error = %e, "could not register the rewynd:// clip protocol");

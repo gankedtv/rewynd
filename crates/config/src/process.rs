@@ -241,16 +241,19 @@ impl NamedEvent {
 #[cfg(windows)]
 fn signal_named_event(name: &str) -> std::io::Result<bool> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, HANDLE};
     use windows::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
-    use windows::core::PCWSTR;
+    use windows::core::{HRESULT, PCWSTR};
 
     let name = wide(name);
     // SAFETY: FFI; `name` is NUL-terminated and outlives the call.
     let handle = match unsafe { OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(name.as_ptr())) } {
         Ok(handle) => handle,
-        // No event object → nothing is waiting on it.
-        Err(_) => return Ok(false),
+        // Only a *missing* event means no recorder is waiting (not an error). Any other failure
+        // (access denied, a bad name) is real and propagates, so a genuine signaling failure is
+        // never mistaken for "no recorder is running".
+        Err(e) if e.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) => return Ok(false),
+        Err(e) => return Err(std::io::Error::other(e)),
     };
     // SAFETY: `OpenEventW` succeeded, so `handle` is a valid handle we now own.
     let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
