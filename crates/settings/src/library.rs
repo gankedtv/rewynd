@@ -1282,7 +1282,7 @@ impl Library {
                 .width(Length::Fill),
         )
         .center_x(Length::Fill);
-        container(scrollable(content))
+        container(crate::scroll::smooth(scrollable(content)))
             .width(Length::Fill)
             .height(Length::Fill)
             .into()

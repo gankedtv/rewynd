@@ -15,6 +15,7 @@
 
 mod library;
 mod player;
+mod scroll;
 mod theme;
 mod thumbs;
 mod trimbar;
@@ -1951,10 +1952,12 @@ impl App {
         // collapsed form fits without it. The body caps at CONTENT_MAX_WIDTH, so on a wider window
         // center it rather than leaving the slack on one side. Collapsing a disclosure keeps the
         // current scroll offset (clamped to the shorter form) instead of jumping the view to the top.
-        container(scrollable(container(body).center_x(Length::Fill)))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+        container(scroll::smooth(scrollable(
+            container(body).center_x(Length::Fill),
+        )))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
     }
 }
 
