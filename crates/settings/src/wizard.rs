@@ -237,7 +237,7 @@ impl Wizard {
                 .width(Length::Fill),
         )
         .center_x(Length::Fill);
-        container(iced::widget::scrollable(content))
+        container(crate::scroll::smooth(iced::widget::scrollable(content)))
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
