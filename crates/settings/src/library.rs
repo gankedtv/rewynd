@@ -19,6 +19,7 @@ use rewynd_upload::youtube::{
 };
 use rewynd_upload::{GankedClient, Visibility, default_title, titled, user_facing_upload_error};
 
+use crate::anim::{ease, lerp_color};
 use crate::player;
 use crate::theme::{
     self, CONTENT_MAX_WIDTH, DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, accent_button_style, accent_chip,
@@ -2508,22 +2509,6 @@ impl AccentFade {
         let linear = now.duration_since(start).as_secs_f32() / ACCENT_FADE.as_secs_f32();
         self.progress = ease(linear);
         linear >= 1.0
-    }
-}
-
-/// Smoothstep easing, clamped to `0.0..=1.0`.
-fn ease(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-/// Per-channel linear interpolation between two colours.
-fn lerp_color(a: iced::Color, b: iced::Color, t: f32) -> iced::Color {
-    iced::Color {
-        r: a.r + (b.r - a.r) * t,
-        g: a.g + (b.g - a.g) * t,
-        b: a.b + (b.b - a.b) * t,
-        a: a.a + (b.a - a.a) * t,
     }
 }
 

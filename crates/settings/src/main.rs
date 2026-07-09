@@ -13,6 +13,7 @@
 // `attach_parent_console` below reconnects stdout/stderr for terminal runs.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod anim;
 mod library;
 mod player;
 mod scroll;

@@ -481,6 +481,36 @@ pub fn hint<'a, M: 'a>(s: impl Into<String>) -> Element<'a, M> {
     text(s.into()).size(11).style(tinted(palette::MUTED)).into()
 }
 
+/// Body copy: the readable middle of the scale, for step explanations and empty states
+/// (hints stay for fine print).
+pub fn body<'a, M: 'a>(s: impl Into<String>) -> Element<'a, M> {
+    text(s.into())
+        .size(13)
+        .style(tinted(palette::TEXT_SECONDARY))
+        .into()
+}
+
+/// A keycap chip (Arena kbd hint): quiet bordered cap, uppercase label.
+pub fn kbd_chip<'a, M: 'a>(label: impl Into<String>) -> Element<'a, M> {
+    container(
+        text(label.into().to_uppercase())
+            .size(11)
+            .font(UI_SEMIBOLD)
+            .style(tinted(palette::TEXT_SECONDARY)),
+    )
+    .padding([3, 8])
+    .style(|_: &Theme| container::Style {
+        background: Some(Background::Color(palette::HIGH)),
+        border: Border {
+            color: palette::BORDER_STRONG,
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        ..container::Style::default()
+    })
+    .into()
+}
+
 /// An accent chip (game tags, connected badges): mint text on the mint tint, 5px radius.
 pub fn accent_chip<'a, M: 'a>(label: String) -> Element<'a, M> {
     container(
