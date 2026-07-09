@@ -50,10 +50,10 @@ pub mod palette {
     pub const INK_ON_YOUTUBE: Color = Color::from_rgb8(0xff, 0xff, 0xff);
 }
 
-/// Cap for the centered page shell (settings columns, clip grid). Chosen so the two-column
-/// settings and the clip grid breathe in the wider default window while very wide windows still
-/// center the content rather than stretching it edge to edge.
-pub const CONTENT_MAX_WIDTH: f32 = 960.0;
+/// Cap for the centered page shell (settings columns, clip grid). Chosen so the four-across clip
+/// grid gives each thumbnail enough pixels to look crisp in the wider default window, while very
+/// wide windows still center the content rather than stretching it edge to edge.
+pub const CONTENT_MAX_WIDTH: f32 = 1120.0;
 
 /// Display face for headings: Barlow Condensed, always uppercase per the design.
 pub const DISPLAY_BLACK: Font = Font {

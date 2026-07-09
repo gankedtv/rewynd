@@ -298,9 +298,10 @@ fn main() -> iced::Result {
         })
         .window(iced::window::Settings {
             // Landscape: the left sidebar takes a fixed column, leaving a wide content area for the
-            // two-column settings and the clip grid. Tall enough that the whole form (advanced
-            // collapsed) fits without scrolling.
-            size: iced::Size::new(1240.0, 860.0),
+            // two-column settings and the four-across clip grid (wide enough that each thumbnail
+            // renders crisp). Tall enough that the whole form (advanced collapsed) fits without
+            // scrolling.
+            size: iced::Size::new(1380.0, 880.0),
             min_size: Some(iced::Size::new(880.0, 560.0)),
             // On Wayland this is a no-op until winit speaks xdg-toplevel-icon; there the
             // taskbar icon resolves through the app id's desktop entry + hicolor icons.
