@@ -252,6 +252,8 @@ pub enum Message {
     Seek(f32),
     /// A timeline drag was released; playback resumes here if seeking paused it.
     TrimDragEnd,
+    /// Escape on the focused timeline: throw the trim edits away, back to the whole clip.
+    TrimReset,
 }
 
 /// What a trim save does with the result.
@@ -748,6 +750,13 @@ impl Library {
                         .unwrap_or(self.trim_start)
                         .clamp(self.trim_start, (self.trim_end - 0.05).max(self.trim_start));
                     self.play_range = Some((from, self.trim_end));
+                }
+            }
+            Message::TrimReset => {
+                if self.open_dur > 0.0 {
+                    self.trim_start = 0.0;
+                    self.trim_end = self.open_dur;
+                    self.trim = TrimState::Idle;
                 }
             }
             Message::OpenLink(url) => {
@@ -1836,7 +1845,8 @@ impl Library {
         .waveform(self.waveform.as_deref())
         .on_seek(Message::Seek)
         .on_released(Message::TrimDragEnd)
-        .on_toggle(Message::PlayToggle);
+        .on_toggle(Message::PlayToggle)
+        .on_reset(Message::TrimReset);
         let stack = layered([cells.into(), bar.into()])
             .width(Length::Fill)
             .height(Length::Fill);
@@ -1867,6 +1877,8 @@ impl Library {
             hint("trim in and out"),
             theme::kbd_chip("space"),
             hint("play"),
+            theme::kbd_chip("esc"),
+            hint("reset"),
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center);
