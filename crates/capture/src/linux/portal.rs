@@ -37,6 +37,9 @@ pub struct PortalSession {
     /// The stream size `(width, height)` in the compositor coordinate space, if
     /// the portal reported it (monitor streams only).
     pub size: Option<(i32, i32)>,
+    /// The stream's top-left `(x, y)` in the compositor coordinate space, if the portal reported it
+    /// (monitor streams only). Identifies which monitor is captured, so overlays can target it.
+    pub position: Option<(i32, i32)>,
 }
 
 impl PortalSession {
@@ -199,6 +202,7 @@ pub async fn open_portal_with(force_picker: bool) -> Result<PortalSession, Captu
 
     let node_id = stream.pipe_wire_node_id();
     let size = stream.size();
+    let position = stream.position();
 
     let fd = proxy
         .open_pipe_wire_remote(&session, Default::default())
@@ -210,5 +214,6 @@ pub async fn open_portal_with(force_picker: bool) -> Result<PortalSession, Captu
         node_id,
         fd: Some(fd),
         size,
+        position,
     })
 }

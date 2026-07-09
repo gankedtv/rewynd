@@ -882,6 +882,11 @@ mod linux {
         let mut portal = runtime.block_on(open_portal_with(config.always_prompt()))?;
         let node_id = portal.node_id;
         let fd = portal.take_fd();
+        // The captured monitor's origin lets the in-game badge target that monitor (where the game
+        // is) instead of the compositor's default output.
+        if let Some(origin) = portal.position {
+            badge::set_capture_origin(origin);
+        }
         tracing::info!(node_id, "screencast portal established");
 
         let stop = Arc::new(AtomicBool::new(false));
