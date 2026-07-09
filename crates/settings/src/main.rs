@@ -1417,7 +1417,7 @@ impl App {
                     "Microphone volume",
                     format!("{:.2}x", self.config.mic_gain()),
                     slider(0.0..=GAIN_MAX, self.config.mic_gain(), Message::MicGain)
-                        .step(0.05)
+                        .step(0.05_f32)
                         .style(arena_slider),
                 ),
             ]
@@ -1441,7 +1441,7 @@ impl App {
                     self.config.system_gain(),
                     Message::SystemGain,
                 )
-                .step(0.05)
+                .step(0.05_f32)
                 .style(arena_slider),
             ),
         ];
