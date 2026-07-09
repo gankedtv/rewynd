@@ -19,6 +19,7 @@ use rewynd_upload::youtube::{
 };
 use rewynd_upload::{GankedClient, Visibility, default_title, titled, user_facing_upload_error};
 
+use crate::anim::lerp_color;
 use crate::player;
 use crate::theme::{
     self, CONTENT_MAX_WIDTH, DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, accent_button_style, accent_chip,
@@ -32,6 +33,22 @@ use crate::video;
 /// Cards per grid row (the body column is width-capped, so a fixed count stays balanced). Four
 /// across suits the wider default window while staying readable if it is narrowed.
 const GRID_COLUMNS: usize = 4;
+
+/// One shows up under the empty-library headline, picked per app run.
+const LIBRARY_QUIPS: [&str; 4] = [
+    "Go make some plays worth keeping.",
+    "The arena is waiting.",
+    "Your first clutch goes right here.",
+    "Warm up the highlight reel.",
+];
+
+/// Warm off-white used only on top of thumbnail imagery (arena.md non-token colors).
+const OVERLAY_INK: iced::Color = iced::Color::from_rgb8(0xf4, 0xf1, 0xe8);
+/// The duration-badge scrim over thumbnails.
+const BADGE_SCRIM: iced::Color = iced::Color::from_rgba(0.0, 0.0, 0.0, 0.75);
+/// The circular play button's scrim and ring, shown over a hovered thumbnail.
+const PLAY_SCRIM: iced::Color = iced::Color::from_rgba(0.0, 0.0, 0.0, 0.55);
+const PLAY_RING: iced::Color = iced::Color::from_rgba(1.0, 1.0, 1.0, 0.3);
 
 /// Section label for clips saved outside a per-game subfolder (desktop / no game detected).
 const ROOT_GROUP: &str = "Desktop";
@@ -235,6 +252,8 @@ pub enum Message {
     Seek(f32),
     /// A timeline drag was released; playback resumes here if seeking paused it.
     TrimDragEnd,
+    /// Escape on the focused timeline: throw the trim edits away, back to the whole clip.
+    TrimReset,
 }
 
 /// What a trim save does with the result.
@@ -257,6 +276,8 @@ enum TrimState {
 
 pub struct Library {
     entries: Vec<ClipEntry>,
+    /// Picked once at construction so redraws don't reshuffle the empty-state line.
+    quip: &'static str,
     thumbs: HashMap<PathBuf, Thumb>,
     /// Thumbnail decodes not yet started; drained into `decoding` as slots free up.
     pending_thumbs: VecDeque<(PathBuf, SystemTime)>,
@@ -326,6 +347,10 @@ impl Library {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            quip: LIBRARY_QUIPS[std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos() as usize)
+                % LIBRARY_QUIPS.len()],
             thumbs: HashMap::new(),
             pending_thumbs: VecDeque::new(),
             decoding: HashMap::new(),
@@ -618,8 +643,7 @@ impl Library {
                     self.accent_fade = Some(AccentFade {
                         from,
                         to: dest_accent(dest),
-                        start: None,
-                        progress: 0.0,
+                        fade: crate::anim::Fade::new(ACCENT_FADE),
                     });
                 }
             }
@@ -726,6 +750,13 @@ impl Library {
                         .unwrap_or(self.trim_start)
                         .clamp(self.trim_start, (self.trim_end - 0.05).max(self.trim_start));
                     self.play_range = Some((from, self.trim_end));
+                }
+            }
+            Message::TrimReset => {
+                if self.open_dur > 0.0 {
+                    self.trim_start = 0.0;
+                    self.trim_end = self.open_dur;
+                    self.trim = TrimState::Idle;
                 }
             }
             Message::OpenLink(url) => {
@@ -1308,7 +1339,7 @@ impl Library {
         let header = row![title].spacing(12).align_y(iced::Alignment::Center);
 
         if self.entries.is_empty() {
-            let empty = column![
+            let mut empty = column![
                 text("NO CLIPS YET").size(22).font(DISPLAY_BLACK),
                 hint(if self.scanning {
                     "Looking for saved clips..."
@@ -1318,6 +1349,9 @@ impl Library {
             ]
             .spacing(8)
             .align_x(iced::Alignment::Center);
+            if !self.scanning {
+                empty = empty.push(theme::aside(self.quip));
+            }
             return column![
                 header,
                 container(empty)
@@ -1491,19 +1525,24 @@ impl Library {
             info = info.push(chip_row);
         }
         let info = info.push(
-            text(self.meta_text(entry))
+            text(size_label(entry.size_bytes))
                 .size(10)
                 .style(tinted(palette::MUTED)),
         );
 
+        let mut layers = vec![self.thumbnail(entry, 148.0)];
+        if let Some(badge) = self.duration_badge(entry) {
+            layers.push(badge);
+        }
+        let thumb = container(
+            layered(layers)
+                .width(Length::Fill)
+                .height(Length::Fixed(148.0)),
+        )
+        .clip(true);
         button(
             column![
-                container(
-                    layered([self.thumbnail(entry, 148.0)])
-                        .width(Length::Fill)
-                        .height(Length::Fixed(148.0)),
-                )
-                .clip(true),
+                iced::widget::hover(thumb, play_hint()),
                 container(info).padding([11, 12]),
             ]
             .spacing(0),
@@ -1561,6 +1600,38 @@ impl Library {
             Some(Thumb::Failed { .. }) => placeholder("No preview", height),
             _ => placeholder("Loading...", height),
         }
+    }
+
+    /// The clip's duration as a badge for the thumbnail's corner (arena.md duration badge:
+    /// dark scrim, warm off-white text), once the decode has reported it.
+    fn duration_badge<'a>(&self, entry: &ClipEntry) -> Option<Element<'a, Message>> {
+        let Some(Thumb::Ready { duration, .. }) = self.thumbs.get(&entry.path) else {
+            return None;
+        };
+        let badge = container(
+            text(duration_label(*duration))
+                .size(10)
+                .font(UI_SEMIBOLD)
+                .style(tinted(OVERLAY_INK)),
+        )
+        .padding([2, 6])
+        .style(|_: &Theme| container::Style {
+            background: Some(Background::Color(BADGE_SCRIM)),
+            border: Border {
+                radius: 4.0.into(),
+                ..Border::default()
+            },
+            ..container::Style::default()
+        });
+        Some(
+            container(badge)
+                .align_x(iced::Alignment::End)
+                .align_y(iced::Alignment::End)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding(6)
+                .into(),
+        )
     }
 
     /// The moving preview frame as an element, when there is one: the live playback frame (a GPU
@@ -1773,7 +1844,9 @@ impl Library {
         .playhead(self.play_pos)
         .waveform(self.waveform.as_deref())
         .on_seek(Message::Seek)
-        .on_released(Message::TrimDragEnd);
+        .on_released(Message::TrimDragEnd)
+        .on_toggle(Message::PlayToggle)
+        .on_reset(Message::TrimReset);
         let stack = layered([cells.into(), bar.into()])
             .width(Length::Fill)
             .height(Length::Fill);
@@ -1792,8 +1865,27 @@ impl Library {
         let end = self.trim_end.clamp(0.0, dur);
         let length = (end - start).max(0.0);
 
+        // A quiet legend for the timeline's keyboard controls; the keys only listen after a
+        // click on the timeline, so say so.
+        let legend = row![
+            hint("Click the timeline, then"),
+            theme::kbd_chip("\u{2190}"),
+            theme::kbd_chip("\u{2192}"),
+            hint("seek"),
+            theme::kbd_chip("i"),
+            theme::kbd_chip("o"),
+            hint("trim in and out"),
+            theme::kbd_chip("space"),
+            hint("play"),
+            theme::kbd_chip("esc"),
+            hint("reset"),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+
         let panel = column![
             self.filmstrip(),
+            legend,
             value_row("Start", secs_label(start)),
             value_row("End", secs_label(end)),
             value_row("Trimmed length", secs_label(length)),
@@ -2482,48 +2574,28 @@ fn filmstrip_positions(n: usize) -> Vec<f32> {
 /// How long the upload-panel accent takes to fade when the destination switches.
 const ACCENT_FADE: Duration = Duration::from_millis(220);
 
-/// An in-flight accent fade between two (fill, ink) brand pairs. `start` is anchored on the
-/// first tick, so all time comes from the frame subscription rather than `Instant::now()` in
-/// update.
+/// An in-flight accent fade between two (fill, ink) brand pairs, timed by a shared
+/// [`Fade`](crate::anim::Fade).
 struct AccentFade {
     from: (iced::Color, iced::Color),
     to: (iced::Color, iced::Color),
-    start: Option<Instant>,
-    progress: f32,
+    fade: crate::anim::Fade,
 }
 
 impl AccentFade {
     /// The interpolated (fill, ink) at the current progress.
     fn accent(&self) -> (iced::Color, iced::Color) {
+        let t = self.fade.progress();
         (
-            lerp_color(self.from.0, self.to.0, self.progress),
-            lerp_color(self.from.1, self.to.1, self.progress),
+            lerp_color(self.from.0, self.to.0, t),
+            lerp_color(self.from.1, self.to.1, t),
         )
     }
 
-    /// Advance to frame time `now`, anchoring the clock on the first call. Returns `true` once
-    /// the fade has reached its end (the caller then drops it).
+    /// Advance to frame time `now`. Returns `true` once the fade has reached its end (the
+    /// caller then drops it).
     fn advance(&mut self, now: Instant) -> bool {
-        let start = *self.start.get_or_insert(now);
-        let linear = now.duration_since(start).as_secs_f32() / ACCENT_FADE.as_secs_f32();
-        self.progress = ease(linear);
-        linear >= 1.0
-    }
-}
-
-/// Smoothstep easing, clamped to `0.0..=1.0`.
-fn ease(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-/// Per-channel linear interpolation between two colours.
-fn lerp_color(a: iced::Color, b: iced::Color, t: f32) -> iced::Color {
-    iced::Color {
-        r: a.r + (b.r - a.r) * t,
-        g: a.g + (b.g - a.g) * t,
-        b: a.b + (b.b - a.b) * t,
-        a: a.a + (b.a - a.a) * t,
+        self.fade.advance(now)
     }
 }
 
@@ -2567,6 +2639,29 @@ fn segment_style(
 /// stack children (the base draws unlayered, and `container.clip` merely narrows a viewport
 /// hint that image drawing ignores), so this is what actually keeps Cover-scaled frames inside
 /// the box of the nearest `clip(true)` ancestor.
+/// The circular play affordance shown over a hovered clip card (arena.md's thumbnail play
+/// button), reusing the brand mark as the glyph like the fullscreen preview does.
+fn play_hint<'a>() -> Element<'a, Message> {
+    let circle = container(theme::logo(18.0))
+        .width(36)
+        .height(36)
+        .align_x(iced::Alignment::Center)
+        .align_y(iced::Alignment::Center)
+        .style(|_: &Theme| container::Style {
+            background: Some(Background::Color(PLAY_SCRIM)),
+            border: Border {
+                color: PLAY_RING,
+                width: 1.0,
+                radius: 18.0.into(),
+            },
+            ..container::Style::default()
+        });
+    container(circle)
+        .center(Length::Fill)
+        .height(Length::Fixed(148.0))
+        .into()
+}
+
 fn layered<'a>(
     content: impl IntoIterator<Item = Element<'a, Message>>,
 ) -> iced::widget::Stack<'a, Message> {
@@ -2638,32 +2733,13 @@ mod accent_tests {
     }
 
     #[test]
-    fn lerp_color_hits_both_ends() {
-        let a = Color::from_rgb(0.0, 0.0, 0.0);
-        let b = Color::from_rgb(1.0, 0.5, 0.25);
-        approx(lerp_color(a, b, 0.0), a);
-        approx(lerp_color(a, b, 1.0), b);
-        approx(lerp_color(a, b, 0.5), Color::from_rgb(0.5, 0.25, 0.125));
-    }
-
-    #[test]
-    fn ease_is_clamped_and_smooth() {
-        assert_eq!(ease(0.0), 0.0);
-        assert_eq!(ease(1.0), 1.0);
-        assert_eq!(ease(-1.0), 0.0);
-        assert_eq!(ease(2.0), 1.0);
-        assert!((ease(0.5) - 0.5).abs() < 1e-6, "symmetric midpoint");
-    }
-
-    #[test]
     fn fade_runs_from_source_to_target_then_ends() {
         let from = (palette::ACCENT, palette::INK_ON_ACCENT);
         let to = (palette::YOUTUBE, palette::INK_ON_YOUTUBE);
         let mut fade = AccentFade {
             from,
             to,
-            start: None,
-            progress: 0.0,
+            fade: crate::anim::Fade::new(ACCENT_FADE),
         };
         let t0 = Instant::now();
 
@@ -2686,8 +2762,7 @@ mod accent_tests {
         let mut fade = AccentFade {
             from: (palette::ACCENT, palette::INK_ON_ACCENT),
             to: (palette::YOUTUBE, palette::INK_ON_YOUTUBE),
-            start: None,
-            progress: 0.0,
+            fade: crate::anim::Fade::new(ACCENT_FADE),
         };
         let t0 = Instant::now();
         assert!(!fade.advance(t0));

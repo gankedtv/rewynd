@@ -13,6 +13,7 @@
 // `attach_parent_console` below reconnects stdout/stderr for terminal runs.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod anim;
 mod library;
 mod player;
 mod scroll;
@@ -1314,13 +1315,16 @@ impl App {
     /// subfolders). The watch is keyed by the resolved directory, so it re-binds if the output
     /// directory changes.
     fn subscription(&self) -> iced::Subscription<Message> {
-        let focus = iced::event::listen_with(|event, _status, _id| match event {
+        let focus = iced::event::listen_with(|event, status, _id| match event {
             iced::Event::Window(iced::window::Event::Focused) => Some(Message::WindowFocused),
-            // Escape leaves the fullscreen preview (a no-op otherwise).
+            // Escape leaves the fullscreen preview (a no-op otherwise), unless a widget
+            // already claimed it (the trim bar captures Escape to drop keyboard focus).
             iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
                 key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
                 ..
-            }) => Some(Message::Library(library::Message::FullscreenExit)),
+            }) if status == iced::event::Status::Ignored => {
+                Some(Message::Library(library::Message::FullscreenExit))
+            }
             _ => None,
         });
         let dir = config::clips_dir(self.config.output_dir().as_deref())
@@ -1334,10 +1338,18 @@ impl App {
         // The library adds its own conditional subscriptions (accent-fade ticks, preview
         // playback); iced re-diffs after each update, so they vanish when idle and the software
         // renderer stops redrawing.
+        // The wizard's ticks only exist while it animates, and only the onboarding view
+        // renders it, so the stream is dropped everywhere else.
+        let wizard = if matches!(self.view, View::Onboarding) {
+            self.wizard.subscription().map(Message::Wizard)
+        } else {
+            iced::Subscription::none()
+        };
         iced::Subscription::batch([
             focus,
             clips,
             status,
+            wizard,
             self.library.subscription().map(Message::Library),
         ])
     }
