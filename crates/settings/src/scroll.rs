@@ -30,7 +30,11 @@ const RATE: f32 = 22.0;
 /// the glide instead of snapping it to the end.
 const MAX_STEP: Duration = Duration::from_millis(50);
 
-/// Distance (px) under which the glide snaps to its target and ends.
+/// Remaining distance (px) under which the glide snaps to its target and ends. Compared
+/// against the wrapper's own float position, never the scrollable's reported translation:
+/// that is rounded to whole pixels, so once a frame's step eases less than half a pixel
+/// (any high-refresh display), progress read back from it quantizes to zero and a glide
+/// driven by it would keep requesting redraws forever.
 const SETTLE: f32 = 0.5;
 
 /// Wrap a `scrollable` so wheel scrolling glides. The wrapper drives the first scrollable in
@@ -49,22 +53,36 @@ struct Smooth<'a, Message> {
 struct State {
     /// The offset the glide is heading for, while one runs.
     target: Option<f32>,
+    /// The glide's own unquantized position (see [`SETTLE`] on why the scrollable's rounded
+    /// translation can't drive the easing).
+    pos: f32,
     /// The previous animation frame's instant, for the easing time step.
     last_tick: Option<Instant>,
-    /// Whether Shift is held: the native scrollable turns that wheel into a horizontal
-    /// scroll, so it is passed through untouched.
-    shift: bool,
+    /// The held keyboard modifiers. A modified wheel means something else — Shift is the
+    /// native horizontal scroll, Ctrl/Cmd steps sliders and pick lists — so only a bare
+    /// wheel glides; everything else passes through untouched.
+    modifiers: keyboard::Modifiers,
+}
+
+/// One glide step: the float position it advances from, its target, and this frame's easing
+/// factor.
+struct Step {
+    pos: f32,
+    target: f32,
+    factor: f32,
 }
 
 /// One visit of the wrapped scrollable: reads its geometry and, when a glide step is
 /// requested, writes the eased offset back.
 struct Visit {
-    /// The glide to advance, if any: (target offset, easing factor for this frame).
-    step: Option<(f32, f32)>,
+    /// The glide to advance, if any.
+    step: Option<Step>,
     /// The scrollable's current offset, once visited.
     offset: Option<f32>,
     /// How far the content can scroll (0 when it fits).
     max: f32,
+    /// The glide's position after this step (unquantized), when one ran.
+    next: f32,
     /// Whether the glide reached its target this step.
     done: bool,
 }
@@ -75,13 +93,14 @@ impl Visit {
             step: None,
             offset: None,
             max: 0.0,
+            next: 0.0,
             done: false,
         }
     }
 
-    fn step(target: f32, factor: f32) -> Self {
+    fn step(step: Step) -> Self {
         Self {
-            step: Some((target, factor)),
+            step: Some(step),
             ..Self::probe()
         }
     }
@@ -105,15 +124,20 @@ impl Operation for Visit {
         }
         self.offset = Some(translation.y);
         self.max = (content_bounds.height - bounds.height).max(0.0);
-        if let Some((target, factor)) = self.step {
+        if let Some(step) = &self.step {
             // Clamp per frame, so a resize mid-glide can't ease past the new end.
-            let target = target.clamp(0.0, self.max);
-            let eased = translation.y + (target - translation.y) * factor;
-            self.done = (target - eased).abs() < SETTLE;
-            let next = if self.done { target } else { eased };
+            let target = step.target.clamp(0.0, self.max);
+            let pos = step.pos.clamp(0.0, self.max);
+            let remaining = target - pos;
+            self.done = remaining.abs() < SETTLE;
+            self.next = if self.done {
+                target
+            } else {
+                pos + remaining * step.factor
+            };
             state.scroll_to(AbsoluteOffset {
                 x: None,
-                y: Some(next),
+                y: Some(self.next),
             });
         }
     }
@@ -203,16 +227,17 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Smooth<'_, Messag
         viewport: &Rectangle,
     ) {
         if let Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) = event {
-            tree.state.downcast_mut::<State>().shift = modifiers.shift();
+            tree.state.downcast_mut::<State>().modifiers = *modifiers;
         }
 
-        // A wheel notch over the area starts (or extends) a glide instead of reaching the
-        // scrollable. Shift is horizontal scrolling in the native widget: pass it through.
+        // A bare wheel notch over the area starts (or extends) a glide instead of reaching
+        // the scrollable.
         if let Event::Mouse(mouse::Event::WheelScrolled {
             delta: mouse::ScrollDelta::Lines { y, .. },
         }) = event
             && cursor.is_over(layout.bounds())
-            && !tree.state.downcast_ref::<State>().shift
+            && tree.state.downcast_ref::<State>().modifiers.is_empty()
+            && !shell.is_event_captured()
         {
             let mut probe = Visit::probe();
             self.visit(tree, layout, renderer, &mut probe);
@@ -222,6 +247,8 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Smooth<'_, Messag
                 let state = tree.state.downcast_mut::<State>();
                 let from = state.target.unwrap_or(current);
                 if state.target.is_none() {
+                    // A fresh glide starts from where the scrollable actually is.
+                    state.pos = current;
                     state.last_tick = Some(Instant::now());
                 }
                 state.target = Some((from - y * LINE_PX).clamp(0.0, probe.max));
@@ -231,14 +258,15 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Smooth<'_, Messag
             }
         }
 
-        // Touchpad deltas, presses and touches interact with the offset directly; a running
-        // glide yields to them rather than fighting.
+        // Touchpad deltas, presses, touches and keys (paging) interact with the offset
+        // directly; a running glide yields to them rather than fighting.
         if matches!(
             event,
             Event::Mouse(mouse::Event::WheelScrolled {
                 delta: mouse::ScrollDelta::Pixels { .. },
             }) | Event::Mouse(mouse::Event::ButtonPressed(_))
                 | Event::Touch(_)
+                | Event::Keyboard(keyboard::Event::KeyPressed { .. })
         ) {
             tree.state.downcast_mut::<State>().target = None;
         }
@@ -269,13 +297,19 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Smooth<'_, Messag
                 .min(MAX_STEP);
             state.last_tick = Some(*now);
             let factor = 1.0 - (-RATE * dt.as_secs_f32()).exp();
+            let pos = state.pos;
 
-            let mut step = Visit::step(target, factor);
+            let mut step = Visit::step(Step {
+                pos,
+                target,
+                factor,
+            });
             self.visit(tree, layout, renderer, &mut step);
             let state = tree.state.downcast_mut::<State>();
             if step.done || step.offset.is_none() {
                 state.target = None;
             } else {
+                state.pos = step.next;
                 shell.request_redraw();
             }
         }
