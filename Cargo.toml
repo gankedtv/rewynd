@@ -135,6 +135,15 @@ unicode-script = { opt-level = 2 }
 unicode-segmentation = { opt-level = 2 }
 iced_tiny_skia = { opt-level = 2 }
 
+# Release builds favor the runtime footprint over compile time: thin LTO + one codegen unit
+# let the per-frame hot path (app → encode → buffer) inline across crate boundaries, and
+# stripping symbols shrinks the shipped binaries. NO `panic = "abort"`: the recorder relies on
+# `catch_unwind` to stop panics unwinding across the PipeWire/WGC C-callback boundary.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
 # Force every wgpu/naga crate to the single pinned source (docs/adr/0001-wgpu-rev.md),
 # so no transitive dependency can pull a second, incompatible wgpu from crates.io.
 [patch.crates-io]

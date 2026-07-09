@@ -5,9 +5,9 @@
 //! no IPC). Changes apply on the recorder's next clip / restart — the window says so after
 //! saving; live-reload is a future refinement.
 //!
-//! Rendered with iced's tiny-skia software backend (no GPU) and the Arena theme (`theme`).
-//! The window needs a display to run, so there is no headless test of `run`; the pure mapping
-//! helpers are unit-tested.
+//! Rendered with iced's wgpu backend (tiny-skia as the software fallback) and the Arena theme
+//! (`theme`). The window needs a display to run, so there is no headless test of `run`; the
+//! pure mapping helpers are unit-tested.
 
 // A windowed GUI should never pop a console. Windows-only (cfg_attr leaves Linux a console app);
 // `attach_parent_console` below reconnects stdout/stderr for terminal runs.
@@ -475,6 +475,9 @@ struct App {
     /// Active input devices for the microphone picker (Windows WASAPI endpoints, Linux PipeWire
     /// sources); empty when enumeration finds nothing, where the control is a free-text name.
     mic_options: Vec<config::AudioInput>,
+    /// Whether the settings page's device discovery (audio inputs, the encoder probe) has been
+    /// kicked off; it runs once, the first time that page opens.
+    probes_started: bool,
     /// Mirror of the ganked.tv API key.
     api_key: String,
     /// Mirror of the ganked.tv API base URL (empty = "use the default").
@@ -577,6 +580,8 @@ enum Message {
     EncoderPicked(String),
     /// The recorder's `--probe-encoders` output (for the recording-method picker).
     EncodersProbed(Result<config::EncoderProbe, String>),
+    /// The machine's active audio inputs (for the microphone picker).
+    MicsListed(Vec<config::AudioInput>),
     /// A poll of the recorder's status file (for the top-right pill).
     RecorderStatus(Option<config::RecorderStatus>),
     OutputDirEdited(String),
@@ -622,20 +627,12 @@ enum Message {
 
 impl App {
     /// Build the initial state and the boot task (the library scan: it is the default view).
+    /// Device discovery for the settings page (audio inputs, the encoder probe) waits until
+    /// that page first opens, so the launch path pays for nothing the library doesn't need.
     fn load() -> (Self, Task<Message>) {
         let mut app = Self::new();
         let scan = app.library.refresh(&app.config).map(Message::Library);
-        // Ask the recorder to enumerate the machine's encoders in the background (it spawns a
-        // short-lived Vulkan probe process); the recording-method picker fills in when it returns.
-        let probe = Task::perform(
-            async {
-                tokio::task::spawn_blocking(probe_encoders_via_recorder)
-                    .await
-                    .unwrap_or_else(|e| Err(e.to_string()))
-            },
-            Message::EncodersProbed,
-        );
-        let mut tasks = vec![scan, probe];
+        let mut tasks = vec![scan];
         // A rewynd://clip/<name> launch (a clicked desktop "clip saved" toast) opens that clip in
         // the library; the detail view fills in once the scan lands.
         if let Some(clip) = deeplink_clip(&app.config) {
@@ -653,7 +650,6 @@ impl App {
         // while the file keeps a different one). Resolution and the keyframe interval are left
         // alone — a custom resolution is shown verbatim, and the GOP is only retuned with the fps.
         normalize(&mut config);
-        let mic_options = config::list_audio_inputs();
         let wizard = wizard::Wizard::new(&config);
         Self {
             view: initial_view(),
@@ -661,7 +657,8 @@ impl App {
             library: library::Library::new(),
             output_dir: config.output_directory().unwrap_or_default().to_owned(),
             hotkey: config.hotkey_trigger().to_owned(),
-            mic_options,
+            mic_options: Vec::new(),
+            probes_started: false,
             api_key: config.upload_api_key().to_owned(),
             // Show the custom-connector fields empty unless a genuinely custom endpoint is set:
             // the built-in default is a placeholder, never a pre-filled value the user didn't
@@ -753,6 +750,12 @@ impl App {
                     self.library.show_grid();
                     return self.library.refresh(&self.config).map(Message::Library);
                 }
+                if view == View::Settings {
+                    return self.start_settings_probes();
+                }
+            }
+            Message::MicsListed(mics) => {
+                self.mic_options = mics;
             }
             Message::Library(message) => {
                 return self
@@ -1065,14 +1068,7 @@ impl App {
             Message::Restart => {
                 self.status = Status::Restarting;
                 // Off the UI thread: stop the old recorder, wait for it to exit, then relaunch.
-                return Task::perform(
-                    async {
-                        tokio::task::spawn_blocking(restart_recorder)
-                            .await
-                            .unwrap_or_else(|e| Err(e.to_string()))
-                    },
-                    Message::Restarted,
-                );
+                return Self::restart_task();
             }
             Message::Restarted(result) => {
                 self.status = match result {
@@ -1108,6 +1104,47 @@ impl App {
             }
         }
         Task::none()
+    }
+
+    /// Device discovery the settings page needs, kicked off once when it first opens: the
+    /// audio-input enumeration (PipeWire/WASAPI) and the encoder probe (a short-lived Vulkan
+    /// probe process the recorder spawns). Neither belongs on the launch path — the library,
+    /// the default view, needs neither.
+    fn start_settings_probes(&mut self) -> Task<Message> {
+        if self.probes_started {
+            return Task::none();
+        }
+        self.probes_started = true;
+        let mics = Task::perform(
+            async {
+                tokio::task::spawn_blocking(config::list_audio_inputs)
+                    .await
+                    .unwrap_or_default()
+            },
+            Message::MicsListed,
+        );
+        let probe = Task::perform(
+            async {
+                tokio::task::spawn_blocking(probe_encoders_via_recorder)
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+            },
+            Message::EncodersProbed,
+        );
+        Task::batch([mics, probe])
+    }
+
+    /// The stop-and-relaunch of the recorder as a task (off the UI thread), reported through
+    /// [`Message::Restarted`].
+    fn restart_task() -> Task<Message> {
+        Task::perform(
+            async {
+                tokio::task::spawn_blocking(restart_recorder)
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+            },
+            Message::Restarted,
+        )
     }
 
     /// Mark the form as having unsaved edits (a restart would no longer apply what's on screen).
@@ -1253,15 +1290,7 @@ impl App {
         self.save();
         self.view = View::Library;
         let refresh = self.library.refresh(&self.config).map(Message::Library);
-        let restart = Task::perform(
-            async {
-                tokio::task::spawn_blocking(restart_recorder)
-                    .await
-                    .unwrap_or_else(|e| Err(e.to_string()))
-            },
-            Message::Restarted,
-        );
-        Task::batch([refresh, restart])
+        Task::batch([refresh, Self::restart_task()])
     }
 
     /// Skip setup: persist the (default) config so the wizard doesn't reappear next launch, then
@@ -1276,15 +1305,7 @@ impl App {
         if !started {
             return refresh;
         }
-        let restart = Task::perform(
-            async {
-                tokio::task::spawn_blocking(restart_recorder)
-                    .await
-                    .unwrap_or_else(|e| Err(e.to_string()))
-            },
-            Message::Restarted,
-        );
-        Task::batch([refresh, restart])
+        Task::batch([refresh, Self::restart_task()])
     }
 
     /// Live events that keep the library in step with what the recorder writes: the OS window

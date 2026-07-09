@@ -110,28 +110,36 @@ impl Encoder for SoftwareTextureEncoder {
             (s.y_buf.clone(), s.uv_buf.clone())
         };
 
-        read_plane(
-            &self.device,
-            &self.queue,
+        // Both plane copies ride one submit and one poll: every extra submit/poll pair is a
+        // full CPU-GPU synchronization stall on the capture thread.
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        record_plane_copy(
+            &mut encoder,
             frame,
             wgpu::TextureAspect::Plane0,
             width,
             height,
             1,
             &y_buf,
-            &mut self.y,
-        )?;
-        read_plane(
-            &self.device,
-            &self.queue,
+        );
+        record_plane_copy(
+            &mut encoder,
             frame,
             wgpu::TextureAspect::Plane1,
             width / 2,
             height / 2,
             2,
             &uv_buf,
-            &mut self.uv,
-        )?;
+        );
+        self.queue.submit([encoder.finish()]);
+        map_for_read(&self.device, [&y_buf, &uv_buf])?;
+
+        copy_depadded(&y_buf, width, 1, &mut self.y)?;
+        copy_depadded(&uv_buf, width / 2, 2, &mut self.uv)?;
+        y_buf.unmap();
+        uv_buf.unmap();
         deinterleave_uv(&self.uv, &mut self.u, &mut self.v);
 
         self.core.encode_i420(
@@ -154,25 +162,17 @@ fn aligned_bytes_per_row(unpadded: u32) -> u32 {
     unpadded.div_ceil(ALIGN) * ALIGN
 }
 
-/// Copy one texture plane into `staging`, then into the tightly-packed (de-padded) `dst`.
-/// `bytes_per_texel` is 1 for the R8 Y plane, 2 for the Rg8 UV plane.
-#[allow(clippy::too_many_arguments)]
-fn read_plane(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
+/// Record the copy of one texture plane into its staging buffer. `bytes_per_texel` is 1 for
+/// the R8 Y plane, 2 for the Rg8 UV plane.
+fn record_plane_copy(
+    encoder: &mut wgpu::CommandEncoder,
     texture: &wgpu::Texture,
     aspect: wgpu::TextureAspect,
     width: u32,
     height: u32,
     bytes_per_texel: u32,
     staging: &wgpu::Buffer,
-    dst: &mut Vec<u8>,
-) -> Result<(), EncodeError> {
-    let unpadded_row = width * bytes_per_texel;
-    let padded_row = aligned_bytes_per_row(unpadded_row);
-
-    let mut encoder =
-        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+) {
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture,
@@ -184,7 +184,7 @@ fn read_plane(
             buffer: staging,
             layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(padded_row),
+                bytes_per_row: Some(aligned_bytes_per_row(width * bytes_per_texel)),
                 rows_per_image: None,
             },
         },
@@ -194,32 +194,50 @@ fn read_plane(
             depth_or_array_layers: 1,
         },
     );
-    queue.submit([encoder.finish()]);
+}
 
+/// Map every staging buffer for reading behind a single device poll.
+fn map_for_read<const N: usize>(
+    device: &wgpu::Device,
+    buffers: [&wgpu::Buffer; N],
+) -> Result<(), EncodeError> {
     let (tx, rx) = std::sync::mpsc::channel();
-    staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-        let _ = tx.send(r);
-    });
+    for buffer in buffers {
+        let tx = tx.clone();
+        buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+    }
     device
         .poll(wgpu::PollType::wait_indefinitely())
         .map_err(|e| EncodeError::Encode(format!("device poll failed: {e}")))?;
-    match rx.recv() {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(EncodeError::Encode(format!("failed to map readback: {e}"))),
-        Err(e) => return Err(EncodeError::Encode(format!("readback channel closed: {e}"))),
-    }
-
-    {
-        let mapped = staging
-            .slice(..)
-            .get_mapped_range()
-            .map_err(|e| EncodeError::Encode(format!("map readback range: {e}")))?;
-        dst.clear();
-        dst.reserve((unpadded_row * height) as usize);
-        for row in mapped.chunks_exact(padded_row as usize) {
-            dst.extend_from_slice(&row[..unpadded_row as usize]);
+    for _ in 0..N {
+        match rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(EncodeError::Encode(format!("failed to map readback: {e}"))),
+            Err(e) => return Err(EncodeError::Encode(format!("readback channel closed: {e}"))),
         }
     }
-    staging.unmap();
+    Ok(())
+}
+
+/// Copy a mapped plane into the tightly-packed (de-padded) `dst`. The caller unmaps.
+fn copy_depadded(
+    staging: &wgpu::Buffer,
+    width: u32,
+    bytes_per_texel: u32,
+    dst: &mut Vec<u8>,
+) -> Result<(), EncodeError> {
+    let unpadded_row = (width * bytes_per_texel) as usize;
+    let padded_row = aligned_bytes_per_row(width * bytes_per_texel) as usize;
+    let mapped = staging
+        .slice(..)
+        .get_mapped_range()
+        .map_err(|e| EncodeError::Encode(format!("map readback range: {e}")))?;
+    dst.clear();
+    dst.reserve(mapped.len() / padded_row * unpadded_row);
+    for row in mapped.chunks_exact(padded_row) {
+        dst.extend_from_slice(&row[..unpadded_row]);
+    }
     Ok(())
 }

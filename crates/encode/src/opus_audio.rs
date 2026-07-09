@@ -177,20 +177,32 @@ impl OpusAudioEncoder {
         self.pending_pts = pts.saturating_sub(rem);
         self.pending.extend_from_slice(pcm);
 
-        while self.pending.len() >= self.frame_len {
-            let n = self
-                .encoder
-                .encode_float(&self.pending[..self.frame_len], &mut self.packet)
-                .map_err(|e| AudioEncodeError::Encode(e.to_string()))?;
-            on_packet(EncodedAudioChunk {
-                bytes: Arc::from(&self.packet[..n]),
-                frames: self.samples_per_channel,
-                pts: self.pending_pts,
-            });
-            self.pending_pts += self.frame_duration;
-            self.pending.drain(..self.frame_len);
-        }
-        Ok(())
+        // Encode from an advancing offset and compact once at the end: draining per frame
+        // would shift the whole remainder down for every packet (a save-time drain hands
+        // this several frames at once).
+        let mut offset = 0;
+        let result = loop {
+            if self.pending.len() - offset < self.frame_len {
+                break Ok(());
+            }
+            match self.encoder.encode_float(
+                &self.pending[offset..offset + self.frame_len],
+                &mut self.packet,
+            ) {
+                Ok(n) => {
+                    on_packet(EncodedAudioChunk {
+                        bytes: Arc::from(&self.packet[..n]),
+                        frames: self.samples_per_channel,
+                        pts: self.pending_pts,
+                    });
+                    self.pending_pts += self.frame_duration;
+                    offset += self.frame_len;
+                }
+                Err(e) => break Err(AudioEncodeError::Encode(e.to_string())),
+            }
+        };
+        self.pending.drain(..offset);
+        result
     }
 
     /// Encode any leftover samples as a final frame, zero-padded to a whole frame. Call at
