@@ -21,15 +21,17 @@ use rewynd_upload::{GankedClient, Visibility, default_title, titled, user_facing
 
 use crate::player;
 use crate::theme::{
-    self, DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, accent_button_style, accent_chip, card, field_label,
-    hint, link_button, palette, primary_button, secondary_button, tinted, value_row,
+    self, CONTENT_MAX_WIDTH, DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, accent_button_style, accent_chip,
+    card, field_label, hint, link_button, palette, primary_button, secondary_button, tinted,
+    value_row,
 };
 use crate::thumbs;
 use crate::trimbar;
 use crate::video;
 
-/// Cards per grid row (the body column is width-capped, so a fixed count stays balanced).
-const GRID_COLUMNS: usize = 3;
+/// Cards per grid row (the body column is width-capped, so a fixed count stays balanced). Four
+/// across suits the wider default window while staying readable if it is narrowed.
+const GRID_COLUMNS: usize = 4;
 
 /// Section label for clips saved outside a per-game subfolder (desktop / no game detected).
 const ROOT_GROUP: &str = "Desktop";
@@ -1249,7 +1251,7 @@ impl Library {
             column![body]
                 .spacing(20)
                 .padding(28)
-                .max_width(880)
+                .max_width(CONTENT_MAX_WIDTH)
                 .width(Length::Fill),
         )
         .center_x(Length::Fill);
@@ -1443,14 +1445,29 @@ impl Library {
     }
 
     fn clip_card<'a>(&'a self, entry: &'a ClipEntry) -> Element<'a, Message> {
-        let info = column![
+        // Stack the chips over the "duration · size" line rather than inlining them: a narrow card
+        // (four across) can't fit a game chip, an upload badge, and the readout on one row, and the
+        // squeezed row wrapped unevenly. Stacking keeps every card the same height at any width.
+        let mut info = column![
             text(saved_at_label(entry.saved_at))
                 .size(12)
                 .font(UI_SEMIBOLD)
                 .style(tinted(palette::TEXT)),
-            self.meta_row(entry, 10.0, palette::MUTED),
         ]
         .spacing(7);
+        let chips = self.meta_chips(entry);
+        if !chips.is_empty() {
+            let mut chip_row = row![].spacing(6).align_y(iced::Alignment::Center);
+            for chip in chips {
+                chip_row = chip_row.push(chip);
+            }
+            info = info.push(chip_row);
+        }
+        let info = info.push(
+            text(self.meta_text(entry))
+                .size(10)
+                .style(tinted(palette::MUTED)),
+        );
 
         button(
             column![
@@ -1471,26 +1488,42 @@ impl Library {
         .into()
     }
 
-    /// The "duration · size" line with the per-game chip, shared by the cards and the
-    /// detail page (which differ only in type size and tint).
+    /// The clip's chips in order (per-game first, then one per uploaded destination). Empty when
+    /// the clip has no detected game and hasn't been uploaded anywhere.
+    fn meta_chips<'a>(&'a self, entry: &'a ClipEntry) -> Vec<Element<'a, Message>> {
+        let mut chips: Vec<Element<'a, Message>> = Vec::new();
+        if let Some(game) = &entry.game {
+            chips.push(accent_chip(game.clone()));
+        }
+        for dest in self.uploaded_dests(entry) {
+            chips.push(accent_chip(format!("On {}", dest.label())));
+        }
+        chips
+    }
+
+    /// The "duration · size" readout (duration only once the thumbnail decode has reported it).
+    fn meta_text(&self, entry: &ClipEntry) -> String {
+        let mut meta = size_label(entry.size_bytes);
+        if let Some(Thumb::Ready { duration, .. }) = self.thumbs.get(&entry.path) {
+            meta = format!("{} · {meta}", duration_label(*duration));
+        }
+        meta
+    }
+
+    /// The chips followed by the "duration · size" readout on a single row, for the detail page
+    /// (which has the width for it; the cards stack the two so a narrow card never wraps).
     fn meta_row<'a>(
         &'a self,
         entry: &'a ClipEntry,
         size: f32,
         color: iced::Color,
     ) -> Element<'a, Message> {
-        let mut meta = size_label(entry.size_bytes);
-        if let Some(Thumb::Ready { duration, .. }) = self.thumbs.get(&entry.path) {
-            meta = format!("{} · {meta}", duration_label(*duration));
-        }
         let mut line = row![].spacing(8).align_y(iced::Alignment::Center);
-        if let Some(game) = &entry.game {
-            line = line.push(accent_chip(game.clone()));
+        for chip in self.meta_chips(entry) {
+            line = line.push(chip);
         }
-        for dest in self.uploaded_dests(entry) {
-            line = line.push(accent_chip(format!("On {}", dest.label())));
-        }
-        line.push(text(meta).size(size).style(tinted(color))).into()
+        line.push(text(self.meta_text(entry)).size(size).style(tinted(color)))
+            .into()
     }
 
     /// The clip's thumbnail at the given height, or a neutral placeholder while it loads

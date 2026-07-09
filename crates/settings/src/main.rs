@@ -32,9 +32,10 @@ use iced::{Background, Border, Element, Font, Length, Task, Theme, font};
 use rewynd_config::{self as config, Config};
 
 use crate::theme::{
-    DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, arena_check, arena_input, arena_pick, arena_slider, card,
-    card_fixed, field, field_label, hint, link_button, logo, oauth_button, palette, primary_button,
-    secondary_button, setting, status_pill, tinted, value_row, window_icon,
+    CONTENT_MAX_WIDTH, DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, arena_check, arena_input, arena_pick,
+    arena_slider, card, card_fixed, field, field_label, hint, link_button, logo, oauth_button,
+    palette, primary_button, secondary_button, setting, status_pill, tinted, value_row,
+    window_icon,
 };
 
 /// Whether a stored URL points somewhere other than the shipped default (empty means "use the
@@ -199,6 +200,9 @@ const FPS_OPTIONS: [u32; 4] = [30, 60, 120, 144];
 const CONNECTOR_CARD_HEIGHT: f32 = 176.0;
 /// The microphone picker's "use the system default" row (stored as an empty value).
 const MIC_DEFAULT: &str = "System default";
+/// Width (logical px) of the fixed left navigation sidebar. Wide enough for the wordmark and the
+/// nav labels; the content area fills the rest of the window.
+const SIDEBAR_WIDTH: f32 = 232.0;
 const BITS_PER_MBIT: u32 = 1_000_000;
 
 fn main() -> iced::Result {
@@ -293,9 +297,12 @@ fn main() -> iced::Result {
             ..Font::DEFAULT
         })
         .window(iced::window::Settings {
-            // Tall enough that the whole form (advanced collapsed) fits without scrolling.
-            size: iced::Size::new(960.0, 900.0),
-            min_size: Some(iced::Size::new(720.0, 560.0)),
+            // Landscape: the left sidebar takes a fixed column, leaving a wide content area for the
+            // two-column settings and the four-across clip grid (wide enough that each thumbnail
+            // renders crisp). Tall enough that the whole form (advanced collapsed) fits without
+            // scrolling.
+            size: iced::Size::new(1380.0, 880.0),
+            min_size: Some(iced::Size::new(880.0, 560.0)),
             // On Wayland this is a no-op until winit speaks xdg-toplevel-icon; there the
             // taskbar icon resolves through the app id's desktop entry + hicolor icons.
             icon: window_icon(),
@@ -1215,8 +1222,8 @@ impl App {
             View::Settings => self.settings_view(),
             View::Onboarding => unreachable!("handled above"),
         };
-        column![
-            nav_bar(
+        row![
+            sidebar(
                 self.view,
                 self.recorder_status.as_ref(),
                 self.is_velopack,
@@ -1224,6 +1231,8 @@ impl App {
             ),
             body
         ]
+        .width(Length::Fill)
+        .height(Length::Fill)
         .into()
     }
 
@@ -1914,13 +1923,13 @@ impl App {
         let body = column![header, columns, connectors, connector, save]
             .spacing(20)
             .padding(28)
-            .max_width(880);
+            .max_width(CONTENT_MAX_WIDTH);
 
         // The scrollable is a safety net for small windows and the opened Advanced disclosure;
         // the default window size is chosen (by eye — iced has no pre-layout measure) so the
-        // collapsed form fits without it. The body caps at 880, so on a wider window center it
-        // rather than leaving the slack on one side. Collapsing a disclosure keeps the current
-        // scroll offset (clamped to the shorter form) instead of jumping the view to the top.
+        // collapsed form fits without it. The body caps at CONTENT_MAX_WIDTH, so on a wider window
+        // center it rather than leaving the slack on one side. Collapsing a disclosure keeps the
+        // current scroll offset (clamped to the shorter form) instead of jumping the view to the top.
         container(scrollable(container(body).center_x(Length::Fill)))
             .width(Length::Fill)
             .height(Length::Fill)
@@ -1984,53 +1993,65 @@ fn brand_home() -> Element<'static, Message> {
     .into()
 }
 
-/// The top navigation, Arena style: the brand on the left, then the Library/Settings links
-/// (accent-on-tint pill when active), on a raised bar over a hairline divider.
-fn nav_bar(
+/// The left navigation sidebar, Arena style: the brand at the top, the Library/Settings nav items
+/// below (accent-on-tint pill when active), and the recorder status + version pinned to the
+/// bottom, on a raised panel with a hairline right edge dividing it from the content.
+fn sidebar(
     active: View,
     recorder_status: Option<&config::RecorderStatus>,
     is_velopack: bool,
     update: &UpdateState,
 ) -> Element<'static, Message> {
-    let tab = |label: &'static str, view: View| {
+    // Full-width nav items: the active one gets the accent pill, matching the old top-bar links.
+    // The label fills the button so the text sits left, sidebar-style, and the pill spans the row.
+    let item = |label: &'static str, view: View| {
         let is_active = view == active;
-        button(text(label).size(12).font(UI_SEMIBOLD))
+        button(text(label).size(13).font(UI_SEMIBOLD).width(Length::Fill))
             .on_press(Message::Tab(view))
+            .width(Length::Fill)
             .style(move |_: &Theme, status| nav_link(is_active, status))
-            .padding([6, 10])
+            .padding([9, 12])
     };
     let (pill_label, pill_dot) = status_pill_parts(recorder_status);
-    let bar = container(
-        row![
-            brand_home(),
-            iced::widget::Space::new().width(8),
-            tab("Library", View::Library),
-            tab("Settings", View::Settings),
-            iced::widget::Space::new().width(Length::Fill),
-            status_pill(pill_label, pill_dot),
-            update_affordance(is_velopack, update),
+    let inner = column![
+        brand_home(),
+        column![
+            item("Library", View::Library),
+            item("Settings", View::Settings),
         ]
-        .spacing(10)
-        .align_y(iced::Alignment::Center),
-    )
-    .width(Length::Fill)
-    .padding([12, 22])
-    .style(|_: &Theme| container::Style {
-        background: Some(Background::Color(palette::PANEL)),
-        ..container::Style::default()
-    });
-    let divider = container(iced::widget::Space::new().height(1))
-        .width(Length::Fill)
+        .spacing(4),
+        // Push the status + version block to the bottom of the sidebar.
+        iced::widget::Space::new().height(Length::Fill),
+        column![
+            status_pill(pill_label, pill_dot),
+            sidebar_updates(is_velopack, update),
+        ]
+        .spacing(12),
+    ]
+    .spacing(22)
+    .height(Length::Fill);
+    let panel = container(inner)
+        .width(Length::Fixed(SIDEBAR_WIDTH))
+        .height(Length::Fill)
+        .padding([22, 18])
+        .style(|_: &Theme| container::Style {
+            background: Some(Background::Color(palette::PANEL)),
+            ..container::Style::default()
+        });
+    // A hairline on the sidebar's right edge divides it from the content. A container border rings
+    // all four sides, so the single edge is a 1px-wide filled column instead.
+    let divider = container(iced::widget::Space::new().width(1))
+        .height(Length::Fill)
         .style(|_: &Theme| container::Style {
             background: Some(Background::Color(palette::BORDER)),
             ..container::Style::default()
         });
-    column![bar, divider].into()
+    row![panel, divider].height(Length::Fill).into()
 }
 
-/// Right side of the nav bar: the running version, plus (only in a Velopack install) a button to
-/// check for and apply an update.
-fn update_affordance(is_velopack: bool, update: &UpdateState) -> Element<'static, Message> {
+/// The sidebar's bottom block below the status pill: the running version, plus (only in a Velopack
+/// install) a button to check for and apply an update, stacked for the narrow sidebar column.
+fn sidebar_updates(is_velopack: bool, update: &UpdateState) -> Element<'static, Message> {
     let version = text(concat!("v", env!("CARGO_PKG_VERSION")))
         .size(11)
         .style(tinted(palette::TEXT_SECONDARY));
@@ -2043,28 +2064,25 @@ fn update_affordance(is_velopack: bool, update: &UpdateState) -> Element<'static
     } else {
         "Check for updates"
     };
-    let mut check = button(text(label).size(11).font(UI_SEMIBOLD))
-        .padding([4, 10])
+    let mut check = button(text(label).size(11).font(UI_SEMIBOLD).width(Length::Fill))
+        .padding([6, 10])
+        .width(Length::Fill)
         .style(move |_: &Theme, status| nav_link(false, status));
     // No on_press while working leaves the button disabled (greyed, no re-entrancy).
     if !working {
         check = check.on_press(Message::CheckForUpdates);
     }
-    let note: Element<'static, Message> = match update {
-        UpdateState::UpToDate => text("Up to date")
-            .size(11)
-            .style(tinted(palette::ACCENT))
-            .into(),
-        UpdateState::Failed(e) => text(e.clone())
-            .size(11)
-            .style(tinted(palette::DANGER))
-            .into(),
-        _ => text("").into(),
-    };
-    row![note, check, version]
-        .spacing(12)
-        .align_y(iced::Alignment::Center)
-        .into()
+    let mut items = column![].spacing(8);
+    match update {
+        UpdateState::UpToDate => {
+            items = items.push(text("Up to date").size(11).style(tinted(palette::ACCENT)));
+        }
+        UpdateState::Failed(e) => {
+            items = items.push(text(e.clone()).size(11).style(tinted(palette::DANGER)));
+        }
+        _ => {}
+    }
+    items.push(check).push(version).into()
 }
 
 /// A nav link: mint text on the mint tint when active, quiet otherwise, 7px pill.
