@@ -21,15 +21,17 @@ use rewynd_upload::{GankedClient, Visibility, default_title, titled, user_facing
 
 use crate::player;
 use crate::theme::{
-    self, DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, accent_button_style, accent_chip, card, field_label,
-    hint, link_button, palette, primary_button, secondary_button, tinted, value_row,
+    self, CONTENT_MAX_WIDTH, DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, accent_button_style, accent_chip,
+    card, field_label, hint, link_button, palette, primary_button, secondary_button, tinted,
+    value_row,
 };
 use crate::thumbs;
 use crate::trimbar;
 use crate::video;
 
-/// Cards per grid row (the body column is width-capped, so a fixed count stays balanced).
-const GRID_COLUMNS: usize = 3;
+/// Cards per grid row (the body column is width-capped, so a fixed count stays balanced). Four
+/// across suits the wider default window while staying readable if it is narrowed.
+const GRID_COLUMNS: usize = 4;
 
 /// Section label for clips saved outside a per-game subfolder (desktop / no game detected).
 const ROOT_GROUP: &str = "Desktop";
@@ -1249,7 +1251,7 @@ impl Library {
             column![body]
                 .spacing(20)
                 .padding(28)
-                .max_width(880)
+                .max_width(CONTENT_MAX_WIDTH)
                 .width(Length::Fill),
         )
         .center_x(Length::Fill);
