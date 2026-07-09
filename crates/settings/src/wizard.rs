@@ -260,7 +260,11 @@ impl Wizard {
             Message::TestClipResult(Ok(Some((path, encoder)))) => {
                 self.test = TestState::Saved { path, encoder };
                 self.saving_dots = None;
-                self.pulse = Some(Fade::new(PULSE));
+                // Same rule as the recorder start: the wash belongs to the step that shows
+                // the result, not wherever the user has navigated meanwhile.
+                if self.step == Step::TestClip {
+                    self.pulse = Some(Fade::new(PULSE));
+                }
             }
             Message::TestClipResult(Ok(None)) => {
                 self.saving_dots = None;

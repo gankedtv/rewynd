@@ -161,6 +161,21 @@ impl<'a, Message> TrimBar<'a, Message> {
             shell.publish(seek(t.clamp(self.start, self.end)));
         }
     }
+
+    /// Drop keyboard focus and every transient key flag with it. An engaged edit still
+    /// publishes its release, so the caller's resume-playback logic never dangles.
+    fn unfocus(&self, state: &mut State, shell: &mut Shell<'_, Message>)
+    where
+        Message: Clone,
+    {
+        if state.keys_engaged {
+            state.keys_engaged = false;
+            self.release(shell);
+        }
+        state.space_down = false;
+        state.focused = false;
+        shell.request_redraw();
+    }
 }
 
 /// Arrow-key seek size in seconds: fine with Shift, coarse with Ctrl, one second otherwise.
@@ -256,8 +271,7 @@ where
                 } else if state.focused {
                     // A click anywhere else moves focus away; the click itself stays uncaptured
                     // so whatever was pressed still gets it.
-                    state.focused = false;
-                    shell.request_redraw();
+                    self.unfocus(state, shell);
                 }
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
@@ -295,8 +309,7 @@ where
                         if let Some(message) = &self.on_reset {
                             shell.publish(message.clone());
                         }
-                        state.focused = false;
-                        shell.request_redraw();
+                        self.unfocus(state, shell);
                         shell.capture_event();
                     }
                     Key::Named(dir @ (Named::ArrowLeft | Named::ArrowRight))
