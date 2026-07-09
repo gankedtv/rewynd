@@ -14,8 +14,9 @@ use rewynd_config::Config;
 
 use crate::anim::{Cycle, Fade};
 use crate::theme::{
-    DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, arena_check, arena_input, arena_slider, body, card, hint,
-    kbd_chip, link_button, logo, palette, primary_button, secondary_button, tinted, value_row,
+    DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, arena_check, arena_input, arena_slider, aside, body, card,
+    dot, hint, kbd_chip, link_button, logo, palette, primary_button, secondary_button, tinted,
+    value_row,
 };
 
 /// Replay-length slider bounds, matching the settings editor's.
@@ -23,10 +24,15 @@ const BUFFER_MIN_S: u32 = 5;
 const BUFFER_MAX_S: u32 = rewynd_config::MAX_BUFFER_SECONDS as u32;
 const BITS_PER_BYTE: u64 = 8;
 
-/// Step-change slide/fade, success wash, and saving-ellipsis timings.
+/// Step-change slide/fade, success wash, and saving-ellipsis timings. The ellipsis only has
+/// three states per period, so it ticks on a timer instead of the frame clock.
 const ENTRANCE: Duration = Duration::from_millis(180);
 const PULSE: Duration = Duration::from_millis(600);
 const SAVING_PERIOD: Duration = Duration::from_millis(900);
+const SAVING_TICK: Duration = Duration::from_millis(300);
+
+/// The suggested hotkey combo: the input placeholder and the keycap preview fallback.
+const DEFAULT_HOTKEY: &str = "CTRL+ALT+R";
 
 /// One shows up under the welcome copy, picked per wizard run.
 const QUIPS: [&str; 4] = [
@@ -111,9 +117,10 @@ pub struct Wizard {
     entrance: Option<Fade>,
     /// One-shot mint wash behind the card on a success (recording up, clip saved, finish).
     pulse: Option<Fade>,
-    saving_dots: Cycle,
-    /// Index into [`QUIPS`], fixed at construction so redraws don't reshuffle the line.
-    quip: usize,
+    /// Drives the saving ellipsis, alive only while a test save runs.
+    saving_dots: Option<Cycle>,
+    /// Picked once at construction so redraws don't reshuffle the line.
+    quip: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -150,11 +157,11 @@ impl Wizard {
             test: TestState::Idle,
             entrance: None,
             pulse: None,
-            saving_dots: Cycle::new(SAVING_PERIOD),
-            quip: std::time::SystemTime::now()
+            saving_dots: None,
+            quip: QUIPS[std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.subsec_nanos() as usize)
-                % QUIPS.len(),
+                % QUIPS.len()],
         }
     }
 
@@ -216,12 +223,16 @@ impl Wizard {
             }
             Message::RecordingStarted(Ok(())) => {
                 self.recording_started = true;
-                self.pulse = Some(Fade::new(PULSE));
+                // The recorder start is async; the wash only makes sense on the step that
+                // shows the result, not wherever the user has navigated meanwhile.
+                if self.step == Step::ScreenShare {
+                    self.pulse = Some(Fade::new(PULSE));
+                }
             }
             Message::RecordingStarted(Err(e)) => self.recording_error = Some(e),
             Message::SaveTestClip => {
                 self.test = TestState::Saving;
-                self.saving_dots = Cycle::new(SAVING_PERIOD);
+                self.saving_dots = Some(Cycle::new(SAVING_PERIOD));
                 let dir = rewynd_config::clips_dir(config.output_dir().as_deref());
                 return Task::perform(
                     async move {
@@ -234,15 +245,20 @@ impl Wizard {
             }
             Message::TestClipResult(Ok(Some((path, encoder)))) => {
                 self.test = TestState::Saved { path, encoder };
+                self.saving_dots = None;
                 self.pulse = Some(Fade::new(PULSE));
             }
             Message::TestClipResult(Ok(None)) => {
+                self.saving_dots = None;
                 self.test = TestState::Failed(
                     "No clip appeared yet. Give the recorder a moment to warm up, then try again."
                         .to_owned(),
                 );
             }
-            Message::TestClipResult(Err(e)) => self.test = TestState::Failed(e),
+            Message::TestClipResult(Err(e)) => {
+                self.saving_dots = None;
+                self.test = TestState::Failed(e);
+            }
             Message::Tick(now) => {
                 if let Some(fade) = &mut self.entrance
                     && fade.advance(now)
@@ -254,8 +270,8 @@ impl Wizard {
                 {
                     self.pulse = None;
                 }
-                if matches!(self.test, TestState::Saving) {
-                    self.saving_dots.advance(now);
+                if let Some(cycle) = &mut self.saving_dots {
+                    cycle.advance(now);
                 }
             }
             // Intercepted by the app.
@@ -264,17 +280,21 @@ impl Wizard {
         Task::none()
     }
 
-    /// Frame ticks while any of the wizard's short animations run; nothing when idle.
+    /// Frame ticks while the short fades run; a slow timer while the saving ellipsis is
+    /// actually visible (it has three states per period, so the frame clock would be ~40x
+    /// overkill); nothing when idle.
     pub fn subscription(&self) -> iced::Subscription<Message> {
         if self.animating() {
             iced::window::frames().map(Message::Tick)
+        } else if matches!(self.test, TestState::Saving) && self.step == Step::TestClip {
+            iced::time::every(SAVING_TICK).map(Message::Tick)
         } else {
             iced::Subscription::none()
         }
     }
 
     fn animating(&self) -> bool {
-        self.entrance.is_some() || self.pulse.is_some() || matches!(self.test, TestState::Saving)
+        self.entrance.is_some() || self.pulse.is_some()
     }
 
     /// Eased entrance progress, `1.0` once the step has settled (no fade running).
@@ -319,16 +339,19 @@ impl Wizard {
         let washed = container(step)
             .padding(4)
             .style(move |_: &Theme| container::Style {
-                background: wash.map(|a| Background::Color(fade_alpha(palette::ACCENT_BG, a))),
+                background: wash.map(|a| Background::Color(palette::ACCENT_BG.scale_alpha(a))),
                 border: Border {
                     radius: 8.0.into(),
                     ..Border::default()
                 },
                 ..container::Style::default()
             });
+        // The slide trades top padding for bottom padding so the wrapper's height is constant
+        // and the nav row below never moves while the card settles.
         let slide = 14.0 * (1.0 - self.entrance_progress());
         let animated = container(washed).padding(iced::Padding {
             top: slide,
+            bottom: 14.0 - slide,
             ..iced::Padding::ZERO
         });
 
@@ -374,13 +397,7 @@ impl Wizard {
         } else {
             ("Next", Message::Next)
         };
-        nav.push(
-            button(text(label).size(13).font(UI_BOLD))
-                .on_press(msg)
-                .style(primary_button)
-                .padding([13, 30]),
-        )
-        .into()
+        nav.push(cta(label, msg)).into()
     }
 
     fn welcome(&self) -> Element<'_, Message> {
@@ -397,7 +414,7 @@ impl Wizard {
                         "It records only the game you're playing. Nothing leaves your machine \
                          unless you choose to upload a clip."
                     ),
-                    muted12(QUIPS[self.quip]),
+                    aside(self.quip),
                 ]
                 .spacing(12),
             ),
@@ -414,12 +431,7 @@ impl Wizard {
                     .style(tinted(palette::ACCENT))
             ]
         } else {
-            row![
-                button(text("Start recording").size(13).font(UI_BOLD))
-                    .on_press(Message::StartRecording)
-                    .style(primary_button)
-                    .padding([13, 30]),
-            ]
+            row![cta("Start recording", Message::StartRecording)]
         };
         let mut col = column![
             body(
@@ -441,7 +453,7 @@ impl Wizard {
             "Choose your hotkey",
             column![
                 body("This is the key you press to save the last few minutes as a clip."),
-                text_input("CTRL+ALT+R", &self.hotkey)
+                text_input(DEFAULT_HOTKEY, &self.hotkey)
                     .on_input(Message::HotkeyEdited)
                     .size(14)
                     .padding(12)
@@ -471,7 +483,7 @@ impl Wizard {
                     Message::BufferChanged
                 )
                 .style(arena_slider),
-                muted12(replay_flavor(self.buffer_seconds)),
+                aside(replay_flavor(self.buffer_seconds)),
                 value_row("Estimated clip size", format!("about {est_mb} MB")),
             ]
             .spacing(12),
@@ -480,16 +492,19 @@ impl Wizard {
 
     fn test_clip(&self) -> Element<'_, Message> {
         let action: Element<Message> = match &self.test {
-            TestState::Saving => body(format!(
-                "Saving a test clip{}",
-                ".".repeat(1 + (self.saving_dots.phase() * 3.0) as usize % 3)
-            )),
+            TestState::Saving => {
+                let phase = self.saving_dots.as_ref().map_or(0.0, Cycle::phase);
+                body(format!(
+                    "Saving a test clip{}",
+                    ".".repeat(1 + (phase * 3.0) as usize)
+                ))
+            }
             TestState::Saved { path, encoder } => {
                 let mut saved = column![
                     text("Clip secured.")
                         .size(13)
                         .style(tinted(palette::ACCENT)),
-                    muted12("That one is a keeper."),
+                    aside("That one is a keeper."),
                     hint(path.display().to_string()),
                 ]
                 .spacing(8);
@@ -501,11 +516,7 @@ impl Wizard {
                 }
                 saved.into()
             }
-            _ => button(text("Save a test clip now").size(13).font(UI_BOLD))
-                .on_press(Message::SaveTestClip)
-                .style(primary_button)
-                .padding([13, 30])
-                .into(),
+            _ => cta("Save a test clip now", Message::SaveTestClip),
         };
         let mut col = column![
             body(
@@ -560,21 +571,22 @@ impl Wizard {
                     .on_toggle(Message::StartOnBoot)
                     .style(arena_check),
                 hint("Want to share clips? Connect ganked.tv or YouTube any time under Settings."),
-                muted12("glhf."),
+                aside("glhf."),
             ]
             .spacing(14),
         )
     }
 
-    /// A titled card for a step's content; the title fades in with the entrance.
+    /// A titled card for a step's content; the title is display-face (so uppercase, per the
+    /// design) and fades in with the entrance.
     fn step_card<'a>(
         &self,
         title: &'a str,
         content: impl Into<Element<'a, Message>>,
     ) -> Element<'a, Message> {
-        let title_color = fade_alpha(palette::TEXT, self.entrance_progress());
+        let title_color = palette::TEXT.scale_alpha(self.entrance_progress());
         let inner = column![
-            text(title)
+            text(title.to_uppercase())
                 .size(32)
                 .font(DISPLAY_BLACK)
                 .style(tinted(title_color)),
@@ -596,17 +608,13 @@ fn estimated_clip_mb(config: &Config, seconds: u32) -> u64 {
     bytes.saturating_add(500_000) / 1_000_000
 }
 
-/// `color` with its alpha scaled by `t`, for fading text in.
-fn fade_alpha(color: iced::Color, t: f32) -> iced::Color {
-    iced::Color {
-        a: color.a * t,
-        ..color
-    }
-}
-
-/// Muted aside a notch above fine print: quips, flavor lines.
-fn muted12<'a, M: 'a>(s: impl Into<String>) -> Element<'a, M> {
-    text(s.into()).size(12).style(tinted(palette::MUTED)).into()
+/// The mint call-to-action every step shares.
+fn cta(label: &str, msg: Message) -> Element<'_, Message> {
+    button(text(label).size(13).font(UI_BOLD))
+        .on_press(msg)
+        .style(primary_button)
+        .padding([13, 30])
+        .into()
 }
 
 /// What `seconds` of replay feels like, for the length slider.
@@ -632,7 +640,7 @@ fn hotkey_parts(s: &str) -> Vec<String> {
 fn hotkey_chips<'a>(hotkey: &str) -> Element<'a, Message> {
     let mut parts = hotkey_parts(hotkey);
     if parts.is_empty() {
-        parts = ["CTRL", "ALT", "R"].map(str::to_owned).into();
+        parts = hotkey_parts(DEFAULT_HOTKEY);
     }
     let mut chips = row![].spacing(6).align_y(iced::Alignment::Center);
     for (i, part) in parts.into_iter().enumerate() {
@@ -647,29 +655,22 @@ fn hotkey_chips<'a>(hotkey: &str) -> Element<'a, Message> {
 /// One stepper dot: filled mint when reached, outlined when ahead; the current one gets a
 /// faint mint well (10px dot + 3px padding = a 16px round well).
 fn step_dot<'a>(done: bool, current: bool) -> Element<'a, Message> {
-    let dot = container(iced::widget::Space::new().width(10).height(10)).style(move |_: &Theme| {
-        if done {
-            container::Style {
-                background: Some(Background::Color(palette::ACCENT)),
-                border: Border {
-                    radius: 5.0.into(),
-                    ..Border::default()
-                },
-                ..container::Style::default()
-            }
-        } else {
-            container::Style {
+    let mark: Element<'a, Message> = if done {
+        dot(10.0, palette::ACCENT)
+    } else {
+        container(iced::widget::Space::new().width(10).height(10))
+            .style(|_: &Theme| container::Style {
                 border: Border {
                     color: palette::BORDER_STRONG,
                     width: 1.0,
                     radius: 5.0.into(),
                 },
                 ..container::Style::default()
-            }
-        }
-    });
+            })
+            .into()
+    };
     if current {
-        container(dot)
+        container(mark)
             .padding(3)
             .style(|_: &Theme| container::Style {
                 background: Some(Background::Color(palette::ACCENT_BG)),
@@ -681,7 +682,7 @@ fn step_dot<'a>(done: bool, current: bool) -> Element<'a, Message> {
             })
             .into()
     } else {
-        dot.into()
+        mark
     }
 }
 

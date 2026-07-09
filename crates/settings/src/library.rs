@@ -19,7 +19,7 @@ use rewynd_upload::youtube::{
 };
 use rewynd_upload::{GankedClient, Visibility, default_title, titled, user_facing_upload_error};
 
-use crate::anim::{ease, lerp_color};
+use crate::anim::lerp_color;
 use crate::player;
 use crate::theme::{
     self, CONTENT_MAX_WIDTH, DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, accent_button_style, accent_chip,
@@ -619,8 +619,7 @@ impl Library {
                     self.accent_fade = Some(AccentFade {
                         from,
                         to: dest_accent(dest),
-                        start: None,
-                        progress: 0.0,
+                        fade: crate::anim::Fade::new(ACCENT_FADE),
                     });
                 }
             }
@@ -1320,7 +1319,7 @@ impl Library {
             .spacing(8)
             .align_x(iced::Alignment::Center);
             if !self.scanning {
-                empty = empty.push(hint("Go make some plays worth keeping."));
+                empty = empty.push(theme::aside("Go make some plays worth keeping."));
             }
             return column![
                 header,
@@ -1797,14 +1796,17 @@ impl Library {
         let end = self.trim_end.clamp(0.0, dur);
         let length = (end - start).max(0.0);
 
-        // A quiet legend for the timeline's keyboard controls (click the timeline to focus it).
+        // A quiet legend for the timeline's keyboard controls; the keys only listen after a
+        // click on the timeline, so say so.
         let legend = row![
-            theme::kbd_chip("ARROWS"),
+            hint("Click the timeline, then"),
+            theme::kbd_chip("\u{2190}"),
+            theme::kbd_chip("\u{2192}"),
             hint("seek"),
-            theme::kbd_chip("I"),
-            theme::kbd_chip("O"),
+            theme::kbd_chip("i"),
+            theme::kbd_chip("o"),
             hint("trim in and out"),
-            theme::kbd_chip("SPACE"),
+            theme::kbd_chip("space"),
             hint("play"),
         ]
         .spacing(8)
@@ -2501,32 +2503,28 @@ fn filmstrip_positions(n: usize) -> Vec<f32> {
 /// How long the upload-panel accent takes to fade when the destination switches.
 const ACCENT_FADE: Duration = Duration::from_millis(220);
 
-/// An in-flight accent fade between two (fill, ink) brand pairs. `start` is anchored on the
-/// first tick, so all time comes from the frame subscription rather than `Instant::now()` in
-/// update.
+/// An in-flight accent fade between two (fill, ink) brand pairs, timed by a shared
+/// [`Fade`](crate::anim::Fade).
 struct AccentFade {
     from: (iced::Color, iced::Color),
     to: (iced::Color, iced::Color),
-    start: Option<Instant>,
-    progress: f32,
+    fade: crate::anim::Fade,
 }
 
 impl AccentFade {
     /// The interpolated (fill, ink) at the current progress.
     fn accent(&self) -> (iced::Color, iced::Color) {
+        let t = self.fade.progress();
         (
-            lerp_color(self.from.0, self.to.0, self.progress),
-            lerp_color(self.from.1, self.to.1, self.progress),
+            lerp_color(self.from.0, self.to.0, t),
+            lerp_color(self.from.1, self.to.1, t),
         )
     }
 
-    /// Advance to frame time `now`, anchoring the clock on the first call. Returns `true` once
-    /// the fade has reached its end (the caller then drops it).
+    /// Advance to frame time `now`. Returns `true` once the fade has reached its end (the
+    /// caller then drops it).
     fn advance(&mut self, now: Instant) -> bool {
-        let start = *self.start.get_or_insert(now);
-        let linear = now.duration_since(start).as_secs_f32() / ACCENT_FADE.as_secs_f32();
-        self.progress = ease(linear);
-        linear >= 1.0
+        self.fade.advance(now)
     }
 }
 
@@ -2641,32 +2639,13 @@ mod accent_tests {
     }
 
     #[test]
-    fn lerp_color_hits_both_ends() {
-        let a = Color::from_rgb(0.0, 0.0, 0.0);
-        let b = Color::from_rgb(1.0, 0.5, 0.25);
-        approx(lerp_color(a, b, 0.0), a);
-        approx(lerp_color(a, b, 1.0), b);
-        approx(lerp_color(a, b, 0.5), Color::from_rgb(0.5, 0.25, 0.125));
-    }
-
-    #[test]
-    fn ease_is_clamped_and_smooth() {
-        assert_eq!(ease(0.0), 0.0);
-        assert_eq!(ease(1.0), 1.0);
-        assert_eq!(ease(-1.0), 0.0);
-        assert_eq!(ease(2.0), 1.0);
-        assert!((ease(0.5) - 0.5).abs() < 1e-6, "symmetric midpoint");
-    }
-
-    #[test]
     fn fade_runs_from_source_to_target_then_ends() {
         let from = (palette::ACCENT, palette::INK_ON_ACCENT);
         let to = (palette::YOUTUBE, palette::INK_ON_YOUTUBE);
         let mut fade = AccentFade {
             from,
             to,
-            start: None,
-            progress: 0.0,
+            fade: crate::anim::Fade::new(ACCENT_FADE),
         };
         let t0 = Instant::now();
 
@@ -2689,8 +2668,7 @@ mod accent_tests {
         let mut fade = AccentFade {
             from: (palette::ACCENT, palette::INK_ON_ACCENT),
             to: (palette::YOUTUBE, palette::INK_ON_YOUTUBE),
-            start: None,
-            progress: 0.0,
+            fade: crate::anim::Fade::new(ACCENT_FADE),
         };
         let t0 = Instant::now();
         assert!(!fade.advance(t0));

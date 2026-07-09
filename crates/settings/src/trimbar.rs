@@ -33,6 +33,12 @@ struct State {
     /// Whether keyboard input edits this bar (gained by clicking it, lost by clicking
     /// elsewhere or Escape).
     focused: bool,
+    /// A keyboard edit (seek or mark) is in progress; the release message goes out once,
+    /// on key release, like a drag end. Publishing it per press would tear down and
+    /// respawn the preview player at the OS key-repeat rate.
+    keys_engaged: bool,
+    /// Space is held; auto-repeat must not toggle playback on and off.
+    space_down: bool,
 }
 
 /// A draggable trim range over a clip of `dur` seconds.
@@ -138,15 +144,11 @@ impl<'a, Message> TrimBar<'a, Message> {
         }
     }
 
-    /// Seek the playhead to `t` (clamped inside the kept range) and release.
-    fn seek_and_release(&self, t: f32, shell: &mut Shell<'_, Message>)
-    where
-        Message: Clone,
-    {
+    /// Seek the playhead to `t`, clamped inside the kept range.
+    fn seek(&self, t: f32, shell: &mut Shell<'_, Message>) {
         if let Some(seek) = &self.on_seek {
             shell.publish(seek(t.clamp(self.start, self.end)));
         }
-        self.release(shell);
     }
 }
 
@@ -266,6 +268,10 @@ where
             Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. })
                 if state.focused =>
             {
+                // Chorded presses (Ctrl/Alt/Super) belong to someone else's shortcut; editing
+                // the trim on them would both corrupt the range and shadow the shortcut.
+                // Shift stays available (it is the fine arrow step and the I/O capitals).
+                let chord = modifiers.control() || modifiers.alt() || modifiers.logo();
                 // The playhead the edit applies to; before playback starts it sits at the
                 // relevant range edge.
                 let head = |fallback: f32| {
@@ -279,41 +285,62 @@ where
                         shell.request_redraw();
                         shell.capture_event();
                     }
-                    Key::Named(Named::ArrowLeft) => {
-                        self.seek_and_release(head(self.start) - seek_step(*modifiers), shell);
+                    Key::Named(dir @ (Named::ArrowLeft | Named::ArrowRight))
+                        if !(modifiers.alt() || modifiers.logo()) =>
+                    {
+                        let sign = if dir == Named::ArrowLeft { -1.0 } else { 1.0 };
+                        self.seek(head(self.start) + sign * seek_step(*modifiers), shell);
+                        state.keys_engaged = true;
                         shell.capture_event();
                     }
-                    Key::Named(Named::ArrowRight) => {
-                        self.seek_and_release(head(self.start) + seek_step(*modifiers), shell);
+                    Key::Named(Named::Home) if !chord => {
+                        self.seek(self.start, shell);
+                        state.keys_engaged = true;
                         shell.capture_event();
                     }
-                    Key::Named(Named::Home) => {
-                        self.seek_and_release(self.start, shell);
+                    Key::Named(Named::End) if !chord => {
+                        self.seek(self.end, shell);
+                        state.keys_engaged = true;
                         shell.capture_event();
                     }
-                    Key::Named(Named::End) => {
-                        self.seek_and_release(self.end, shell);
+                    // The editor in/out idiom: mark a trim point at the playhead. The seek
+                    // right after keeps the playhead where it was; the mark alone would
+                    // clear it and send the next arrow press back to the range edge.
+                    Key::Character("i" | "I") if !chord => {
+                        let t = head(self.start);
+                        shell.publish((self.on_start)(t));
+                        self.seek(t, shell);
+                        state.keys_engaged = true;
                         shell.capture_event();
                     }
-                    // The editor in/out idiom: mark the trim points at the playhead.
-                    Key::Character("i") | Key::Character("I") => {
-                        shell.publish((self.on_start)(head(self.start)));
-                        self.release(shell);
+                    Key::Character("o" | "O") if !chord => {
+                        let t = head(self.end);
+                        shell.publish((self.on_end)(t));
+                        self.seek(t, shell);
+                        state.keys_engaged = true;
                         shell.capture_event();
                     }
-                    Key::Character("o") | Key::Character("O") => {
-                        shell.publish((self.on_end)(head(self.end)));
-                        self.release(shell);
-                        shell.capture_event();
-                    }
-                    Key::Named(Named::Space) | Key::Character(" ") => {
-                        if let Some(message) = &self.on_toggle {
+                    Key::Named(Named::Space) | Key::Character(" ") if !chord => {
+                        if !state.space_down
+                            && let Some(message) = &self.on_toggle
+                        {
                             shell.publish(message.clone());
                         }
-                        // Captured either way so the page does not scroll.
+                        state.space_down = true;
+                        // Captured even when held so the page does not scroll.
                         shell.capture_event();
                     }
                     _ => {}
+                }
+            }
+            Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) if state.focused => {
+                if matches!(key.as_ref(), Key::Named(Named::Space) | Key::Character(" ")) {
+                    state.space_down = false;
+                }
+                if state.keys_engaged {
+                    state.keys_engaged = false;
+                    self.release(shell);
+                    shell.capture_event();
                 }
             }
             _ => {}

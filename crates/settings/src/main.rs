@@ -1315,13 +1315,16 @@ impl App {
     /// subfolders). The watch is keyed by the resolved directory, so it re-binds if the output
     /// directory changes.
     fn subscription(&self) -> iced::Subscription<Message> {
-        let focus = iced::event::listen_with(|event, _status, _id| match event {
+        let focus = iced::event::listen_with(|event, status, _id| match event {
             iced::Event::Window(iced::window::Event::Focused) => Some(Message::WindowFocused),
-            // Escape leaves the fullscreen preview (a no-op otherwise).
+            // Escape leaves the fullscreen preview (a no-op otherwise), unless a widget
+            // already claimed it (the trim bar captures Escape to drop keyboard focus).
             iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
                 key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
                 ..
-            }) => Some(Message::Library(library::Message::FullscreenExit)),
+            }) if status == iced::event::Status::Ignored => {
+                Some(Message::Library(library::Message::FullscreenExit))
+            }
             _ => None,
         });
         let dir = config::clips_dir(self.config.output_dir().as_deref())

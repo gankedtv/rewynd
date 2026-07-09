@@ -490,25 +490,44 @@ pub fn body<'a, M: 'a>(s: impl Into<String>) -> Element<'a, M> {
         .into()
 }
 
-/// A keycap chip (Arena kbd hint): quiet bordered cap, uppercase label.
+/// A muted aside one notch above fine print: quips and flavor lines.
+pub fn aside<'a, M: 'a>(s: impl Into<String>) -> Element<'a, M> {
+    text(s.into()).size(12).style(tinted(palette::MUTED)).into()
+}
+
+/// A keycap chip (Arena kbd hint): transparent, hairline border, quiet muted label,
+/// rendered verbatim (the design shows lowercase keys like "esc").
 pub fn kbd_chip<'a, M: 'a>(label: impl Into<String>) -> Element<'a, M> {
     container(
-        text(label.into().to_uppercase())
-            .size(11)
+        text(label.into())
+            .size(10)
             .font(UI_SEMIBOLD)
-            .style(tinted(palette::TEXT_SECONDARY)),
+            .style(tinted(palette::MUTED)),
     )
-    .padding([3, 8])
+    .padding([3, 7])
     .style(|_: &Theme| container::Style {
-        background: Some(Background::Color(palette::HIGH)),
         border: Border {
-            color: palette::BORDER_STRONG,
+            color: palette::BORDER,
             width: 1.0,
             radius: 4.0.into(),
         },
         ..container::Style::default()
     })
     .into()
+}
+
+/// A solid filled circle of `size` logical pixels: stepper dots, status indicators.
+pub fn dot<'a, M: 'a>(size: f32, color: iced::Color) -> Element<'a, M> {
+    container(iced::widget::Space::new().width(size).height(size))
+        .style(move |_: &Theme| container::Style {
+            background: Some(Background::Color(color)),
+            border: Border {
+                radius: (size / 2.0).into(),
+                ..Border::default()
+            },
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// An accent chip (game tags, connected badges): mint text on the mint tint, 5px radius.
@@ -534,20 +553,9 @@ pub fn accent_chip<'a, M: 'a>(label: String) -> Element<'a, M> {
 
 /// The recorder-status pill for the window's top-right (Arena §5.9 status dot): a small coloured
 /// dot plus a quiet label.
-pub fn status_pill<'a, M: 'a>(label: String, dot: iced::Color) -> Element<'a, M> {
-    let indicator =
-        container(iced::widget::Space::new().width(7).height(7)).style(move |_: &Theme| {
-            container::Style {
-                background: Some(Background::Color(dot)),
-                border: Border {
-                    radius: 4.0.into(),
-                    ..Border::default()
-                },
-                ..container::Style::default()
-            }
-        });
+pub fn status_pill<'a, M: 'a>(label: String, color: iced::Color) -> Element<'a, M> {
     row![
-        indicator,
+        dot(7.0, color),
         text(label)
             .size(11)
             .font(UI_SEMIBOLD)
