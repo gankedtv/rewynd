@@ -177,7 +177,11 @@ const POLL_MAX_READS: u32 = 60;
 pub enum Message {
     SearchEdited(String),
     GameFilterPicked(Option<String>),
-    Scanned(Vec<ClipEntry>),
+    /// A directory rescan finished: the clips found plus the upload history read alongside
+    /// (both come off one blocking task, so neither read stalls the UI thread).
+    Scanned(Vec<ClipEntry>, Vec<UploadRecord>),
+    /// The open clip's header was read: its duration in seconds (the trim range's ceiling).
+    SummaryLoaded(PathBuf, f32),
     ThumbDone(PathBuf, SystemTime, Result<thumbs::Loaded, String>),
     Open(PathBuf),
     Back,
@@ -355,7 +359,9 @@ impl Library {
             accent_fade: None,
             visibility: Visibility::default(),
             upload: UploadState::Idle,
-            history: upload_history::load(),
+            // Filled by the first scan (the boot task); reading it here would block the UI
+            // thread during startup.
+            history: Vec::new(),
         }
     }
 
@@ -405,13 +411,17 @@ impl Library {
     pub fn refresh(&mut self, config: &Config) -> Task<Message> {
         self.scanning = true;
         let dir = rewynd_config::clips_dir(config.output_dir().as_deref());
+        // The upload history rides along so badges + the duplicate guard reflect uploads made
+        // from the tray (or a prior run) without a restart — and without a UI-thread file read.
         Task::perform(
             async move {
-                tokio::task::spawn_blocking(move || rewynd_config::list_clips(&dir))
-                    .await
-                    .unwrap_or_default()
+                tokio::task::spawn_blocking(move || {
+                    (rewynd_config::list_clips(&dir), upload_history::load())
+                })
+                .await
+                .unwrap_or_default()
             },
-            Message::Scanned,
+            |(entries, history)| Message::Scanned(entries, history),
         )
     }
 
@@ -419,7 +429,7 @@ impl Library {
         match message {
             Message::SearchEdited(q) => self.search = q,
             Message::GameFilterPicked(game) => self.game_filter = game,
-            Message::Scanned(entries) => return self.scanned(entries),
+            Message::Scanned(entries, history) => return self.scanned(entries, history),
             Message::ThumbDone(path, modified, result) => {
                 // Free the decode slot, unless a newer decode for the same path superseded it.
                 if self.decoding.get(&path) == Some(&modified) {
@@ -443,11 +453,11 @@ impl Library {
                 return self.start_pending_decodes();
             }
             Message::Open(path) => {
-                // Reset the trim to the clip's full span (its duration comes from the file header).
-                self.open_dur =
-                    rewynd_mux::read::clip_summary(&path).map_or(0.0, |s| s.duration.as_secs_f32());
+                // The trim span resets to the clip's full duration once [`Message::SummaryLoaded`]
+                // delivers it (the header read is file I/O, kept off the UI thread).
+                self.open_dur = 0.0;
                 self.trim_start = 0.0;
-                self.trim_end = self.open_dur;
+                self.trim_end = 0.0;
                 self.trim = TrimState::Idle;
                 self.reset_preview();
                 // The suggested title leads with the game when one was detected.
@@ -470,12 +480,15 @@ impl Library {
                 self.visibility = self.default_visibility(config);
                 return self.load_open_media(path);
             }
-            Message::Back => {
-                self.open = None;
-                self.confirm_delete = false;
-                self.action_error = None;
-                self.clear_strip();
-                self.reset_preview();
+            Message::Back => self.show_grid(),
+            Message::SummaryLoaded(path, dur) => {
+                // The summary landing completes the open: the trim resets to the full span.
+                // Handles can't be moved meaningfully before this (the span was 0 until now).
+                if self.open.as_deref() == Some(path.as_path()) {
+                    self.open_dur = dur;
+                    self.trim_start = 0.0;
+                    self.trim_end = dur;
+                }
             }
             Message::Play => {
                 if let Some(path) = &self.open
@@ -728,7 +741,7 @@ impl Library {
     /// Store a fresh scan and queue thumbnail decodes for entries whose (path, mtime) slot is
     /// missing or stale. The queue is rebuilt from this scan; decodes already in flight keep
     /// their slot and are not restarted.
-    fn scanned(&mut self, entries: Vec<ClipEntry>) -> Task<Message> {
+    fn scanned(&mut self, entries: Vec<ClipEntry>, history: Vec<UploadRecord>) -> Task<Message> {
         self.scanning = false;
         self.thumbs
             .retain(|path, _| entries.iter().any(|e| &e.path == path));
@@ -748,9 +761,7 @@ impl Library {
                 .push_back((entry.path.clone(), modified));
         }
         self.entries = entries;
-        // Refresh the upload memory so badges + the duplicate guard reflect uploads made from the
-        // tray (or a prior run) without a restart.
-        self.history = upload_history::load();
+        self.history = history;
         // Drop a game filter whose section vanished (its last clip was deleted or moved).
         let stale = self
             .game_filter
@@ -793,17 +804,33 @@ impl Library {
         let Some(path) = self.open.clone() else {
             return Task::none();
         };
-        self.open_dur =
-            rewynd_mux::read::clip_summary(&path).map_or(0.0, |s| s.duration.as_secs_f32());
+        self.open_dur = 0.0;
         self.trim_start = 0.0;
-        self.trim_end = self.open_dur;
+        self.trim_end = 0.0;
         self.reset_preview();
         self.load_open_media(path)
     }
 
-    /// (Re)build the open clip's timeline media: the filmstrip cells and the audio-peak lane.
+    /// (Re)build the open clip's timeline media: the header summary (the trim span's ceiling),
+    /// the filmstrip cells and the audio-peak lane — all off the UI thread.
     fn load_open_media(&mut self, path: PathBuf) -> Task<Message> {
         self.waveform = None;
+        let sum_path = path.clone();
+        let summary = Task::perform(
+            async move {
+                let dur = tokio::task::spawn_blocking({
+                    let path = sum_path.clone();
+                    move || {
+                        rewynd_mux::read::clip_summary(&path)
+                            .map_or(0.0, |s| s.duration.as_secs_f32())
+                    }
+                })
+                .await
+                .unwrap_or(0.0);
+                (sum_path, dur)
+            },
+            |(path, dur)| Message::SummaryLoaded(path, dur),
+        );
         let wave_path = path.clone();
         let wave = Task::perform(
             async move {
@@ -817,7 +844,7 @@ impl Library {
             },
             |(path, peaks)| Message::WaveformDone(path, peaks),
         );
-        Task::batch([self.build_strip(path), wave])
+        Task::batch([summary, self.build_strip(path), wave])
     }
 
     /// Grow or shrink the preview; a running playback restarts from its current position so the

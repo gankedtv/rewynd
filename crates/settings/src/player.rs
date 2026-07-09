@@ -220,9 +220,11 @@ fn read_frames(
     tx: &tokio::sync::mpsc::Sender<Event>,
 ) -> bool {
     let frame_bytes = width as usize * height as usize * 4;
-    let mut buffer = vec![0u8; frame_bytes];
     let mut clock: Option<(Instant, Duration)> = None;
     for index in 0u32.. {
+        // A fresh buffer per frame, moved into the Arc: reusing one and cloning it out would
+        // add a full extra copy of every frame (~2 MB at 60 fps) on top of the allocation.
+        let mut buffer = vec![0u8; frame_bytes];
         if stdout.read_exact(&mut buffer).is_err() {
             return true;
         }
@@ -237,7 +239,7 @@ fn read_frames(
             clock = Some((now, pts));
         }
         let frame = video::Frame {
-            pixels: Arc::new(buffer.clone()),
+            pixels: Arc::new(buffer),
             width,
             height,
         };
