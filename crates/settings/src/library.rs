@@ -1309,7 +1309,7 @@ impl Library {
         let header = row![title].spacing(12).align_y(iced::Alignment::Center);
 
         if self.entries.is_empty() {
-            let empty = column![
+            let mut empty = column![
                 text("NO CLIPS YET").size(22).font(DISPLAY_BLACK),
                 hint(if self.scanning {
                     "Looking for saved clips..."
@@ -1319,6 +1319,9 @@ impl Library {
             ]
             .spacing(8)
             .align_x(iced::Alignment::Center);
+            if !self.scanning {
+                empty = empty.push(hint("Go make some plays worth keeping."));
+            }
             return column![
                 header,
                 container(empty)
@@ -1774,7 +1777,8 @@ impl Library {
         .playhead(self.play_pos)
         .waveform(self.waveform.as_deref())
         .on_seek(Message::Seek)
-        .on_released(Message::TrimDragEnd);
+        .on_released(Message::TrimDragEnd)
+        .on_toggle(Message::PlayToggle);
         let stack = layered([cells.into(), bar.into()])
             .width(Length::Fill)
             .height(Length::Fill);
@@ -1793,8 +1797,22 @@ impl Library {
         let end = self.trim_end.clamp(0.0, dur);
         let length = (end - start).max(0.0);
 
+        // A quiet legend for the timeline's keyboard controls (click the timeline to focus it).
+        let legend = row![
+            theme::kbd_chip("ARROWS"),
+            hint("seek"),
+            theme::kbd_chip("I"),
+            theme::kbd_chip("O"),
+            hint("trim in and out"),
+            theme::kbd_chip("SPACE"),
+            hint("play"),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+
         let panel = column![
             self.filmstrip(),
+            legend,
             value_row("Start", secs_label(start)),
             value_row("End", secs_label(end)),
             value_row("Trimmed length", secs_label(length)),

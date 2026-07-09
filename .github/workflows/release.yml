@@ -104,7 +104,7 @@ jobs:
           # Publishing via gh, not `vpk upload`: two parallel `vpk upload --publish` calls both try
           # to CREATE the release and the second fails ("release already exists").
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --title "rewynd $VERSION" --notes "rewynd $VERSION" $PRE_FLAG \
+            --title "rewynd $VERSION" --generate-notes $PRE_FLAG \
             || echo "release already exists, reusing it"
           gh release upload "$TAG" Releases/* --repo "$GITHUB_REPOSITORY" --clobber
 
@@ -149,7 +149,8 @@ jobs:
         run: |
           mkdir -p pack
           cp target/release/rewynd.exe target/release/rewynd-recorder.exe pack/
-          vpk pack -u rewynd -v "$VERSION" -p pack -e rewynd.exe -i packaging/rewynd.ico
+          vpk pack -u rewynd -v "$VERSION" -p pack -e rewynd.exe -i packaging/rewynd.ico \
+            --splashImage packaging/splash.png
           # The release already exists (linux-pack created it); append the Windows assets.
           gh release upload "$TAG" Releases/* --repo "$GITHUB_REPOSITORY" --clobber
 

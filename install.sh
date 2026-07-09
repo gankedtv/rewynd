@@ -13,8 +13,10 @@ BIN="$DEST/rewynd"
 
 echo "Finding the latest rewynd release..."
 # /releases (newest first) includes prereleases, so the beta is picked up; grab its AppImage.
+# Match only asset download URLs, not URLs that happen to appear in the release notes.
 URL=$(curl -fsSL "https://api.github.com/repos/$REPO/releases" \
-  | grep -o 'https://[^"]*/rewynd\.AppImage' | head -n 1)
+  | grep -o '"browser_download_url": *"[^"]*/rewynd\.AppImage"' \
+  | grep -o 'https://[^"]*' | head -n 1)
 if [ -z "${URL:-}" ]; then
   echo "error: no rewynd.AppImage asset found in the $REPO releases" >&2
   exit 1

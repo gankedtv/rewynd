@@ -1335,10 +1335,18 @@ impl App {
         // The library adds its own conditional subscriptions (accent-fade ticks, preview
         // playback); iced re-diffs after each update, so they vanish when idle and the software
         // renderer stops redrawing.
+        // The wizard's ticks only exist while it animates, and only the onboarding view
+        // renders it, so the stream is dropped everywhere else.
+        let wizard = if matches!(self.view, View::Onboarding) {
+            self.wizard.subscription().map(Message::Wizard)
+        } else {
+            iced::Subscription::none()
+        };
         iced::Subscription::batch([
             focus,
             clips,
             status,
+            wizard,
             self.library.subscription().map(Message::Library),
         ])
     }

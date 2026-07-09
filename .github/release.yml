@@ -1,0 +1,20 @@
+# Auto-generated release notes (gh release create --generate-notes).
+changelog:
+  exclude:
+    authors:
+      - coderabbitai
+      - coderabbitai[bot]
+      - github-actions[bot]
+  categories:
+    - title: New
+      labels:
+        - enhancement
+    - title: Fixed
+      labels:
+        - bug
+    - title: Docs
+      labels:
+        - documentation
+    - title: Other
+      labels:
+        - "*"

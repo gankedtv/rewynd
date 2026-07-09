@@ -2,10 +2,15 @@
 //! the trim card's stack, so the filmstrip frames show through beneath; the kept `[start, end]`
 //! range stays bright while the rest is scrimmed. Dragging a handle publishes the new time via
 //! the caller's message constructors (which clamp, so the widget stays dumb about limits).
+//!
+//! Clicking the bar also focuses it for keyboard editing: arrows seek, I/O set the trim
+//! in/out points at the playhead, Home/End jump to the range edges, Space toggles playback,
+//! Escape unfocuses.
 
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::widget::{Tree, tree};
 use iced::advanced::{Clipboard, Shell, Widget, mouse, renderer};
+use iced::keyboard::{self, Key, key::Named};
 use iced::{Background, Border, Color, Element, Event, Length, Rectangle, Size};
 
 use crate::theme::palette;
@@ -25,6 +30,9 @@ const GRAB: f32 = 10.0;
 #[derive(Default)]
 struct State {
     drag: Option<Handle>,
+    /// Whether keyboard input edits this bar (gained by clicking it, lost by clicking
+    /// elsewhere or Escape).
+    focused: bool,
 }
 
 /// A draggable trim range over a clip of `dur` seconds.
@@ -44,6 +52,8 @@ pub struct TrimBar<'a, Message> {
     on_seek: Option<Box<dyn Fn(f32) -> Message + 'a>>,
     /// Published when a drag (of any handle) is let go.
     on_released: Option<Message>,
+    /// Published when Space is pressed while the bar has keyboard focus.
+    on_toggle: Option<Message>,
 }
 
 impl<'a, Message> TrimBar<'a, Message> {
@@ -65,6 +75,7 @@ impl<'a, Message> TrimBar<'a, Message> {
             on_end: Box::new(on_end),
             on_seek: None,
             on_released: None,
+            on_toggle: None,
         }
     }
 
@@ -77,6 +88,12 @@ impl<'a, Message> TrimBar<'a, Message> {
     /// Publish `message` when a drag is released.
     pub fn on_released(mut self, message: Message) -> Self {
         self.on_released = Some(message);
+        self
+    }
+
+    /// Publish `message` when Space is pressed while the bar has keyboard focus.
+    pub fn on_toggle(mut self, message: Message) -> Self {
+        self.on_toggle = Some(message);
         self
     }
 
@@ -108,6 +125,39 @@ impl<'a, Message> TrimBar<'a, Message> {
                 }
             }
         }
+    }
+
+    /// Publish the release message, so keyboard edits end like a drag would (the caller's
+    /// resume-playback logic runs either way).
+    fn release(&self, shell: &mut Shell<'_, Message>)
+    where
+        Message: Clone,
+    {
+        if let Some(message) = &self.on_released {
+            shell.publish(message.clone());
+        }
+    }
+
+    /// Seek the playhead to `t` (clamped inside the kept range) and release.
+    fn seek_and_release(&self, t: f32, shell: &mut Shell<'_, Message>)
+    where
+        Message: Clone,
+    {
+        if let Some(seek) = &self.on_seek {
+            shell.publish(seek(t.clamp(self.start, self.end)));
+        }
+        self.release(shell);
+    }
+}
+
+/// Arrow-key seek size in seconds: fine with Shift, coarse with Ctrl, one second otherwise.
+fn seek_step(modifiers: keyboard::Modifiers) -> f32 {
+    if modifiers.shift() {
+        0.1
+    } else if modifiers.control() {
+        5.0
+    } else {
+        1.0
     }
 }
 
@@ -170,6 +220,7 @@ where
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 if let Some(pos) = cursor.position_over(bounds) {
+                    state.focused = true;
                     let sx = self.pixel_of(self.start, bounds.x, bounds.width);
                     let ex = self.pixel_of(self.end, bounds.x, bounds.width);
                     // Near an edge grabs it to trim; anywhere else seeks the playhead (or,
@@ -189,6 +240,11 @@ where
                     let t = time_at(pos.x, bounds.x, bounds.width, self.dur);
                     self.publish(handle, t, shell);
                     shell.capture_event();
+                } else if state.focused {
+                    // A click anywhere else moves focus away; the click itself stays uncaptured
+                    // so whatever was pressed still gets it.
+                    state.focused = false;
+                    shell.request_redraw();
                 }
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
@@ -207,13 +263,66 @@ where
                     shell.publish(message.clone());
                 }
             }
+            Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. })
+                if state.focused =>
+            {
+                // The playhead the edit applies to; before playback starts it sits at the
+                // relevant range edge.
+                let head = |fallback: f32| {
+                    self.playhead
+                        .unwrap_or(fallback)
+                        .clamp(self.start, self.end)
+                };
+                match key.as_ref() {
+                    Key::Named(Named::Escape) => {
+                        state.focused = false;
+                        shell.request_redraw();
+                        shell.capture_event();
+                    }
+                    Key::Named(Named::ArrowLeft) => {
+                        self.seek_and_release(head(self.start) - seek_step(*modifiers), shell);
+                        shell.capture_event();
+                    }
+                    Key::Named(Named::ArrowRight) => {
+                        self.seek_and_release(head(self.start) + seek_step(*modifiers), shell);
+                        shell.capture_event();
+                    }
+                    Key::Named(Named::Home) => {
+                        self.seek_and_release(self.start, shell);
+                        shell.capture_event();
+                    }
+                    Key::Named(Named::End) => {
+                        self.seek_and_release(self.end, shell);
+                        shell.capture_event();
+                    }
+                    // The editor in/out idiom: mark the trim points at the playhead.
+                    Key::Character("i") | Key::Character("I") => {
+                        shell.publish((self.on_start)(head(self.start)));
+                        self.release(shell);
+                        shell.capture_event();
+                    }
+                    Key::Character("o") | Key::Character("O") => {
+                        shell.publish((self.on_end)(head(self.end)));
+                        self.release(shell);
+                        shell.capture_event();
+                    }
+                    Key::Named(Named::Space) | Key::Character(" ") => {
+                        if let Some(message) = &self.on_toggle {
+                            shell.publish(message.clone());
+                        }
+                        // Captured either way so the page does not scroll.
+                        shell.capture_event();
+                    }
+                    _ => {}
+                }
+            }
             _ => {}
         }
     }
 
     fn draw(
         &self,
-        _tree: &Tree,
+        tree: &Tree,
         renderer: &mut Renderer,
         _theme: &Theme,
         _style: &renderer::Style,
@@ -282,6 +391,21 @@ where
         }
         handle(renderer, sx, b);
         handle(renderer, ex, b);
+        // A focus ring around the whole bar, so keyboard users see where input goes.
+        if tree.state.downcast_ref::<State>().focused {
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: b,
+                    border: Border {
+                        color: palette::ACCENT,
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    ..renderer::Quad::default()
+                },
+                Background::Color(Color::TRANSPARENT),
+            );
+        }
     }
 
     fn mouse_interaction(
@@ -392,5 +516,16 @@ mod tests {
         assert!(nearer_is_start(10.0, 0.0, 100.0), "near the left edge");
         assert!(!nearer_is_start(90.0, 0.0, 100.0), "near the right edge");
         assert!(nearer_is_start(50.0, 0.0, 100.0), "a tie goes to the start");
+    }
+
+    #[test]
+    fn seek_step_scales_with_modifiers() {
+        use keyboard::Modifiers;
+        assert_eq!(seek_step(Modifiers::default()), 1.0);
+        assert_eq!(seek_step(Modifiers::SHIFT), 0.1);
+        assert_eq!(seek_step(Modifiers::CTRL), 5.0);
+        // Shift wins when both are held: the finer nudge is the safer guess.
+        assert_eq!(seek_step(Modifiers::SHIFT | Modifiers::CTRL), 0.1);
+        assert_eq!(seek_step(Modifiers::ALT), 1.0);
     }
 }
