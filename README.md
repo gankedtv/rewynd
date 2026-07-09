@@ -13,6 +13,8 @@ See [`PLAN.md`](PLAN.md) for the full design and rationale, and
 
 rewynd is in **beta** (`v1.0.0-beta.1`). Builds are unsigned, so Windows SmartScreen
 (and occasionally antivirus) may warn on first run — choose **More info → Run anyway**.
+Code signing via the SignPath Foundation is being set up; see the
+[code signing policy](docs/code-signing-policy.md).
 
 **Linux** — any distro, via the self-updating AppImage:
 
