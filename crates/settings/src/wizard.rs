@@ -119,6 +119,8 @@ pub struct Wizard {
     pulse: Option<Fade>,
     /// Drives the saving ellipsis, alive only while a test save runs.
     saving_dots: Option<Cycle>,
+    /// A failed "Open folder" on the test-clip step.
+    open_error: Option<String>,
     /// Picked once at construction so redraws don't reshuffle the line.
     quip: &'static str,
 }
@@ -136,6 +138,7 @@ pub enum Message {
     RecordingStarted(Result<(), String>),
     SaveTestClip,
     TestClipResult(Result<Option<(PathBuf, Option<String>)>, String>),
+    OpenClipFolder,
     Tick(std::time::Instant),
     Finish,
 }
@@ -158,6 +161,7 @@ impl Wizard {
             entrance: None,
             pulse: None,
             saving_dots: None,
+            open_error: None,
             quip: QUIPS[std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.subsec_nanos() as usize)
@@ -230,9 +234,19 @@ impl Wizard {
                 }
             }
             Message::RecordingStarted(Err(e)) => self.recording_error = Some(e),
+            Message::OpenClipFolder => {
+                self.open_error = None;
+                if let TestState::Saved { path, .. } = &self.test
+                    && let Some(dir) = path.parent()
+                    && let Err(e) = open::that_detached(dir)
+                {
+                    self.open_error = Some(format!("Could not open the folder: {e}"));
+                }
+            }
             Message::SaveTestClip => {
                 self.test = TestState::Saving;
                 self.saving_dots = Some(Cycle::new(SAVING_PERIOD));
+                self.open_error = None;
                 let dir = rewynd_config::clips_dir(config.output_dir().as_deref());
                 return Task::perform(
                     async move {
@@ -506,6 +520,10 @@ impl Wizard {
                         .style(tinted(palette::ACCENT)),
                     aside("That one is a keeper."),
                     hint(path.display().to_string()),
+                    button(text("Open folder").size(12).font(UI_SEMIBOLD))
+                        .on_press(Message::OpenClipFolder)
+                        .style(secondary_button)
+                        .padding([6, 14]),
                 ]
                 .spacing(8);
                 if encoder.as_deref() == Some("cpu") {
@@ -513,6 +531,9 @@ impl Wizard {
                         "Your GPU can't encode video, so rewynd used its CPU encoder. Clips still \
                          work, at the cost of more processor power.",
                     ));
+                }
+                if let Some(e) = &self.open_error {
+                    saved = saved.push(text(e.clone()).size(12).style(tinted(palette::DANGER)));
                 }
                 saved.into()
             }

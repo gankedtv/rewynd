@@ -34,6 +34,22 @@ use crate::video;
 /// across suits the wider default window while staying readable if it is narrowed.
 const GRID_COLUMNS: usize = 4;
 
+/// One shows up under the empty-library headline, picked per app run.
+const LIBRARY_QUIPS: [&str; 4] = [
+    "Go make some plays worth keeping.",
+    "The arena is waiting.",
+    "Your first clutch goes right here.",
+    "Warm up the highlight reel.",
+];
+
+/// Warm off-white used only on top of thumbnail imagery (arena.md non-token colors).
+const OVERLAY_INK: iced::Color = iced::Color::from_rgb8(0xf4, 0xf1, 0xe8);
+/// The duration-badge scrim over thumbnails.
+const BADGE_SCRIM: iced::Color = iced::Color::from_rgba(0.0, 0.0, 0.0, 0.75);
+/// The circular play button's scrim and ring, shown over a hovered thumbnail.
+const PLAY_SCRIM: iced::Color = iced::Color::from_rgba(0.0, 0.0, 0.0, 0.55);
+const PLAY_RING: iced::Color = iced::Color::from_rgba(1.0, 1.0, 1.0, 0.3);
+
 /// Section label for clips saved outside a per-game subfolder (desktop / no game detected).
 const ROOT_GROUP: &str = "Desktop";
 
@@ -258,6 +274,8 @@ enum TrimState {
 
 pub struct Library {
     entries: Vec<ClipEntry>,
+    /// Picked once at construction so redraws don't reshuffle the empty-state line.
+    quip: &'static str,
     thumbs: HashMap<PathBuf, Thumb>,
     /// Thumbnail decodes not yet started; drained into `decoding` as slots free up.
     pending_thumbs: VecDeque<(PathBuf, SystemTime)>,
@@ -327,6 +345,10 @@ impl Library {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            quip: LIBRARY_QUIPS[std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos() as usize)
+                % LIBRARY_QUIPS.len()],
             thumbs: HashMap::new(),
             pending_thumbs: VecDeque::new(),
             decoding: HashMap::new(),
@@ -1319,7 +1341,7 @@ impl Library {
             .spacing(8)
             .align_x(iced::Alignment::Center);
             if !self.scanning {
-                empty = empty.push(theme::aside("Go make some plays worth keeping."));
+                empty = empty.push(theme::aside(self.quip));
             }
             return column![
                 header,
@@ -1494,19 +1516,24 @@ impl Library {
             info = info.push(chip_row);
         }
         let info = info.push(
-            text(self.meta_text(entry))
+            text(size_label(entry.size_bytes))
                 .size(10)
                 .style(tinted(palette::MUTED)),
         );
 
+        let mut layers = vec![self.thumbnail(entry, 148.0)];
+        if let Some(badge) = self.duration_badge(entry) {
+            layers.push(badge);
+        }
+        let thumb = container(
+            layered(layers)
+                .width(Length::Fill)
+                .height(Length::Fixed(148.0)),
+        )
+        .clip(true);
         button(
             column![
-                container(
-                    layered([self.thumbnail(entry, 148.0)])
-                        .width(Length::Fill)
-                        .height(Length::Fixed(148.0)),
-                )
-                .clip(true),
+                iced::widget::hover(thumb, play_hint()),
                 container(info).padding([11, 12]),
             ]
             .spacing(0),
@@ -1564,6 +1591,38 @@ impl Library {
             Some(Thumb::Failed { .. }) => placeholder("No preview", height),
             _ => placeholder("Loading...", height),
         }
+    }
+
+    /// The clip's duration as a badge for the thumbnail's corner (arena.md duration badge:
+    /// dark scrim, warm off-white text), once the decode has reported it.
+    fn duration_badge<'a>(&self, entry: &ClipEntry) -> Option<Element<'a, Message>> {
+        let Some(Thumb::Ready { duration, .. }) = self.thumbs.get(&entry.path) else {
+            return None;
+        };
+        let badge = container(
+            text(duration_label(*duration))
+                .size(10)
+                .font(UI_SEMIBOLD)
+                .style(tinted(OVERLAY_INK)),
+        )
+        .padding([2, 6])
+        .style(|_: &Theme| container::Style {
+            background: Some(Background::Color(BADGE_SCRIM)),
+            border: Border {
+                radius: 4.0.into(),
+                ..Border::default()
+            },
+            ..container::Style::default()
+        });
+        Some(
+            container(badge)
+                .align_x(iced::Alignment::End)
+                .align_y(iced::Alignment::End)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding(6)
+                .into(),
+        )
     }
 
     /// The moving preview frame as an element, when there is one: the live playback frame (a GPU
@@ -2568,6 +2627,29 @@ fn segment_style(
 /// stack children (the base draws unlayered, and `container.clip` merely narrows a viewport
 /// hint that image drawing ignores), so this is what actually keeps Cover-scaled frames inside
 /// the box of the nearest `clip(true)` ancestor.
+/// The circular play affordance shown over a hovered clip card (arena.md's thumbnail play
+/// button), reusing the brand mark as the glyph like the fullscreen preview does.
+fn play_hint<'a>() -> Element<'a, Message> {
+    let circle = container(theme::logo(18.0))
+        .width(36)
+        .height(36)
+        .align_x(iced::Alignment::Center)
+        .align_y(iced::Alignment::Center)
+        .style(|_: &Theme| container::Style {
+            background: Some(Background::Color(PLAY_SCRIM)),
+            border: Border {
+                color: PLAY_RING,
+                width: 1.0,
+                radius: 18.0.into(),
+            },
+            ..container::Style::default()
+        });
+    container(circle)
+        .center(Length::Fill)
+        .height(Length::Fixed(148.0))
+        .into()
+}
+
 fn layered<'a>(
     content: impl IntoIterator<Item = Element<'a, Message>>,
 ) -> iced::widget::Stack<'a, Message> {
