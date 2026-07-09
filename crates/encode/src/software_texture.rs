@@ -134,10 +134,19 @@ impl Encoder for SoftwareTextureEncoder {
             &uv_buf,
         );
         self.queue.submit([encoder.finish()]);
-        map_for_read(&self.device, [&y_buf, &uv_buf])?;
-
-        copy_depadded(&y_buf, width, 1, &mut self.y)?;
-        copy_depadded(&uv_buf, width / 2, 2, &mut self.uv)?;
+        // On any readback failure, drop the staging pair instead of unmapping: a failed map
+        // can leave one buffer mapped, and copying into a still-mapped buffer next frame is a
+        // validation error. The next frame simply recreates them.
+        if let Err(e) = map_for_read(&self.device, [&y_buf, &uv_buf]) {
+            self.staging = None;
+            return Err(e);
+        }
+        if let Err(e) = copy_depadded(&y_buf, width, 1, &mut self.y)
+            .and_then(|()| copy_depadded(&uv_buf, width / 2, 2, &mut self.uv))
+        {
+            self.staging = None;
+            return Err(e);
+        }
         y_buf.unmap();
         uv_buf.unmap();
         deinterleave_uv(&self.uv, &mut self.u, &mut self.v);
@@ -208,6 +217,9 @@ fn map_for_read<const N: usize>(
             let _ = tx.send(r);
         });
     }
+    // Only the callbacks hold senders now: a callback that never fires disconnects the
+    // channel and surfaces as an error below instead of blocking the capture thread forever.
+    drop(tx);
     device
         .poll(wgpu::PollType::wait_indefinitely())
         .map_err(|e| EncodeError::Encode(format!("device poll failed: {e}")))?;

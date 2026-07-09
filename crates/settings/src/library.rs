@@ -482,13 +482,12 @@ impl Library {
             }
             Message::Back => self.show_grid(),
             Message::SummaryLoaded(path, dur) => {
+                // The summary landing completes the open: the trim resets to the full span.
+                // Handles can't be moved meaningfully before this (the span was 0 until now).
                 if self.open.as_deref() == Some(path.as_path()) {
                     self.open_dur = dur;
-                    // A fresh open keeps the full span; leave handles alone if the user already
-                    // moved one (only possible when a previous summary had set a range).
-                    if self.trim_end == 0.0 {
-                        self.trim_end = dur;
-                    }
+                    self.trim_start = 0.0;
+                    self.trim_end = dur;
                 }
             }
             Message::Play => {
