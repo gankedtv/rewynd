@@ -40,6 +40,16 @@ futures-util.workspace = true
 ksni = "0.3"
 notify-rust = "4"
 image.workspace = true
+# In-game save badge (the Windows overlay's Linux counterpart): a wlr-layer-shell surface on the
+# overlay layer, drawn on the CPU (tiny-skia + ab_glyph text) and shown over fullscreen games, plus
+# the save chime played through rodio (the notification server mutes its own sound under KDE's
+# fullscreen Do-Not-Disturb, so we play it ourselves). rodio matches the settings crate's config.
+# default-features off: the badge drives its own roundtrip loop and needs no calloop/xkbcommon.
+smithay-client-toolkit = { version = "0.19", default-features = false }
+wayland-client = "0.31"
+tiny-skia = "0.11"
+ab_glyph = "0.2"
+rodio = { version = "0.22.2", default-features = false, features = ["playback"] }
 
 # Windows wiring: WGC capture + D3D11 import + a RegisterHotKey message loop, with
 # the tray (tray-icon pumps on the same thread).

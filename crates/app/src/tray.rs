@@ -153,14 +153,10 @@ const DISMISS_AFTER: std::time::Duration = std::time::Duration::from_secs(4);
 /// over a fullscreen game: KWin/Plasma auto-enables Do-Not-Disturb while a window is fullscreen,
 /// which swallows normal-urgency notifications. Critical bypasses that, but KDE then holds the
 /// notification until dismissed (it ignores the expire timeout for critical urgency), so we close
-/// it ourselves after [`DISMISS_AFTER`] to keep repeated saves from stacking on screen. `sound`,
-/// when set, plays a chime/error tone through the server (a `sound-file` or `sound-name` hint).
-async fn notify(
-    summary: &str,
-    body: &str,
-    urgency: notify_rust::Urgency,
-    sound: Option<notify_rust::Hint>,
-) {
+/// it ourselves after [`DISMISS_AFTER`] to keep repeated saves from stacking on screen. The sound
+/// is deliberately left off — the in-game badge plays the chime itself (see `crate::badge`), which
+/// is the only route that survives the same fullscreen Do-Not-Disturb.
+async fn notify(summary: &str, body: &str, urgency: notify_rust::Urgency) {
     // Notification bodies are markup on many servers (KDE renders a HTML subset); escape so
     // server-provided text (error details, share codes) can't inject tags.
     let body = body
@@ -173,9 +169,6 @@ async fn notify(
         .icon(rewynd_config::APP_ID)
         .appname("rewynd")
         .urgency(urgency);
-    if let Some(hint) = sound {
-        note.hint(hint);
-    }
     let handle = match note.show_async().await {
         Ok(handle) => handle,
         Err(e) => {
@@ -191,32 +184,24 @@ async fn notify(
     }
 }
 
-/// Best-effort desktop notification at normal urgency, no sound (mic toggle, config errors).
+/// Best-effort desktop notification at normal urgency (mic toggle, config errors).
 pub async fn toast(summary: &str, body: &str) {
-    notify(summary, body, notify_rust::Urgency::Normal, None).await;
+    notify(summary, body, notify_rust::Urgency::Normal).await;
 }
 
-/// "Clip saved" notification for a freshly written clip: critical urgency so it surfaces over a
-/// fullscreen game, with the bundled chime (`sound-file`) when the chime could be extracted.
-pub async fn clip_saved_toast(path: &Path, chime: Option<&Path>) {
-    let sound = chime.map(|p| notify_rust::Hint::SoundFile(p.display().to_string()));
+/// "Clip saved" notification for a freshly written clip. Only used as the fallback when the in-game
+/// badge can't be shown (a compositor without layer-shell); critical so it still surfaces in-game.
+pub async fn clip_saved_toast(path: &Path) {
     notify(
         "Clip saved",
         &path.display().to_string(),
         notify_rust::Urgency::Critical,
-        sound,
     )
     .await;
 }
 
-/// A failed/empty save notification: critical (surfaces over a fullscreen game) with a themed
-/// freedesktop sound (`sound-name`, e.g. `dialog-error`), mirroring the Windows failure beep.
-pub async fn save_failed_toast(summary: &str, body: &str, sound_name: &str) {
-    notify(
-        summary,
-        body,
-        notify_rust::Urgency::Critical,
-        Some(notify_rust::Hint::SoundName(sound_name.to_owned())),
-    )
-    .await;
+/// A failed/empty save notification (the badge fallback). Critical so it surfaces over a fullscreen
+/// game.
+pub async fn save_failed_toast(summary: &str, body: &str) {
+    notify(summary, body, notify_rust::Urgency::Critical).await;
 }
