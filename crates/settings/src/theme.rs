@@ -80,9 +80,11 @@ pub fn brand_png(size: u32) -> &'static [u8] {
 }
 
 // The brand mark, decoded once per displayed size: a fresh handle every `view` call would miss
-// the renderer's raster cache and re-decode each frame.
+// the renderer's raster cache and re-decode each frame. The large handle sources the 128px PNG so
+// the play button (the mark reused as a play control, up to 96px in the fullscreen preview) stays
+// crisp when the renderer scales it on a HiDPI display.
 static LOGO_LARGE: LazyLock<iced::widget::image::Handle> =
-    LazyLock::new(|| iced::widget::image::Handle::from_bytes(brand_png(64)));
+    LazyLock::new(|| iced::widget::image::Handle::from_bytes(brand_png(128)));
 static LOGO_SMALL: LazyLock<iced::widget::image::Handle> =
     LazyLock::new(|| iced::widget::image::Handle::from_bytes(brand_png(32)));
 
@@ -117,6 +119,29 @@ pub fn card_accent<'a, M: 'a>(
     accent: iced::Color,
     content: impl Into<Element<'a, M>>,
 ) -> Element<'a, M> {
+    card_accent_sized(title, accent, content, Length::Shrink)
+}
+
+/// [`card`] pinned to a fixed height, so a shorter card matches a taller sibling in the same row.
+/// iced rows don't stretch children to equal height, and a `Fill`-height child collapses in a
+/// content-height row, so the height is pinned instead. Used for the ganked.tv connector, which has
+/// no advanced settings and would otherwise sit shorter than the YouTube card beside it.
+pub fn card_fixed<'a, M: 'a>(
+    title: &'a str,
+    height: f32,
+    content: impl Into<Element<'a, M>>,
+) -> Element<'a, M> {
+    card_accent_sized(title, palette::ACCENT, content, Length::Fixed(height))
+}
+
+/// The shared card body: a titled panel whose height is `Shrink` (sizes to content) for the common
+/// case, or a fixed height via [`card_fixed`] to match a taller row sibling.
+fn card_accent_sized<'a, M: 'a>(
+    title: &'a str,
+    accent: iced::Color,
+    content: impl Into<Element<'a, M>>,
+    height: Length,
+) -> Element<'a, M> {
     let inner = column![
         text(title).size(10).font(UI_BOLD).style(tinted(accent)),
         content.into(),
@@ -124,6 +149,7 @@ pub fn card_accent<'a, M: 'a>(
     .spacing(14);
     container(inner)
         .width(Length::Fill)
+        .height(height)
         .padding(18)
         .style(card_style)
         .into()
