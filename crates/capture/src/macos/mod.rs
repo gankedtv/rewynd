@@ -65,10 +65,7 @@ impl SessionShared {
     }
 
     pub(crate) fn fail(&self, msg: String) {
-        let mut error = self
-            .error
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut error = lock_unpoisoned(&self.error);
         if error.is_none() {
             *error = Some(msg);
         }
@@ -98,11 +95,14 @@ impl SessionShared {
     }
 
     fn take_error(&self) -> Option<String> {
-        self.error
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+        lock_unpoisoned(&self.error).take()
     }
+}
+
+/// Lock a mutex, recovering the guard from a poisoned lock (a panicked holder already
+/// surfaced its own failure; the data here is simple state that stays coherent).
+pub(crate) fn lock_unpoisoned<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[repr(C)]

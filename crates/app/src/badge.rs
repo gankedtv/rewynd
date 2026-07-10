@@ -59,6 +59,16 @@ const DEFAULT_SCALE: i32 = 2;
 /// The audible half lives in the shared `chime` module (also used by macOS).
 pub use crate::chime::{Accent, play};
 
+impl Accent {
+    /// The accent bar colour: mint on success, red on failure.
+    fn rgb(self) -> (u8, u8, u8) {
+        match self {
+            Accent::Success => (0x2E, 0xCC, 0x71),
+            Accent::Failure => (0xE7, 0x4C, 0x3C),
+        }
+    }
+}
+
 /// The badge's label face: Inter SemiBold, embedded so there is no system-font scan.
 static FONT: &[u8] = include_bytes!("../assets/fonts/Inter-SemiBold.ttf");
 

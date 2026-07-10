@@ -372,14 +372,30 @@ fn install_autostart_at(path: &Path, exec: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
 }
 
-/// The testable core of [`refresh_autostart`]: rewrite an existing agent whose plist is stale
-/// (e.g. the exec path moved with an update). A missing one means start-on-login is off and
-/// must stay off; an unreadable one is ours (our label, our filename) and is rewritten.
+/// The program a LaunchAgent plist launches: the first `<string>` after the
+/// `ProgramArguments` key, best-effort (our own plist shape; a hand-built exotic one
+/// simply yields `None` and is left alone).
+#[cfg(target_os = "macos")]
+fn plist_program(plist: &str) -> Option<&str> {
+    let (_, tail) = plist.split_once("<key>ProgramArguments</key>")?;
+    let (_, tail) = tail.split_once("<string>")?;
+    tail.split_once("</string>").map(|(program, _)| program)
+}
+
+/// The testable core of [`refresh_autostart`]: repoint an existing agent whose program
+/// no longer exists (the install moved with an update). Mirrors the other platforms'
+/// ownership caution — a missing agent means start-on-login is off and must stay off,
+/// and a plist launching a live binary (ours from another install, or user-customized)
+/// is not touched, so a dev build never hijacks a packaged install's autostart. An
+/// unreadable one is ours (our label, our filename) and is rewritten.
 #[cfg(target_os = "macos")]
 fn refresh_autostart_at(path: &Path, exec: &Path) -> std::io::Result<()> {
     match std::fs::read_to_string(path) {
         Ok(existing) if existing == launch_agent_plist(exec) => Ok(()),
-        Ok(_) => install_autostart_at(path, exec),
+        Ok(existing) => match plist_program(&existing) {
+            Some(program) if !Path::new(program).exists() => install_autostart_at(path, exec),
+            _ => Ok(()),
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => install_autostart_at(path, exec),
         Err(e) => Err(e),
@@ -760,6 +776,24 @@ mod macos_tests {
         remove_autostart_at(&path).expect("remove");
         assert!(!path.exists(), "disabling removes the agent");
         remove_autostart_at(&path).expect("idempotent remove");
+    }
+
+    #[test]
+    fn autostart_refresh_leaves_a_live_program_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("LaunchAgents").join("rewynd.plist");
+        // A plist whose program still exists (another install, or user-managed) must not
+        // be hijacked by a differently-located build.
+        let live = dir.path().join("rewynd-recorder");
+        std::fs::write(&live, b"").expect("live binary");
+        install_autostart_at(&path, &live).expect("install");
+        let before = std::fs::read_to_string(&path).expect("read");
+        refresh_autostart_at(&path, Path::new("/somewhere/else/rewynd-recorder")).expect("refresh");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            before,
+            "live-program plist stays untouched"
+        );
     }
 
     #[test]

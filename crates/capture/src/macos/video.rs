@@ -36,8 +36,6 @@ const QUEUE_DEPTH: isize = 5;
 pub struct CapturedPixelBuf {
     /// The IOSurface-backed pixel buffer (NV12 video-range), retained.
     pub pixel_buf: arc::R<cv::PixelBuf>,
-    pub width: u32,
-    pub height: u32,
     /// Monotonic capture time relative to the stream epoch, strictly increasing
     /// (the VideoToolbox encoder rejects non-increasing timestamps).
     pub pts: Duration,
@@ -48,6 +46,10 @@ struct VideoOutputInner {
     shared: Arc<SessionShared>,
     on_frame: Box<dyn FnMut(CapturedPixelBuf) -> ControlFlow<()> + Send>,
     epoch: Instant,
+    /// The first frame's host-clock presentation time and its epoch-relative stamp.
+    /// Later frames keep their true capture spacing from the sample PTS instead of
+    /// the delivery time, which lags by the encoder's per-frame latency.
+    anchor: Option<(cm::Time, Duration)>,
     last_pts: Option<Duration>,
     frames: u64,
 }
@@ -71,7 +73,7 @@ impl VideoOutputInner {
             return;
         }
 
-        let mut pts = self.epoch.elapsed();
+        let mut pts = self.capture_pts(sample_buf.pts());
         if let Some(last) = self.last_pts
             && pts <= last
         {
@@ -86,8 +88,6 @@ impl VideoOutputInner {
 
         let frame = CapturedPixelBuf {
             pixel_buf: image.retained(),
-            width,
-            height,
             pts,
         };
         // The callback must not unwind across the ObjC/dispatch boundary.
@@ -95,6 +95,30 @@ impl VideoOutputInner {
             Ok(ControlFlow::Continue(())) => {}
             Ok(ControlFlow::Break(())) => self.shared.finish(),
             Err(_) => self.shared.fail("frame callback panicked".to_owned()),
+        }
+    }
+
+    /// The frame's epoch-relative capture time: the sample PTS rebased onto the
+    /// epoch clock at the first frame (both are mach-host-time based, so no drift
+    /// correction is needed). An invalid sample PTS falls back to delivery time.
+    fn capture_pts(&mut self, sample_pts: cm::Time) -> Duration {
+        if !sample_pts.is_valid() {
+            return self.epoch.elapsed();
+        }
+        match self.anchor {
+            None => {
+                let now = self.epoch.elapsed();
+                self.anchor = Some((sample_pts, now));
+                now
+            }
+            Some((base, base_elapsed)) => {
+                let delta = sample_pts.as_secs() - base.as_secs();
+                if delta.is_finite() && delta >= 0.0 {
+                    base_elapsed + Duration::from_secs_f64(delta)
+                } else {
+                    self.epoch.elapsed()
+                }
+            }
         }
     }
 }
@@ -192,6 +216,7 @@ where
         shared: shared.clone(),
         on_frame: Box::new(on_frame),
         epoch,
+        anchor: None,
         last_pts: None,
         frames: 0,
     });

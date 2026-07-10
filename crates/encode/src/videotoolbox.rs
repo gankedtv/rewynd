@@ -52,9 +52,9 @@ struct CallbackState {
 pub struct VideoToolboxEncoder {
     session: arc::R<vt::CompressionSession>,
     rx: mpsc::Receiver<CallbackResult>,
-    /// Owns the callback context the session holds a raw pointer to. Dropped after
-    /// `Drop` invalidates the session, so no callback can observe a dangling pointer.
-    _state: Box<CallbackState>,
+    /// The callback context the session holds; reclaimed in `Drop` after the session
+    /// is invalidated, so no callback can observe a dangling pointer.
+    state: *mut CallbackState,
     params: EncodeParams,
     /// Apple's software encoder buffers frames until nudged (it ignores
     /// `MaxFrameDelayCount`), so the software path flushes after every submission.
@@ -84,27 +84,42 @@ impl VideoToolboxEncoder {
         }
 
         let (tx, rx) = mpsc::channel();
-        let state = Box::new(CallbackState { tx });
-        let ctx: *mut CallbackState = std::ptr::from_ref(&*state).cast_mut();
+        // Raw, not a Box field: the callback context must not alias a Box the compiler
+        // may treat as uniquely owned (noalias). Reclaimed in `Drop` (and below on init
+        // failure) after the session can no longer invoke the callback.
+        let state = Box::into_raw(Box::new(CallbackState { tx }));
 
-        let spec = encoder_spec(require_hardware);
-        let mut session = vt::CompressionSession::new(
-            params.width,
-            params.height,
-            cm::VideoCodec::H264,
-            Some(&spec),
-            None,
-            None,
-            Some(output_callback),
-            ctx,
-        )
-        .map_err(|e| EncodeError::Init(format!("VTCompressionSessionCreate failed: {e}")))?;
+        let built = (|| {
+            let spec = encoder_spec(require_hardware);
+            let mut session = vt::CompressionSession::new(
+                params.width,
+                params.height,
+                cm::VideoCodec::H264,
+                Some(&spec),
+                None,
+                None,
+                Some(output_callback),
+                state,
+            )
+            .map_err(|e| EncodeError::Init(format!("VTCompressionSessionCreate failed: {e}")))?;
 
-        configure_session(&mut session, params)?;
+            configure_session(&mut session, params)?;
 
-        session
-            .prepare()
-            .map_err(|e| EncodeError::Init(format!("prepare-to-encode failed: {e}")))?;
+            session
+                .prepare()
+                .map_err(|e| EncodeError::Init(format!("prepare-to-encode failed: {e}")))?;
+            Ok(session)
+        })();
+        let session = match built {
+            Ok(session) => session,
+            Err(e) => {
+                // No frame was submitted, so no callback can be in flight: dropping the
+                // (auto-invalidated) session first makes reclaiming the context safe.
+                // SAFETY: `state` came from Box::into_raw above and is reclaimed once.
+                drop(unsafe { Box::from_raw(state) });
+                return Err(e);
+            }
+        };
 
         if require_hardware {
             log_hardware_usage(&session);
@@ -113,7 +128,7 @@ impl VideoToolboxEncoder {
         Ok(Self {
             session,
             rx,
-            _state: state,
+            state,
             params,
             flush_per_frame: !require_hardware,
         })
@@ -186,9 +201,12 @@ impl VideoToolboxEncoder {
 impl Drop for VideoToolboxEncoder {
     fn drop(&mut self) {
         // OBS teardown order: flush pending frames, then invalidate so no callback can
-        // run once the context box (dropped after this) goes away.
+        // run once the context (reclaimed below) goes away.
         let _ = self.session.complete_all();
         self.session.invalidate();
+        // SAFETY: `state` came from Box::into_raw in `new`; the invalidated session
+        // makes no further callbacks, so this is the sole owner reclaiming it once.
+        drop(unsafe { Box::from_raw(self.state) });
     }
 }
 

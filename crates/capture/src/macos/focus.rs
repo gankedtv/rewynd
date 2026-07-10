@@ -12,12 +12,13 @@
 //! rather than silently capturing the desktop).
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cidre::{arc, cf, cg, ns, objc, sys};
 use thiserror::Error;
 
+use super::lock_unpoisoned;
 use crate::game::{GameInfo, is_shell_app_id};
 
 /// How often the watcher samples the frontmost app + window list. Cheap queries;
@@ -48,12 +49,6 @@ trait WorkspaceFrontmost: objc::Obj {
 }
 
 impl WorkspaceFrontmost for ns::Workspace {}
-
-/// Lock a mutex, recovering a poisoned one — the watcher state must stay
-/// readable even if some holder panicked.
-fn lock_unpoisoned<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
 
 /// State shared between the watcher thread and its readers. All transitions go
 /// through [`publish`](Self::publish).

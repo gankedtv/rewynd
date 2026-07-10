@@ -95,6 +95,10 @@ pub enum CaptureError {
     /// A ScreenCaptureKit error (video, system-audio, or microphone stream).
     #[error("screencapturekit error: {0}")]
     Sck(String),
+    /// A platform-neutral failure in the consumer's frame/sample callback (e.g. a
+    /// caught panic), surfaced by shared code that serves every backend.
+    #[error("capture callback error: {0}")]
+    Callback(String),
 }
 
 #[cfg(test)]
@@ -134,6 +138,10 @@ mod tests {
         assert_eq!(
             CaptureError::Sck("stream stopped".to_owned()).to_string(),
             "screencapturekit error: stream stopped"
+        );
+        assert_eq!(
+            CaptureError::Callback("it panicked".to_owned()).to_string(),
+            "capture callback error: it panicked"
         );
     }
 }

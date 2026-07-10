@@ -234,7 +234,7 @@ mod audio_pipeline {
                 // A panic Break reads as a clean stream end; surface it like a capture error.
                 let result = match result {
                     Ok(()) if panicked.load(Ordering::Relaxed) => {
-                        Err(rewynd_capture::CaptureError::PipeWire(
+                        Err(rewynd_capture::CaptureError::Callback(
                             "the audio callback panicked".to_owned(),
                         ))
                     }
@@ -516,6 +516,136 @@ mod probe {
     pub(crate) fn run() -> anyhow::Result<()> {
         println!("{}", EncoderProbe::new(adapter_list()).to_json());
         Ok(())
+    }
+}
+
+/// Tray plumbing shared by the platforms whose tray is `tray-icon` (Windows + macOS):
+/// the brand icon and the synchronous menu commands. Linux keeps its async ksni
+/// variants. `toast` is the platform's notification fn (their identity setup differs).
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+mod tray_common {
+    use rewynd_config::{self as config};
+
+    /// The brand mark as a tray icon, from the PNG ladder the config crate owns.
+    pub(crate) fn tray_brand_icon() -> Option<tray_icon::Icon> {
+        let (_, png) = config::BRAND_ICONS.iter().find(|(size, _)| *size >= 32)?;
+        let img = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?;
+        let rgba = img.into_rgba8();
+        let (width, height) = rgba.dimensions();
+        tray_icon::Icon::from_rgba(rgba.into_vec(), width, height).ok()
+    }
+
+    /// Flip the microphone on/off in the config file and restart the recorder to apply
+    /// it (the recorder reads audio config once at startup).
+    pub(crate) fn toggle_mic_and_restart(toast: &dyn Fn(&str, &str)) {
+        let Some(path) = config::config_path() else {
+            toast("Microphone", "Could not find the config file.");
+            return;
+        };
+        let mut cfg = config::load_file();
+        let now_on = !cfg.mic_enabled();
+        cfg.set_mic_enabled(now_on);
+        if let Err(e) = cfg.save_to(&path) {
+            tracing::warn!(error = %e, "could not save the microphone toggle");
+            toast("Microphone", "Could not save the change.");
+            return;
+        }
+        let bin =
+            config::sibling_binary("rewynd-recorder").or_else(|| std::env::current_exe().ok());
+        match bin.and_then(|bin| {
+            std::process::Command::new(bin)
+                .arg("--restart")
+                .spawn()
+                .ok()
+        }) {
+            Some(_) => toast(
+                "Microphone",
+                if now_on {
+                    "Microphone on. Restarting to apply."
+                } else {
+                    "Microphone off. Restarting to apply."
+                },
+            ),
+            None => toast(
+                "Microphone",
+                "Saved, but could not restart. Restart rewynd to apply.",
+            ),
+        }
+    }
+
+    /// Launch the sibling settings binary, reaping the child in the background (an
+    /// unwaited child stays a zombie for the recorder's whole lifetime).
+    pub(crate) fn open_settings(toast: &dyn Fn(&str, &str)) {
+        let Some(settings) = config::sibling_binary("rewynd") else {
+            toast(
+                "Could not open settings",
+                "The settings binary was not found.",
+            );
+            return;
+        };
+        match std::process::Command::new(&settings).spawn() {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, path = %settings.display(), "could not open settings");
+                toast(
+                    "Could not open settings",
+                    &format!("{}: {e}", settings.display()),
+                );
+            }
+        }
+    }
+}
+
+/// The `REWYND_FLUSH_AFTER` dev aid, shared by every platform recorder: flush one clip
+/// after N seconds without a keypress, so the pipeline can be exercised headlessly.
+/// Stop-aware and joined at shutdown like every other thread.
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+mod flush_hook {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use anyhow::{Context, Result};
+    use rewynd_clip::ClipSaver;
+
+    /// Spawn the flush-hook thread when the env var is set; `Ok(None)` when unset or
+    /// invalid (a bad value is logged and ignored — a dev aid must not stop the run).
+    pub(crate) fn spawn(
+        saver: &Arc<ClipSaver>,
+        stop: &Arc<AtomicBool>,
+    ) -> Result<Option<std::thread::JoinHandle<()>>> {
+        let Ok(value) = std::env::var("REWYND_FLUSH_AFTER") else {
+            return Ok(None);
+        };
+        let secs = match value.parse::<u64>() {
+            Ok(secs) => secs,
+            Err(e) => {
+                tracing::warn!(value, error = %e, "ignoring invalid REWYND_FLUSH_AFTER");
+                return Ok(None);
+            }
+        };
+        let saver = saver.clone();
+        let stop = stop.clone();
+        std::thread::Builder::new()
+            .name("rewynd-flush-hook".to_owned())
+            .spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(secs);
+                while Instant::now() < deadline {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                if let Err(e) = saver.save() {
+                    tracing::warn!(error = %e, "dev flush produced no clip");
+                }
+            })
+            .map(Some)
+            .context("spawning the flush hook thread")
     }
 }
 
@@ -1084,36 +1214,7 @@ mod linux {
                     .context("spawning the capture thread")?,
             );
 
-            // Dev aid: flush once after N seconds without a keypress, so the pipeline can be
-            // exercised headlessly. Stop-aware and joined at shutdown like every other thread.
-            if let Ok(value) = std::env::var("REWYND_FLUSH_AFTER") {
-                match value.parse::<u64>() {
-                    Ok(secs) => {
-                        let flush_saver = saver.clone();
-                        let flush_stop = stop.clone();
-                        recorder.flush_hook = Some(
-                            std::thread::Builder::new()
-                                .name("rewynd-flush-hook".to_owned())
-                                .spawn(move || {
-                                    let deadline = Instant::now() + Duration::from_secs(secs);
-                                    while Instant::now() < deadline {
-                                        if flush_stop.load(Ordering::Relaxed) {
-                                            return;
-                                        }
-                                        std::thread::sleep(Duration::from_millis(250));
-                                    }
-                                    if let Err(e) = flush_saver.save() {
-                                        tracing::warn!(error = %e, "dev flush produced no clip");
-                                    }
-                                })
-                                .context("spawning the flush hook thread")?,
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(value, error = %e, "ignoring invalid REWYND_FLUSH_AFTER");
-                    }
-                }
-            }
+            recorder.flush_hook = crate::flush_hook::spawn(&saver, &stop)?;
             Ok(())
         })();
         if let Err(e) = started {
@@ -2092,37 +2193,7 @@ mod windows {
             })
             .context("spawning the tray thread")?;
 
-        // Dev aid: flush once after N seconds without a keypress, so the pipeline can be
-        // exercised headlessly. Stop-aware and joined at shutdown like every other thread.
-        let mut flush_hook = None;
-        if let Ok(value) = std::env::var("REWYND_FLUSH_AFTER") {
-            match value.parse::<u64>() {
-                Ok(secs) => {
-                    let flush_saver = saver.clone();
-                    let flush_stop = stop.clone();
-                    flush_hook = Some(
-                        std::thread::Builder::new()
-                            .name("rewynd-flush-hook".to_owned())
-                            .spawn(move || {
-                                let deadline = Instant::now() + Duration::from_secs(secs);
-                                while Instant::now() < deadline {
-                                    if flush_stop.load(Ordering::Relaxed) {
-                                        return;
-                                    }
-                                    std::thread::sleep(Duration::from_millis(250));
-                                }
-                                if let Err(e) = flush_saver.save() {
-                                    tracing::warn!(error = %e, "dev flush produced no clip");
-                                }
-                            })
-                            .context("spawning the flush hook thread")?,
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(value, error = %e, "ignoring invalid REWYND_FLUSH_AFTER");
-                }
-            }
-        }
+        let flush_hook = crate::flush_hook::spawn(&saver, &stop)?;
 
         // Park until Ctrl+C or the named stop event (the settings app's restart request
         // — the Windows SIGTERM stand-in), then run the same stop-flag-then-join
@@ -2427,7 +2498,7 @@ mod windows {
                 let mut builder = tray_icon::TrayIconBuilder::new()
                     .with_menu(Box::new(menu))
                     .with_tooltip("rewynd — instant replay");
-                if let Some(icon) = tray_brand_icon() {
+                if let Some(icon) = crate::tray_common::tray_brand_icon() {
                     builder = builder.with_icon(icon);
                 }
                 builder.build().map_err(|e| e.to_string())
@@ -2487,9 +2558,9 @@ mod windows {
                 if id == save_item.id() {
                     save_and_toast(saver, capture_desktop);
                 } else if id == mic_item.id() {
-                    toggle_mic_and_restart();
+                    crate::tray_common::toggle_mic_and_restart(&toast);
                 } else if id == settings_item.id() {
-                    open_settings();
+                    crate::tray_common::open_settings(&toast);
                 } else if id == quit_item.id() {
                     tracing::info!("quit requested from the tray");
                     let _ = shutdown.send("quit from the tray");
@@ -2505,79 +2576,6 @@ mod windows {
             let _ = unsafe { UnregisterHotKey(None, HOTKEY_ID) };
         }
         // `_tray` drops here, removing the icon.
-    }
-
-    /// The brand mark as a tray icon, from the PNG ladder the config crate owns.
-    fn tray_brand_icon() -> Option<tray_icon::Icon> {
-        let (_, png) = config::BRAND_ICONS.iter().find(|(size, _)| *size >= 32)?;
-        let img = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?;
-        let rgba = img.into_rgba8();
-        let (width, height) = rgba.dimensions();
-        tray_icon::Icon::from_rgba(rgba.into_vec(), width, height).ok()
-    }
-
-    /// Launch the sibling settings binary, reaping the child in the background (an
-    /// unwaited child stays a zombie for the recorder's whole lifetime).
-    /// Flip the microphone on/off in the config file and restart the recorder to apply it (the
-    /// recorder reads audio config once at startup).
-    fn toggle_mic_and_restart() {
-        let Some(path) = config::config_path() else {
-            toast("Microphone", "Could not find the config file.");
-            return;
-        };
-        let mut cfg = config::load_file();
-        let now_on = !cfg.mic_enabled();
-        cfg.set_mic_enabled(now_on);
-        if let Err(e) = cfg.save_to(&path) {
-            tracing::warn!(error = %e, "could not save the microphone toggle");
-            toast("Microphone", "Could not save the change.");
-            return;
-        }
-        let bin =
-            config::sibling_binary("rewynd-recorder").or_else(|| std::env::current_exe().ok());
-        match bin.and_then(|bin| {
-            std::process::Command::new(bin)
-                .arg("--restart")
-                .spawn()
-                .ok()
-        }) {
-            Some(_) => toast(
-                "Microphone",
-                if now_on {
-                    "Microphone on. Restarting to apply."
-                } else {
-                    "Microphone off. Restarting to apply."
-                },
-            ),
-            None => toast(
-                "Microphone",
-                "Saved, but could not restart. Restart rewynd to apply.",
-            ),
-        }
-    }
-
-    fn open_settings() {
-        let Some(settings) = config::sibling_binary("rewynd") else {
-            toast(
-                "Could not open settings",
-                "The settings binary was not found.",
-            );
-            return;
-        };
-        match std::process::Command::new(&settings).spawn() {
-            Ok(mut child) => {
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, path = %settings.display(), "could not open settings");
-                toast(
-                    "Could not open settings",
-                    &format!("{}: {e}", settings.display()),
-                );
-            }
-        }
     }
 
     /// Parse a `CTRL+ALT+R`-style trigger (the config's format, shared with the Linux
@@ -2703,7 +2701,7 @@ mod macos {
     use std::ops::ControlFlow;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     use anyhow::{Context, Result, anyhow};
     use global_hotkey::hotkey::{Code, HotKey, Modifiers};
@@ -3013,37 +3011,7 @@ mod macos {
             })
             .context("spawning the capture thread")?;
 
-        // Dev aid: flush once after N seconds without a keypress, so the pipeline can be
-        // exercised headlessly. Stop-aware and joined at shutdown like every other thread.
-        let mut flush_hook = None;
-        if let Ok(value) = std::env::var("REWYND_FLUSH_AFTER") {
-            match value.parse::<u64>() {
-                Ok(secs) => {
-                    let flush_saver = saver.clone();
-                    let flush_stop = stop.clone();
-                    flush_hook = Some(
-                        std::thread::Builder::new()
-                            .name("rewynd-flush-hook".to_owned())
-                            .spawn(move || {
-                                let deadline = Instant::now() + Duration::from_secs(secs);
-                                while Instant::now() < deadline {
-                                    if flush_stop.load(Ordering::Relaxed) {
-                                        return;
-                                    }
-                                    std::thread::sleep(Duration::from_millis(250));
-                                }
-                                if let Err(e) = flush_saver.save() {
-                                    tracing::warn!(error = %e, "dev flush produced no clip");
-                                }
-                            })
-                            .context("spawning the flush hook thread")?,
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(value, error = %e, "ignoring invalid REWYND_FLUSH_AFTER");
-                }
-            }
-        }
+        let flush_hook = crate::flush_hook::spawn(&saver, &stop)?;
 
         // Every exit path funnels through this channel: tray Quit, SIGTERM/SIGINT (the
         // settings restart sends SIGTERM via `stop_recorder`), and Ctrl+C.
@@ -3165,7 +3133,7 @@ mod macos {
                 let mut builder = tray_icon::TrayIconBuilder::new()
                     .with_menu(Box::new(menu))
                     .with_tooltip("rewynd — instant replay");
-                if let Some(icon) = tray_brand_icon() {
+                if let Some(icon) = crate::tray_common::tray_brand_icon() {
                     builder = builder.with_icon(icon);
                 }
                 builder.build().map_err(|e| e.to_string())
@@ -3234,9 +3202,9 @@ mod macos {
                 if id == save_item.id() {
                     save_and_toast(saver);
                 } else if id == mic_item.id() {
-                    toggle_mic_and_restart();
+                    crate::tray_common::toggle_mic_and_restart(&toast);
                 } else if id == settings_item.id() {
-                    open_settings();
+                    crate::tray_common::open_settings(&toast);
                 } else if id == quit_item.id() {
                     tracing::info!("quit requested from the tray");
                     let _ = cmd_tx.send(MainCmd::Shutdown("quit from the tray"));
@@ -3247,6 +3215,9 @@ mod macos {
                     if event.id() == *hotkey_id && event.state() == HotKeyState::Pressed {
                         tracing::info!("hotkey activated");
                         save_and_toast(saver);
+                        // The blocking save queues any repeat presses made meanwhile;
+                        // drop them instead of replaying near-duplicate saves.
+                        while GlobalHotKeyEvent::receiver().try_recv().is_ok() {}
                     }
                 }
             }
@@ -3264,15 +3235,6 @@ mod macos {
             }
         }
         // `_tray` and the hotkey manager drop here, removing the icon + registration.
-    }
-
-    /// The brand mark as a tray icon, from the PNG ladder the config crate owns.
-    fn tray_brand_icon() -> Option<tray_icon::Icon> {
-        let (_, png) = config::BRAND_ICONS.iter().find(|(size, _)| *size >= 32)?;
-        let img = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?;
-        let rgba = img.into_rgba8();
-        let (width, height) = rgba.dimensions();
-        tray_icon::Icon::from_rgba(rgba.into_vec(), width, height).ok()
     }
 
     /// Build the VideoToolbox encoder for `choice`: hardware for `Gpu`, Apple's software
@@ -3392,70 +3354,6 @@ mod macos {
         match reason {
             Some(reason) => Err(anyhow!("{reason} (see the log for details)")),
             None => Ok(()),
-        }
-    }
-
-    /// Flip the microphone on/off in the config file and restart the recorder to apply it
-    /// (the recorder reads audio config once at startup).
-    fn toggle_mic_and_restart() {
-        let Some(path) = config::config_path() else {
-            toast("Microphone", "Could not find the config file.");
-            return;
-        };
-        let mut cfg = config::load_file();
-        let now_on = !cfg.mic_enabled();
-        cfg.set_mic_enabled(now_on);
-        if let Err(e) = cfg.save_to(&path) {
-            tracing::warn!(error = %e, "could not save the microphone toggle");
-            toast("Microphone", "Could not save the change.");
-            return;
-        }
-        let bin =
-            config::sibling_binary("rewynd-recorder").or_else(|| std::env::current_exe().ok());
-        match bin.and_then(|bin| {
-            std::process::Command::new(bin)
-                .arg("--restart")
-                .spawn()
-                .ok()
-        }) {
-            Some(_) => toast(
-                "Microphone",
-                if now_on {
-                    "Microphone on. Restarting to apply."
-                } else {
-                    "Microphone off. Restarting to apply."
-                },
-            ),
-            None => toast(
-                "Microphone",
-                "Saved, but could not restart. Restart rewynd to apply.",
-            ),
-        }
-    }
-
-    /// Launch the sibling settings binary, reaping the child in the background (an
-    /// unwaited child stays a zombie for the recorder's whole lifetime).
-    fn open_settings() {
-        let Some(settings) = config::sibling_binary("rewynd") else {
-            toast(
-                "Could not open settings",
-                "The settings binary was not found.",
-            );
-            return;
-        };
-        match std::process::Command::new(&settings).spawn() {
-            Ok(mut child) => {
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, path = %settings.display(), "could not open settings");
-                toast(
-                    "Could not open settings",
-                    &format!("{}: {e}", settings.display()),
-                );
-            }
         }
     }
 

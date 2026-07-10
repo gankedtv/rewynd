@@ -7,21 +7,12 @@ use std::num::NonZero;
 use std::time::Duration;
 
 /// The one visual/audible bit of outcome signal (mirrors the Windows overlay accent).
+/// Its badge colour lives with the badge (`badge::Accent::rgb`) — the chime only
+/// cares which of the two sounds to play.
 #[derive(Clone, Copy)]
 pub enum Accent {
     Success,
     Failure,
-}
-
-impl Accent {
-    /// The accent bar colour: mint on success, red on failure.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
-    pub fn rgb(self) -> (u8, u8, u8) {
-        match self {
-            Accent::Success => (0x2E, 0xCC, 0x71),
-            Accent::Failure => (0xE7, 0x4C, 0x3C),
-        }
-    }
 }
 
 /// Play the save sound off-thread: the chime on success, a short error tone on failure.
