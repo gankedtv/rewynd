@@ -19,7 +19,7 @@ fn parse_pid(contents: &str) -> Option<u32> {
 
 /// Field 22 (start time in clock ticks) of `/proc/<pid>/stat` content: with the pid, a stable
 /// identity that distinguishes the original process from a reused pid.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn parse_start_time(stat: &str) -> Option<String> {
     // comm (field 2) is parenthesised and may itself contain spaces/parens, so resume after the
     // last ')': the remaining tokens start at field 3, putting start time at index 19.
@@ -30,9 +30,93 @@ fn parse_start_time(stat: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn proc_start_time(pid: u32) -> Option<String> {
     parse_start_time(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// Start time (epoch seconds and microseconds) via libproc's `proc_pidinfo`: with the pid, a
+/// stable identity that distinguishes the original process from a reused pid.
+#[cfg(target_os = "macos")]
+fn proc_start_time(pid: u32) -> Option<String> {
+    let raw = libc::pid_t::try_from(pid).ok()?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: FFI; the buffer holds a `proc_bsdinfo` and is only trusted when the kernel
+    // reports it filled the whole struct.
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            raw,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if filled != size {
+        return None;
+    }
+    // SAFETY: the kernel filled the whole struct.
+    let info = unsafe { info.assume_init() };
+    Some(format!(
+        "{}.{}",
+        info.pbi_start_tvsec, info.pbi_start_tvusec
+    ))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn proc_start_time(_pid: u32) -> Option<String> {
+    None
+}
+
+/// The process's command name (`/proc/<pid>/comm`), or `None` when it is gone or unreadable.
+#[cfg(target_os = "linux")]
+fn process_comm(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|comm| comm.trim().to_owned())
+}
+
+/// The process's command name via libproc's `proc_name`, or `None` when it is gone or
+/// unreadable. `proc_name` truncates to 32 bytes, which holds all of `rewynd-recorder`.
+#[cfg(target_os = "macos")]
+fn process_comm(pid: u32) -> Option<String> {
+    let raw = libc::c_int::try_from(pid).ok()?;
+    let mut buf = [0u8; 64];
+    // SAFETY: FFI; `buf` is valid for the stated size, and `proc_name` returns the name's
+    // length (0 on failure).
+    let len = unsafe { libc::proc_name(raw, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    let len = usize::try_from(len)
+        .ok()
+        .filter(|&n| n > 0 && n <= buf.len())?;
+    Some(String::from_utf8_lossy(&buf[..len]).into_owned())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn process_comm(_pid: u32) -> Option<String> {
+    None
+}
+
+/// Whether some process (possibly a reused pid) currently holds `pid`.
+#[cfg(target_os = "linux")]
+fn pid_exists(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn pid_exists(pid: u32) -> bool {
+    let Ok(raw) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if raw <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 performs only the existence check, never delivers anything.
+    if unsafe { libc::kill(raw, 0) } == 0 {
+        return true;
+    }
+    // EPERM means the pid exists but belongs to someone we may not signal.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Whether the original process (pid + start-time identity) is still running.
@@ -41,7 +125,7 @@ fn still_running(pid: u32, identity: Option<&str>) -> bool {
     match identity {
         Some(start) => proc_start_time(pid).as_deref() == Some(start),
         // No identity captured: fall back to bare pid existence.
-        None => std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        None => pid_exists(pid),
     }
 }
 
@@ -87,7 +171,7 @@ pub fn stop_recorder(term_wait: Duration, kill_wait: Duration) -> std::io::Resul
 
 /// Ask the running recorder to save a clip now, via SIGUSR1 — used by the onboarding wizard's
 /// test-clip step so the user need not press the just-configured hotkey. Verifies the pid is
-/// actually the recorder (its `/proc/<pid>/comm`) before signalling, so a reused pid is never hit.
+/// actually the recorder (its command name) before signalling, so a reused pid is never hit.
 /// `Ok(true)` when a save was requested, `Ok(false)` when no recorder is running.
 #[cfg(unix)]
 pub fn request_recorder_save() -> std::io::Result<bool> {
@@ -118,12 +202,11 @@ pub fn request_recorder_save() -> std::io::Result<bool> {
 }
 
 /// Whether `pid` is a live recorder process. The identity check (a reused pid must never read
-/// as alive) mirrors [`stop_process`]: `/proc/<pid>/comm` on unix, the image file name on
+/// as alive) mirrors [`stop_process`]: the command name on unix, the image file name on
 /// Windows. Used by the status reader to reject a stale `status.json` after a crash.
 #[cfg(unix)]
 pub(crate) fn recorder_alive(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .is_ok_and(|comm| comm.trim() == "rewynd-recorder")
+    process_comm(pid).as_deref() == Some("rewynd-recorder")
 }
 
 /// The file name of `handle`'s process image (the Windows analog of `/proc/<pid>/comm`), or
@@ -404,9 +487,7 @@ fn stop_process(
     if raw <= 0 {
         return Ok(true);
     }
-    if !std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .is_ok_and(|c| c.trim() == expected_comm)
-    {
+    if process_comm(pid).as_deref() != Some(expected_comm) {
         return Ok(true);
     }
     let identity = proc_start_time(pid);
@@ -522,7 +603,7 @@ mod tests {
         assert_eq!(parse_pid("-5\n"), None, "negative pids don't parse as u32");
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn parse_start_time_survives_hostile_comm() {
         // comm may hold spaces and parens; fields resume after the LAST ')'.
@@ -536,7 +617,7 @@ mod tests {
         assert_eq!(parse_start_time("no parens at all"), None);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn parse_start_time_matches_our_own_stat() {
         let pid = std::process::id();
@@ -547,7 +628,43 @@ mod tests {
         );
     }
 
-    /// Spawn `sleep 30` and wait until `/proc/<pid>/comm` reads `sleep` (post-exec).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn proc_start_time_is_seconds_and_micros() {
+        let start = proc_start_time(std::process::id()).expect("own start time");
+        let (sec, usec) = start.split_once('.').expect("sec.usec form");
+        assert!(
+            !sec.is_empty() && sec.chars().all(|c| c.is_ascii_digit()),
+            "seconds are numeric: {start}"
+        );
+        assert!(
+            usec.chars().all(|c| c.is_ascii_digit()),
+            "micros are numeric: {start}"
+        );
+        assert_ne!(sec, "0", "a real epoch start time");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn own_process_identity_reads_consistently() {
+        let pid = std::process::id();
+        let start = proc_start_time(pid).expect("own start time");
+        assert!(still_running(pid, Some(&start)), "our identity is running");
+        assert!(still_running(pid, None), "our bare pid exists");
+        assert!(
+            !still_running(pid, Some("mismatched-identity")),
+            "a mismatched identity reads as exited"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn recorder_alive_rejects_a_non_recorder_pid() {
+        // Our own comm is the test binary's, so the recorder identity check must refuse it.
+        assert!(!recorder_alive(std::process::id()));
+    }
+
+    /// Spawn `sleep 30` and wait until its comm reads `sleep` (post-exec).
     #[cfg(unix)]
     fn spawn_sleep() -> std::process::Child {
         let child = std::process::Command::new("sleep")
@@ -556,9 +673,7 @@ mod tests {
             .expect("spawn sleep");
         let pid = child.id();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !std::fs::read_to_string(format!("/proc/{pid}/comm"))
-            .is_ok_and(|c| c.trim() == "sleep")
-        {
+        while process_comm(pid).as_deref() != Some("sleep") {
             assert!(
                 std::time::Instant::now() < deadline,
                 "child never exec'd sleep"

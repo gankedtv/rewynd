@@ -2,9 +2,10 @@
 # ADR 0001: exactly one wgpu source).
 
 [graph]
-# Only the platforms we ship; keeps advisories in macOS/BSD-only corners of the
-# tree from failing a build that never compiles them.
-targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Only the platforms we ship; keeps advisories in BSD-only corners of the tree from
+# failing a build that never compiles them. macOS (Apple Silicon) is a shipping
+# target since ADR 0015, so its dependency tree (cidre etc.) is checked too.
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
 
 [advisories]
 version = 2
@@ -14,6 +15,10 @@ ignore = [
     "RUSTSEC-2026-0150", # audiopus_sys unmaintained — we link SYSTEM libopus via pkg-config, the bundled-CMake path never runs
     "RUSTSEC-2026-0192", # ttf-parser unmaintained — transitive via iced/winit; upstream migration (skrifa) is theirs
     "RUSTSEC-2024-0388", # derivative unmaintained — inside the ADR-0001-pinned gpu-video rev
+    # paste (proc-macro, archived by its author): compile-time only, pulled in by the Metal
+    # backend of iced's wgpu 27 — visible since aarch64-apple-darwin became a checked target.
+    # Drop when wgpu/metal move off paste (their migration, not ours).
+    "RUSTSEC-2024-0436",
     # quick-xml quadratic-runtime DoS on attacker-supplied start tags (0194) and unbounded
     # namespace-declaration allocation in NsReader (0195); both patched only in >= 0.41 while
     # both our copies are semver-pinned upstream. Not reachable here: 0.39 sits in
@@ -24,7 +29,7 @@ ignore = [
     "RUSTSEC-2026-0195",
     # tray-icon's Linux backend (gtk-rs GTK3 bindings + proc-macro-error, all
     # unmaintained): dead code here — our Linux tray is ksni over D-Bus, tray-icon is
-    # only ever compiled on Windows, where none of these are in the build. cargo-deny
+    # only ever compiled on Windows and macOS, where none of these are in the build. cargo-deny
     # still walks the edges because its target filter is per-cfg, not per-platform
     # reachability. Drop when tray-icon moves off GTK3 (its tracking issue: GTK4/xdg
     # portal backend) or grows a feature to opt out of the GTK backend.

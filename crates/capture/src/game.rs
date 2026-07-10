@@ -64,6 +64,12 @@ const EXCLUDED_APP_IDS: &[&str] = &[
     "hyprlock",
     "wofi",
     "rofi",
+    // macOS shell (bundle ids, stored lowercase; the matcher lowercases its input)
+    "com.apple.finder",
+    "com.apple.dock",
+    "com.apple.loginwindow",
+    "com.apple.windowmanager",
+    "com.apple.spotlight",
     // rewynd's own windows
     "tv.ganked.rewynd",
     "rewynd",
@@ -128,7 +134,10 @@ mod tests {
         }
         assert!(is_shell_app_id("PlasmaShell"));
         assert!(is_shell_app_id("org.kde.plasmashell"));
+        assert!(is_shell_app_id("com.apple.Finder"));
+        assert!(is_shell_app_id("com.apple.WindowManager"));
         assert!(!is_shell_app_id("factorio"));
+        assert!(!is_shell_app_id("com.kovidgoyal.kitty"));
     }
 
     #[test]

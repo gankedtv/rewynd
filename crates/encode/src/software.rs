@@ -157,7 +157,9 @@ fn timestamp_from(pts: Duration) -> openh264::Timestamp {
 }
 
 /// Deinterleave an NV12 UV plane (`U,V,U,V,…`) into separate U and V planes, reusing the
-/// destination buffers' allocations.
+/// destination buffers' allocations. Only the Vulkan-gated texture adapter consumes it
+/// outside tests, hence the cfg.
+#[cfg(any(vulkan, test))]
 pub(crate) fn deinterleave_uv(uv: &[u8], u: &mut Vec<u8>, v: &mut Vec<u8>) {
     u.clear();
     v.clear();

@@ -9,8 +9,8 @@
 - Dev box: CachyOS / RTX 3080 Ti / KWin Wayland.
 
 ### Coverage
-- CI gates **85% line coverage** on CI-testable code, excluding GPU/portal/GUI/wiring code via `--ignore-filename-regex '(capture/src/linux/|gpu/src/|encode/src/(gpu_video_backend|software_texture)\.rs|app/src/|settings/src/|vendor/mp4/)'` (no GPU/live Wayland/display/tray in CI; `app/src/` is the binary wiring + the tray; `settings/src/` is the iced GUI; `encode/src/software_texture.rs` is the CPU encoder's GPU-readback adapter, while its pure CPU core in `software.rs` stays covered; `vendor/mp4/` is the vendored third-party muxer fork — ADR 0004). Testable logic lives in the library crates.
-- That GPU/portal code is validated by `#[ignore]`d tests on a GPU box. Full local coverage including them: `cargo llvm-cov --workspace --include-ignored`.
+- CI gates **85% line coverage** on CI-testable code, excluding GPU/portal/macOS/GUI/wiring code via `--ignore-filename-regex '(capture/src/(linux|macos)/|gpu/src/|encode/src/(gpu_video_backend|software_texture|videotoolbox)\.rs|app/src/|settings/src/|vendor/mp4/)'` (no GPU/live Wayland/display/tray/ScreenCaptureKit in CI; `app/src/` is the binary wiring + the tray; `settings/src/` is the iced GUI; `encode/src/software_texture.rs` is the CPU encoder's GPU-readback adapter, while its pure CPU core in `software.rs` stays covered; `encode/src/videotoolbox.rs` needs a live VideoToolbox session, while the pure AVCC→Annex-B converter in `annexb.rs` stays covered; `vendor/mp4/` is the vendored third-party muxer fork — ADR 0004). Testable logic lives in the library crates.
+- That GPU/portal code is validated by `#[ignore]`d tests on a GPU box, and the macOS capture/encode path by `#[ignore]`d tests against live ScreenCaptureKit/VideoToolbox on a Mac. Full local coverage including them: `cargo llvm-cov --workspace --include-ignored`.
 
 ## Hard rules
 - **GPU pin:** `wgpu` git rev `1503796` + `gpu-video` git `4fff151f`, unified via `[patch.crates-io]`. Do not bump `wgpu`/`gpu-video` without an ADR (`docs/adr/`). See ADR 0001.

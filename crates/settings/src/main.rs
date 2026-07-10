@@ -253,7 +253,7 @@ fn main() -> iced::Result {
     // Best-effort desktop integration, so the taskbar and notification icons resolve even when
     // the settings window is the first rewynd binary this machine ever runs. The recorder does
     // the same at startup; both paths are cheap and idempotent.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     if let Err(e) = config::install_icons() {
         tracing::warn!(error = %e, "could not install app icons");
     }
@@ -262,7 +262,7 @@ fn main() -> iced::Result {
         tracing::warn!(error = %e, "could not register the toast identity");
     }
     // The launcher entry opens this GUI (the user-facing `rewynd`).
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     if let Ok(exe) = std::env::current_exe()
         && let Err(e) = config::install_launcher_entry(&exe)
     {
@@ -270,7 +270,7 @@ fn main() -> iced::Result {
     }
     if let Some(recorder) = recorder_path().filter(|p| p.is_file()) {
         // Migrate a stale autostart entry (pre-icon, or the pre-rename recorder binary on Linux;
-        // a moved binary on Windows) onto the current recorder.
+        // a moved binary on Windows or macOS) onto the current recorder.
         if let Err(e) = config::refresh_autostart(&recorder) {
             tracing::warn!(error = %e, "could not refresh the autostart entry");
         }

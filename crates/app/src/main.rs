@@ -10,6 +10,9 @@
 //! portal close → thread joins → audio flush). On Windows the capture is WGC, the
 //! hotkey is a `RegisterHotKey` message loop, and Ctrl+C drives the same
 //! stop-flag-then-join shutdown (video-only for now; audio/tray/upload follow).
+//! On macOS the capture is ScreenCaptureKit → VideoToolbox (docs/adr/0015), and the
+//! main thread pumps AppKit events for the tray + Carbon hotkey, with the same
+//! stop-flag-then-join shutdown.
 
 // A background recorder should never pop a console. Windows-only (cfg_attr leaves Linux a
 // console app); `attach_parent_console` below reconnects stdout/stderr for terminal runs.
@@ -18,8 +21,17 @@
 #[cfg(target_os = "linux")]
 mod badge;
 
+/// The macOS in-game save badge (an AppKit panel over fullscreen games); named apart
+/// from the Linux `badge` module because the file name must differ.
+#[cfg(target_os = "macos")]
+#[path = "badge_macos.rs"]
+mod badge_macos;
+
 #[cfg(target_os = "linux")]
 mod tray;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod chime;
 
 #[cfg(target_os = "windows")]
 mod overlay;
@@ -28,12 +40,12 @@ mod overlay;
 mod toast;
 
 /// The clip-saved chime (generated two-note pling, mono 16-bit WAV), embedded once and shared by
-/// both platforms: Windows plays it from memory (`overlay::play_chime`), Linux decodes and plays it
-/// through rodio (`badge::play`).
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+/// all platforms: Windows plays it from memory (`overlay::play_chime`), Linux and macOS decode and
+/// play it through rodio (`chime::play`).
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 pub(crate) const CLIP_SAVED_WAV: &[u8] = include_bytes!("../assets/clip-saved.wav");
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 fn main() -> anyhow::Result<()> {
     // Must be first: on a packaged install this handles Velopack's install/update hook args and
     // may exit or restart the process. A normal launch passes straight through, and it is inert
@@ -70,6 +82,8 @@ fn main() -> anyhow::Result<()> {
     let result = linux::run();
     #[cfg(target_os = "windows")]
     let result = windows::run();
+    #[cfg(target_os = "macos")]
+    let result = macos::run();
     if let Err(e) = &result {
         // The recorder is a windowless background app (often autostarted): without this, a
         // fatal startup error is invisible. Blocking `show` is fine — no runtime is live here.
@@ -91,9 +105,9 @@ fn main() -> anyhow::Result<()> {
 
 /// The audio half of the pipeline, shared by the platform recorders: capture threads
 /// summing into the mixer, and the mixer thread draining into the Opus encoder + ring.
-/// Only `capture_audio` itself is platform-specific (PipeWire vs WASAPI); the callback
-/// shape and everything downstream are identical.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+/// Only `capture_audio` itself is platform-specific (PipeWire vs WASAPI vs SCK); the
+/// callback shape and everything downstream are identical.
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 mod audio_pipeline {
     use std::ops::ControlFlow;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -103,6 +117,8 @@ mod audio_pipeline {
     use anyhow::{Context, Result};
     #[cfg(target_os = "linux")]
     use rewynd_capture::linux::capture_audio;
+    #[cfg(target_os = "macos")]
+    use rewynd_capture::macos::capture_audio;
     #[cfg(target_os = "windows")]
     use rewynd_capture::windows::capture_audio;
     use rewynd_capture::{AudioParams, AudioSource};
@@ -153,7 +169,9 @@ mod audio_pipeline {
                 // stuck in one ear, system audio keeps its stereo image, and the configured
                 // gain is applied to each.
                 let mut prep = Vec::new();
-                let panicked = std::rc::Rc::new(std::cell::Cell::new(false));
+                // Arc, not Rc: the macOS backend delivers samples on a dispatch queue, so
+                // the callback must be Send there (the other platforms don't mind).
+                let panicked = Arc::new(AtomicBool::new(false));
                 // No idle timeout (capture runs until shutdown); the stop flag drives the
                 // watchdog so the loop quits promptly even if the endpoint suspends.
                 let panicked_flag = panicked.clone();
@@ -213,7 +231,7 @@ mod audio_pipeline {
                             Ok(()) => ControlFlow::Continue(()),
                             Err(_) => {
                                 tracing::error!("audio callback panicked; stopping this capture");
-                                panicked_flag.set(true);
+                                panicked_flag.store(true, Ordering::Relaxed);
                                 ControlFlow::Break(())
                             }
                         }
@@ -221,9 +239,11 @@ mod audio_pipeline {
                 );
                 // A panic Break reads as a clean stream end; surface it like a capture error.
                 let result = match result {
-                    Ok(()) if panicked.get() => Err(rewynd_capture::CaptureError::PipeWire(
-                        "the audio callback panicked".to_owned(),
-                    )),
+                    Ok(()) if panicked.load(Ordering::Relaxed) => {
+                        Err(rewynd_capture::CaptureError::Callback(
+                            "the audio callback panicked".to_owned(),
+                        ))
+                    }
                     other => other,
                 };
                 if let Err(e) = result {
@@ -318,14 +338,14 @@ mod audio_pipeline {
 
 /// Upload wiring (ganked.tv + YouTube) shared by the platform trays; the platform module owns
 /// the toast/task plumbing around it.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-/// The shared reaction to game-focus changes (both platforms): mirror the gate into
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+/// The shared reaction to game-focus changes (all platforms): mirror the gate into
 /// the `recording` flag, keep the saver's per-game folder current, and start each
 /// recorded stretch with cleared rings so a clip never spans a gated-off gap (the
 /// muxer writes audio packets back-to-back; a mid-clip gap would desynchronize the
 /// tracks). Runs on the detector's thread, never inside a capture FFI callback, so
 /// the (steamlocate) name lookup may block briefly.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 mod game_gate {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -393,7 +413,7 @@ mod game_gate {
 }
 
 /// Config → encoder parameter mapping, shared by the platform recorders.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 mod params {
     use rewynd_config::{AudioSettings, VideoSettings};
     use rewynd_encode::{AudioEncodeParams, EncodeParams};
@@ -475,10 +495,170 @@ mod probe {
     }
 }
 
+/// Encoder-capability probe, macOS shape: no Vulkan here — the one "adapter" is the
+/// media engine behind VideoToolbox (docs/adr/0015), present on every Apple Silicon
+/// Mac. `h264_encode` still reflects a live session probe so a broken VT install
+/// degrades honestly instead of lying to the selector.
+#[cfg(target_os = "macos")]
+mod probe {
+    use rewynd_config::{EncoderProbe, ProbeAdapter};
+
+    /// The display name for the VideoToolbox hardware path, shared with the selector
+    /// so a `gpu:<name>` config pin matches what the probe reports.
+    pub(crate) const VIDEOTOOLBOX_ADAPTER: &str = "Apple VideoToolbox";
+
+    pub(crate) fn adapter_list() -> Vec<ProbeAdapter> {
+        vec![ProbeAdapter {
+            name: VIDEOTOOLBOX_ADAPTER.to_owned(),
+            device_type: "integrated".to_owned(),
+            h264_encode: rewynd_encode::hardware_h264_available(),
+            // H.264 level 5.2, the ceiling of the hardware encoder's advertised range.
+            max_width: 4096,
+            max_height: 4096,
+        }]
+    }
+
+    /// The `--probe-encoders` subcommand: print the probe as JSON on stdout, nothing else.
+    pub(crate) fn run() -> anyhow::Result<()> {
+        println!("{}", EncoderProbe::new(adapter_list()).to_json());
+        Ok(())
+    }
+}
+
+/// Tray plumbing shared by the platforms whose tray is `tray-icon` (Windows + macOS):
+/// the brand icon and the synchronous menu commands. Linux keeps its async ksni
+/// variants. `toast` is the platform's notification fn (their identity setup differs).
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+mod tray_common {
+    use rewynd_config::{self as config};
+
+    /// The brand mark as a tray icon, from the PNG ladder the config crate owns.
+    pub(crate) fn tray_brand_icon() -> Option<tray_icon::Icon> {
+        let (_, png) = config::BRAND_ICONS.iter().find(|(size, _)| *size >= 32)?;
+        let img = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?;
+        let rgba = img.into_rgba8();
+        let (width, height) = rgba.dimensions();
+        tray_icon::Icon::from_rgba(rgba.into_vec(), width, height).ok()
+    }
+
+    /// Flip the microphone on/off in the config file and restart the recorder to apply
+    /// it (the recorder reads audio config once at startup).
+    pub(crate) fn toggle_mic_and_restart(toast: &dyn Fn(&str, &str)) {
+        let Some(path) = config::config_path() else {
+            toast("Microphone", "Could not find the config file.");
+            return;
+        };
+        let mut cfg = config::load_file();
+        let now_on = !cfg.mic_enabled();
+        cfg.set_mic_enabled(now_on);
+        if let Err(e) = cfg.save_to(&path) {
+            tracing::warn!(error = %e, "could not save the microphone toggle");
+            toast("Microphone", "Could not save the change.");
+            return;
+        }
+        let bin =
+            config::sibling_binary("rewynd-recorder").or_else(|| std::env::current_exe().ok());
+        match bin.and_then(|bin| {
+            std::process::Command::new(bin)
+                .arg("--restart")
+                .spawn()
+                .ok()
+        }) {
+            Some(_) => toast(
+                "Microphone",
+                if now_on {
+                    "Microphone on. Restarting to apply."
+                } else {
+                    "Microphone off. Restarting to apply."
+                },
+            ),
+            None => toast(
+                "Microphone",
+                "Saved, but could not restart. Restart rewynd to apply.",
+            ),
+        }
+    }
+
+    /// Launch the sibling settings binary, reaping the child in the background (an
+    /// unwaited child stays a zombie for the recorder's whole lifetime).
+    pub(crate) fn open_settings(toast: &dyn Fn(&str, &str)) {
+        let Some(settings) = config::sibling_binary("rewynd") else {
+            toast(
+                "Could not open settings",
+                "The settings binary was not found.",
+            );
+            return;
+        };
+        match std::process::Command::new(&settings).spawn() {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, path = %settings.display(), "could not open settings");
+                toast(
+                    "Could not open settings",
+                    &format!("{}: {e}", settings.display()),
+                );
+            }
+        }
+    }
+}
+
+/// The `REWYND_FLUSH_AFTER` dev aid, shared by every platform recorder: flush one clip
+/// after N seconds without a keypress, so the pipeline can be exercised headlessly.
+/// Stop-aware and joined at shutdown like every other thread.
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+mod flush_hook {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use anyhow::{Context, Result};
+    use rewynd_clip::ClipSaver;
+
+    /// Spawn the flush-hook thread when the env var is set; `Ok(None)` when unset or
+    /// invalid (a bad value is logged and ignored — a dev aid must not stop the run).
+    pub(crate) fn spawn(
+        saver: &Arc<ClipSaver>,
+        stop: &Arc<AtomicBool>,
+    ) -> Result<Option<std::thread::JoinHandle<()>>> {
+        let Ok(value) = std::env::var("REWYND_FLUSH_AFTER") else {
+            return Ok(None);
+        };
+        let secs = match value.parse::<u64>() {
+            Ok(secs) => secs,
+            Err(e) => {
+                tracing::warn!(value, error = %e, "ignoring invalid REWYND_FLUSH_AFTER");
+                return Ok(None);
+            }
+        };
+        let saver = saver.clone();
+        let stop = stop.clone();
+        std::thread::Builder::new()
+            .name("rewynd-flush-hook".to_owned())
+            .spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(secs);
+                while Instant::now() < deadline {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                if let Err(e) = saver.save() {
+                    tracing::warn!(error = %e, "dev flush produced no clip");
+                }
+            })
+            .map(Some)
+            .context("spawning the flush hook thread")
+    }
+}
+
 /// The recorder's live status, published to a file the GUI polls. A single shared cell holds
 /// the current state so any thread (the game gate, the capture thread, the tray) can update one
 /// field and re-publish atomically.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 mod status {
     use std::sync::{Arc, Mutex};
 
@@ -1040,36 +1220,7 @@ mod linux {
                     .context("spawning the capture thread")?,
             );
 
-            // Dev aid: flush once after N seconds without a keypress, so the pipeline can be
-            // exercised headlessly. Stop-aware and joined at shutdown like every other thread.
-            if let Ok(value) = std::env::var("REWYND_FLUSH_AFTER") {
-                match value.parse::<u64>() {
-                    Ok(secs) => {
-                        let flush_saver = saver.clone();
-                        let flush_stop = stop.clone();
-                        recorder.flush_hook = Some(
-                            std::thread::Builder::new()
-                                .name("rewynd-flush-hook".to_owned())
-                                .spawn(move || {
-                                    let deadline = Instant::now() + Duration::from_secs(secs);
-                                    while Instant::now() < deadline {
-                                        if flush_stop.load(Ordering::Relaxed) {
-                                            return;
-                                        }
-                                        std::thread::sleep(Duration::from_millis(250));
-                                    }
-                                    if let Err(e) = flush_saver.save() {
-                                        tracing::warn!(error = %e, "dev flush produced no clip");
-                                    }
-                                })
-                                .context("spawning the flush hook thread")?,
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(value, error = %e, "ignoring invalid REWYND_FLUSH_AFTER");
-                    }
-                }
-            }
+            recorder.flush_hook = crate::flush_hook::spawn(&saver, &stop)?;
             Ok(())
         })();
         if let Err(e) = started {
@@ -2048,37 +2199,7 @@ mod windows {
             })
             .context("spawning the tray thread")?;
 
-        // Dev aid: flush once after N seconds without a keypress, so the pipeline can be
-        // exercised headlessly. Stop-aware and joined at shutdown like every other thread.
-        let mut flush_hook = None;
-        if let Ok(value) = std::env::var("REWYND_FLUSH_AFTER") {
-            match value.parse::<u64>() {
-                Ok(secs) => {
-                    let flush_saver = saver.clone();
-                    let flush_stop = stop.clone();
-                    flush_hook = Some(
-                        std::thread::Builder::new()
-                            .name("rewynd-flush-hook".to_owned())
-                            .spawn(move || {
-                                let deadline = Instant::now() + Duration::from_secs(secs);
-                                while Instant::now() < deadline {
-                                    if flush_stop.load(Ordering::Relaxed) {
-                                        return;
-                                    }
-                                    std::thread::sleep(Duration::from_millis(250));
-                                }
-                                if let Err(e) = flush_saver.save() {
-                                    tracing::warn!(error = %e, "dev flush produced no clip");
-                                }
-                            })
-                            .context("spawning the flush hook thread")?,
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(value, error = %e, "ignoring invalid REWYND_FLUSH_AFTER");
-                }
-            }
-        }
+        let flush_hook = crate::flush_hook::spawn(&saver, &stop)?;
 
         // Park until Ctrl+C or the named stop event (the settings app's restart request
         // — the Windows SIGTERM stand-in), then run the same stop-flag-then-join
@@ -2383,7 +2504,7 @@ mod windows {
                 let mut builder = tray_icon::TrayIconBuilder::new()
                     .with_menu(Box::new(menu))
                     .with_tooltip("rewynd — instant replay");
-                if let Some(icon) = tray_brand_icon() {
+                if let Some(icon) = crate::tray_common::tray_brand_icon() {
                     builder = builder.with_icon(icon);
                 }
                 builder.build().map_err(|e| e.to_string())
@@ -2443,9 +2564,9 @@ mod windows {
                 if id == save_item.id() {
                     save_and_toast(saver, capture_desktop);
                 } else if id == mic_item.id() {
-                    toggle_mic_and_restart();
+                    crate::tray_common::toggle_mic_and_restart(&toast);
                 } else if id == settings_item.id() {
-                    open_settings();
+                    crate::tray_common::open_settings(&toast);
                 } else if id == quit_item.id() {
                     tracing::info!("quit requested from the tray");
                     let _ = shutdown.send("quit from the tray");
@@ -2461,79 +2582,6 @@ mod windows {
             let _ = unsafe { UnregisterHotKey(None, HOTKEY_ID) };
         }
         // `_tray` drops here, removing the icon.
-    }
-
-    /// The brand mark as a tray icon, from the PNG ladder the config crate owns.
-    fn tray_brand_icon() -> Option<tray_icon::Icon> {
-        let (_, png) = config::BRAND_ICONS.iter().find(|(size, _)| *size >= 32)?;
-        let img = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?;
-        let rgba = img.into_rgba8();
-        let (width, height) = rgba.dimensions();
-        tray_icon::Icon::from_rgba(rgba.into_vec(), width, height).ok()
-    }
-
-    /// Launch the sibling settings binary, reaping the child in the background (an
-    /// unwaited child stays a zombie for the recorder's whole lifetime).
-    /// Flip the microphone on/off in the config file and restart the recorder to apply it (the
-    /// recorder reads audio config once at startup).
-    fn toggle_mic_and_restart() {
-        let Some(path) = config::config_path() else {
-            toast("Microphone", "Could not find the config file.");
-            return;
-        };
-        let mut cfg = config::load_file();
-        let now_on = !cfg.mic_enabled();
-        cfg.set_mic_enabled(now_on);
-        if let Err(e) = cfg.save_to(&path) {
-            tracing::warn!(error = %e, "could not save the microphone toggle");
-            toast("Microphone", "Could not save the change.");
-            return;
-        }
-        let bin =
-            config::sibling_binary("rewynd-recorder").or_else(|| std::env::current_exe().ok());
-        match bin.and_then(|bin| {
-            std::process::Command::new(bin)
-                .arg("--restart")
-                .spawn()
-                .ok()
-        }) {
-            Some(_) => toast(
-                "Microphone",
-                if now_on {
-                    "Microphone on. Restarting to apply."
-                } else {
-                    "Microphone off. Restarting to apply."
-                },
-            ),
-            None => toast(
-                "Microphone",
-                "Saved, but could not restart. Restart rewynd to apply.",
-            ),
-        }
-    }
-
-    fn open_settings() {
-        let Some(settings) = config::sibling_binary("rewynd") else {
-            toast(
-                "Could not open settings",
-                "The settings binary was not found.",
-            );
-            return;
-        };
-        match std::process::Command::new(&settings).spawn() {
-            Ok(mut child) => {
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, path = %settings.display(), "could not open settings");
-                toast(
-                    "Could not open settings",
-                    &format!("{}: {e}", settings.display()),
-                );
-            }
-        }
     }
 
     /// Parse a `CTRL+ALT+R`-style trigger (the config's format, shared with the Linux
@@ -2654,7 +2702,807 @@ mod windows {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "macos")]
+mod macos {
+    use std::ops::ControlFlow;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    use anyhow::{Context, Result, anyhow};
+    use global_hotkey::hotkey::{Code, HotKey, Modifiers};
+    use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSEventMask};
+    use objc2_foundation::{
+        NSActivityOptions, NSDate, NSDefaultRunLoopMode, NSProcessInfo, NSString,
+    };
+    use rewynd_buffer::{AudioRingBuffer, RingBuffer};
+    use rewynd_capture::macos::CapturedPixelBuf;
+    use rewynd_capture::{AudioSource, StreamPrefs};
+    use rewynd_clip::{ClipSaver, SaveError, SharedAudioBuffer, SharedBuffer, lock_unpoisoned};
+    use rewynd_config::{self as config};
+    use rewynd_encode::{AudioMixer, EncodeParams, VideoToolboxEncoder};
+
+    use crate::audio_pipeline::{AUDIO_SETTLE, SharedMixer, run_audio_mixer, spawn_audio_capture};
+    use crate::badge_macos;
+    use crate::chime;
+    use crate::params::{audio_encode_params, encode_params};
+
+    /// How long one AppKit pump slice may block waiting for an event before the loop
+    /// re-checks the menu/hotkey/command channels — the worst-case added latency on a
+    /// press, well under perception (the Windows pump's `HOTKEY_POLL` counterpart).
+    const PUMP_SLICE: f64 = 0.03;
+
+    /// What the main pump reacts to besides AppKit events: the signal thread's requests.
+    enum MainCmd {
+        Save,
+        Shutdown(&'static str),
+    }
+
+    pub fn run() -> Result<()> {
+        tracing_subscriber::fmt::init();
+
+        config::ensure_default_file();
+        let config = config::load();
+
+        // Single-instance guard (flock'd pid file, the shared unix path): two recorders
+        // would mean two SCK streams and two hotkey registrations fighting each other.
+        let _instance = match config::acquire_recorder_lock() {
+            Ok(Some(lock)) => Some(lock),
+            Ok(None) => {
+                tracing::error!("another rewynd recorder is already running; exiting");
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not acquire the recorder lock; starting without one");
+                None
+            }
+        };
+
+        // AppKit wants the main thread; everything below assumes we own it.
+        let mtm = MainThreadMarker::new()
+            .ok_or_else(|| anyhow!("the recorder must start on the main thread"))?;
+
+        // A background recorder with no windows is exactly what App Nap throttles;
+        // hold an activity for the process lifetime so capture never gets napped.
+        // (The token must stay alive — dropping it ends the assertion.)
+        let _activity = NSProcessInfo::processInfo().beginActivityWithOptions_reason(
+            NSActivityOptions::UserInitiatedAllowingIdleSystemSleep,
+            &NSString::from_str("rewynd is recording the replay buffer"),
+        );
+
+        // Resolution / framerate / bitrate stay parameters (PLAN §9), sourced from the config.
+        let params = encode_params(config.video());
+        let buffer_window = config.buffer_window();
+        let output_dir = config.output_dir();
+        tracing::info!(
+            width = params.width,
+            height = params.height,
+            fps = params.framerate,
+            bitrate_bps = params.bitrate_bps,
+            idr_period = params.idr_period,
+            buffer_s = buffer_window.as_secs(),
+            "encode parameters"
+        );
+
+        // Pick the encoder backend up front: probe VideoToolbox, honour the config
+        // override, log both. `Cpu` maps to Apple's software VT encoder rather than
+        // openh264 — same session API, no GPU requirement either way (ADR 0015).
+        let adapters = crate::probe::adapter_list();
+        let (encoder_choice, encoder_warning) =
+            config::choose_encoder(&config.encoder_preference(), &adapters);
+        tracing::info!(
+            adapters = ?adapters,
+            choice = %encoder_choice.label(),
+            "encoder capability and selection"
+        );
+        if let Some(warning) = &encoder_warning {
+            tracing::warn!(warning, "encoder selection fell back");
+            toast("Recording method", warning);
+        }
+
+        let audio_params = audio_encode_params(config.audio());
+        tracing::info!(
+            sample_rate = audio_params.sample_rate,
+            channels = audio_params.channels,
+            bitrate_bps = audio_params.bitrate_bps,
+            mic_gain = config.mic_gain(),
+            system_gain = config.system_gain(),
+            "audio parameters"
+        );
+
+        let buffer: SharedBuffer = Arc::new(Mutex::new(RingBuffer::new(buffer_window)));
+        let audio_buffer: SharedAudioBuffer =
+            Arc::new(Mutex::new(AudioRingBuffer::new(buffer_window)));
+        let mixer: SharedMixer = Arc::new(Mutex::new(AudioMixer::new(
+            audio_params.sample_rate,
+            audio_params.channels,
+            AUDIO_SETTLE,
+        )));
+        // Raised by a clip save so the mixer drains its in-flight tail before the audio cut.
+        let audio_drain_now = Arc::new(AtomicBool::new(false));
+
+        // The separate-mic-track option: a second ring + mixer + drain flag feed a mic-only
+        // Opus track. `separate_mic_track` is already gated on the mic being enabled.
+        let mic_enabled = config.mic_enabled();
+        let separate_mic = config.separate_mic_track();
+        let (mic_audio_buffer, mic_mixer, mic_drain_now) = if separate_mic {
+            let ring: SharedAudioBuffer = Arc::new(Mutex::new(AudioRingBuffer::new(buffer_window)));
+            let mx: SharedMixer = Arc::new(Mutex::new(AudioMixer::new(
+                audio_params.sample_rate,
+                audio_params.channels,
+                AUDIO_SETTLE,
+            )));
+            (Some(ring), Some(mx), Some(Arc::new(AtomicBool::new(false))))
+        } else {
+            (None, None, None)
+        };
+
+        let mut drains = vec![audio_drain_now.clone()];
+        drains.extend(mic_drain_now.clone());
+        let saver = ClipSaver::new(
+            buffer.clone(),
+            audio_buffer.clone(),
+            mic_audio_buffer.clone(),
+            params,
+            audio_params,
+            buffer_window,
+            output_dir,
+            drains,
+        );
+
+        // Game gating (mirrors Linux, ADR 0012): a focus watcher outside the capture
+        // path flips the `recording` gate on the focused fullscreen game; the capture
+        // stream itself runs continuously and drops frames while the gate is closed.
+        let capture_desktop = config.capture_desktop();
+        let game_only = !capture_desktop;
+        let game_folders = config.game_folders();
+        let recording = Arc::new(AtomicBool::new(!game_only));
+
+        let initial_state = if game_only {
+            config::RecorderState::Idle
+        } else {
+            config::RecorderState::Recording
+        };
+        let status = crate::status::StatusPublisher::new(encoder_choice.label(), initial_state);
+
+        let _focus_watcher = if game_only || game_folders {
+            let reaction = crate::game_gate::reaction(
+                game_only,
+                game_folders,
+                recording.clone(),
+                saver.clone(),
+                buffer.clone(),
+                audio_buffer.clone(),
+                mic_audio_buffer.clone(),
+                status.clone(),
+            );
+            match rewynd_capture::macos::FocusWatcher::spawn(Some(reaction)) {
+                Ok(watcher) => Some(watcher),
+                Err(e) => {
+                    // No watcher, no gate: fall back to continuous capture.
+                    recording.store(true, Ordering::Relaxed);
+                    status.set_recording(None);
+                    tracing::warn!(
+                        error = %e,
+                        "game detection unavailable; recording the display continuously"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // One monotonic epoch shared by all capture threads, so the video, system-audio
+        // and mic PTS are on the same clock and the mixer/muxer can align them.
+        let epoch = Instant::now();
+        let stop = Arc::new(AtomicBool::new(false));
+        let captures_done = Arc::new(AtomicBool::new(false));
+
+        // Audio: SCK system loopback + mic sum into the mixer; the mixer thread drains it.
+        let system_audio = spawn_audio_capture(
+            "rewynd-audio-system",
+            AudioSource::SinkMonitor,
+            None,
+            audio_params,
+            config.system_gain(),
+            mixer.clone(),
+            None,
+            &stop,
+            epoch,
+            Some(Box::new(|e: String| {
+                toast(
+                    "System audio lost",
+                    &format!("Clips will have no system sound: {e}"),
+                );
+            })),
+        )?;
+        let mic_audio = if mic_enabled {
+            Some(spawn_audio_capture(
+                "rewynd-audio-mic",
+                AudioSource::Microphone,
+                config.microphone().map(str::to_owned),
+                audio_params,
+                config.mic_gain(),
+                mixer.clone(),
+                mic_mixer.clone(),
+                &stop,
+                epoch,
+                None,
+            )?)
+        } else {
+            None
+        };
+        let mixer_buffer = audio_buffer.clone();
+        let mixer_mixer = mixer.clone();
+        let mixer_done = captures_done.clone();
+        let mixer_drain_now = audio_drain_now.clone();
+        let mixer_recording = recording.clone();
+        let audio_mixer = std::thread::Builder::new()
+            .name("rewynd-audio-mixer".to_owned())
+            .spawn(move || {
+                if let Err(e) = run_audio_mixer(
+                    epoch,
+                    audio_params,
+                    mixer_mixer,
+                    mixer_buffer,
+                    &mixer_done,
+                    &mixer_drain_now,
+                    Some(mixer_recording),
+                ) {
+                    tracing::error!(error = %e, "audio mixer loop stopped");
+                }
+            })
+            .context("spawning the audio mixer thread")?;
+
+        // The mic-only mixer thread, when the separate-track option is on.
+        let mic_audio_mixer = if let (Some(mic_mixer), Some(mic_buffer), Some(mic_drain)) = (
+            mic_mixer.clone(),
+            mic_audio_buffer.clone(),
+            mic_drain_now.clone(),
+        ) {
+            let mic_done = captures_done.clone();
+            let mic_recording = recording.clone();
+            Some(
+                std::thread::Builder::new()
+                    .name("rewynd-audio-mic-mixer".to_owned())
+                    .spawn(move || {
+                        if let Err(e) = run_audio_mixer(
+                            epoch,
+                            audio_params,
+                            mic_mixer,
+                            mic_buffer,
+                            &mic_done,
+                            &mic_drain,
+                            Some(mic_recording),
+                        ) {
+                            tracing::error!(error = %e, "mic audio mixer loop stopped");
+                        }
+                    })
+                    .context("spawning the mic audio mixer thread")?,
+            )
+        } else {
+            None
+        };
+
+        // Fill the video ring on its own thread: the SCK watchdog loop blocks, and the
+        // VT session lives (and tears down) there.
+        let capture_buffer = buffer.clone();
+        let capture_stop = stop.clone();
+        let capture_recording = recording.clone();
+        let capture_choice = encoder_choice.clone();
+        let capture_status = status.clone();
+        let capture = std::thread::Builder::new()
+            .name("rewynd-capture".to_owned())
+            .spawn(move || {
+                if let Err(e) = run_capture(
+                    params,
+                    epoch,
+                    &capture_buffer,
+                    &capture_stop,
+                    capture_recording,
+                    capture_choice,
+                    &capture_status,
+                ) {
+                    tracing::error!(error = %e, "capture loop stopped");
+                    capture_status.set_failed(format!("{e:#}"));
+                    toast(
+                        "Recording stopped",
+                        &format!(
+                            "The screen capture failed: {e:#}. Already-buffered footage can still be saved."
+                        ),
+                    );
+                }
+            })
+            .context("spawning the capture thread")?;
+
+        let flush_hook = crate::flush_hook::spawn(&saver, &stop)?;
+
+        // Every exit path funnels through this channel: tray Quit, SIGTERM/SIGINT (the
+        // settings restart sends SIGTERM via `stop_recorder`), and Ctrl+C.
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<MainCmd>();
+
+        // SIGTERM/SIGINT → shutdown; SIGUSR1 → save (the onboarding wizard's test-clip
+        // path, matching the Linux recorder). A plain thread with its own small runtime,
+        // because the main thread is about to become the AppKit pump.
+        {
+            let tx = cmd_tx.clone();
+            std::thread::Builder::new()
+                .name("rewynd-signals".to_owned())
+                .spawn(move || signal_loop(&tx))
+                .context("spawning the signal thread")?;
+        }
+
+        // The main thread becomes the tray + hotkey pump (NSStatusItem and the Carbon
+        // hotkey both require the main thread's event loop), then runs the same
+        // stop-flag-then-join shutdown as the other platforms.
+        run_main_pump(
+            mtm,
+            config.hotkey_trigger(),
+            &saver,
+            &cmd_tx,
+            &cmd_rx,
+            mic_enabled,
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = capture.join();
+        let _ = system_audio.join();
+        if let Some(h) = mic_audio {
+            let _ = h.join();
+        }
+        captures_done.store(true, Ordering::Relaxed);
+        let _ = audio_mixer.join();
+        if let Some(h) = mic_audio_mixer {
+            let _ = h.join();
+        }
+        if let Some(h) = flush_hook {
+            let _ = h.join();
+        }
+        // Drop the status file so the GUI shows "not recording" once we exit.
+        config::clear_recorder_status();
+        Ok(())
+    }
+
+    /// Wait for unix signals and translate them into main-pump commands.
+    fn signal_loop(tx: &std::sync::mpsc::Sender<MainCmd>) {
+        use tokio::signal::unix::{SignalKind, signal};
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            tracing::error!("could not build the signal runtime; signals are inert");
+            return;
+        };
+        runtime.block_on(async {
+            let (Ok(mut term), Ok(mut int), Ok(mut usr1)) = (
+                signal(SignalKind::terminate()),
+                signal(SignalKind::interrupt()),
+                signal(SignalKind::user_defined1()),
+            ) else {
+                tracing::error!("could not install the signal handlers; signals are inert");
+                return;
+            };
+            loop {
+                let cmd = tokio::select! {
+                    _ = term.recv() => MainCmd::Shutdown("SIGTERM"),
+                    _ = int.recv() => MainCmd::Shutdown("SIGINT"),
+                    _ = usr1.recv() => MainCmd::Save,
+                };
+                let done = matches!(cmd, MainCmd::Shutdown(_));
+                if tx.send(cmd).is_err() || done {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// The main thread's AppKit pump: the tray icon + menu, the Carbon global hotkey,
+    /// and the command channel, drained together (the macOS shape of the Windows
+    /// `PeekMessageW` loop). Returns when a quit/shutdown command arrives. A hotkey
+    /// that cannot be parsed or registered degrades to tray-only saving; a failed tray
+    /// degrades to hotkey-only.
+    fn run_main_pump(
+        mtm: MainThreadMarker,
+        trigger: &str,
+        saver: &Arc<ClipSaver>,
+        cmd_tx: &std::sync::mpsc::Sender<MainCmd>,
+        cmd_rx: &std::sync::mpsc::Receiver<MainCmd>,
+        mic_enabled: bool,
+    ) {
+        use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+
+        let app = NSApplication::sharedApplication(mtm);
+        // No Dock icon, no menu bar takeover: the recorder is a status-item app. An
+        // unbundled binary defaults to Regular, which would flash a Dock tile.
+        app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+        // The tray needs a launched app with a live event loop; `finishLaunching` plus
+        // our pump below is the manual (non-winit) way to provide one.
+        app.finishLaunching();
+
+        let save_item = MenuItem::new("Save clip now", true, None);
+        let mic_item = CheckMenuItem::new("Record microphone", true, mic_enabled, None);
+        let settings_item = MenuItem::new("Open settings", true, None);
+        let quit_item = MenuItem::new("Quit rewynd", true, None);
+        let menu = Menu::new();
+        let _tray = match menu
+            .append_items(&[
+                &save_item,
+                &mic_item,
+                &settings_item,
+                &PredefinedMenuItem::separator(),
+                &quit_item,
+            ])
+            .map_err(|e| e.to_string())
+            .and_then(|()| {
+                let mut builder = tray_icon::TrayIconBuilder::new()
+                    .with_menu(Box::new(menu))
+                    .with_tooltip("rewynd — instant replay");
+                if let Some(icon) = crate::tray_common::tray_brand_icon() {
+                    builder = builder.with_icon(icon);
+                }
+                builder.build().map_err(|e| e.to_string())
+            }) {
+            Ok(tray) => Some(tray),
+            Err(e) => {
+                tracing::warn!(error = %e, "tray unavailable; continuing without it");
+                None
+            }
+        };
+
+        // Carbon RegisterEventHotKey via global-hotkey: fires over fullscreen games and
+        // needs no accessibility permission. The manager unregisters on drop.
+        let mut hotkey_manager = None;
+        match parse_trigger(trigger) {
+            Some(hotkey) => match GlobalHotKeyManager::new() {
+                Ok(manager) => match manager.register(hotkey) {
+                    Ok(()) => {
+                        tracing::info!(trigger, "global hotkey ready; press it to save a clip");
+                        hotkey_manager = Some((manager, hotkey.id()));
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, trigger, "could not register the global hotkey (in use elsewhere?)");
+                        toast(
+                            "Hotkey unavailable",
+                            &format!("Could not register {trigger}: use the tray's Save clip now."),
+                        );
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, "could not create the hotkey manager");
+                    toast(
+                        "Hotkey unavailable",
+                        "Clips can still be saved from the tray menu (Save clip now).",
+                    );
+                }
+            },
+            None => {
+                tracing::error!(trigger, "could not parse the hotkey trigger; no hotkey");
+                toast(
+                    "Hotkey unavailable",
+                    &format!("The configured hotkey \"{trigger}\" could not be understood."),
+                );
+            }
+        }
+
+        // The badge currently on screen, owned by the pump (AppKit windows live on the
+        // main thread); closed when it expires, replaced by a newer save's badge.
+        let mut badge: Option<badge_macos::ActiveBadge> = None;
+
+        'pump: loop {
+            // One event per slice: with events pending this returns immediately, so a
+            // burst drains across quick iterations; idle, it blocks ≤ PUMP_SLICE while
+            // the run loop underneath still fires timers and dispatch-queue work.
+            let deadline = NSDate::dateWithTimeIntervalSinceNow(PUMP_SLICE);
+            let event = unsafe {
+                app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                    NSEventMask::Any,
+                    Some(&deadline),
+                    NSDefaultRunLoopMode,
+                    true,
+                )
+            };
+            if let Some(event) = event {
+                app.sendEvent(&event);
+            }
+
+            if badge
+                .as_ref()
+                .is_some_and(badge_macos::ActiveBadge::expired)
+                && let Some(expired) = badge.take()
+            {
+                expired.close();
+            }
+
+            while let Ok(event) = MenuEvent::receiver().try_recv() {
+                let id = event.id();
+                if id == save_item.id() {
+                    save_and_toast(saver, mtm, &mut badge);
+                } else if id == mic_item.id() {
+                    crate::tray_common::toggle_mic_and_restart(&toast);
+                } else if id == settings_item.id() {
+                    crate::tray_common::open_settings(&toast);
+                } else if id == quit_item.id() {
+                    tracing::info!("quit requested from the tray");
+                    let _ = cmd_tx.send(MainCmd::Shutdown("quit from the tray"));
+                }
+            }
+            if let Some((_, hotkey_id)) = &hotkey_manager {
+                while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+                    if event.id() == *hotkey_id && event.state() == HotKeyState::Pressed {
+                        tracing::info!("hotkey activated");
+                        save_and_toast(saver, mtm, &mut badge);
+                        // The blocking save queues any repeat presses made meanwhile;
+                        // drop them instead of replaying near-duplicate saves.
+                        while GlobalHotKeyEvent::receiver().try_recv().is_ok() {}
+                    }
+                }
+            }
+            while let Ok(cmd) = cmd_rx.try_recv() {
+                match cmd {
+                    MainCmd::Save => {
+                        tracing::info!("save requested via SIGUSR1");
+                        save_and_toast(saver, mtm, &mut badge);
+                    }
+                    MainCmd::Shutdown(reason) => {
+                        tracing::info!(reason, "shutting down");
+                        break 'pump;
+                    }
+                }
+            }
+        }
+        if let Some(active) = badge.take() {
+            active.close();
+        }
+        // `_tray` and the hotkey manager drop here, removing the icon + registration.
+    }
+
+    /// Build the VideoToolbox encoder for `choice`: hardware for `Gpu`, Apple's software
+    /// encoder for `Cpu`, with a hardware→software fallback if session creation fails
+    /// (the probe said it could, but init still failed).
+    fn build_encoder(
+        choice: &config::EncoderChoice,
+        params: EncodeParams,
+        status: &crate::status::StatusPublisher,
+    ) -> Result<VideoToolboxEncoder> {
+        match choice {
+            config::EncoderChoice::Gpu(_) => match VideoToolboxEncoder::new(params, true) {
+                Ok(enc) => Ok(enc),
+                Err(e) => {
+                    tracing::warn!(error = %e, "hardware VideoToolbox init failed; falling back to the software encoder");
+                    toast(
+                        "Recording (software encoder)",
+                        &format!(
+                            "The hardware encoder failed to start: {e}. Recording continues in software, which uses more processor power."
+                        ),
+                    );
+                    status.set_encoder(config::EncoderChoice::Cpu.label());
+                    Ok(VideoToolboxEncoder::new(params, false)?)
+                }
+            },
+            config::EncoderChoice::Cpu => Ok(VideoToolboxEncoder::new(params, false)?),
+        }
+    }
+
+    /// Pump captured frames into `buffer` until the stream ends. `recording` is the game
+    /// gate (kept current by the focus watcher): while false, frames are dropped before
+    /// the encoder so the desktop never enters the ring.
+    fn run_capture(
+        params: EncodeParams,
+        epoch: Instant,
+        buffer: &SharedBuffer,
+        stop: &Arc<AtomicBool>,
+        recording: Arc<AtomicBool>,
+        choice: config::EncoderChoice,
+        status: &crate::status::StatusPublisher,
+    ) -> Result<()> {
+        // Mutex like Windows: the per-frame callback runs on SCK's dispatch queue, so
+        // everything it captures must be Send.
+        let enc = Arc::new(Mutex::new(build_encoder(&choice, params, status)?));
+        tracing::info!("capture pipeline ready; filling the ring buffer");
+
+        // SCK scales server-side to the requested size and paces delivery to the
+        // requested rate — no converter and no GPU import on this platform.
+        let prefs = StreamPrefs {
+            width: params.width,
+            height: params.height,
+            framerate: params.framerate,
+        };
+        // A callback Break reads as a clean stop to the stream; record the real reason
+        // so it still surfaces as this function's Err.
+        let failure: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(None));
+        let on_frame = {
+            let enc = enc.clone();
+            let stop = stop.clone();
+            let buffer = buffer.clone();
+            let failure = failure.clone();
+            let mut frame_index: u64 = 0;
+            // Set while the gate is closed so the first frame of the next game starts a
+            // fresh, cuttable GOP instead of referencing pre-pause frames.
+            let mut resume_keyframe = false;
+            move |captured: CapturedPixelBuf| -> ControlFlow<()> {
+                if stop.load(Ordering::Relaxed) {
+                    return ControlFlow::Break(());
+                }
+                if !recording.load(Ordering::Relaxed) {
+                    resume_keyframe = true;
+                    return ControlFlow::Continue(());
+                }
+                // Force an IDR on the very first frame — and whenever the ring is empty
+                // (a game switch starts with cleared rings) — so the buffer always has
+                // an early keyframe to cut on. A panic must not unwind into the SCK
+                // dispatch callback (an FFI boundary) — catch it and stop cleanly.
+                let fresh_ring = lock_unpoisoned(&buffer).is_empty();
+                let force_keyframe = frame_index == 0 || resume_keyframe || fresh_ring;
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    lock_unpoisoned(&enc).encode_pixel_buf(
+                        &captured.pixel_buf,
+                        force_keyframe,
+                        captured.pts,
+                    )
+                }));
+                match outcome {
+                    Ok(Ok(Some(chunk))) => {
+                        lock_unpoisoned(&buffer).push(chunk);
+                        frame_index += 1;
+                        resume_keyframe = false;
+                        ControlFlow::Continue(())
+                    }
+                    // The encoder dropped this frame (VT signals it; rare in realtime
+                    // mode). Keep any pending keyframe request armed for the next frame.
+                    Ok(Ok(None)) => {
+                        resume_keyframe = force_keyframe;
+                        ControlFlow::Continue(())
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(error = %e, "frame failed; stopping capture");
+                        *lock_unpoisoned(&failure) = Some("a frame failed to encode");
+                        ControlFlow::Break(())
+                    }
+                    Err(_) => {
+                        tracing::error!("frame panicked; stopping capture");
+                        *lock_unpoisoned(&failure) = Some("the encode pipeline panicked");
+                        ControlFlow::Break(())
+                    }
+                }
+            }
+        };
+        rewynd_capture::macos::capture_stream(None, epoch, prefs, Some(stop.clone()), on_frame)?;
+
+        drop(enc);
+        let reason = *lock_unpoisoned(&failure);
+        match reason {
+            Some(reason) => Err(anyhow!("{reason} (see the log for details)")),
+            None => Ok(()),
+        }
+    }
+
+    /// Parse a `CTRL+ALT+R`-style trigger (the config's format, shared across platforms)
+    /// into a [`HotKey`]. Exactly one non-modifier key is required: a letter, a digit,
+    /// or `F1`–`F24`. Note macOS 15 rejects hotkeys whose only modifiers are
+    /// Shift/Option; the default (Ctrl+Alt) is fine.
+    fn parse_trigger(trigger: &str) -> Option<HotKey> {
+        let mut mods = Modifiers::empty();
+        let mut code = None;
+        for part in trigger.split('+') {
+            match part.trim().to_ascii_uppercase().as_str() {
+                "CTRL" | "CONTROL" => mods |= Modifiers::CONTROL,
+                "ALT" => mods |= Modifiers::ALT,
+                "SHIFT" => mods |= Modifiers::SHIFT,
+                "SUPER" | "META" | "WIN" | "LOGO" | "CMD" => mods |= Modifiers::META,
+                k => {
+                    if code.replace(parse_key(k)?).is_some() {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(HotKey::new(Some(mods), code?))
+    }
+
+    /// The key code for a single non-modifier key name (already uppercased), mapped
+    /// through the W3C code names `keyboard-types` parses.
+    fn parse_key(key: &str) -> Option<Code> {
+        let mut bytes = key.bytes();
+        if let (Some(c), None) = (bytes.next(), bytes.next()) {
+            if c.is_ascii_uppercase() {
+                return format!("Key{}", c as char).parse().ok();
+            }
+            if c.is_ascii_digit() {
+                return format!("Digit{}", c as char).parse().ok();
+            }
+            return None;
+        }
+        let n: u32 = key.strip_prefix('F')?.parse().ok()?;
+        (1..=24).contains(&n).then(|| key.parse().ok())?
+    }
+
+    /// Cut + mux a clip and confirm on every channel, mirroring the other platforms:
+    /// the chime plus the in-game badge (a screen-saver-level panel that lands over
+    /// fullscreen games), falling back to a desktop notification when the badge can't
+    /// show. A newer save's badge replaces one still on screen.
+    fn save_and_toast(
+        saver: &Arc<ClipSaver>,
+        mtm: MainThreadMarker,
+        badge: &mut Option<badge_macos::ActiveBadge>,
+    ) {
+        let saved = saver.save();
+        let (accent, title, body) = match &saved {
+            Ok(path) => (
+                chime::Accent::Success,
+                "Clip saved",
+                path.display().to_string(),
+            ),
+            Err(SaveError::Empty(reason)) => (
+                chime::Accent::Failure,
+                "Nothing to save yet",
+                reason.clone(),
+            ),
+            Err(e) => {
+                tracing::error!(error = %e, "clip save failed");
+                (
+                    chime::Accent::Failure,
+                    "Could not save the clip",
+                    e.to_string(),
+                )
+            }
+        };
+        chime::play(accent);
+        if let Some(old) = badge.take() {
+            old.close();
+        }
+        match badge_macos::show(mtm, accent, title) {
+            Some(active) => *badge = Some(active),
+            None => toast(title, &body),
+        }
+    }
+
+    /// Fire-and-forget desktop notification. Outside an .app bundle macOS attributes it
+    /// to the launching host (Terminal); the packaged build gets the real identity.
+    fn toast(title: &str, body: &str) {
+        let _ = notify_rust::Notification::new()
+            .summary(title)
+            .body(body)
+            .appname("rewynd")
+            .show();
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn triggers_parse_to_modifiers_and_keys() {
+            let hk = parse_trigger("CTRL+ALT+R").expect("parses");
+            assert_eq!(
+                hk,
+                HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyR)
+            );
+
+            let hk = parse_trigger(" shift + win + f12 ").expect("parses");
+            assert_eq!(
+                hk,
+                HotKey::new(Some(Modifiers::SHIFT | Modifiers::META), Code::F12)
+            );
+
+            let hk = parse_trigger("CTRL+9").expect("parses");
+            assert_eq!(hk, HotKey::new(Some(Modifiers::CONTROL), Code::Digit9));
+        }
+
+        #[test]
+        fn bad_triggers_are_rejected() {
+            assert!(parse_trigger("").is_none(), "no key");
+            assert!(parse_trigger("CTRL+ALT").is_none(), "modifiers only");
+            assert!(parse_trigger("CTRL+R+S").is_none(), "two keys");
+            assert!(parse_trigger("CTRL+F25").is_none(), "F-key out of range");
+            assert!(parse_trigger("CTRL+ESC?").is_none(), "unsupported key name");
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn main() {
-    println!("rewynd currently runs on Linux and Windows only");
+    println!("rewynd currently runs on Linux, Windows and macOS only");
 }

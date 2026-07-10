@@ -9,7 +9,7 @@
 
 ## 1. Mission
 
-**Rewynd** is a lightweight, native, cross-platform (**Linux + Windows**, macOS explicitly out of scope) "instant replay" clip recorder for gameplay. It continuously keeps a **configurable replay window** (default 30 s, up to 120 s) of the screen in a GPU-encoded ring buffer; on a hotkey it flushes that buffer to an MP4. The whole point is **low resource usage** — it must be comfortable to run while gaming on lower-end PCs, which means the frame stays on the GPU from capture through hardware encode (zero-copy), never round-tripping through the CPU.
+**Rewynd** is a lightweight, native, cross-platform (**Linux + Windows**; macOS was explicitly out of scope for v1 and was added later for Apple Silicon via ADR 0015) "instant replay" clip recorder for gameplay. It continuously keeps a **configurable replay window** (default 30 s, up to 120 s) of the screen in a GPU-encoded ring buffer; on a hotkey it flushes that buffer to an MP4. The whole point is **low resource usage** — it must be comfortable to run while gaming on lower-end PCs, which means the frame stays on the GPU from capture through hardware encode (zero-copy), never round-tripping through the CPU.
 
 It is **general-purpose first**: it produces standalone video files and is not tied to any platform. Integration with **ganked.tv** (the author's clip-sharing platform) — auto-upload triggered from the UI — is a planned *later* feature, not a dependency and not part of the core identity. Build the general-purpose recorder first; add the ganked.tv connection afterward.
 
@@ -31,7 +31,7 @@ It is **general-purpose first**: it produces standalone video files and is not t
 - Windows parity, audio + A/V sync, configurable buffer length / hotkey / output dir, a minimal tray/overlay, optional ganked.tv upload.
 
 ### Non-goals (do **not** build these unless explicitly told)
-- macOS / Apple Silicon support. (Rationale in §3.) Treat as "maybe someday, separate backend."
+- ~~macOS / Apple Silicon support~~ — was a v1 non-goal; the "maybe someday, separate backend" shipped later as exactly that: ScreenCaptureKit + VideoToolbox, Apple Silicon only, no wgpu/gpu-video. See ADR 0015 and the §3.6 note.
 - A full OBS-style compositor (multiple sources, scenes, overlays mixing). We capture **one** source and encode it.
 - Streaming/RTMP, editing UI, cloud features beyond a single upload call.
 - CPU/software encoding paths as a primary mode.
@@ -67,9 +67,12 @@ We are on wgpu, **not** raw `ash`, because our encode library rides on wgpu. Bon
 There is no single cross-platform capture API. Capture is the one genuinely per-platform layer.
 - **Linux (Wayland, the author's primary platform):** XDG screencast portal via **`ashpd`** to negotiate the session + **`pipewire`** (pipewire-rs) to receive the stream as a **DMA-BUF** (DRM PRIME) fd — not memmapped CPU pixels.
 - **Windows:** Windows Graphics Capture (WGC) / DXGI Desktop Duplication → a D3D11 texture (shared NT handle). Use the `windows-capture` crate or raw `windows` (windows-rs).
+- **macOS (Apple Silicon, added post-v1 — ADR 0015):** ScreenCaptureKit `SCStream` → NV12 IOSurface-backed `CVPixelBuffer`, fed straight to VideoToolbox. No wgpu import on this platform — the frame never becomes a `wgpu::Texture`.
 
 ### 3.6 macOS is out of scope — and why "Metal has ray tracing now" does **not** change that
 Apple has hardware ray tracing (M3+), but RT is a *rendering* feature, independent of video encode. The relevant fact: **Vulkan Video is still not available on Apple** (MoltenVK does not expose the video-encode extensions; the request has been open since 2021), and `gpu-video` itself targets only Linux + Windows. So an Apple port would mean a **separate VideoToolbox backend**, not our `gpu-video`/Vulkan path. Out of scope for v1.
+
+> **Superseded (2026-07):** that separate VideoToolbox backend now exists — ScreenCaptureKit → VideoToolbox, Apple Silicon only, bypassing wgpu/`gpu-video` entirely. See **ADR 0015**. The rationale above stands unchanged: it is *why* the macOS path had to be a separate backend rather than the Vulkan pipeline.
 
 ### 3.7 Licensing — cleared, with one ongoing obligation
 - **rewynd's own license: `GPL-3.0-or-later`** (decided — the repo ships under GPLv3; set in the root `LICENSE` and every crate's `license` field). This is sound because **every dependency at its currently pinned revision is GPLv3-compatible**: `gpu-video` (MIT), `wgpu`/`ash`/`naga`/etc. (MIT/Apache-2.0) all incorporate cleanly into a GPLv3 work — re-verify this whenever a dependency is added or bumped, since the guarantee is only as current as the pins. The flip side is a constraint *going forward*: anything we link must be GPLv3-compatible (MIT and Apache-2.0 are — note Apache-2.0 is compatible with GPLv3 but **not** GPLv2).

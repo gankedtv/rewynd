@@ -9,11 +9,22 @@ authors.workspace = true
 publish = false
 
 [dependencies]
-wgpu.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 # Maps a running Steam appid to the installed game's human name (per-game clip folders).
 steamlocate = "2.1"
+
+# The frame descriptors' `texture_format()` accessors map platform formats onto wgpu's.
+# Only the Linux/Windows backends feed a wgpu import; macOS frames go straight to
+# VideoToolbox (docs/adr/0015), so it stays off that target's dependency graph.
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+wgpu.workspace = true
+
+# macOS capture (docs/adr/0015): ScreenCaptureKit video + audio, IOSurface-backed
+# NV12 CVPixelBuffers straight into the VideoToolbox encoder.
+[target.'cfg(target_os = "macos")'.dependencies]
+cidre.workspace = true
+pollster.workspace = true
 
 # Linux capture (PLAN §3.5): XDG ScreenCast portal + PipeWire. Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]
