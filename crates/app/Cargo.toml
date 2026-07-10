@@ -78,6 +78,25 @@ windows = { workspace = true, features = [
     "UI_Notifications",
 ] }
 
+# macOS wiring (docs/adr/0015): ScreenCaptureKit capture + VideoToolbox encode, with the
+# tray + hotkey on the main thread's AppKit event pump (an NSStatusItem and Carbon
+# RegisterEventHotKey both require it). objc2-app-kit drives that pump — it is already in
+# tray-icon's own macOS dependency tree, so this adds no new build cost — and
+# objc2-foundation holds the NSProcessInfo activity that keeps App Nap off the recorder.
+[target.'cfg(target_os = "macos")'.dependencies]
+rewynd-capture.workspace = true
+rewynd-clip.workspace = true
+# macros drives the select!-based signal loop, mirroring the Linux hotkey loop.
+tokio = { workspace = true, features = ["macros", "signal"] }
+notify-rust = "4"
+tray-icon = "0.24"
+global-hotkey = "0.8"
+image.workspace = true
+rodio = { version = "0.22.2", default-features = false, features = ["playback"] }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSEvent", "NSRunningApplication"] }
+objc2-foundation = "0.3"
+
 # Embeds packaging/rewynd.ico as the exe icon (taskbar / Start / Explorer). Host-gated to
 # Windows, so Linux CI never compiles it; Windows release exes are built on a Windows runner.
 [target.'cfg(windows)'.build-dependencies]

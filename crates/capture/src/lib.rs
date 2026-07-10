@@ -10,6 +10,8 @@
 //! - [`windows`]: Windows Graphics Capture → shareable D3D11 textures, delivering an
 //!   NT shared handle per frame ([`windows::capture_stream`]) for the Vulkan
 //!   external-memory import.
+//! - [`macos`]: ScreenCaptureKit → IOSurface-backed NV12 `CVPixelBuffer`s
+//!   ([`macos::capture_stream`]), handed straight to the VideoToolbox encoder.
 
 use thiserror::Error;
 
@@ -17,6 +19,9 @@ pub mod game;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
+
+#[cfg(target_os = "macos")]
+pub mod macos;
 
 #[cfg(target_os = "windows")]
 pub mod windows;
@@ -87,6 +92,9 @@ pub enum CaptureError {
     /// A WASAPI audio-capture error.
     #[error("wasapi error: {0}")]
     Wasapi(String),
+    /// A ScreenCaptureKit error (video, system-audio, or microphone stream).
+    #[error("screencapturekit error: {0}")]
+    Sck(String),
 }
 
 #[cfg(test)]
@@ -122,6 +130,10 @@ mod tests {
         assert_eq!(
             CaptureError::Wasapi("no endpoint".to_owned()).to_string(),
             "wasapi error: no endpoint"
+        );
+        assert_eq!(
+            CaptureError::Sck("stream stopped".to_owned()).to_string(),
+            "screencapturekit error: stream stopped"
         );
     }
 }

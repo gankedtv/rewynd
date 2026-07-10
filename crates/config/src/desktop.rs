@@ -1,6 +1,6 @@
-//! Desktop integration: the login autostart (an XDG `.desktop` entry on Linux, an HKCU
-//! Run-key value on Windows), the Linux launcher entry (app-id registration), and the
-//! brand icons.
+//! Desktop integration: the login autostart (an XDG `.desktop` entry on Linux, a launchd
+//! LaunchAgent on macOS, an HKCU Run-key value on Windows), the Linux launcher entry
+//! (app-id registration), and the brand icons.
 
 #[cfg(any(unix, windows))]
 use std::path::Path;
@@ -8,7 +8,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::paths::APP_ID;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use crate::paths::{config_home_from, data_home_from};
 
 /// The brand mark's PNG renders as `(pixel_size, png_bytes)`, smallest first — the one owner
@@ -29,7 +29,7 @@ pub const BRAND_ICONS: &[(u32, &[u8])] = &[
 /// backslashes, and a path with spaces is simply quoted. ASCII control characters cannot be
 /// represented (a newline would smuggle extra entry lines) and never occur in a legitimate
 /// binary path, so they are stripped with a warning.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[must_use]
 pub fn desktop_exec_value(path: &str) -> String {
     if path.chars().any(|c| c.is_ascii_control()) {
@@ -50,7 +50,7 @@ pub fn desktop_exec_value(path: &str) -> String {
 /// A minimal `[Desktop Entry]` body for `exec`, with `extra` key-lines appended — the shared
 /// core of the launcher entry (app id registration) and the login autostart entry. `Icon` is
 /// the app id, resolved through the icon theme (see [`install_icons`]).
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[must_use]
 pub fn desktop_entry(exec: &Path, extra: &str) -> String {
     format!(
@@ -68,7 +68,7 @@ pub fn desktop_entry(exec: &Path, extra: &str) -> String {
 
 /// Path of rewynd's XDG autostart entry (`<config-home>/autostart/<APP_ID>.desktop`), or `None`
 /// if the environment can't resolve one.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[must_use]
 pub fn autostart_path() -> Option<PathBuf> {
     config_home_from(|k| std::env::var_os(k))
@@ -92,7 +92,7 @@ fn write_file_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 
 /// Install (or refresh) the autostart entry at `path`, launching `exec` at login. The testable
 /// core of [`install_autostart`].
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn install_autostart_at(path: &Path, exec: &Path) -> std::io::Result<()> {
     write_file_atomic(
         path,
@@ -110,7 +110,7 @@ fn remove_autostart_at(path: &Path) -> std::io::Result<()> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn autostart_path_or_err() -> std::io::Result<PathBuf> {
     autostart_path().ok_or_else(|| {
         std::io::Error::new(
@@ -121,13 +121,13 @@ fn autostart_path_or_err() -> std::io::Result<PathBuf> {
 }
 
 /// Install (or refresh) the login autostart entry, launching `exec` at login.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub fn install_autostart(exec: &Path) -> std::io::Result<()> {
     install_autostart_at(&autostart_path_or_err()?, exec)
 }
 
 /// Remove the login autostart entry (absent is fine).
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub fn remove_autostart() -> std::io::Result<()> {
     remove_autostart_at(&autostart_path_or_err()?)
 }
@@ -136,7 +136,7 @@ pub fn remove_autostart() -> std::io::Result<()> {
 /// id, so trays/notifications resolve rewynd's name and icon — unless one already exists:
 /// packaged installs ship the entry, and a package-managed file must stay untouched. Returns the
 /// entry path either way.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub fn install_launcher_entry(exec: &Path) -> std::io::Result<PathBuf> {
     // In an AppImage the launcher must point at the image itself ($APPIMAGE), not the ephemeral
     // mount path in `exec` (stale once the image unmounts). The AppImage's mainExe is the GUI,
@@ -159,7 +159,7 @@ pub fn install_launcher_entry(exec: &Path) -> std::io::Result<PathBuf> {
 /// space around `=`, optional `[locale]` suffix. Used as the ownership heuristic below — every
 /// entry we write (and any real packaged one) has an icon, so a missing key marks one of our
 /// own pre-icon self-installs.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn has_icon_key(entry: &str) -> bool {
     entry.lines().any(|line| {
         let Some(rest) = line.trim_start().strip_prefix("Icon") else {
@@ -179,7 +179,7 @@ fn has_icon_key(entry: &str) -> bool {
 /// Refresh `path` with a fresh entry unless the existing one carries an Icon key (then it is
 /// packaged or user-managed and must stay untouched). Unreadable-as-text entries are treated
 /// as foreign and also left alone.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn refresh_iconless_entry_at(path: &Path, entry: &str) -> std::io::Result<()> {
     match std::fs::read_to_string(path) {
         Ok(existing) if has_icon_key(&existing) => return Ok(()),
@@ -192,7 +192,7 @@ fn refresh_iconless_entry_at(path: &Path, entry: &str) -> std::io::Result<()> {
 }
 
 /// The testable core of [`install_launcher_entry`].
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn install_launcher_entry_at(path: &Path, exec: &Path) -> std::io::Result<()> {
     refresh_iconless_entry_at(
         path,
@@ -203,7 +203,7 @@ fn install_launcher_entry_at(path: &Path, exec: &Path) -> std::io::Result<()> {
 /// Bring a pre-icon autostart entry up to date so it gains the `Icon=` key. Only an existing,
 /// icon-less entry is rewritten: a missing one means start-on-boot is off (this must not turn
 /// it on), and one with an icon may be user-managed.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub fn refresh_autostart(exec: &Path) -> std::io::Result<()> {
     refresh_autostart_at(&autostart_path_or_err()?, exec)
 }
@@ -212,12 +212,12 @@ pub fn refresh_autostart(exec: &Path) -> std::io::Result<()> {
 /// the GUI's name) and the GUI `rewynd-settings`. An autostart entry still launching one of these
 /// is a pre-rename entry of ours and is repointed at the current recorder — otherwise, because the
 /// old recorder name is now the GUI, boot would open the library window instead of recording.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 const RENAMED_BINARIES: &[&str] = &["rewynd", "rewynd-settings"];
 
 /// The binary basename in a desktop entry's `Exec` line, best-effort (the Exec is a quoted path;
 /// pathological paths with embedded quotes just yield a wrong basename, which is harmless here).
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn entry_exec_basename(entry: &str) -> Option<String> {
     let value = entry
         .lines()
@@ -230,7 +230,7 @@ fn entry_exec_basename(entry: &str) -> Option<String> {
 }
 
 /// The testable core of [`refresh_autostart`].
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn refresh_autostart_at(path: &Path, exec: &Path) -> std::io::Result<()> {
     if !path.exists() {
         return Ok(());
@@ -258,7 +258,7 @@ fn refresh_autostart_at(path: &Path, exec: &Path) -> std::io::Result<()> {
 /// `Icon=` name in our entries, the taskbar icon for our app id, and notification icons.
 /// Unlike the launcher entry a stale icon is refreshed: packaged icons live under
 /// `/usr/share/icons`, never in the user's data home, so nothing package-managed is at risk.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub fn install_icons() -> std::io::Result<()> {
     let hicolor = data_home_from(|k| std::env::var_os(k))
         .map(|home| home.join("icons").join("hicolor"))
@@ -273,7 +273,7 @@ pub fn install_icons() -> std::io::Result<()> {
 
 /// The testable core of [`install_icons`]. Writes only what differs — the common case (every
 /// start after the first install) touches nothing.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn install_icons_at(hicolor: &Path, icons: &[(u32, &[u8])]) -> std::io::Result<()> {
     let mut changed = false;
     for (size, png) in icons {
@@ -293,6 +293,127 @@ fn install_icons_at(hicolor: &Path, icons: &[(u32, &[u8])]) -> std::io::Result<(
         let _ = std::fs::File::open(hicolor)
             .and_then(|dir| dir.set_modified(std::time::SystemTime::now()));
     }
+    Ok(())
+}
+
+// macOS autostart: a launchd LaunchAgent plist under ~/Library/LaunchAgents. RunAtLoad
+// launches the recorder at login; KeepAlive stays off so quitting from the tray sticks.
+
+/// Path of rewynd's LaunchAgent plist (`~/Library/LaunchAgents/<APP_ID>.plist`), or `None`
+/// if `HOME` is unusable.
+#[cfg(target_os = "macos")]
+#[must_use]
+fn launch_agent_path() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .map(|home| {
+            home.join("Library")
+                .join("LaunchAgents")
+                .join(format!("{APP_ID}.plist"))
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn launch_agent_path_or_err() -> std::io::Result<PathBuf> {
+    launch_agent_path()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"))
+}
+
+/// Escape the XML-reserved characters that can occur in a filesystem path (`&`, `<`, `>`), so
+/// the path can't break out of its `<string>` element.
+#[cfg(target_os = "macos")]
+fn xml_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+/// The LaunchAgent plist launching `exec` at login.
+#[cfg(target_os = "macos")]
+#[must_use]
+fn launch_agent_plist(exec: &Path) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>{APP_ID}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{}</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<false/>
+</dict>
+</plist>
+"#,
+        xml_escape(&exec.to_string_lossy()),
+    )
+}
+
+/// Install (or refresh) the LaunchAgent at `path`, launching `exec` at login. The testable
+/// core of [`install_autostart`].
+#[cfg(target_os = "macos")]
+fn install_autostart_at(path: &Path, exec: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    write_file_atomic(path, launch_agent_plist(exec).as_bytes())?;
+    // launchd refuses group/world-writable agent plists.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+}
+
+/// The testable core of [`refresh_autostart`]: rewrite an existing agent whose plist is stale
+/// (e.g. the exec path moved with an update). A missing one means start-on-login is off and
+/// must stay off; an unreadable one is ours (our label, our filename) and is rewritten.
+#[cfg(target_os = "macos")]
+fn refresh_autostart_at(path: &Path, exec: &Path) -> std::io::Result<()> {
+    match std::fs::read_to_string(path) {
+        Ok(existing) if existing == launch_agent_plist(exec) => Ok(()),
+        Ok(_) => install_autostart_at(path, exec),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => install_autostart_at(path, exec),
+        Err(e) => Err(e),
+    }
+}
+
+/// Install (or refresh) the login LaunchAgent, launching `exec` at login.
+#[cfg(target_os = "macos")]
+pub fn install_autostart(exec: &Path) -> std::io::Result<()> {
+    install_autostart_at(&launch_agent_path_or_err()?, exec)
+}
+
+/// Remove the login LaunchAgent (absent is fine).
+#[cfg(target_os = "macos")]
+pub fn remove_autostart() -> std::io::Result<()> {
+    remove_autostart_at(&launch_agent_path_or_err()?)
+}
+
+/// Repoint an existing LaunchAgent at the current binary (e.g. after the install moved).
+/// A missing agent means start-on-login is off; this must not turn it on.
+#[cfg(target_os = "macos")]
+pub fn refresh_autostart(exec: &Path) -> std::io::Result<()> {
+    refresh_autostart_at(&launch_agent_path_or_err()?, exec)
+}
+
+/// No launcher entry on macOS: the `.app` bundle owns the app's identity.
+#[cfg(target_os = "macos")]
+pub fn install_launcher_entry(_exec: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// No icon install on macOS: the `.app` bundle owns the app's icons.
+#[cfg(target_os = "macos")]
+pub fn install_icons() -> std::io::Result<()> {
     Ok(())
 }
 
@@ -486,7 +607,7 @@ pub fn attach_parent_console() {
 pub fn attach_parent_console() {}
 
 // No autostart mechanism on other targets; the settings toggle surfaces the error.
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn install_autostart(_exec: &Path) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -494,12 +615,12 @@ pub fn install_autostart(_exec: &Path) -> std::io::Result<()> {
     ))
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn remove_autostart() -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn refresh_autostart(_exec: &Path) -> std::io::Result<()> {
     Ok(())
 }
@@ -588,7 +709,75 @@ mod windows_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+
+    #[test]
+    fn plist_carries_label_exec_and_launch_keys() {
+        let plist = launch_agent_plist(Path::new("/opt/rewynd/rewynd-recorder"));
+        assert!(plist.starts_with(r#"<?xml version="1.0" encoding="UTF-8"?>"#));
+        assert!(plist.contains(&format!("<string>{APP_ID}</string>")));
+        assert!(plist.contains("<string>/opt/rewynd/rewynd-recorder</string>"));
+        assert!(plist.contains("<key>RunAtLoad</key>\n\t<true/>"));
+        assert!(plist.contains("<key>KeepAlive</key>\n\t<false/>"));
+    }
+
+    #[test]
+    fn plist_escapes_xml_reserved_path_characters() {
+        let plist = launch_agent_plist(Path::new("/apps/a&b <c>/rewynd-recorder"));
+        assert!(plist.contains("<string>/apps/a&amp;b &lt;c&gt;/rewynd-recorder</string>"));
+        assert_eq!(xml_escape("plain/path"), "plain/path");
+        assert_eq!(xml_escape("&&"), "&amp;&amp;");
+    }
+
+    #[test]
+    fn autostart_install_refresh_and_remove() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("LaunchAgents").join("rewynd.plist");
+
+        install_autostart_at(&path, Path::new("/opt/rewynd/rewynd-recorder")).expect("install");
+        let agent = std::fs::read_to_string(&path).expect("read agent");
+        assert_eq!(
+            agent,
+            launch_agent_plist(Path::new("/opt/rewynd/rewynd-recorder"))
+        );
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o644,
+            "launchd wants a non-group-writable plist"
+        );
+
+        // A stale exec path (the install moved) is refreshed in place; a current one is not
+        // rewritten.
+        refresh_autostart_at(&path, Path::new("/new/rewynd-recorder")).expect("refresh");
+        let refreshed = std::fs::read_to_string(&path).expect("read refreshed");
+        assert!(refreshed.contains("<string>/new/rewynd-recorder</string>"));
+        refresh_autostart_at(&path, Path::new("/new/rewynd-recorder")).expect("idempotent");
+
+        remove_autostart_at(&path).expect("remove");
+        assert!(!path.exists(), "disabling removes the agent");
+        remove_autostart_at(&path).expect("idempotent remove");
+    }
+
+    #[test]
+    fn autostart_refresh_never_creates_a_missing_agent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("LaunchAgents").join("rewynd.plist");
+        refresh_autostart_at(&path, Path::new("/opt/rewynd/rewynd-recorder")).expect("absent ok");
+        assert!(!path.exists(), "start-on-login stays off");
+    }
+
+    #[test]
+    fn launcher_and_icon_installs_are_no_ops() {
+        install_launcher_entry(Path::new("/opt/rewynd/rewynd")).expect("no-op");
+        install_icons().expect("no-op");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
@@ -710,7 +899,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).expect("read"), managed);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn autostart_refresh_migrates_the_pre_rename_recorder_binary() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -734,7 +923,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).expect("read"), migrated);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn entry_exec_basename_reads_the_quoted_exec_path() {
         let entry = desktop_entry(Path::new("/opt/rewynd/rewynd-recorder"), "");
@@ -751,7 +940,7 @@ mod tests {
 
     // The mtime pinning below opens the theme *directory* as a file, which Windows
     // refuses (and hicolor icon installs are a Linux desktop concern anyway).
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn icons_install_into_hicolor_skip_unchanged_and_refresh() {
         let dir = tempfile::tempdir().expect("tempdir");

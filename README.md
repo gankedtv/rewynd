@@ -14,7 +14,8 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/gankedtv/rewynd" alt="License"></a>
 </p>
 
-rewynd is a lightweight, native clip recorder for **Linux and Windows**. It continuously
+rewynd is a lightweight, native clip recorder for **Linux and Windows**, plus
+**macOS (Apple Silicon, beta — build from source for now)**. It continuously
 keeps the last 60 seconds (configurable) of the screen in a GPU-encoded ring buffer; on a hotkey it
 flushes that buffer to an MP4. The frame stays on the GPU from capture through hardware
 H.264 encode (zero-copy), so it is light enough to run while gaming.
@@ -57,7 +58,7 @@ The app checks for updates on launch; one click updates both binaries in place.
 
 | Crate | Role |
 | --- | --- |
-| [`rewynd-capture`](crates/capture) | `FrameSource` trait + per-platform GPU-resident capture (Linux: portal + PipeWire into DMABUF; Windows: WGC/DXGI into D3D11). |
+| [`rewynd-capture`](crates/capture) | `FrameSource` trait + per-platform GPU-resident capture (Linux: portal + PipeWire into DMABUF; Windows: WGC/DXGI into D3D11; macOS: ScreenCaptureKit into IOSurface). |
 | [`rewynd-gpu`](crates/gpu) | Shared `wgpu` device/queue and the capture-import interop helpers. |
 | [`rewynd-encode`](crates/encode) | Thin wrapper over `gpu-video` (NV12 `wgpu::Texture` to H.264) + RGBA-to-NV12 conversion. |
 | [`rewynd-buffer`](crates/buffer) | Keyframe-aware ring buffer; the pure-Rust core, no GPU dependency. |
@@ -71,7 +72,9 @@ The app checks for updates on launch; one click updates both binaries in place.
 Requires a recent stable Rust (edition 2024) and a C++ compiler (for `vk-mem`). On
 Linux the capture crate additionally needs PipeWire dev headers and libclang (for
 `pipewire-sys`/`libspa-sys` bindgen): on Debian/Ubuntu, `pkg-config
-libpipewire-0.3-dev clang libclang-dev`.
+libpipewire-0.3-dev clang libclang-dev`. On macOS (Apple Silicon, macOS 15+) the
+Xcode Command Line Tools and `cmake` (bundled libopus) are the only extras — capture
+and encode use the system ScreenCaptureKit/VideoToolbox frameworks.
 
 ```sh
 cargo build

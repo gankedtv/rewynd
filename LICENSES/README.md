@@ -9,6 +9,7 @@ this directory is sufficient).
 | Dependency | License | Notice |
 | --- | --- | --- |
 | [`gpu-video`](https://github.com/software-mansion/smelter) (Software Mansion) | MIT | [gpu-video-MIT.txt](gpu-video-MIT.txt) |
+| [`cidre`](https://github.com/yury/cidre) (Yury Korolev; macOS ScreenCaptureKit/VideoToolbox bindings) | MIT | [upstream LICENSE.txt](https://github.com/yury/cidre/blob/main/LICENSE.txt) |
 | [Barlow Condensed](https://github.com/jpt/barlow) (embedded font, settings app) | OFL-1.1 | [crates/settings/assets/fonts/OFL-BarlowCondensed.txt](../crates/settings/assets/fonts/OFL-BarlowCondensed.txt) |
 | [Inter](https://github.com/rsms/inter) (embedded font, settings app) | OFL-1.1 | [crates/settings/assets/fonts/OFL-Inter.txt](../crates/settings/assets/fonts/OFL-Inter.txt) |
 

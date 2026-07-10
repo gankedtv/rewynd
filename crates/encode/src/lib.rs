@@ -87,6 +87,17 @@ pub use gpu_video_backend::{GpuVideoEncoder, Nv12Converter};
 mod software;
 pub use software::{I420Frame, SoftwareEncoder};
 
+// AVCC → Annex-B byte helpers — pure byte logic, platform-agnostic and CI-tested,
+// though today only the VideoToolbox backend consumes them.
+pub mod annexb;
+
+// The VideoToolbox H.264 backend takes CoreVideo pixel buffers straight from
+// ScreenCaptureKit, so it lives outside the wgpu-texture `Encoder` trait.
+#[cfg(target_os = "macos")]
+mod videotoolbox;
+#[cfg(target_os = "macos")]
+pub use videotoolbox::{VideoToolboxEncoder, hardware_h264_available};
+
 // The NV12 texture -> I420 readback adapter that feeds the CPU encoder. Needs a wgpu device,
 // so it only exists where the GPU stack builds.
 #[cfg(vulkan)]

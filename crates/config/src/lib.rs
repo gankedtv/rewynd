@@ -44,12 +44,14 @@ pub use devices::{AudioInput, list_audio_inputs};
 pub use encoders::{
     ENCODER_PROBE_VERSION, EncoderChoice, EncoderProbe, ProbeAdapter, choose_encoder,
 };
-// XDG desktop entries / hicolor icons exist only on unix desktops; Windows autostart is
-// a Run-key value behind the same install/remove/refresh surface above.
-#[cfg(unix)]
-pub use desktop::{
-    autostart_path, desktop_entry, desktop_exec_value, install_icons, install_launcher_entry,
-};
+// XDG desktop entries exist only on Linux desktops; Windows autostart is a Run-key value and
+// macOS autostart a LaunchAgent plist, all behind the same install/remove/refresh surface above.
+#[cfg(target_os = "linux")]
+pub use desktop::{autostart_path, desktop_entry, desktop_exec_value};
+// The launcher/icon installers run at both recorder and GUI startup; on macOS they are no-ops
+// (the .app bundle owns the app's identity and icons).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use desktop::{install_icons, install_launcher_entry};
 pub use lock::{InstanceLock, acquire_recorder_lock, acquire_settings_lock};
 pub use paths::{
     APP_ID, config_path, default_output_dir, recorder_pid_path, settings_lock_path, sibling_binary,

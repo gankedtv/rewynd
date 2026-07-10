@@ -21,9 +21,14 @@ opus.workspace = true
 openh264.workspace = true
 
 # gpu-video only builds where Vulkan exists (Windows + non-Apple unixes), matching the
-# crate's own target gating. macOS is out of scope (PLAN §3.6).
+# crate's own target gating.
 [target.'cfg(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "emscripten"))))'.dependencies]
 gpu-video.workspace = true
+
+# VideoToolbox H.264 backend (docs/adr/0015).
+[target.'cfg(target_os = "macos")'.dependencies]
+cidre.workspace = true
+tracing.workspace = true
 
 [build-dependencies]
 cfg_aliases = "0.2.1"

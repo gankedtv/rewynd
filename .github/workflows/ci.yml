@@ -77,6 +77,35 @@ jobs:
       - name: test
         run: cargo test --workspace --locked
 
+  macos:
+    name: macos · clippy · build · test
+    runs-on: macos-latest # Apple Silicon — the only macOS target we ship (ADR 0015)
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      # No system deps here: the capture/encode path binds preinstalled system frameworks
+      # (ScreenCaptureKit/VideoToolbox via cidre), and cmake for audiopus_sys' bundled
+      # libopus ships on the runner. rustfmt runs on the Linux job.
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: build
+        run: cargo build --workspace --all-targets --locked
+
+      - name: test
+        run: cargo test --workspace --locked
+
   deny:
     name: advisories · licenses · sources
     runs-on: ubuntu-latest
@@ -110,10 +139,11 @@ jobs:
           tool: cargo-llvm-cov
 
       # Gates 85% line coverage on CI-testable code only. GPU/portal code needs a
-      # GPU/live Wayland session CI does not have, so it is excluded here and covered
-      # by #[ignore]d tests on the dev box (see CLAUDE.md → Coverage).
+      # GPU/live Wayland session, and the macOS capture/encode path needs live
+      # ScreenCaptureKit/VideoToolbox — neither exists in CI, so those are excluded
+      # here and covered by #[ignore]d tests on the dev boxes (see CLAUDE.md → Coverage).
       - name: coverage gate
         run: |
           cargo llvm-cov --workspace --locked \
-            --ignore-filename-regex '(capture/src/linux/|gpu/src/|encode/src/(gpu_video_backend|software_texture)\.rs|app/src/|settings/src/|vendor/mp4/)' \
+            --ignore-filename-regex '(capture/src/(linux|macos)/|gpu/src/|encode/src/(gpu_video_backend|software_texture|videotoolbox)\.rs|app/src/|settings/src/|vendor/mp4/)' \
             --fail-under-lines 85 --summary-only
