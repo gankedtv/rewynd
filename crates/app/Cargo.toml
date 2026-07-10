@@ -94,7 +94,27 @@ global-hotkey = "0.8"
 image.workspace = true
 rodio = { version = "0.22.2", default-features = false, features = ["playback"] }
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSEvent", "NSRunningApplication"] }
+# NSApplication/NSEvent drive the main-thread pump; the NSWindow/NSBox/NSTextField…
+# set builds the in-game save badge (a screen-saver-level panel over fullscreen games).
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSEvent",
+    "NSRunningApplication",
+    "NSResponder",
+    "NSWindow",
+    "NSView",
+    "NSControl",
+    "NSTextField",
+    "NSText",
+    "NSBox",
+    "NSColor",
+    "NSFont",
+    "NSGraphics",
+    "NSImage",
+    "NSImageView",
+    "NSScreen",
+    "objc2-core-foundation",
+] }
 objc2-foundation = "0.3"
 
 # Embeds packaging/rewynd.ico as the exe icon (taskbar / Start / Explorer). Host-gated to

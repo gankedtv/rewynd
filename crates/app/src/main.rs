@@ -21,6 +21,12 @@
 #[cfg(target_os = "linux")]
 mod badge;
 
+/// The macOS in-game save badge (an AppKit panel over fullscreen games); named apart
+/// from the Linux `badge` module because the file name must differ.
+#[cfg(target_os = "macos")]
+#[path = "badge_macos.rs"]
+mod badge_macos;
+
 #[cfg(target_os = "linux")]
 mod tray;
 
@@ -2719,6 +2725,7 @@ mod macos {
     use rewynd_encode::{AudioMixer, EncodeParams, VideoToolboxEncoder};
 
     use crate::audio_pipeline::{AUDIO_SETTLE, SharedMixer, run_audio_mixer, spawn_audio_capture};
+    use crate::badge_macos;
     use crate::chime;
     use crate::params::{audio_encode_params, encode_params};
 
@@ -3180,6 +3187,10 @@ mod macos {
             }
         }
 
+        // The badge currently on screen, owned by the pump (AppKit windows live on the
+        // main thread); closed when it expires, replaced by a newer save's badge.
+        let mut badge: Option<badge_macos::ActiveBadge> = None;
+
         'pump: loop {
             // One event per slice: with events pending this returns immediately, so a
             // burst drains across quick iterations; idle, it blocks ≤ PUMP_SLICE while
@@ -3197,10 +3208,18 @@ mod macos {
                 app.sendEvent(&event);
             }
 
+            if badge
+                .as_ref()
+                .is_some_and(badge_macos::ActiveBadge::expired)
+                && let Some(expired) = badge.take()
+            {
+                expired.close();
+            }
+
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 let id = event.id();
                 if id == save_item.id() {
-                    save_and_toast(saver);
+                    save_and_toast(saver, mtm, &mut badge);
                 } else if id == mic_item.id() {
                     crate::tray_common::toggle_mic_and_restart(&toast);
                 } else if id == settings_item.id() {
@@ -3214,7 +3233,7 @@ mod macos {
                 while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
                     if event.id() == *hotkey_id && event.state() == HotKeyState::Pressed {
                         tracing::info!("hotkey activated");
-                        save_and_toast(saver);
+                        save_and_toast(saver, mtm, &mut badge);
                         // The blocking save queues any repeat presses made meanwhile;
                         // drop them instead of replaying near-duplicate saves.
                         while GlobalHotKeyEvent::receiver().try_recv().is_ok() {}
@@ -3225,7 +3244,7 @@ mod macos {
                 match cmd {
                     MainCmd::Save => {
                         tracing::info!("save requested via SIGUSR1");
-                        save_and_toast(saver);
+                        save_and_toast(saver, mtm, &mut badge);
                     }
                     MainCmd::Shutdown(reason) => {
                         tracing::info!(reason, "shutting down");
@@ -3233,6 +3252,9 @@ mod macos {
                     }
                 }
             }
+        }
+        if let Some(active) = badge.take() {
+            active.close();
         }
         // `_tray` and the hotkey manager drop here, removing the icon + registration.
     }
@@ -3397,10 +3419,15 @@ mod macos {
         (1..=24).contains(&n).then(|| key.parse().ok())?
     }
 
-    /// Cut + mux a clip and confirm: chime + desktop notification. (The in-game badge
-    /// overlay is a later follow-up on macOS; the chime still lands over a fullscreen
-    /// game.)
-    fn save_and_toast(saver: &Arc<ClipSaver>) {
+    /// Cut + mux a clip and confirm on every channel, mirroring the other platforms:
+    /// the chime plus the in-game badge (a screen-saver-level panel that lands over
+    /// fullscreen games), falling back to a desktop notification when the badge can't
+    /// show. A newer save's badge replaces one still on screen.
+    fn save_and_toast(
+        saver: &Arc<ClipSaver>,
+        mtm: MainThreadMarker,
+        badge: &mut Option<badge_macos::ActiveBadge>,
+    ) {
         let saved = saver.save();
         let (accent, title, body) = match &saved {
             Ok(path) => (
@@ -3423,7 +3450,13 @@ mod macos {
             }
         };
         chime::play(accent);
-        toast(title, &body);
+        if let Some(old) = badge.take() {
+            old.close();
+        }
+        match badge_macos::show(mtm, accent, title) {
+            Some(active) => *badge = Some(active),
+            None => toast(title, &body),
+        }
     }
 
     /// Fire-and-forget desktop notification. Outside an .app bundle macOS attributes it
