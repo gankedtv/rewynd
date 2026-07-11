@@ -74,7 +74,9 @@ Linux the capture crate additionally needs PipeWire dev headers and libclang (fo
 `pipewire-sys`/`libspa-sys` bindgen): on Debian/Ubuntu, `pkg-config
 libpipewire-0.3-dev clang libclang-dev`. On macOS (Apple Silicon, macOS 15+) the
 Xcode Command Line Tools and `cmake` (bundled libopus) are the only extras — capture
-and encode use the system ScreenCaptureKit/VideoToolbox frameworks.
+and encode use the system ScreenCaptureKit/VideoToolbox frameworks. On every platform
+an `ffmpeg` binary on PATH is optional but enables in-app clip playback in the library
+(`brew install ffmpeg` on macOS).
 
 ```sh
 cargo build
