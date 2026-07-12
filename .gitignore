@@ -17,3 +17,6 @@ vendor/mp4/target/
 # Local vpk pack output (release builds happen in CI)
 /Releases/
 /pack/
+
+# Brainstorming visual-companion mockups (local design scratch)
+.superpowers/

@@ -1,0 +1,51 @@
+---
+import LibraryShot from './LibraryShot.astro';
+---
+<section class="hero" style="border-top:none"><div class="wrap">
+  <span class="kick">Native · Open source · Linux · Windows · macOS</span>
+  <h1 class="lead h1">Instant replay for your gameplay.</h1>
+  <p class="sub">The last 60 seconds, always one hotkey away. A lightweight recorder that keeps your clip buffer on the GPU and sits in the tray — quiet enough to leave running while you play.</p>
+  <div class="cmd"><span class="p">$</span> <span id="installCmd">curl -fsSL rewynd.gg/install.sh | sh</span> <button class="cp" data-copy="#installCmd" aria-label="Copy install command">copy</button></div>
+  <div class="ctas">
+    <a class="btn mint" id="dlPrimary" href="#download">↓ Download for Linux</a>
+    <a class="btn ghost" href="https://github.com/gankedtv/rewynd">★ Star on GitHub</a>
+  </div>
+  <p class="betanote"><span class="b">Beta</span> Work in progress — expect rough edges. It self-updates, so fixes land fast.</p>
+  <div class="platrow">
+    <span class="chip"><span class="dot"></span>Linux · AppImage, self-updating</span>
+    <span class="chip">Windows · installer</span>
+    <span class="chip">macOS · Apple Silicon (beta)</span>
+  </div>
+
+  <LibraryShot />
+</div></section>
+
+<script>
+  // Progressive enhancement only — the page is fully functional without JS.
+  const GH = 'https://github.com/gankedtv/rewynd';
+  const REL = GH + '/releases/latest';
+
+  // Label the primary download button for the visitor's OS.
+  const dl = document.getElementById('dlPrimary') as HTMLAnchorElement | null;
+  if (dl) {
+    const nav = navigator as Navigator & { userAgentData?: { platform?: string } };
+    const p = nav.userAgentData?.platform || navigator.platform || '';
+    if (/Win/i.test(p)) { dl.textContent = '↓ Download for Windows'; dl.href = REL; }
+    else if (/Mac/i.test(p)) { dl.textContent = '↓ Build for macOS'; dl.href = GH + '#building'; }
+    else { dl.textContent = '↓ Download for Linux'; dl.href = REL; }
+  }
+
+  // Copy-to-clipboard buttons.
+  document.querySelectorAll<HTMLButtonElement>('.cp[data-copy]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const sel = btn.getAttribute('data-copy');
+      const el = sel ? document.querySelector(sel) : null;
+      if (!el || !navigator.clipboard) return;
+      navigator.clipboard.writeText((el.textContent || '').trim()).then(() => {
+        const prev = btn.textContent;
+        btn.textContent = 'copied';
+        setTimeout(() => { btn.textContent = prev; }, 1400);
+      });
+    });
+  });
+</script>

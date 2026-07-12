@@ -1,0 +1,42 @@
+---
+import '../styles/global.css';
+import SvgDefs from '../components/SvgDefs.astro';
+
+interface Props {
+  title?: string;
+  description?: string;
+}
+const {
+  title = 'rewynd — instant replay for your gameplay',
+  description = 'rewynd is a lightweight, native instant-replay clip recorder for Linux, Windows, and macOS. The last 60 seconds, always one hotkey away. Open source, GPU-light, and one click from ganked.tv.',
+} = Astro.props;
+
+const canonical = new URL(Astro.url.pathname, Astro.site).href;
+const ogImage = new URL('/assets/logo-512.png', Astro.site).href;
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{title}</title>
+  <meta name="description" content={description} />
+  <link rel="canonical" href={canonical} />
+  <link rel="icon" href="/assets/logo.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="/assets/logo-256.png" />
+  <!-- Open Graph / social. Replace /assets/logo-512.png with a proper 1200x630 card. -->
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content={title} />
+  <meta property="og:description" content={description} />
+  <meta property="og:image" content={ogImage} />
+  <meta property="og:url" content={canonical} />
+  <meta name="twitter:card" content="summary_large_image" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800;900&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+</head>
+<body>
+  <SvgDefs />
+  <slot />
+</body>
+</html>

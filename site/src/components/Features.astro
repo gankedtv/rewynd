@@ -1,0 +1,18 @@
+---
+const features = [
+  { icon: '▤', title: 'Lives in your tray', body: 'A background recorder that stays out of the way. Launch the app for your clip library and settings whenever you want.' },
+  { icon: '⚡', title: 'Zero-copy pipeline', body: 'The frame stays on the GPU from capture through hardware H.264 encode — light enough to run while gaming on modest hardware.' },
+  { icon: '◇', title: 'Clean, playable clips', body: 'Every clip starts on a keyframe and is independently decodable. No half-frames, no re-encode step.' },
+  { icon: '✎', title: 'Library & trim', body: "Browse, trim, and manage everything you've clipped in a native app — not a folder full of mystery filenames." },
+  { icon: '⚙', title: 'Yours to tune', body: 'Replay length, hotkey, output folder, resolution, framerate, bitrate — all parameters. Target 1080p60 out of the box.' },
+  { icon: '↑', title: 'Optional uploads', body: 'One click to ganked.tv or YouTube — only when you ask. Clips never leave your machine on their own.' },
+];
+---
+<section class="sec" id="features"><div class="wrap">
+  <div class="sechead"><span class="kick">Features</span><h2 class="sectitle">Small footprint, no compromises</h2></div>
+  <div class="feat">
+    {features.map((f) => (
+      <div class="fcard"><div class="ficon" aria-hidden="true">{f.icon}</div><h3>{f.title}</h3><p>{f.body}</p></div>
+    ))}
+  </div>
+</div></section>

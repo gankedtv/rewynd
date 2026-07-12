@@ -1,0 +1,10 @@
+---
+// Shared SVG gradient defs + the logo `#mark` symbol. Rendered once per page
+// (in the layout); LogoMark.astro references `#mark` via <use>.
+---
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <linearGradient id="af" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7dffd8" /><stop offset=".5" stop-color="#00e5a0" /><stop offset="1" stop-color="#00a376" /></linearGradient>
+  <radialGradient id="as" cx=".5" cy=".4" r=".85"><stop offset="0" stop-color="#13211a" /><stop offset="1" stop-color="#060b09" /></radialGradient>
+  <linearGradient id="ap" x1="0" y1="0" x2=".3" y2="1"><stop offset="0" stop-color="#b6ffe6" /><stop offset="1" stop-color="#00e5a0" /></linearGradient>
+</defs></svg>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><symbol id="mark" viewBox="0 0 120 120"><path d="M30 0 L100 0 A20 20 0 0 1 120 20 L120 90 L90 120 L20 120 A20 20 0 0 1 0 100 L0 30 Z" fill="url(#af)" /><path d="M36 14 L92 14 A14 14 0 0 1 106 28 L106 84 L84 106 L28 106 A14 14 0 0 1 14 92 L14 36 Z" fill="url(#as)" /><path d="M49 38 L80 60 L49 82 Z" fill="url(#ap)" /></symbol></svg>
