@@ -200,6 +200,9 @@ impl Wizard {
                 let before = self.step;
                 self.step = self.step.next();
                 if self.step != before {
+                    // Leaving the step disarms the hotkey field; a stale armed state would
+                    // capture again the moment the step reopens.
+                    self.hotkey_recording = false;
                     self.entrance = Some(Fade::new(ENTRANCE));
                     if self.step == Step::Finish {
                         self.pulse = Some(Fade::new(PULSE));
@@ -210,6 +213,7 @@ impl Wizard {
                 let before = self.step;
                 self.step = self.step.back();
                 if self.step != before {
+                    self.hotkey_recording = false;
                     self.entrance = Some(Fade::new(ENTRANCE));
                 }
             }

@@ -302,8 +302,11 @@ fn refresh_autostart_at(path: &Path, exec: &Path, appimage: Option<&Path>) -> st
     };
     // Beyond ownership, heal a gone program (a moved install, or an unmounted AppImage path
     // after a reboot) and finish pre-icon self-installs. An icon-bearing entry whose foreign
-    // program still exists is user-managed and stays untouched.
-    let stale_program = !program.is_empty() && !Path::new(program).exists();
+    // program still exists is user-managed and stays untouched — and a bare, PATH-relying
+    // Exec (a legitimate XDG pattern) can't be existence-checked, so only an absolute path
+    // counts as verifiably stale.
+    let program = Path::new(program);
+    let stale_program = program.is_absolute() && !program.exists();
     if owned || stale_program || !has_icon_key(&existing) {
         return write_file_atomic(path, desired.as_bytes());
     }
@@ -1016,6 +1019,12 @@ mod tests {
                 .expect("read")
                 .contains("Exec=\"/opt/rewynd/rewynd\"\n")
         );
+
+        // A bare, PATH-relying Exec can't be existence-checked and must not read as stale.
+        let bare = "[Desktop Entry]\nIcon=custom\nExec=some-wrapper --flag\n";
+        std::fs::write(&path, bare).expect("seed bare");
+        refresh_autostart_at(&path, Path::new("/opt/rewynd/rewynd"), None).expect("no-op");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), bare);
     }
 
     #[test]
