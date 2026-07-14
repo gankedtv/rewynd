@@ -11,6 +11,7 @@ members = [
     "crates/clip",
     "crates/settings",
     "crates/app",
+    "crates/installer",
 ]
 # Vendored third-party muxer fork (ADR 0004). It's a path dependency inside the workspace
 # root, which would otherwise auto-include it as a member; exclude it so the clippy/fmt/

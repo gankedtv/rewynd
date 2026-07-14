@@ -36,7 +36,8 @@ before the certificate is applied.
 
 The Windows artifacts to be signed are the executables Velopack packages and installs:
 `rewynd.exe` (the settings/library app), `rewynd-recorder.exe` (the background
-recorder), the bundled `Update.exe` updater, and the `rewynd-win-Setup.exe` installer.
+recorder), the bundled `Update.exe` updater, the `rewynd-win-Setup.exe` installer, and
+`rewynd-win-Installer.exe` (the branded installer front-end that runs Setup.exe).
 
 Dependencies are open source Rust crates compiled from source into the binaries (plus
 the vendored fork in [`vendor/`](../vendor)); the release ships no separate third-party

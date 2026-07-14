@@ -439,11 +439,7 @@ fn text_mask(
 
 /// Decode the brand mark nearest `size` into a premultiplied tiny-skia [`Pixmap`].
 fn logo_pixmap(size: u32) -> Option<Pixmap> {
-    let bytes = rewynd_config::BRAND_ICONS
-        .iter()
-        .find(|(s, _)| *s >= size)
-        .or(rewynd_config::BRAND_ICONS.last())
-        .map(|(_, b)| *b)?;
+    let bytes = rewynd_config::brand_png(size);
     let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
         .ok()?
         .into_rgba8();

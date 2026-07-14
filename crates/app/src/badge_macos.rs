@@ -179,11 +179,7 @@ pub fn show(mtm: MainThreadMarker, accent: Accent, text: &str) -> Option<ActiveB
 
 /// The brand mark nearest the badge's logo size, decoded by AppKit from the embedded PNG.
 fn brand_image() -> Option<Retained<NSImage>> {
-    let bytes = rewynd_config::BRAND_ICONS
-        .iter()
-        .find(|(size, _)| *size >= LOGO as u32)
-        .or(rewynd_config::BRAND_ICONS.last())
-        .map(|(_, b)| *b)?;
+    let bytes = rewynd_config::brand_png(LOGO as u32);
     let data = NSData::with_bytes(bytes);
     NSImage::initWithData(NSImage::alloc(), &data)
 }

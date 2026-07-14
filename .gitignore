@@ -13,3 +13,7 @@ vendor/mp4/target/
 
 # Local Claude Code working notes / progress tracking (not shared)
 .claude/
+
+# Local vpk pack output (release builds happen in CI)
+/Releases/
+/pack/

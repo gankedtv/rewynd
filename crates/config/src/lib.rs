@@ -38,7 +38,8 @@ pub use clips::{
     clip_output_path, clips_dir, ensure_private_dir, folder_name, list_clips, newest_clip_in,
 };
 pub use desktop::{
-    BRAND_ICONS, attach_parent_console, install_autostart, refresh_autostart, remove_autostart,
+    BRAND_ICONS, attach_parent_console, brand_png, install_autostart, refresh_autostart,
+    remove_autostart,
 };
 #[cfg(windows)]
 pub use desktop::{register_clip_protocol, register_toast_identity};
