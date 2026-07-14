@@ -16,6 +16,7 @@
 mod anim;
 #[cfg(target_os = "macos")]
 mod dock;
+mod hotkey;
 mod library;
 mod player;
 mod scroll;
@@ -305,6 +306,13 @@ fn main() -> iced::Result {
         return Ok(());
     }
 
+    // `--recorder`: become the recorder instead of opening a window. An AppImage's only
+    // boot-stable path is the image itself, whose entry binary is this GUI — the autostart entry
+    // launches it with this flag. Before the settings lock: the recorder holds its own.
+    if std::env::args().any(|arg| arg == "--recorder") {
+        return run_as_recorder();
+    }
+
     tracing_subscriber::fmt::init();
 
     // Single-instance guard: a second window edits the same file, where its save clobbers the
@@ -567,8 +575,10 @@ struct App {
     config: Config,
     /// Mirror of the output directory for the text box (empty = "use the default").
     output_dir: String,
-    /// Mirror of the hotkey trigger for the text box.
+    /// Mirror of the hotkey trigger for the capture field.
     hotkey: String,
+    /// Whether the hotkey field is armed and the next key press becomes the trigger.
+    hotkey_recording: bool,
     /// Active input devices for the microphone picker (Windows WASAPI endpoints, Linux PipeWire
     /// sources); empty when enumeration finds nothing, where the control is a free-text name.
     mic_options: Vec<config::AudioInput>,
@@ -684,7 +694,10 @@ enum Message {
     OutputDirEdited(String),
     BrowseDir,
     DirPicked(Option<String>),
-    HotkeyEdited(String),
+    /// Arm or disarm the hotkey capture field.
+    HotkeyRecord(bool),
+    /// A key press while the hotkey field is armed.
+    HotkeyKey(iced::keyboard::Key, iced::keyboard::Modifiers),
     #[cfg(target_os = "linux")]
     AlwaysPrompt(bool),
     #[cfg(target_os = "linux")]
@@ -760,6 +773,7 @@ impl App {
             library: library::Library::new(),
             output_dir: config.output_directory().unwrap_or_default().to_owned(),
             hotkey: config.hotkey_trigger().to_owned(),
+            hotkey_recording: false,
             mic_options: Vec::new(),
             probes_started: false,
             api_key: config.upload_api_key().to_owned(),
@@ -847,6 +861,9 @@ impl App {
         match message {
             Message::Tab(view) => {
                 self.view = view;
+                // Navigating away disarms the hotkey field; a stale armed state would start
+                // capturing again the moment Settings reopens.
+                self.hotkey_recording = false;
                 // The Library tab / brand logo is a home action: leave any open clip's detail for
                 // the grid, and refresh so clips saved while away appear.
                 if view == View::Library {
@@ -955,10 +972,20 @@ impl App {
                 self.touch();
             }
             Message::DirPicked(None) => {}
-            Message::HotkeyEdited(s) => {
-                self.hotkey = s;
-                self.touch();
+            Message::HotkeyRecord(armed) => {
+                self.hotkey_recording = armed;
             }
+            Message::HotkeyKey(key, modifiers) => match hotkey::capture(&key, modifiers) {
+                hotkey::Capture::Done(trigger) => {
+                    self.hotkey_recording = false;
+                    if self.hotkey != trigger {
+                        self.hotkey = trigger;
+                        self.touch();
+                    }
+                }
+                hotkey::Capture::Cancel => self.hotkey_recording = false,
+                hotkey::Capture::Pending => {}
+            },
             #[cfg(target_os = "linux")]
             Message::AlwaysPrompt(on) => {
                 self.config.set_always_prompt(on);
@@ -1452,6 +1479,19 @@ impl App {
             }
             _ => None,
         });
+        // Only while the hotkey field is armed AND its page is showing: every key press goes to
+        // the capture logic. Diffing drops the listener the moment recording ends, and the view
+        // gate keeps keystrokes elsewhere (the library, onboarding) from silently rebinding.
+        let hotkey = if self.hotkey_recording && matches!(self.view, View::Settings) {
+            iced::event::listen_with(|event, _status, _id| match event {
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key, modifiers, ..
+                }) => Some(Message::HotkeyKey(key, modifiers)),
+                _ => None,
+            })
+        } else {
+            iced::Subscription::none()
+        };
         let dir = config::clips_dir(self.config.output_dir().as_deref())
             .to_string_lossy()
             .into_owned();
@@ -1475,6 +1515,7 @@ impl App {
         };
         iced::Subscription::batch([
             focus,
+            hotkey,
             clips,
             status,
             activation,
@@ -1706,9 +1747,12 @@ impl App {
             .spacing(8),
             field(
                 "Hotkey",
-                text_input("CTRL+ALT+R", &self.hotkey)
-                    .on_input(Message::HotkeyEdited)
-                    .style(arena_input),
+                hotkey::field(
+                    &self.hotkey,
+                    self.hotkey_recording,
+                    Message::HotkeyRecord(true),
+                    Message::HotkeyRecord(false),
+                ),
             )
             .push(hint(
                 "Your desktop may let you rebind this in its shortcut settings.",
@@ -2386,6 +2430,33 @@ fn run_update_flow() -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// The `--recorder` launch: replace this process with the recorder beside us. Exec (not spawn)
+/// keeps the AppImage runtime waiting on the recorder, so the FUSE mount holding both binaries
+/// lives exactly as long as the recorder does. Off unix (no exec, and no ephemeral mount to
+/// outlive) a detached spawn does the same job.
+fn run_as_recorder() -> iced::Result {
+    let Some(rec) = recorder_path().filter(|p| p.is_file()) else {
+        eprintln!("rewynd: no recorder found beside this binary");
+        std::process::exit(1);
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let e = std::process::Command::new(&rec).exec();
+        eprintln!("rewynd: could not launch {}: {e}", rec.display());
+        std::process::exit(1);
+    }
+    #[cfg(not(unix))]
+    {
+        if let Ok(mut child) = std::process::Command::new(&rec).spawn() {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Launch a detached recorder — used to bring it back after an update relaunch. The child is
