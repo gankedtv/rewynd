@@ -8,5 +8,5 @@
   <path d="M30 0 L100 0 A20 20 0 0 1 120 20 L120 90 L90 120 L20 120 A20 20 0 0 1 0 100 L0 30 Z" fill="url(#f)"></path>
   <path d="M30 0 L100 0 A20 20 0 0 1 120 20 L120 90 L90 120 L20 120 A20 20 0 0 1 0 100 L0 30 Z" fill="url(#g)" opacity=".5"></path>
   <path d="M36 14 L92 14 A14 14 0 0 1 106 28 L106 84 L84 106 L28 106 A14 14 0 0 1 14 92 L14 36 Z" fill="url(#s)"></path>
-  <path d="M49 38 L80 60 L49 82 Z" fill="url(#p)"></path>
+  <path d="M60 42 L38 60 L60 78 Z M82 42 L60 60 L82 78 Z" fill="url(#p)"></path>
 </svg>

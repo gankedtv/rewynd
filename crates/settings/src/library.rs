@@ -46,10 +46,6 @@ const LIBRARY_QUIPS: [&str; 4] = [
 const OVERLAY_INK: iced::Color = iced::Color::from_rgb8(0xf4, 0xf1, 0xe8);
 /// The duration-badge scrim over thumbnails.
 const BADGE_SCRIM: iced::Color = iced::Color::from_rgba(0.0, 0.0, 0.0, 0.75);
-/// The circular play button's scrim and ring, shown over a hovered thumbnail.
-const PLAY_SCRIM: iced::Color = iced::Color::from_rgba(0.0, 0.0, 0.0, 0.55);
-const PLAY_RING: iced::Color = iced::Color::from_rgba(1.0, 1.0, 1.0, 0.3);
-
 /// Section label for clips saved outside a per-game subfolder (desktop / no game detected).
 const ROOT_GROUP: &str = "Desktop";
 
@@ -1667,7 +1663,7 @@ impl Library {
         ];
         if !playing {
             layers.push(
-                container(logo_play_button(56.0))
+                container(play_button(56.0))
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .align_x(iced::Alignment::Center)
@@ -1716,7 +1712,7 @@ impl Library {
         ];
         if !playing {
             layers.push(
-                container(logo_play_button(96.0))
+                container(play_button(96.0))
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .align_x(iced::Alignment::Center)
@@ -2640,23 +2636,9 @@ fn segment_style(
 /// hint that image drawing ignores), so this is what actually keeps Cover-scaled frames inside
 /// the box of the nearest `clip(true)` ancestor.
 /// The circular play affordance shown over a hovered clip card (arena.md's thumbnail play
-/// button), reusing the brand mark as the glyph like the fullscreen preview does.
+/// button), the same badge the previews use.
 fn play_hint<'a>() -> Element<'a, Message> {
-    let circle = container(theme::logo(18.0))
-        .width(36)
-        .height(36)
-        .align_x(iced::Alignment::Center)
-        .align_y(iced::Alignment::Center)
-        .style(|_: &Theme| container::Style {
-            background: Some(Background::Color(PLAY_SCRIM)),
-            border: Border {
-                color: PLAY_RING,
-                width: 1.0,
-                radius: 18.0.into(),
-            },
-            ..container::Style::default()
-        });
-    container(circle)
+    container(theme::play_badge(36.0))
         .center(Length::Fill)
         .height(Length::Fixed(148.0))
         .into()
@@ -2671,9 +2653,9 @@ fn layered<'a>(
     )
 }
 
-/// The brand mark as a bare play control (it is a play button), centred over the preview.
-fn logo_play_button<'a>(size: f32) -> Element<'a, Message> {
-    button(theme::logo(size))
+/// The play badge as a bare button, centred over the preview.
+fn play_button<'a>(size: f32) -> Element<'a, Message> {
+    button(theme::play_badge(size))
         .on_press(Message::PlayToggle)
         .style(|_: &Theme, _| iced::widget::button::Style::default())
         .padding(0)

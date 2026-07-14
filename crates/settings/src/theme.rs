@@ -78,9 +78,8 @@ pub const UI_BOLD: Font = Font {
 pub use config::brand_png;
 
 // The brand mark, decoded once per displayed size: a fresh handle every `view` call would miss
-// the renderer's raster cache and re-decode each frame. The large handle sources the 128px PNG so
-// the play button (the mark reused as a play control, up to 96px in the fullscreen preview) stays
-// crisp when the renderer scales it on a HiDPI display.
+// the renderer's raster cache and re-decode each frame. The large handle sources the 128px PNG
+// so the navbar mark stays crisp when the renderer scales it on a HiDPI display.
 static LOGO_LARGE: LazyLock<iced::widget::image::Handle> =
     LazyLock::new(|| iced::widget::image::Handle::from_bytes(brand_png(128)));
 static LOGO_SMALL: LazyLock<iced::widget::image::Handle> =
@@ -92,6 +91,28 @@ pub fn logo<'a, M: 'a>(size: f32) -> Element<'a, M> {
         LOGO_SMALL.clone()
     } else {
         LOGO_LARGE.clone()
+    };
+    iced::widget::image(handle).width(size).height(size).into()
+}
+
+// The play control shown over clip previews — its own mark, not the brand logo: the logo's
+// inner glyph is a rewind symbol, the wrong affordance on a play button. Same two-size decode
+// cache as the logo (up to 96px in the fullscreen preview).
+static PLAY_LARGE: LazyLock<iced::widget::image::Handle> = LazyLock::new(|| {
+    iced::widget::image::Handle::from_bytes(
+        include_bytes!("../assets/play/play-128.png").as_slice(),
+    )
+});
+static PLAY_SMALL: LazyLock<iced::widget::image::Handle> = LazyLock::new(|| {
+    iced::widget::image::Handle::from_bytes(include_bytes!("../assets/play/play-24.png").as_slice())
+});
+
+/// The play badge (dark scrim circle + white triangle) at `size` logical pixels.
+pub fn play_badge<'a, M: 'a>(size: f32) -> Element<'a, M> {
+    let handle = if size <= 24.0 {
+        PLAY_SMALL.clone()
+    } else {
+        PLAY_LARGE.clone()
     };
     iced::widget::image(handle).width(size).height(size).into()
 }

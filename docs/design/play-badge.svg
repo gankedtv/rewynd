@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120">
+  <!-- Play control overlaid on clip previews. Deliberately NOT the brand mark: the logo's inner
+       glyph is a rewind symbol, which would read as the wrong affordance on a play button. -->
+  <circle cx="60" cy="60" r="56" fill="#000000" fill-opacity=".62"></circle>
+  <circle cx="60" cy="60" r="55.5" fill="none" stroke="#ffffff" stroke-opacity=".12" stroke-width="1"></circle>
+  <path d="M50 38 L85 60 L50 82 Z" fill="#f0f0f4"></path>
+</svg>
