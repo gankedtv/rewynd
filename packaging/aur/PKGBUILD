@@ -1,0 +1,67 @@
+# Maintainer: ganked.tv <hello@ganked.tv>
+# Source PKGBUILD for the AUR `rewynd` package, kept in-tree so release bumps are one commit.
+# Publish flow: packaging/aur/README.md. The self-updater stays silent here by design (no
+# Velopack receipt), so updates arrive through the AUR like any other package.
+
+pkgname=rewynd
+# AUR pkgver cannot carry hyphens; _tag is the upstream tag it maps to.
+_tag=v1.0.0-beta.3
+pkgver=1.0.0beta3
+pkgrel=1
+pkgdesc="Instant-replay clip recorder: hotkey saves the last minutes of gameplay"
+arch=('x86_64')
+url="https://github.com/gankedtv/rewynd"
+license=('GPL-3.0-or-later')
+# vulkan-icd-loader, libxkbcommon and wayland are dlopened at runtime (wgpu / winit); the rest
+# link directly. ffmpeg backs in-app clip playback.
+depends=('alsa-lib' 'ffmpeg' 'gcc-libs' 'glibc' 'libpipewire' 'libxkbcommon' 'opus'
+         'vulkan-icd-loader' 'wayland')
+makedepends=('cargo' 'clang' 'git')
+# makepkg's default LTO CFLAGS break aws-lc-sys (rustls' crypto backend): its C objects get
+# GCC LTO bitcode the Rust linker cannot resolve, ending in undefined-symbol spew.
+options=('!lto')
+source=("$pkgname-$_tag.tar.gz::$url/archive/refs/tags/$_tag.tar.gz"
+        'tv.ganked.rewynd.desktop')
+sha256sums=('f1aa91c19224a48db0c485212e30dd771d78f6fdd741e84510d849e39b9c2cf2'
+            '661b590d1662d0f52df984c2209864152c735d62f3b4dac2be13ea4b8c796f6b')
+
+prepare() {
+    cd "$pkgname-${_tag#v}"
+    export RUSTUP_TOOLCHAIN=stable
+    # The GPU stack is pinned to git revisions ([patch.crates-io]), so the lockfile pulls git
+    # sources too; fetch everything here so build() can run offline.
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$pkgname-${_tag#v}"
+    export RUSTUP_TOOLCHAIN=stable
+    # An AUR build ships no compiled-in YouTube OAuth client (that is injected from repo
+    # secrets on the official release build); users can supply their own in the app's
+    # advanced settings — see docs/youtube-oauth.md.
+    cargo build --frozen --release -p rewynd -p rewynd-recorder
+}
+
+check() {
+    cd "$pkgname-${_tag#v}"
+    export RUSTUP_TOOLCHAIN=stable
+    # GPU/portal-dependent tests are #[ignore]d upstream, so this passes on a headless builder.
+    cargo test --frozen --workspace
+}
+
+package() {
+    cd "$pkgname-${_tag#v}"
+    install -Dm755 target/release/rewynd "$pkgdir/usr/bin/rewynd"
+    install -Dm755 target/release/rewynd-recorder "$pkgdir/usr/bin/rewynd-recorder"
+    install -Dm644 "$srcdir/tv.ganked.rewynd.desktop" \
+        "$pkgdir/usr/share/applications/tv.ganked.rewynd.desktop"
+    local size
+    for size in 24 32 48 64 128; do
+        install -Dm644 "crates/config/assets/brand/logo-$size.png" \
+            "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/tv.ganked.rewynd.png"
+    done
+    for size in 256 512; do
+        install -Dm644 "packaging/logo-$size.png" \
+            "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/tv.ganked.rewynd.png"
+    done
+}
