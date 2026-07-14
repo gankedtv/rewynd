@@ -147,6 +147,41 @@ pub fn settings_lock_path() -> PathBuf {
     instance_dir().path.join("settings.lock")
 }
 
+/// File name of the settings activation hand-off inside the instance dir (docs/adr/0016).
+pub(crate) const SETTINGS_ACTIVATION_FILE: &str = "settings.activate";
+
+/// Path of the settings activation file: a pending `rewynd://clip/<name>` link dropped by a
+/// refused second settings instance for the running window to pick up (docs/adr/0016).
+#[must_use]
+pub fn settings_activation_path() -> PathBuf {
+    instance_dir().path.join(SETTINGS_ACTIVATION_FILE)
+}
+
+/// The staging sibling for an atomic write of `path`: the full file name plus a pid-unique
+/// suffix. Appended, not `with_extension` — replacing the extension would collide two files
+/// sharing a stem (`settings.lock` / `settings.activate`) on the same staging name.
+fn staged_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().map(OsString::from).unwrap_or_default();
+    name.push(format!(".{}.part", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Write `contents` to `path` atomically (write a staged sibling, then rename over), creating
+/// parent directories. A crash can't leave a truncated file, and a reader never sees a partial
+/// write. The staged name carries our pid so concurrent writers of the same path can't rename
+/// each other's half-written staging file into place.
+pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let staged = staged_path(path);
+    let result = std::fs::write(&staged, contents).and_then(|()| std::fs::rename(&staged, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    result
+}
+
 /// `name` beside `exe`, with the platform's executable suffix. The testable core of
 /// [`sibling_binary`].
 fn sibling_of(exe: &Path, name: &str) -> Option<PathBuf> {
@@ -168,6 +203,28 @@ pub fn sibling_binary(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staged_path_appends_to_the_full_file_name() {
+        let staged = staged_path(Path::new("run").join("settings.activate").as_path());
+        assert_eq!(
+            staged.file_name().and_then(|n| n.to_str()),
+            Some(format!("settings.activate.{}.part", std::process::id()).as_str()),
+            "the suffix is appended, not swapped for the extension"
+        );
+    }
+
+    #[test]
+    fn write_file_atomic_creates_parents_and_leaves_no_staging_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("nested").join("status.json");
+        write_file_atomic(&target, b"{}").expect("write");
+        assert_eq!(std::fs::read(&target).expect("read"), b"{}");
+        let entries = std::fs::read_dir(target.parent().expect("parent"))
+            .expect("read_dir")
+            .count();
+        assert_eq!(entries, 1, "only the target remains, no staging leftovers");
+    }
 
     // The XDG-semantics tests assert against unix path literals (`/home/u` is not an
     // absolute path on Windows), so they only run there — matching the environments
