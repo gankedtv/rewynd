@@ -140,7 +140,7 @@ jobs:
           REWYND_YT_CLIENT_SECRET: ${{ secrets.REWYND_YT_CLIENT_SECRET }}
         run: cargo build --release --locked -p rewynd -p rewynd-recorder
 
-      - name: Pack and upload (Setup.exe)
+      - name: Pack and upload (Setup.exe + branded installer)
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -151,6 +151,11 @@ jobs:
           cp target/release/rewynd.exe target/release/rewynd-recorder.exe pack/
           vpk pack -u rewynd -v "$VERSION" -p pack -e rewynd.exe -i packaging/rewynd.ico \
             --splashImage packaging/splash.png
+          # The branded installer embeds the Setup.exe just packed (docs/adr/0017), so it is
+          # built after vpk and published beside it.
+          REWYND_SETUP_EXE="$PWD/Releases/rewynd-win-Setup.exe" \
+            cargo build --release --locked -p rewynd-installer
+          cp target/release/rewynd-installer.exe Releases/rewynd-win-Installer.exe
           # The release already exists (linux-pack created it); append the Windows assets.
           gh release upload "$TAG" Releases/* --repo "$GITHUB_REPOSITORY" --clobber
 

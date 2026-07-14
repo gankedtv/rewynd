@@ -39,9 +39,10 @@ curl -fsSL https://raw.githubusercontent.com/gankedtv/rewynd/main/install.sh | s
 Or grab `rewynd.AppImage` from the [latest release](https://github.com/gankedtv/rewynd/releases),
 `chmod +x rewynd.AppImage`, and run it.
 
-**Windows**: download `rewynd-win-Setup.exe` from the
+**Windows**: download `rewynd-win-Installer.exe` from the
 [latest release](https://github.com/gankedtv/rewynd/releases) and run it (per-user, no
-admin rights needed).
+admin rights needed). Prefer a one-click unattended install? `rewynd-win-Setup.exe` is
+the same install without the window.
 
 The app checks for updates on launch; one click updates both binaries in place.
 
