@@ -2450,7 +2450,11 @@ fn run_as_recorder() -> iced::Result {
     }
     #[cfg(not(unix))]
     {
-        spawn_recorder_detached();
+        if let Ok(mut child) = std::process::Command::new(&rec).spawn() {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
         Ok(())
     }
 }
