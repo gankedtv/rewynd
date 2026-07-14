@@ -192,12 +192,19 @@ jobs:
         run: |
           mkdir -p pack
           cp target/release/rewynd target/release/rewynd-recorder pack/
+          # Our own Info.plist (--plist, which excludes --bundleId: the plist carries the id):
+          # Velopack's generated one has no NSMicrophoneUsageDescription, and macOS kills a
+          # bundled process the moment it touches the microphone without it. vpk does not stamp
+          # a supplied plist, so the version keys are set here (the short one must stay numeric).
+          cp packaging/Info.plist pack-info.plist
+          plutil -replace CFBundleShortVersionString -string "${VERSION%%-*}" pack-info.plist
+          plutil -replace CFBundleVersion -string "$VERSION" pack-info.plist
           # Unsigned: no Developer ID yet, so no --signAppIdentity/--notaryProfile. Gatekeeper
           # therefore quarantines the download (README documents the first-run steps), and the
           # ad-hoc signature changes per build, so macOS re-asks for screen recording after an
           # update. Both go away once a Developer ID is in place.
           vpk pack -u rewynd -v "$VERSION" -p pack -e rewynd -i packaging/rewynd.icns \
-            --bundleId tv.ganked.rewynd --packTitle rewynd
+            --packTitle rewynd --plist pack-info.plist
           gh release upload "$TAG" Releases/* --repo "$GITHUB_REPOSITORY" --clobber
 
   # Attach a SHA256SUMS over every published asset so testers can verify their download
