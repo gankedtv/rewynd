@@ -7,16 +7,16 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use iced::widget::{button, checkbox, column, container, row, slider, text, text_input};
+use iced::widget::{button, checkbox, column, container, row, slider, text};
 use iced::{Background, Border, Element, Length, Task, Theme};
 
 use rewynd_config::Config;
 
 use crate::anim::{Cycle, Fade};
+use crate::hotkey;
 use crate::theme::{
-    DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, arena_check, arena_input, arena_slider, aside, body, card,
-    dot, hint, kbd_chip, link_button, logo, palette, primary_button, secondary_button, tinted,
-    value_row,
+    DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, arena_check, arena_slider, aside, body, card, dot, hint,
+    link_button, logo, palette, primary_button, secondary_button, tinted, value_row,
 };
 
 /// Replay-length slider bounds, matching the settings editor's.
@@ -30,9 +30,6 @@ const ENTRANCE: Duration = Duration::from_millis(180);
 const PULSE: Duration = Duration::from_millis(600);
 const SAVING_PERIOD: Duration = Duration::from_millis(900);
 const SAVING_TICK: Duration = Duration::from_millis(300);
-
-/// The suggested hotkey combo: the input placeholder and the keycap preview fallback.
-const DEFAULT_HOTKEY: &str = "CTRL+ALT+R";
 
 /// One shows up under the welcome copy, picked per wizard run.
 const QUIPS: [&str; 4] = [
@@ -105,6 +102,8 @@ enum TestState {
 pub struct Wizard {
     step: Step,
     hotkey: String,
+    /// Whether the hotkey field is armed and the next key press becomes the trigger.
+    hotkey_recording: bool,
     buffer_seconds: u32,
     start_on_boot: bool,
     /// Whether to record the whole desktop instead of only the active game (the capture-mode step).
@@ -130,7 +129,10 @@ pub enum Message {
     Next,
     Back,
     SkipSetup,
-    HotkeyEdited(String),
+    /// Arm or disarm the hotkey capture field.
+    HotkeyRecord(bool),
+    /// A key press while the hotkey field is armed.
+    HotkeyKey(iced::keyboard::Key, iced::keyboard::Modifiers),
     BufferChanged(u32),
     StartOnBoot(bool),
     CaptureDesktop(bool),
@@ -149,6 +151,7 @@ impl Wizard {
         Self {
             step: Step::Welcome,
             hotkey: config.hotkey_trigger().to_owned(),
+            hotkey_recording: false,
             buffer_seconds: config
                 .buffer_seconds()
                 .clamp(u64::from(BUFFER_MIN_S), u64::from(BUFFER_MAX_S))
@@ -210,7 +213,15 @@ impl Wizard {
                     self.entrance = Some(Fade::new(ENTRANCE));
                 }
             }
-            Message::HotkeyEdited(s) => self.hotkey = s,
+            Message::HotkeyRecord(armed) => self.hotkey_recording = armed,
+            Message::HotkeyKey(key, modifiers) => match hotkey::capture(&key, modifiers) {
+                hotkey::Capture::Done(trigger) => {
+                    self.hotkey_recording = false;
+                    self.hotkey = trigger;
+                }
+                hotkey::Capture::Cancel => self.hotkey_recording = false,
+                hotkey::Capture::Pending => {}
+            },
             Message::BufferChanged(s) => self.buffer_seconds = s.clamp(BUFFER_MIN_S, BUFFER_MAX_S),
             Message::StartOnBoot(on) => self.start_on_boot = on,
             Message::CaptureDesktop(on) => self.capture_desktop = on,
@@ -302,13 +313,25 @@ impl Wizard {
     /// actually visible (it has three states per period, so the frame clock would be ~40x
     /// overkill); nothing when idle.
     pub fn subscription(&self) -> iced::Subscription<Message> {
-        if self.animating() {
+        let ticks = if self.animating() {
             iced::window::frames().map(Message::Tick)
         } else if matches!(self.test, TestState::Saving) && self.step == Step::TestClip {
             iced::time::every(SAVING_TICK).map(Message::Tick)
         } else {
             iced::Subscription::none()
-        }
+        };
+        // Only while the hotkey field is armed: every key press goes to the capture logic.
+        let keys = if self.hotkey_recording && self.step == Step::Hotkey {
+            iced::event::listen_with(|event, _status, _id| match event {
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key, modifiers, ..
+                }) => Some(Message::HotkeyKey(key, modifiers)),
+                _ => None,
+            })
+        } else {
+            iced::Subscription::none()
+        };
+        iced::Subscription::batch([ticks, keys])
     }
 
     fn animating(&self) -> bool {
@@ -471,12 +494,12 @@ impl Wizard {
             "Choose your hotkey",
             column![
                 body("This is the key you press to save the last few minutes as a clip."),
-                text_input(DEFAULT_HOTKEY, &self.hotkey)
-                    .on_input(Message::HotkeyEdited)
-                    .size(14)
-                    .padding(12)
-                    .style(arena_input),
-                hotkey_chips(&self.hotkey),
+                hotkey::field(
+                    &self.hotkey,
+                    self.hotkey_recording,
+                    Message::HotkeyRecord(true),
+                    Message::HotkeyRecord(false),
+                ),
                 hint(
                     "On KDE, your desktop may open its shortcuts dialog the first time so you can \
                      assign the key to rewynd. Assign it there and it sticks."
@@ -582,7 +605,7 @@ impl Wizard {
 
     fn finish(&self) -> Element<'_, Message> {
         let hotkey_line = row![
-            hotkey_chips(&self.hotkey),
+            hotkey::chips(&self.hotkey),
             body("while playing, and the moment is yours."),
         ]
         .spacing(6)
@@ -650,31 +673,6 @@ fn replay_flavor(seconds: u32) -> &'static str {
         91..=180 => "The whole teamfight, start to finish.",
         _ => "The full story arc, hero included.",
     }
-}
-
-/// The hotkey string split on `+` into uppercase keycap labels, empties dropped.
-fn hotkey_parts(s: &str) -> Vec<String> {
-    s.split('+')
-        .map(|p| p.trim().to_uppercase())
-        .filter(|p| !p.is_empty())
-        .collect()
-}
-
-/// The hotkey as keycap chips joined by muted plus signs; the placeholder combo when the
-/// input has no usable parts.
-fn hotkey_chips<'a>(hotkey: &str) -> Element<'a, Message> {
-    let mut parts = hotkey_parts(hotkey);
-    if parts.is_empty() {
-        parts = hotkey_parts(DEFAULT_HOTKEY);
-    }
-    let mut chips = row![].spacing(6).align_y(iced::Alignment::Center);
-    for (i, part) in parts.into_iter().enumerate() {
-        if i > 0 {
-            chips = chips.push(text("+").size(11).style(tinted(palette::MUTED)));
-        }
-        chips = chips.push(kbd_chip(part));
-    }
-    chips.into()
 }
 
 /// One stepper dot: filled mint when reached, outlined when ahead; the current one gets a
@@ -816,14 +814,6 @@ mod tests {
         assert_eq!(replay_flavor(91), "The whole teamfight, start to finish.");
         assert_eq!(replay_flavor(180), "The whole teamfight, start to finish.");
         assert_eq!(replay_flavor(181), "The full story arc, hero included.");
-    }
-
-    #[test]
-    fn hotkey_parts_uppercase_trim_and_drop_empties() {
-        assert_eq!(hotkey_parts("ctrl + alt+r"), vec!["CTRL", "ALT", "R"]);
-        assert_eq!(hotkey_parts(" shift +"), vec!["SHIFT"]);
-        assert!(hotkey_parts("").is_empty());
-        assert!(hotkey_parts(" + ").is_empty());
     }
 
     #[test]

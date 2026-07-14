@@ -16,6 +16,7 @@
 mod anim;
 #[cfg(target_os = "macos")]
 mod dock;
+mod hotkey;
 mod library;
 mod player;
 mod scroll;
@@ -574,8 +575,10 @@ struct App {
     config: Config,
     /// Mirror of the output directory for the text box (empty = "use the default").
     output_dir: String,
-    /// Mirror of the hotkey trigger for the text box.
+    /// Mirror of the hotkey trigger for the capture field.
     hotkey: String,
+    /// Whether the hotkey field is armed and the next key press becomes the trigger.
+    hotkey_recording: bool,
     /// Active input devices for the microphone picker (Windows WASAPI endpoints, Linux PipeWire
     /// sources); empty when enumeration finds nothing, where the control is a free-text name.
     mic_options: Vec<config::AudioInput>,
@@ -691,7 +694,10 @@ enum Message {
     OutputDirEdited(String),
     BrowseDir,
     DirPicked(Option<String>),
-    HotkeyEdited(String),
+    /// Arm or disarm the hotkey capture field.
+    HotkeyRecord(bool),
+    /// A key press while the hotkey field is armed.
+    HotkeyKey(iced::keyboard::Key, iced::keyboard::Modifiers),
     #[cfg(target_os = "linux")]
     AlwaysPrompt(bool),
     #[cfg(target_os = "linux")]
@@ -767,6 +773,7 @@ impl App {
             library: library::Library::new(),
             output_dir: config.output_directory().unwrap_or_default().to_owned(),
             hotkey: config.hotkey_trigger().to_owned(),
+            hotkey_recording: false,
             mic_options: Vec::new(),
             probes_started: false,
             api_key: config.upload_api_key().to_owned(),
@@ -962,10 +969,20 @@ impl App {
                 self.touch();
             }
             Message::DirPicked(None) => {}
-            Message::HotkeyEdited(s) => {
-                self.hotkey = s;
-                self.touch();
+            Message::HotkeyRecord(armed) => {
+                self.hotkey_recording = armed;
             }
+            Message::HotkeyKey(key, modifiers) => match hotkey::capture(&key, modifiers) {
+                hotkey::Capture::Done(trigger) => {
+                    self.hotkey_recording = false;
+                    if self.hotkey != trigger {
+                        self.hotkey = trigger;
+                        self.touch();
+                    }
+                }
+                hotkey::Capture::Cancel => self.hotkey_recording = false,
+                hotkey::Capture::Pending => {}
+            },
             #[cfg(target_os = "linux")]
             Message::AlwaysPrompt(on) => {
                 self.config.set_always_prompt(on);
@@ -1459,6 +1476,18 @@ impl App {
             }
             _ => None,
         });
+        // Only while the hotkey field is armed: every key press goes to the capture logic.
+        // Diffing drops the listener the moment recording ends.
+        let hotkey = if self.hotkey_recording {
+            iced::event::listen_with(|event, _status, _id| match event {
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key, modifiers, ..
+                }) => Some(Message::HotkeyKey(key, modifiers)),
+                _ => None,
+            })
+        } else {
+            iced::Subscription::none()
+        };
         let dir = config::clips_dir(self.config.output_dir().as_deref())
             .to_string_lossy()
             .into_owned();
@@ -1482,6 +1511,7 @@ impl App {
         };
         iced::Subscription::batch([
             focus,
+            hotkey,
             clips,
             status,
             activation,
@@ -1713,9 +1743,12 @@ impl App {
             .spacing(8),
             field(
                 "Hotkey",
-                text_input("CTRL+ALT+R", &self.hotkey)
-                    .on_input(Message::HotkeyEdited)
-                    .style(arena_input),
+                hotkey::field(
+                    &self.hotkey,
+                    self.hotkey_recording,
+                    Message::HotkeyRecord(true),
+                    Message::HotkeyRecord(false),
+                ),
             )
             .push(hint(
                 "Your desktop may let you rebind this in its shortcut settings.",
