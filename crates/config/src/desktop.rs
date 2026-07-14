@@ -22,6 +22,18 @@ pub const BRAND_ICONS: &[(u32, &[u8])] = &[
     (128, include_bytes!("../assets/brand/logo-128.png")),
 ];
 
+/// The [`BRAND_ICONS`] PNG nearest at or above `size` pixels, falling back to the largest —
+/// the one selection rule for every consumer (window icons, tray, badges, the installer).
+#[must_use]
+pub fn brand_png(size: u32) -> &'static [u8] {
+    BRAND_ICONS
+        .iter()
+        .find(|(s, _)| *s >= size)
+        .or(BRAND_ICONS.last())
+        .map(|(_, bytes)| *bytes)
+        .expect("BRAND_ICONS is non-empty")
+}
+
 /// Render a path as a single quoted desktop-entry `Exec` value, applying the unescaping layers
 /// the Desktop Entry spec runs on read: wrap in double quotes and backslash-escape the reserved
 /// characters (`"` `` ` `` `$` `\`), escape every backslash again for the string-value layer,

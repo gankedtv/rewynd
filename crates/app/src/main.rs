@@ -534,7 +534,7 @@ mod tray_common {
 
     /// The brand mark as a tray icon, from the PNG ladder the config crate owns.
     pub(crate) fn tray_brand_icon() -> Option<tray_icon::Icon> {
-        let (_, png) = config::BRAND_ICONS.iter().find(|(size, _)| *size >= 32)?;
+        let png = config::brand_png(32);
         let img = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?;
         let rgba = img.into_rgba8();
         let (width, height) = rgba.dimensions();

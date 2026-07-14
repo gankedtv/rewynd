@@ -6,7 +6,11 @@
 
 mod setup;
 
-use iced::widget::{Space, button, column, container, mouse_area, progress_bar, row, text};
+use std::sync::LazyLock;
+
+use iced::widget::{
+    Space, button, column, container, mouse_area, progress_bar, row, scrollable, text,
+};
 use iced::{Background, Border, Element, Font, Length, Subscription, Task, Theme, font};
 use rewynd_config as config;
 
@@ -66,6 +70,9 @@ fn main() -> iced::Result {
             // close).
             decorations: false,
             icon: window_icon(),
+            // Close requests go through `update`, which refuses them mid-install: exiting
+            // then would abandon a running Setup.exe and skip the app launch.
+            exit_on_close_request: false,
             ..iced::window::Settings::default()
         })
         .run()
@@ -73,20 +80,16 @@ fn main() -> iced::Result {
 
 /// The window icon, from the shipped brand-mark PNGs.
 fn window_icon() -> Option<iced::window::Icon> {
-    let img = image::load_from_memory_with_format(brand_png(64), image::ImageFormat::Png).ok()?;
+    let img =
+        image::load_from_memory_with_format(config::brand_png(64), image::ImageFormat::Png).ok()?;
     let (width, height) = (img.width(), img.height());
     iced::window::icon::from_rgba(img.into_rgba8().into_vec(), width, height).ok()
 }
 
-/// The shipped brand-mark PNG nearest at or above `size` pixels (falling back to the largest).
-fn brand_png(size: u32) -> &'static [u8] {
-    config::BRAND_ICONS
-        .iter()
-        .find(|(s, _)| *s >= size)
-        .or(config::BRAND_ICONS.last())
-        .map(|(_, bytes)| *bytes)
-        .expect("BRAND_ICONS is non-empty")
-}
+// Decoded once: a fresh handle every `view` call would miss the renderer's raster cache and
+// re-decode the PNG each frame — and the install phase redraws at the tick rate.
+static LOGO: LazyLock<iced::widget::image::Handle> =
+    LazyLock::new(|| iced::widget::image::Handle::from_bytes(config::brand_png(128)));
 
 #[derive(Default)]
 enum Phase {
@@ -100,9 +103,8 @@ enum Phase {
 #[derive(Default)]
 struct Installer {
     phase: Phase,
-    /// Position of the indeterminate bar, 0..1, bounced by ticks while installing.
+    /// Monotone tick count while installing; the bar position is the derived triangle wave.
     sweep: f32,
-    sweep_forward: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -128,7 +130,6 @@ impl Installer {
             Message::Install => {
                 self.phase = Phase::Installing;
                 self.sweep = 0.0;
-                self.sweep_forward = true;
                 return Task::perform(
                     async {
                         tokio::task::spawn_blocking(setup::run)
@@ -138,24 +139,20 @@ impl Installer {
                     Message::Finished,
                 );
             }
-            Message::Tick => {
-                let step = if self.sweep_forward {
-                    SWEEP_STEP
-                } else {
-                    -SWEEP_STEP
-                };
-                self.sweep += step;
-                if !(0.0..=1.0).contains(&self.sweep) {
-                    self.sweep = self.sweep.clamp(0.0, 1.0);
-                    self.sweep_forward = !self.sweep_forward;
-                }
-            }
+            Message::Tick => self.sweep += SWEEP_STEP,
             Message::Finished(Ok(())) => {
                 self.phase = Phase::Done;
                 return Task::perform(tokio::time::sleep(DONE_LINGER), |()| Message::Close);
             }
             Message::Finished(Err(e)) => self.phase = Phase::Failed(e),
-            Message::Close => return iced::exit(),
+            Message::Close => {
+                // Mid-install there is nothing sane to cancel: Setup.exe would keep running
+                // detached and the launch/cleanup would be skipped. Refuse; the button is
+                // hidden then anyway, this also catches Alt+F4.
+                if !matches!(self.phase, Phase::Installing) {
+                    return iced::exit();
+                }
+            }
             Message::Drag => {
                 return iced::window::latest().and_then(iced::window::drag);
             }
@@ -164,12 +161,16 @@ impl Installer {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        match self.phase {
+        let ticks = match self.phase {
             Phase::Installing => {
                 iced::time::every(std::time::Duration::from_millis(33)).map(|_| Message::Tick)
             }
             _ => Subscription::none(),
-        }
+        };
+        // OS close requests (Alt+F4) arrive here because `exit_on_close_request` is off;
+        // `update` decides whether closing is allowed right now.
+        let close = iced::window::close_requests().map(|_| Message::Close);
+        Subscription::batch([ticks, close])
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -185,8 +186,7 @@ impl Installer {
             .padding([2, 8])
             .on_press(Message::Close);
 
-        let logo_handle = iced::widget::image::Handle::from_bytes(brand_png(128));
-        let mark = iced::widget::image(logo_handle).width(64.0).height(64.0);
+        let mark = iced::widget::image(LOGO.clone()).width(64.0).height(64.0);
 
         let body: Element<'_, Message> = match &self.phase {
             Phase::Ready => column![
@@ -199,7 +199,7 @@ impl Installer {
             .align_x(iced::Alignment::Center)
             .into(),
             Phase::Installing => column![
-                progress_bar(0.0..=1.0, self.sweep)
+                progress_bar(0.0..=1.0, triangle(self.sweep))
                     .girth(6.0)
                     .length(Length::Fixed(240.0))
                     .style(|_: &Theme| progress_bar::Style {
@@ -226,8 +226,11 @@ impl Installer {
             ]
             .align_x(iced::Alignment::Center)
             .into(),
+            // The log tail can be long; a capped scrollable keeps the CLOSE button on
+            // screen inside the fixed window.
             Phase::Failed(why) => column![
-                text(why.clone()).size(11).style(tinted(palette::DANGER)),
+                scrollable(text(why.as_str()).size(11).style(tinted(palette::DANGER)))
+                    .height(Length::Fixed(96.0)),
                 primary("CLOSE", Message::Close),
             ]
             .spacing(14)
@@ -235,8 +238,14 @@ impl Installer {
             .into(),
         };
 
+        // No close affordance mid-install: there is no cancel, only abandonment.
+        let top_right: Element<'_, Message> = if matches!(self.phase, Phase::Installing) {
+            Space::new().height(20.0).into()
+        } else {
+            close.into()
+        };
         let content = column![
-            row![Space::new().width(Length::Fill), close],
+            row![Space::new().width(Length::Fill), top_right],
             Space::new().height(Length::Fill),
             mark,
             text("REWYND")
@@ -305,4 +314,10 @@ fn primary(label: &str, on_press: Message) -> Element<'_, Message> {
 /// A text style closure for one fixed color.
 fn tinted(color: iced::Color) -> impl Fn(&Theme) -> iced::widget::text::Style {
     move |_| iced::widget::text::Style { color: Some(color) }
+}
+
+/// A 0..1 triangle wave over a monotone phase: the indeterminate bar's bounce.
+fn triangle(phase: f32) -> f32 {
+    let t = phase % 2.0;
+    if t > 1.0 { 2.0 - t } else { t }
 }

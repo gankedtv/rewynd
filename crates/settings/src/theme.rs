@@ -73,16 +73,9 @@ pub const UI_BOLD: Font = Font {
     ..Font::DEFAULT
 };
 
-/// The shipped brand-mark PNG nearest at or above `size` pixels (falling back to the largest),
-/// from the ladder the config crate owns.
-pub fn brand_png(size: u32) -> &'static [u8] {
-    config::BRAND_ICONS
-        .iter()
-        .find(|(s, _)| *s >= size)
-        .or(config::BRAND_ICONS.last())
-        .map(|(_, bytes)| *bytes)
-        .expect("BRAND_ICONS is non-empty")
-}
+/// The shipped brand-mark PNG nearest at or above `size` pixels, from the config crate's
+/// ladder (selection rule and all).
+pub use config::brand_png;
 
 // The brand mark, decoded once per displayed size: a fresh handle every `view` call would miss
 // the renderer's raster cache and re-decode each frame. The large handle sources the 128px PNG so
