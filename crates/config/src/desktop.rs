@@ -75,20 +75,8 @@ pub fn autostart_path() -> Option<PathBuf> {
         .map(|home| home.join("autostart").join(format!("{APP_ID}.desktop")))
 }
 
-/// Write `contents` to `path` atomically (temp + rename), creating parent directories: a crash
-/// can't leave a truncated file that would silently break the launcher, autostart, or icon.
 #[cfg(unix)]
-fn write_file_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("tmp");
-    let result = std::fs::write(&tmp, contents).and_then(|()| std::fs::rename(&tmp, path));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
-}
+use crate::paths::write_file_atomic;
 
 /// Install (or refresh) the autostart entry at `path`, launching `exec` at login. The testable
 /// core of [`install_autostart`].

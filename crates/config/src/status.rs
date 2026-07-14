@@ -63,10 +63,7 @@ pub fn write_recorder_status(status: &RecorderStatus) -> std::io::Result<()> {
     let dir = instance_dir();
     ensure_instance_dir(&dir)?;
     let json = serde_json::to_string(status).map_err(std::io::Error::other)?;
-    let tmp = dir.path.join("status.json.tmp");
-    let path = dir.path.join("status.json");
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, &path)
+    crate::paths::write_file_atomic(&dir.path.join("status.json"), json.as_bytes())
 }
 
 /// Remove the status file (recorder shutdown). Best-effort.

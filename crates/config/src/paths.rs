@@ -147,11 +147,30 @@ pub fn settings_lock_path() -> PathBuf {
     instance_dir().path.join("settings.lock")
 }
 
+/// File name of the settings activation hand-off inside the instance dir (docs/adr/0016).
+pub(crate) const SETTINGS_ACTIVATION_FILE: &str = "settings.activate";
+
 /// Path of the settings activation file: a pending `rewynd://clip/<name>` link dropped by a
 /// refused second settings instance for the running window to pick up (docs/adr/0016).
 #[must_use]
 pub fn settings_activation_path() -> PathBuf {
-    instance_dir().path.join("settings.activate")
+    instance_dir().path.join(SETTINGS_ACTIVATION_FILE)
+}
+
+/// Write `contents` to `path` atomically (write a staged sibling, then rename over), creating
+/// parent directories. A crash can't leave a truncated file, and a reader never sees a partial
+/// write. The staged name carries our pid so concurrent writers of the same path can't rename
+/// each other's half-written staging file into place.
+pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let staged = path.with_extension(format!("{}.part", std::process::id()));
+    let result = std::fs::write(&staged, contents).and_then(|()| std::fs::rename(&staged, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    result
 }
 
 /// `name` beside `exe`, with the platform's executable suffix. The testable core of

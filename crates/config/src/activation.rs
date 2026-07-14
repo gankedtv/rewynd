@@ -7,7 +7,10 @@
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use crate::paths::{ensure_instance_dir, instance_dir, settings_activation_path};
+use crate::paths::{
+    SETTINGS_ACTIVATION_FILE, ensure_instance_dir, instance_dir, settings_activation_path,
+    write_file_atomic,
+};
 
 /// How long a pending activation stays honored. Generous against watcher latency and a slow
 /// machine, short enough that a link left behind by a crashed window is not replayed as a
@@ -19,40 +22,39 @@ const MAX_AGE: Duration = Duration::from_secs(30);
 /// ours and is discarded unread.
 const MAX_LEN: u64 = 4096;
 
-/// Hand `link` to the running settings window by (re)placing the activation file. The rename is
-/// atomic on both unix and Windows, so the watcher on the other side never sees a partial write;
-/// a second hand-off before the first is consumed replaces it (last click wins).
+/// Hand `link` to the running settings window by (re)placing the activation file (an atomic
+/// staged write + rename, so the watcher on the other side never sees a partial file). A second
+/// hand-off before the first is consumed replaces it (last click wins).
 pub fn send_settings_activation(link: &str) -> std::io::Result<()> {
     let dir = instance_dir();
     ensure_instance_dir(&dir)?;
-    send_activation_at(&settings_activation_path(), link)
-}
-
-/// The testable core of [`send_settings_activation`]: write beside `path`, then rename over it.
-fn send_activation_at(path: &Path, link: &str) -> std::io::Result<()> {
-    let staged = path.with_extension("part");
-    std::fs::write(&staged, link)?;
-    std::fs::rename(&staged, path)
+    write_file_atomic(&dir.path.join(SETTINGS_ACTIVATION_FILE), link.as_bytes())
 }
 
 /// Consume the pending activation, if there is a fresh one: the link is returned and the file
 /// removed. `None` when there is nothing pending, or the pending file is stale, oversized, or
-/// not text — those are removed too, so nothing lingers to be replayed later.
+/// not text — those are consumed too, so nothing lingers to be replayed later.
 #[must_use]
 pub fn take_settings_activation() -> Option<String> {
     take_activation_at(&settings_activation_path(), SystemTime::now())
 }
 
 /// The testable core of [`take_settings_activation`], with the freshness reference injected.
+///
+/// Consumption is claim-by-rename: the pending file is renamed aside first, then judged. A
+/// hand-off renamed into place mid-consume is therefore never deleted unread — the claim grabs
+/// exactly one complete file, and a replacement landing after it stays pending with its own
+/// watcher event.
 fn take_activation_at(path: &Path, now: SystemTime) -> Option<String> {
-    let meta = std::fs::metadata(path).ok()?;
-    // Consume-first: whatever the verdict below, a pending file never outlives one look at it.
+    let claimed = path.with_extension("claimed");
+    std::fs::rename(path, &claimed).ok()?;
+    let meta = std::fs::metadata(&claimed).ok()?;
     let content = if meta.len() <= MAX_LEN {
-        std::fs::read(path).ok()
+        std::fs::read(&claimed).ok()
     } else {
         None
     };
-    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(&claimed);
     // An mtime ahead of `now` (clock step between writer and reader) counts as fresh — age zero,
     // not an error.
     let age = now
@@ -72,6 +74,11 @@ mod tests {
 
     fn path_in(dir: &tempfile::TempDir) -> std::path::PathBuf {
         dir.path().join("settings.activate")
+    }
+
+    /// The sender's write, aimed at a test path instead of the real instance dir.
+    fn send_activation_at(path: &Path, link: &str) -> std::io::Result<()> {
+        write_file_atomic(path, link.as_bytes())
     }
 
     #[test]
@@ -149,5 +156,18 @@ mod tests {
     fn taking_from_an_absent_path_is_none() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert_eq!(take_activation_at(&path_in(&dir), SystemTime::now()), None);
+    }
+
+    #[test]
+    fn a_leftover_claim_from_a_crashed_consume_is_overwritten() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = path_in(&dir);
+        std::fs::write(path.with_extension("claimed"), "rewynd://clip/dead.mp4").expect("plant");
+        send_activation_at(&path, "rewynd://clip/live.mp4").expect("send");
+        assert_eq!(
+            take_activation_at(&path, SystemTime::now()).as_deref(),
+            Some("rewynd://clip/live.mp4"),
+            "the claim renames over the leftover"
+        );
     }
 }

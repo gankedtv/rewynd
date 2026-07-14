@@ -16,17 +16,24 @@ the clip never opens. The refused instance needs a way to hand its link to the h
 
 An **activation file in the per-user instance dir**, consumed by a directory watch:
 
-- The refused instance writes the raw link to `settings.activate` beside the lock files —
-  write-aside then rename, atomic on unix and Windows, so a watcher never sees a partial file.
-  A second hand-off before the first is consumed replaces it (last click wins).
+- The refused instance validates its link first (only one that resolves to a clip is worth
+  handing over), then writes it to `settings.activate` beside the lock files — a staged write
+  then rename, atomic on unix and Windows, so a watcher never sees a partial file; the staged
+  name carries the writer's pid so concurrent senders can't publish each other's half-written
+  file. A second hand-off before the first is consumed replaces it (last click wins).
 - The running window watches the instance dir (`notify`, non-recursive, filtered to that one
-  file name so recorder pid/status churn never wakes the UI) and consumes the file: read,
-  delete, then re-validate through the same `clip_from_deeplink` path as a launch argument
-  before opening the clip and raising the window.
+  file name so recorder pid/status churn never wakes the UI) and consumes the file:
+  claim-by-rename (so a replacement landing mid-consume is never deleted unread — it stays
+  pending with its own event), read, delete, then re-validate through the same
+  `clip_from_deeplink` path as a launch argument before opening the clip and raising the
+  window. Mid-onboarding a hand-off only raises the window — it must not yank the user out of
+  the wizard.
 - Consumption drops anything stale (mtime older than 30 s — a leftover from a crashed window
   must not replay an old clip at the next launch), oversized, or non-text. `App::load` also
-  consumes a pending file, covering a hand-off that lands before the watch arms.
-- If the hand-off fails, the refused instance falls back to today's "already open" notification.
+  consumes a pending file, and the watch sends one nudge after arming, covering hand-offs that
+  land before it arms.
+- If the hand-off fails (or the link doesn't resolve), the refused instance falls back to
+  today's "already open" notification.
 
 ## Options evaluated
 
@@ -52,7 +59,9 @@ An **activation file in the per-user instance dir**, consumed by a directory wat
   link (it exits successfully once the file is placed). If the holder's watcher died, the click
   is lost silently — accepted; the watcher failing is loud in the logs and rare.
 - The Windows settings lock now also creates the instance dir (unix always did), so the watch
-  target exists as soon as the guard is held.
+  target exists as soon as the guard is held — best-effort, after the mutex, because a
+  filesystem failure must degrade forwarding, never the guard. The watch retries its arm for
+  the same reason.
 - The tray's "Open settings" with a window already open still shows the notification rather
   than raising the window; the same channel could carry a plain "raise" activation later (the
   refinement ADR 0008 already flagged).

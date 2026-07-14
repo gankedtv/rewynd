@@ -154,12 +154,18 @@ pub fn acquire_recorder_lock() -> std::io::Result<Option<InstanceLock>> {
 }
 
 /// Acquire the settings app's single-instance lock (a named mutex). `Ok(None)` means a
-/// settings window is already open. The instance dir is created here too — the mutex itself
-/// needs no file, but the holder watches that dir for forwarded activations.
+/// settings window is already open. The holder watches the instance dir for forwarded
+/// activations, so the dir is created here too — but only best-effort, after the mutex: a
+/// filesystem failure must degrade the forwarding, never the guard itself.
 #[cfg(windows)]
 pub fn acquire_settings_lock() -> std::io::Result<Option<InstanceLock>> {
-    ensure_instance_dir(&instance_dir())?;
-    Ok(create_instance_mutex(&mutex_name("settings"))?.map(|mutex| InstanceLock { _mutex: mutex }))
+    let Some(mutex) = create_instance_mutex(&mutex_name("settings"))? else {
+        return Ok(None);
+    };
+    if let Err(e) = ensure_instance_dir(&instance_dir()) {
+        tracing::warn!(error = %e, "could not create the instance dir; activation forwarding unavailable");
+    }
+    Ok(Some(InstanceLock { _mutex: mutex }))
 }
 
 // No guard on other targets; stubs keep the public API total so callers need no `#[cfg]`.

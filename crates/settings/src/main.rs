@@ -139,6 +139,26 @@ fn recorder_status_stream() -> impl iced::futures::Stream<Item = Message> {
     )
 }
 
+/// A `notify` watcher bridged to a tokio channel: filesystem events that pass `filter` become
+/// unit ticks on the receiver. The watcher must be kept alive (and pointed at a dir via
+/// `watch`) for ticks to flow.
+fn watch_channel(
+    filter: impl Fn(&notify::Event) -> bool + Send + 'static,
+) -> notify::Result<(
+    notify::RecommendedWatcher,
+    tokio::sync::mpsc::UnboundedReceiver<()>,
+)> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(event) = res
+            && filter(&event)
+        {
+            let _ = tx.send(());
+        }
+    })?;
+    Ok((watcher, rx))
+}
+
 /// Watch `dir` recursively and yield a debounced [`Message::ClipsChanged`] whenever clips there
 /// appear or disappear. Recursive so a brand-new per-game subfolder (the first clip of a new
 /// game) is covered without re-binding. The `notify` watcher is owned by the async block and
@@ -150,15 +170,8 @@ fn clip_watch_stream(dir: std::path::PathBuf) -> impl iced::futures::Stream<Item
             use iced::futures::SinkExt;
             use notify::{RecursiveMode, Watcher};
 
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-            let mut watcher = match notify::recommended_watcher(
-                move |res: notify::Result<notify::Event>| {
-                    if res.is_ok() {
-                        let _ = tx.send(());
-                    }
-                },
-            ) {
-                Ok(watcher) => watcher,
+            let (mut watcher, mut rx) = match watch_channel(|_| true) {
+                Ok(bridge) => bridge,
                 Err(e) => {
                     tracing::warn!(error = %e, "clip-directory watcher unavailable; refresh is manual");
                     return;
@@ -213,29 +226,33 @@ fn activation_watch_stream() -> impl iced::futures::Stream<Item = Message> {
                 return;
             };
             let file_name = target.file_name().map(std::ffi::OsStr::to_owned);
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-            let mut watcher = match notify::recommended_watcher(
-                move |res: notify::Result<notify::Event>| {
-                    if let Ok(event) = res
-                        && event
-                            .paths
-                            .iter()
-                            .any(|p| p.file_name().map(std::ffi::OsStr::to_owned) == file_name)
-                    {
-                        let _ = tx.send(());
-                    }
-                },
-            ) {
-                Ok(watcher) => watcher,
+            let (mut watcher, mut rx) = match watch_channel(move |event| {
+                event
+                    .paths
+                    .iter()
+                    .any(|p| p.file_name() == file_name.as_deref())
+            }) {
+                Ok(bridge) => bridge,
                 Err(e) => {
                     tracing::warn!(error = %e, "activation watcher unavailable; clip links from toasts need this window closed");
                     return;
                 }
             };
-            // The dir exists — taking the settings lock created it. Non-recursive: only the
-            // activation file matters.
-            if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
-                tracing::warn!(error = %e, "activation watch failed; clip links from toasts need this window closed");
+            // The dir normally exists (taking the settings lock creates it), but that creation
+            // is best-effort — retry rather than give up, the sender creates the dir too.
+            // Non-recursive: only the activation file matters.
+            loop {
+                match watcher.watch(&dir, RecursiveMode::NonRecursive) {
+                    Ok(()) => break,
+                    Err(e) => {
+                        tracing::debug!(error = %e, dir = %dir.display(), "instance dir not watchable yet; retrying");
+                        tokio::time::sleep(WATCH_RETRY).await;
+                    }
+                }
+            }
+            // A hand-off that landed after load but before the watch armed produced no event;
+            // one nudge covers it (consuming is idempotent — nothing pending is a no-op).
+            if output.send(Message::ClipForwarded).await.is_err() {
                 return;
             }
             while rx.recv().await.is_some() {
@@ -295,9 +312,12 @@ fn main() -> iced::Result {
         Ok(None) => {
             tracing::info!("rewynd settings is already open; not opening a second window");
             // A clip link (a clicked "clip saved" toast) is handed to the running window
-            // instead: it opens the clip itself. Only a failed hand-off falls through to the
-            // "already open" notification.
-            if let Some(link) = deeplink_arg() {
+            // instead: it opens the clip itself. Only a link that actually resolves to a clip
+            // is worth handing over — a bogus one, or a failed hand-off, falls through to the
+            // "already open" notification like any other second launch.
+            if let Some(link) = deeplink_arg()
+                && deeplink_clip(&config::load_file()).is_some()
+            {
                 match config::send_settings_activation(&link) {
                     Ok(()) => return Ok(()),
                     Err(e) => {
@@ -712,9 +732,11 @@ impl App {
         let scan = app.library.refresh(&app.config).map(Message::Library);
         let mut tasks = vec![scan];
         // A rewynd://clip/<name> launch (a clicked desktop "clip saved" toast) opens that clip in
-        // the library; the detail view fills in once the scan lands. An activation forwarded in
-        // the moments before the watch below arms is picked up the same way.
-        if let Some(clip) = deeplink_clip(&app.config).or_else(|| forwarded_clip(&app.config)) {
+        // the library; the detail view fills in once the scan lands. A pending forwarded
+        // activation is consumed unconditionally (`or`, not `or_else`) — even when the argument
+        // wins, a leftover must not linger to replay later.
+        let forwarded = forwarded_clip(&app.config);
+        if let Some(clip) = deeplink_clip(&app.config).or(forwarded) {
             app.view = View::Library;
             tasks.push(Task::done(Message::Library(library::Message::Open(clip))));
         }
@@ -1182,7 +1204,14 @@ impl App {
                 }
             }
             Message::ClipForwarded => {
-                if let Some(clip) = forwarded_clip(&self.config) {
+                // Mid-onboarding the hand-off is consumed but only raises the window: the
+                // wizard's own test clip fires a toast, and clicking it must not yank the user
+                // out of setup into the library.
+                if self.view == View::Onboarding {
+                    if config::take_settings_activation().is_some() {
+                        return iced::window::latest().and_then(iced::window::gain_focus);
+                    }
+                } else if let Some(clip) = forwarded_clip(&self.config) {
                     tracing::info!(clip = %clip.display(), "opening a clip link handed over by a second launch");
                     self.view = View::Library;
                     return Task::batch([
