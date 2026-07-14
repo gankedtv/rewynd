@@ -14,8 +14,8 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/gankedtv/rewynd" alt="License"></a>
 </p>
 
-rewynd is a lightweight, native clip recorder for **Linux and Windows**, plus
-**macOS (Apple Silicon, beta — build from source for now)**. It continuously
+rewynd is a lightweight, native clip recorder for **Linux, Windows and macOS**
+(Apple Silicon, macOS 15+). It continuously
 keeps the last 60 seconds (configurable) of the screen in a GPU-encoded ring buffer; on a hotkey it
 flushes that buffer to an MP4. The frame stays on the GPU from capture through hardware
 H.264 encode (zero-copy), so it is light enough to run while gaming.
@@ -42,6 +42,14 @@ Or grab `rewynd.AppImage` from the [latest release](https://github.com/gankedtv/
 **Windows**: download `rewynd-win-Setup.exe` from the
 [latest release](https://github.com/gankedtv/rewynd/releases) and run it (per-user, no
 admin rights needed).
+
+**macOS** (Apple Silicon, macOS 15+): download `rewynd-osx-Portable.zip` from the
+[latest release](https://github.com/gankedtv/rewynd/releases), unzip it, and move
+`rewynd.app` to Applications. The build is unsigned, so the first launch needs
+**right-click → Open** (Gatekeeper offers no Open button on a plain double-click), and
+macOS asks for Screen Recording permission — grant it and relaunch. Because unsigned
+builds get a fresh identity on every update, macOS asks for that permission again after
+each update; a Developer ID signature (planned) fixes that.
 
 The app checks for updates on launch; one click updates both binaries in place.
 
