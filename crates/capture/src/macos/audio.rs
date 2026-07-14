@@ -21,6 +21,7 @@ use cidre::cat::audio::{Format, FormatFlags};
 use cidre::sc::StreamOutput;
 use cidre::{arc, av, cat, cm, define_obj_type, dispatch, ns, objc, sc};
 
+use super::resample::Resampler;
 use super::{
     SessionShared, StreamErrDelegate, StreamErrDelegateInner, ensure_screen_capture_access,
     select_display, session_result, shareable_content, watch_session,
@@ -43,8 +44,16 @@ struct AudioOutputInner {
     params: AudioParams,
     /// Which output type this session consumes (`Audio` loopback or `Mic`).
     expected: sc::OutputType,
-    /// Reused interleave scratch, sized `frames * params.channels` per buffer.
+    /// Reused scratch: the source's frames mapped onto `params.channels`, still at the
+    /// source rate.
+    mapped: Vec<f32>,
+    /// Reused scratch: `mapped` at `params.sample_rate` — what the callback receives.
     interleaved: Vec<f32>,
+    /// Rate conversion, built once the first buffer reveals the source's rate. `None`
+    /// while the source already runs at `params.sample_rate`.
+    resampler: Option<Resampler>,
+    /// Whether the source format has been logged/validated (it never changes mid-stream).
+    format_seen: bool,
     /// Reused audio-buffer-list storage for the per-buffer plane extraction.
     buf_list: cat::AudioBufListN,
     stream_clock: Option<Duration>,
@@ -61,8 +70,10 @@ impl AudioOutputInner {
         let Some(asbd) = desc.stream_basic_desc() else {
             return;
         };
-        // Fail loudly on any format surprise rather than delivering garbage: the
-        // interleave below assumes planar f32 planes at the requested rate.
+        // f32 PCM is the one hard requirement (SCK always delivers it); rate, channel
+        // count and interleaving are whatever the source runs at — the microphone leg
+        // ignores the configured rate and hands over the capture device's native format
+        // — so those are converted below rather than rejected.
         if asbd.format != Format::LINEAR_PCM
             || !asbd.format_flags.contains(FormatFlags::IS_FLOAT)
             || asbd.bits_per_channel != 32
@@ -71,18 +82,27 @@ impl AudioOutputInner {
                 .fail(format!("SCK delivered non-f32 PCM audio: {asbd:?}"));
             return;
         }
-        if !asbd.format_flags.contains(FormatFlags::IS_NON_INTERLEAVED) {
-            self.shared
-                .fail(format!("SCK delivered interleaved audio: {asbd:?}"));
-            return;
-        }
-        let rate = asbd.sample_rate as u32;
-        if rate != self.params.sample_rate {
-            self.shared.fail(format!(
-                "SCK delivered {rate} Hz audio, requested {} Hz",
-                self.params.sample_rate
-            ));
-            return;
+        let src_rate = asbd.sample_rate as u32;
+        let src_channels = (asbd.channels_per_frame as usize).max(1);
+        let planar = asbd.format_flags.contains(FormatFlags::IS_NON_INTERLEAVED);
+        if !self.format_seen {
+            self.format_seen = true;
+            tracing::info!(
+                source = ?self.expected,
+                src_rate,
+                src_channels,
+                planar,
+                out_rate = self.params.sample_rate,
+                out_channels = self.params.channels,
+                "SCK audio format"
+            );
+            if src_rate != self.params.sample_rate {
+                self.resampler = Some(Resampler::new(
+                    src_rate,
+                    self.params.sample_rate,
+                    self.params.channels as usize,
+                ));
+            }
         }
 
         let num_samples = sample_buf.num_samples();
@@ -102,9 +122,10 @@ impl AudioOutputInner {
         if planes.is_empty() {
             return;
         }
+        let per_plane_channels = if planar { 1 } else { src_channels };
         let frames = planes
             .iter()
-            .map(|b| b.data_bytes_size as usize / size_of::<f32>())
+            .map(|b| b.data_bytes_size as usize / size_of::<f32>() / per_plane_channels)
             .min()
             .unwrap_or(0)
             .min(num_samples as usize);
@@ -112,19 +133,42 @@ impl AudioOutputInner {
             return;
         }
 
-        // Interleave into frames of `params.channels`: a mono source duplicates
-        // into every requested channel; extra source planes are dropped.
+        // Map onto frames of `params.channels`: a mono source duplicates into every
+        // requested channel; extra source channels are dropped. Planar sources carry one
+        // plane per channel; a packed source interleaves them all in plane 0.
         let out_channels = self.params.channels as usize;
-        self.interleaved.clear();
-        self.interleaved.reserve(frames * out_channels);
+        self.mapped.clear();
+        self.mapped.reserve(frames * out_channels);
         for frame in 0..frames {
             for channel in 0..out_channels {
-                let plane = &planes[channel.min(planes.len() - 1)];
-                // SAFETY: `frame < frames <= data_bytes_size / 4` for every
-                // plane, and the block buffer keeps the data alive via `list`.
-                let sample = unsafe { *plane.data.cast::<f32>().add(frame) };
-                self.interleaved.push(sample);
+                let sample = if planar {
+                    let plane = &planes[channel.min(planes.len() - 1)];
+                    // SAFETY: `frame < frames <= data_bytes_size / 4` for every plane,
+                    // and the block buffer keeps the data alive via `list`.
+                    unsafe { *plane.data.cast::<f32>().add(frame) }
+                } else {
+                    let channel = channel.min(src_channels - 1);
+                    // SAFETY: as above; a packed buffer holds `frames * src_channels`
+                    // samples in plane 0 (`frames` is derived from its byte size).
+                    unsafe {
+                        *planes[0]
+                            .data
+                            .cast::<f32>()
+                            .add(frame * src_channels + channel)
+                    }
+                };
+                self.mapped.push(sample);
             }
+        }
+
+        // Re-establish the pipeline's fixed rate when the source runs at another one.
+        match self.resampler.as_mut() {
+            Some(resampler) => resampler.process(&self.mapped, &mut self.interleaved),
+            None => std::mem::swap(&mut self.mapped, &mut self.interleaved),
+        }
+        let frames = self.interleaved.len() / out_channels;
+        if frames == 0 {
+            return;
         }
 
         // Continuous stream clock (see the WASAPI backend for the rationale):
@@ -266,6 +310,10 @@ where
             sc::OutputType::Audio
         }
         AudioSource::Microphone => {
+            // Apple's own sample enables both on a microphone stream; only the Mic
+            // output is attached below, so no system audio is delivered here.
+            cfg.set_captures_audio(true);
+            cfg.set_excludes_current_process_audio(true);
             cfg.set_capture_mic(true);
             if let Some(name) = device {
                 let uid = resolve_mic_uid(name)?;
@@ -285,7 +333,10 @@ where
         epoch,
         params,
         expected,
+        mapped: Vec::new(),
         interleaved: Vec::new(),
+        resampler: None,
+        format_seen: false,
         buf_list: cat::AudioBufListN::default(),
         stream_clock: None,
     });

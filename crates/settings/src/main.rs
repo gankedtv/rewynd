@@ -286,11 +286,6 @@ fn main() -> iced::Result {
         spawn_recorder_detached();
     }
 
-    // Before iced runs: winit shares this NSApplication, so the icon set here is the one
-    // the Dock shows for the window it opens.
-    #[cfg(target_os = "macos")]
-    dock::set_icon();
-
     iced::application(App::load, App::update, App::view)
         .title("rewynd")
         .theme(App::theme)
@@ -1259,6 +1254,11 @@ impl App {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        // The Dock icon is set from here (a main-thread call after AppKit finished
+        // launching, which resets any icon set earlier); it self-limits to one call.
+        #[cfg(target_os = "macos")]
+        dock::set_icon();
+
         // The wizard is full-screen (its own steps + Skip), with no nav bar to wander off into.
         if self.view == View::Onboarding {
             return self.wizard.view(&self.config).map(Message::Wizard);

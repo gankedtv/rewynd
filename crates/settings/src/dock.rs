@@ -6,6 +6,8 @@
 //! correct when packaging lands. iced's `window::Settings::icon` is the *window* icon,
 //! which macOS does not show at all.
 
+use std::sync::Once;
+
 use objc2::{AnyThread, MainThreadMarker};
 use objc2_app_kit::{NSApplication, NSImage};
 use objc2_foundation::NSData;
@@ -14,12 +16,23 @@ use objc2_foundation::NSData;
 /// bigger than the tray/notification ladder in `rewynd-config` carries.
 const DOCK_ICON: &[u8] = include_bytes!("../../../packaging/logo-512.png");
 
-/// Point the Dock at the brand mark. Best-effort: a failure just leaves the generic icon.
+/// Point the Dock at the brand mark, once. Called from the render path rather than
+/// before the event loop: AppKit resets the application icon while finishing launching,
+/// so an icon set before that is thrown away. Best-effort — a failure leaves the generic
+/// icon.
 pub fn set_icon() {
+    static ONCE: Once = Once::new();
+    if ONCE.is_completed() {
+        return;
+    }
     let Some(mtm) = MainThreadMarker::new() else {
         tracing::debug!("not on the main thread; leaving the Dock icon alone");
         return;
     };
+    ONCE.call_once(|| set_icon_now(mtm));
+}
+
+fn set_icon_now(mtm: MainThreadMarker) {
     let data = NSData::with_bytes(DOCK_ICON);
     let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else {
         tracing::warn!("could not decode the Dock icon");
