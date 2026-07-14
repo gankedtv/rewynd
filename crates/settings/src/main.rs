@@ -305,6 +305,13 @@ fn main() -> iced::Result {
         return Ok(());
     }
 
+    // `--recorder`: become the recorder instead of opening a window. An AppImage's only
+    // boot-stable path is the image itself, whose entry binary is this GUI — the autostart entry
+    // launches it with this flag. Before the settings lock: the recorder holds its own.
+    if std::env::args().any(|arg| arg == "--recorder") {
+        return run_as_recorder();
+    }
+
     tracing_subscriber::fmt::init();
 
     // Single-instance guard: a second window edits the same file, where its save clobbers the
@@ -2386,6 +2393,29 @@ fn run_update_flow() -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// The `--recorder` launch: replace this process with the recorder beside us. Exec (not spawn)
+/// keeps the AppImage runtime waiting on the recorder, so the FUSE mount holding both binaries
+/// lives exactly as long as the recorder does. Off unix (no exec, and no ephemeral mount to
+/// outlive) a detached spawn does the same job.
+fn run_as_recorder() -> iced::Result {
+    let Some(rec) = recorder_path().filter(|p| p.is_file()) else {
+        eprintln!("rewynd: no recorder found beside this binary");
+        std::process::exit(1);
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let e = std::process::Command::new(&rec).exec();
+        eprintln!("rewynd: could not launch {}: {e}", rec.display());
+        std::process::exit(1);
+    }
+    #[cfg(not(unix))]
+    {
+        spawn_recorder_detached();
+        Ok(())
+    }
 }
 
 /// Launch a detached recorder — used to bring it back after an update relaunch. The child is

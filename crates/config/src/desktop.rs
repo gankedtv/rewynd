@@ -65,17 +65,44 @@ pub fn desktop_exec_value(path: &str) -> String {
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn desktop_entry(exec: &Path, extra: &str) -> String {
+    desktop_entry_for_exec_line(&desktop_exec_value(&exec.to_string_lossy()), extra)
+}
+
+/// [`desktop_entry`] over an already-rendered `Exec` value — the autostart entry appends an
+/// argument to the quoted program path, which `desktop_entry`'s path parameter can't express.
+#[cfg(target_os = "linux")]
+fn desktop_entry_for_exec_line(exec_line: &str, extra: &str) -> String {
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\
          Name=rewynd\n\
          Comment=Instant-replay clip recorder\n\
          Icon={APP_ID}\n\
-         Exec={}\n\
+         Exec={exec_line}\n\
          Terminal=false\n\
-         {extra}",
-        desktop_exec_value(&exec.to_string_lossy()),
+         {extra}"
     )
+}
+
+/// The `$APPIMAGE` path when running from an AppImage: the only launch path that survives the
+/// image's ephemeral FUSE mount, so every entry we persist must point at it.
+#[cfg(target_os = "linux")]
+fn appimage_env() -> Option<PathBuf> {
+    std::env::var_os("APPIMAGE").map(PathBuf::from)
+}
+
+/// The `Exec` value launching the recorder at login: the recorder binary itself, or — inside an
+/// AppImage, where `exec` is an ephemeral mount path — the image with `--recorder`, which the
+/// GUI (the image's entry binary) turns into the recorder.
+#[cfg(target_os = "linux")]
+fn autostart_exec_line(exec: &Path, appimage: Option<&Path>) -> String {
+    match appimage {
+        Some(image) => format!(
+            "{} --recorder",
+            desktop_exec_value(&image.to_string_lossy())
+        ),
+        None => desktop_exec_value(&exec.to_string_lossy()),
+    }
 }
 
 /// Path of rewynd's XDG autostart entry (`<config-home>/autostart/<APP_ID>.desktop`), or `None`
@@ -90,14 +117,20 @@ pub fn autostart_path() -> Option<PathBuf> {
 #[cfg(unix)]
 use crate::paths::write_file_atomic;
 
+/// The autostart entry body launching `exec` (through `appimage` when set) at login.
+#[cfg(target_os = "linux")]
+fn autostart_entry(exec: &Path, appimage: Option<&Path>) -> String {
+    desktop_entry_for_exec_line(
+        &autostart_exec_line(exec, appimage),
+        "StartupNotify=false\n",
+    )
+}
+
 /// Install (or refresh) the autostart entry at `path`, launching `exec` at login. The testable
 /// core of [`install_autostart`].
 #[cfg(target_os = "linux")]
-fn install_autostart_at(path: &Path, exec: &Path) -> std::io::Result<()> {
-    write_file_atomic(
-        path,
-        desktop_entry(exec, "StartupNotify=false\n").as_bytes(),
-    )
+fn install_autostart_at(path: &Path, exec: &Path, appimage: Option<&Path>) -> std::io::Result<()> {
+    write_file_atomic(path, autostart_entry(exec, appimage).as_bytes())
 }
 
 /// Remove the autostart entry at `path`; an already-absent entry is fine. The testable core of
@@ -123,7 +156,7 @@ fn autostart_path_or_err() -> std::io::Result<PathBuf> {
 /// Install (or refresh) the login autostart entry, launching `exec` at login.
 #[cfg(target_os = "linux")]
 pub fn install_autostart(exec: &Path) -> std::io::Result<()> {
-    install_autostart_at(&autostart_path_or_err()?, exec)
+    install_autostart_at(&autostart_path_or_err()?, exec, appimage_env().as_deref())
 }
 
 /// Remove the login autostart entry (absent is fine).
@@ -141,7 +174,7 @@ pub fn install_launcher_entry(exec: &Path) -> std::io::Result<PathBuf> {
     // In an AppImage the launcher must point at the image itself ($APPIMAGE), not the ephemeral
     // mount path in `exec` (stale once the image unmounts). The AppImage's mainExe is the GUI,
     // which is exactly what the launcher opens, so this holds for both callers.
-    let appimage = std::env::var_os("APPIMAGE").map(PathBuf::from);
+    let appimage = appimage_env();
     let exec = appimage.as_deref().unwrap_or(exec);
     let path = data_home_from(|k| std::env::var_os(k))
         .map(|home| home.join("applications").join(format!("{APP_ID}.desktop")))
@@ -200,57 +233,81 @@ fn install_launcher_entry_at(path: &Path, exec: &Path) -> std::io::Result<()> {
     )
 }
 
-/// Bring a pre-icon autostart entry up to date so it gains the `Icon=` key. Only an existing,
-/// icon-less entry is rewritten: a missing one means start-on-boot is off (this must not turn
-/// it on), and one with an icon may be user-managed.
+/// Bring an existing autostart entry up to date: heal a stale program path (a moved install, or
+/// an AppImage's unmounted FUSE path), migrate a pre-rename binary name, and give a pre-icon
+/// entry its `Icon=` key. A missing entry means start-on-boot is off (this must not turn it on),
+/// and an entry launching some foreign, still-existing program may be user-managed and stays
+/// untouched.
 #[cfg(target_os = "linux")]
 pub fn refresh_autostart(exec: &Path) -> std::io::Result<()> {
-    refresh_autostart_at(&autostart_path_or_err()?, exec)
+    refresh_autostart_at(&autostart_path_or_err()?, exec, appimage_env().as_deref())
 }
 
-/// Old binary basenames a rename must migrate away from: the recorder used to be `rewynd` (now
-/// the GUI's name) and the GUI `rewynd-settings`. An autostart entry still launching one of these
-/// is a pre-rename entry of ours and is repointed at the current recorder — otherwise, because the
-/// old recorder name is now the GUI, boot would open the library window instead of recording.
+/// Every binary basename an autostart entry of ours may launch: the current pair, plus the
+/// pre-rename names (the recorder used to be `rewynd` — now the GUI — and the GUI
+/// `rewynd-settings`).
 #[cfg(target_os = "linux")]
-const RENAMED_BINARIES: &[&str] = &["rewynd", "rewynd-settings"];
+const OWNED_BASENAMES: &[&str] = &["rewynd", "rewynd-settings", "rewynd-recorder"];
 
-/// The binary basename in a desktop entry's `Exec` line, best-effort (the Exec is a quoted path;
-/// pathological paths with embedded quotes just yield a wrong basename, which is harmless here).
+/// The full `Exec` value of a desktop entry, and the program path within one, best-effort (the
+/// Exec is a quoted path; pathological paths with embedded quotes just yield a wrong program,
+/// which is harmless here).
 #[cfg(target_os = "linux")]
-fn entry_exec_basename(entry: &str) -> Option<String> {
-    let value = entry
+fn entry_exec_value(entry: &str) -> Option<&str> {
+    entry
         .lines()
-        .find_map(|line| line.trim_start().strip_prefix("Exec="))?;
-    let path = match value.strip_prefix('"') {
+        .find_map(|line| line.trim_start().strip_prefix("Exec="))
+}
+
+#[cfg(target_os = "linux")]
+fn exec_value_program(value: &str) -> &str {
+    match value.strip_prefix('"') {
         Some(rest) => rest.split('"').next().unwrap_or(rest),
         None => value.split_whitespace().next().unwrap_or(value),
-    };
-    path.rsplit('/').next().map(str::to_owned)
+    }
 }
 
 /// The testable core of [`refresh_autostart`].
 #[cfg(target_os = "linux")]
-fn refresh_autostart_at(path: &Path, exec: &Path) -> std::io::Result<()> {
+fn refresh_autostart_at(path: &Path, exec: &Path, appimage: Option<&Path>) -> std::io::Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let desired = desktop_entry(exec, "StartupNotify=false\n");
-    // Rename migration: an autostart entry still launching an old binary name gets repointed at
-    // the current recorder even when it already carries an icon. This overrides the icon-ownership
-    // guard because it's our own rename, not a packaged file (no packaged autostart exists).
-    let target = exec
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default();
-    if let Ok(existing) = std::fs::read_to_string(path)
-        && let Some(basename) = entry_exec_basename(&existing)
-        && basename != target
-        && RENAMED_BINARIES.contains(&basename.as_str())
-    {
+    let desired = autostart_entry(exec, appimage);
+    let existing = match std::fs::read_to_string(path) {
+        Ok(existing) => existing,
+        // Missing lost a race with a toggle-off; non-text is foreign. Both are left alone.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if existing == desired {
+        return Ok(());
+    }
+    let value = entry_exec_value(&existing).unwrap_or_default();
+    let program = exec_value_program(value);
+    let basename = program.rsplit('/').next().unwrap_or_default();
+    // An entry in the `"image" --recorder` form belongs to an AppImage install; a run outside
+    // that image (a dev build, a distro package) must not repoint it at its own recorder.
+    let appimage_form = value.ends_with(" --recorder");
+    let owned = if appimage.is_some() {
+        // Under an AppImage every entry launching our binary names is ours to canonicalize:
+        // a mount path dies with the session, so it must be repointed at the image itself.
+        OWNED_BASENAMES.contains(&basename)
+    } else {
+        // Rename migration: an entry still launching an old binary name (the old recorder was
+        // `rewynd`, now the GUI's name) is repointed at the current recorder — otherwise boot
+        // would open the library window instead of recording.
+        !appimage_form && basename != "rewynd-recorder" && OWNED_BASENAMES.contains(&basename)
+    };
+    // Beyond ownership, heal a gone program (a moved install, or an unmounted AppImage path
+    // after a reboot) and finish pre-icon self-installs. An icon-bearing entry whose foreign
+    // program still exists is user-managed and stays untouched.
+    let stale_program = !program.is_empty() && !Path::new(program).exists();
+    if owned || stale_program || !has_icon_key(&existing) {
         return write_file_atomic(path, desired.as_bytes());
     }
-    refresh_iconless_entry_at(path, &desired)
+    Ok(())
 }
 
 /// Install [`BRAND_ICONS`] into the per-user hicolor theme
@@ -849,14 +906,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("autostart").join("rewynd.desktop");
 
-        install_autostart_at(&path, Path::new("/opt/rewynd/rewynd")).expect("install");
+        install_autostart_at(&path, Path::new("/opt/rewynd/rewynd"), None).expect("install");
         let entry = std::fs::read_to_string(&path).expect("read entry");
         assert!(entry.starts_with("[Desktop Entry]\n"));
         assert!(entry.contains("Exec=\"/opt/rewynd/rewynd\"\n"));
         assert!(entry.contains("StartupNotify=false\n"));
 
         // Re-installing refreshes a stale Exec path in place.
-        install_autostart_at(&path, Path::new("/new/rewynd")).expect("refresh");
+        install_autostart_at(&path, Path::new("/new/rewynd"), None).expect("refresh");
         assert!(
             std::fs::read_to_string(&path)
                 .expect("read refreshed")
@@ -866,6 +923,23 @@ mod tests {
         remove_autostart_at(&path).expect("remove");
         assert!(!path.exists(), "disabling removes the entry");
         remove_autostart_at(&path).expect("idempotent remove");
+    }
+
+    #[test]
+    fn autostart_install_under_an_appimage_points_at_the_image() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("autostart").join("rewynd.desktop");
+
+        // The recorder's mount path is ephemeral; the entry must launch the image itself, whose
+        // entry binary (the GUI) turns `--recorder` into the recorder.
+        install_autostart_at(
+            &path,
+            Path::new("/tmp/.mount_rewynd123/usr/bin/rewynd-recorder"),
+            Some(Path::new("/home/u/.local/bin/rewynd")),
+        )
+        .expect("install");
+        let entry = std::fs::read_to_string(&path).expect("read entry");
+        assert!(entry.contains("Exec=\"/home/u/.local/bin/rewynd\" --recorder\n"));
     }
 
     #[test]
@@ -915,25 +989,35 @@ mod tests {
         let path = dir.path().join("autostart").join("rewynd.desktop");
 
         // Missing entry: start-on-boot is off; the refresh must not create one.
-        refresh_autostart_at(&path, Path::new("/opt/rewynd/rewynd")).expect("absent ok");
+        refresh_autostart_at(&path, Path::new("/opt/rewynd/rewynd"), None).expect("absent ok");
         assert!(!path.exists());
 
         // Pre-icon entry gains the Icon key (and the current exec).
         std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         std::fs::write(&path, "[Desktop Entry]\nName=rewynd\n").expect("seed old");
-        refresh_autostart_at(&path, Path::new("/opt/rewynd/rewynd")).expect("refresh");
+        refresh_autostart_at(&path, Path::new("/opt/rewynd/rewynd"), None).expect("refresh");
         let refreshed = std::fs::read_to_string(&path).expect("read");
         assert!(refreshed.contains(&format!("Icon={APP_ID}\n")));
         assert!(refreshed.contains("StartupNotify=false\n"));
 
-        // Already-current (or user-managed) entries stay untouched.
-        let managed = "[Desktop Entry]\nIcon=custom\nExec=/my/wrapper\n";
-        std::fs::write(&path, managed).expect("seed managed");
-        refresh_autostart_at(&path, Path::new("/opt/rewynd/rewynd")).expect("no-op");
+        // A user-managed entry launching a live foreign program stays untouched.
+        let wrapper = dir.path().join("wrapper.sh");
+        std::fs::write(&wrapper, b"#!/bin/sh\n").expect("live wrapper");
+        let managed = format!("[Desktop Entry]\nIcon=custom\nExec={}\n", wrapper.display());
+        std::fs::write(&path, &managed).expect("seed managed");
+        refresh_autostart_at(&path, Path::new("/opt/rewynd/rewynd"), None).expect("no-op");
         assert_eq!(std::fs::read_to_string(&path).expect("read"), managed);
+
+        // A gone program is healed even in a foreign-looking entry: the launch is broken anyway.
+        std::fs::remove_file(&wrapper).expect("break wrapper");
+        refresh_autostart_at(&path, Path::new("/opt/rewynd/rewynd"), None).expect("heal");
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("read")
+                .contains("Exec=\"/opt/rewynd/rewynd\"\n")
+        );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn autostart_refresh_migrates_the_pre_rename_recorder_binary() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -942,34 +1026,61 @@ mod tests {
 
         // A pre-rename entry (icon-bearing) that still launches the old `rewynd` recorder — now
         // the GUI's name — is repointed at the current recorder despite carrying an icon; without
-        // this, start-on-boot would open the library window instead of recording.
-        let stale = desktop_entry(Path::new("/opt/rewynd/rewynd"), "StartupNotify=false\n");
+        // this, start-on-boot would open the library window instead of recording. The old
+        // program must exist, or the stale-program heal would mask the rename path.
+        let old = dir.path().join("rewynd");
+        std::fs::write(&old, b"").expect("old binary");
+        let stale = desktop_entry(&old, "StartupNotify=false\n");
         std::fs::write(&path, &stale).expect("seed stale");
-        refresh_autostart_at(&path, Path::new("/opt/rewynd/rewynd-recorder")).expect("migrate");
+        refresh_autostart_at(&path, Path::new("/opt/rewynd/rewynd-recorder"), None)
+            .expect("migrate");
         let migrated = std::fs::read_to_string(&path).expect("read");
-        assert_eq!(
-            entry_exec_basename(&migrated).as_deref(),
-            Some("rewynd-recorder")
-        );
+        assert!(migrated.contains("Exec=\"/opt/rewynd/rewynd-recorder\"\n"));
 
         // Idempotent: the now-current entry is left alone on a second pass.
-        refresh_autostart_at(&path, Path::new("/opt/rewynd/rewynd-recorder")).expect("idempotent");
+        refresh_autostart_at(&path, Path::new("/opt/rewynd/rewynd-recorder"), None)
+            .expect("idempotent");
         assert_eq!(std::fs::read_to_string(&path).expect("read"), migrated);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn entry_exec_basename_reads_the_quoted_exec_path() {
+    fn autostart_refresh_canonicalizes_mount_paths_under_an_appimage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("autostart").join("rewynd.desktop");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let image = dir.path().join("rewynd");
+        std::fs::write(&image, b"").expect("image");
+
+        // A pre-fix entry launching the recorder through a (still-live) mount path is repointed
+        // at the image itself, which is the only path that survives the session.
+        let mounted = dir.path().join("rewynd-recorder");
+        std::fs::write(&mounted, b"").expect("mounted recorder");
+        std::fs::write(&path, desktop_entry(&mounted, "StartupNotify=false\n")).expect("seed");
+        refresh_autostart_at(&path, &mounted, Some(&image)).expect("canonicalize");
+        let healed = std::fs::read_to_string(&path).expect("read");
+        assert!(healed.contains(&format!("Exec=\"{}\" --recorder\n", image.display())));
+
+        // Idempotent under the image, and — crucially — a later run OUTSIDE the image (a dev
+        // build) must not repoint the image-form entry at its own recorder.
+        refresh_autostart_at(&path, &mounted, Some(&image)).expect("idempotent");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), healed);
+        refresh_autostart_at(&path, Path::new("/dev/tree/rewynd-recorder"), None)
+            .expect("dev no-op");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), healed);
+    }
+
+    #[test]
+    fn exec_value_program_reads_quoted_and_bare_paths() {
         let entry = desktop_entry(Path::new("/opt/rewynd/rewynd-recorder"), "");
         assert_eq!(
-            entry_exec_basename(&entry).as_deref(),
-            Some("rewynd-recorder")
+            entry_exec_value(&entry).map(exec_value_program),
+            Some("/opt/rewynd/rewynd-recorder")
         );
         assert_eq!(
-            entry_exec_basename("[Desktop Entry]\nExec=/usr/bin/rewynd\n").as_deref(),
-            Some("rewynd")
+            exec_value_program("/usr/bin/rewynd --recorder"),
+            "/usr/bin/rewynd"
         );
-        assert_eq!(entry_exec_basename("[Desktop Entry]\nName=x\n"), None);
+        assert_eq!(entry_exec_value("[Desktop Entry]\nName=x\n"), None);
     }
 
     // The mtime pinning below opens the theme *directory* as a file, which Windows
