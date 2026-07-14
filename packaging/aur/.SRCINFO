@@ -1,0 +1,26 @@
+pkgbase = rewynd
+	pkgdesc = Instant-replay clip recorder: hotkey saves the last minutes of gameplay
+	pkgver = 1.0.0beta3
+	pkgrel = 1
+	url = https://github.com/gankedtv/rewynd
+	arch = x86_64
+	license = GPL-3.0-or-later
+	makedepends = cargo
+	makedepends = clang
+	makedepends = git
+	depends = alsa-lib
+	depends = ffmpeg
+	depends = gcc-libs
+	depends = glibc
+	depends = libpipewire
+	depends = libxkbcommon
+	depends = opus
+	depends = vulkan-icd-loader
+	depends = wayland
+	options = !lto
+	source = rewynd-v1.0.0-beta.3.tar.gz::https://github.com/gankedtv/rewynd/archive/refs/tags/v1.0.0-beta.3.tar.gz
+	source = tv.ganked.rewynd.desktop
+	sha256sums = f1aa91c19224a48db0c485212e30dd771d78f6fdd741e84510d849e39b9c2cf2
+	sha256sums = 661b590d1662d0f52df984c2209864152c735d62f3b4dac2be13ea4b8c796f6b
+
+pkgname = rewynd

@@ -175,9 +175,19 @@ fn spawn_audio_ffmpeg(path: &Path, start: Duration, end: Duration) -> std::io::R
     command.spawn()
 }
 
+/// The ffmpeg to spawn: the copy the installers bundle beside our own binaries (not every
+/// machine has ffmpeg), else whatever `PATH` provides (dev runs, distro packages that depend on
+/// the system ffmpeg).
+fn ffmpeg_command() -> Command {
+    match rewynd_config::sibling_binary("ffmpeg").filter(|p| p.is_file()) {
+        Some(bundled) => Command::new(bundled),
+        None => Command::new("ffmpeg"),
+    }
+}
+
 /// The shared ffmpeg invocation prefix for one `[start, end]` range of a clip.
 fn ffmpeg_range(path: &Path, start: Duration, end: Duration) -> Command {
-    let mut command = Command::new("ffmpeg");
+    let mut command = ffmpeg_command();
     command
         .arg("-hide_banner")
         .args(["-loglevel", "error", "-nostdin"])
@@ -323,7 +333,7 @@ fn audio_loop(path: &Path, start: Duration, end: Duration, stop: &AtomicBool) {
 /// Per-bucket audio peaks (`0.0..=1.0`) across the whole clip, decoded by ffmpeg at a low
 /// mono rate, for the timeline's waveform lane. `None` when there is no audio (or no ffmpeg).
 pub fn waveform(path: &Path, buckets: usize) -> Option<Vec<f32>> {
-    let mut command = Command::new("ffmpeg");
+    let mut command = ffmpeg_command();
     command
         .arg("-hide_banner")
         .args(["-loglevel", "error", "-nostdin"])

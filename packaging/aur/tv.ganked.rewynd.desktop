@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=rewynd
+Comment=Instant-replay clip recorder
+Icon=tv.ganked.rewynd
+Exec=/usr/bin/rewynd
+Terminal=false
+Categories=AudioVideo;Recorder;
