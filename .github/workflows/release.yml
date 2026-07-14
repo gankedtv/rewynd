@@ -197,8 +197,16 @@ jobs:
         id: ver
         run: bash .github/scripts/release-version.sh
 
-      - name: Install vpk
-        run: dotnet tool install -g vpk --version "$VPK_VERSION"
+      # The macOS runner image no longer ships .NET on the default location (the macOS 26
+      # image dropped it), so install it the same way the Linux job does; without DOTNET_ROOT
+      # the vpk apphost aborts with "You must install .NET to run this application".
+      - name: Install .NET + vpk
+        run: |
+          curl -fsSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 8.0
+          echo "DOTNET_ROOT=$HOME/.dotnet" >> "$GITHUB_ENV"
+          echo "$HOME/.dotnet" >> "$GITHUB_PATH"
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+          "$HOME/.dotnet/dotnet" tool install -g vpk --version "$VPK_VERSION"
 
       - name: Build release binaries
         env:
