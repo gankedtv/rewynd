@@ -14,6 +14,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod anim;
+#[cfg(target_os = "macos")]
+mod dock;
 mod library;
 mod player;
 mod scroll;
@@ -283,6 +285,11 @@ fn main() -> iced::Result {
     if initial_view() != View::Onboarding {
         spawn_recorder_detached();
     }
+
+    // Before iced runs: winit shares this NSApplication, so the icon set here is the one
+    // the Dock shows for the window it opens.
+    #[cfg(target_os = "macos")]
+    dock::set_icon();
 
     iced::application(App::load, App::update, App::view)
         .title("rewynd")

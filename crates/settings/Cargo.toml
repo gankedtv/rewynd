@@ -79,3 +79,11 @@ winresource = "0.1"
 
 [dev-dependencies]
 tempfile.workspace = true
+
+# The macOS Dock icon: unbundled there is no Info.plist to carry one, so NSApplication's
+# icon is set at runtime (src/dock.rs). objc2-app-kit is already in winit's macOS
+# dependency tree, so this adds no new build cost.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSResponder"] }
+objc2-foundation = "0.3"
