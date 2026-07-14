@@ -32,12 +32,18 @@ curl -fsSLo "$work/$asset" \
     "https://github.com/BtbN/FFmpeg-Builds/releases/download/$FFMPEG_TAG/$asset"
 echo "$sha256  $work/$asset" | sha256sum -c -
 
-# The archive root dir matches the asset basename; bsdtar (present on every runner, Windows
-# included) extracts both the .tar.xz and the .zip.
+# The archive root dir matches the asset basename. The .zip goes through Python's zipfile:
+# the Windows runner's git-bash resolves `tar`/no `unzip` to GNU tar, which cannot read zip
+# (only the system bsdtar can, and PATH hides it).
 case "$asset" in
-    *.tar.xz) root="${asset%.tar.xz}" ;;
-    *.zip) root="${asset%.zip}" ;;
+    *.tar.xz)
+        root="${asset%.tar.xz}"
+        tar -xf "$work/$asset" -C "$work" "$root/bin/$bin"
+        ;;
+    *.zip)
+        root="${asset%.zip}"
+        python -m zipfile -e "$work/$asset" "$work/"
+        ;;
 esac
-tar -xf "$work/$asset" -C "$work" "$root/bin/$bin"
 install -m 755 "$work/$root/bin/$bin" "$dest/$bin"
 echo "bundled $("$dest/$bin" -version | head -n 1)"

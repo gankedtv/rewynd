@@ -19,6 +19,9 @@ env:
   # not every machine has one). Pinned to a BtbN monthly autobuild (kept for two years) with
   # per-asset sha256, fetched by .github/scripts/fetch-ffmpeg.sh. GPL builds — the app is
   # GPL-3.0-or-later. The Linux build's glibc floor (2.28) sits below the AppImage's 2.35.
+  # Bumping the pin (needed before the tag ages out): pick a newer end-of-month tag from
+  # BtbN/FFmpeg-Builds releases, take its release-branch (-gpl-N.N) linux64/win64 assets, and
+  # refresh the two sha256s from a local download.
   FFMPEG_TAG: autobuild-2026-06-30-13-34
   FFMPEG_LINUX_ASSET: ffmpeg-n8.1.2-21-gce3c09c101-linux64-gpl-8.1.tar.xz
   FFMPEG_LINUX_SHA256: 0ba73bbd93472c7622f6dec26d334c5e62e64d858d072490b2844320970456cd
