@@ -81,13 +81,24 @@ fn initial_view() -> View {
     }
 }
 
-/// The clip a `rewynd://clip/<name>` launch argument points at — a clicked desktop "clip saved"
-/// toast — resolved against the configured output directory. `None` when no such argument is
-/// present (or it fails validation).
+/// The raw `rewynd://clip/<name>` launch argument, if any — a clicked desktop "clip saved"
+/// toast launches us with the link as an argument.
+fn deeplink_arg() -> Option<String> {
+    std::env::args().find(|arg| arg.starts_with(config::CLIP_URL_PREFIX))
+}
+
+/// The clip a `rewynd://clip/<name>` launch argument points at, resolved against the configured
+/// output directory. `None` when no such argument is present (or it fails validation).
 fn deeplink_clip(config: &Config) -> Option<std::path::PathBuf> {
-    std::env::args()
-        .find(|arg| arg.starts_with(config::CLIP_URL_PREFIX))
-        .and_then(|arg| config::clip_from_deeplink(&arg, config.output_dir().as_deref()))
+    deeplink_arg().and_then(|arg| config::clip_from_deeplink(&arg, config.output_dir().as_deref()))
+}
+
+/// The clip a *forwarded* activation points at: a refused second instance (a toast clicked while
+/// this window is open) hands its link over via the activation file. Consumes the pending file;
+/// the link is re-validated here, exactly like a launch argument.
+fn forwarded_clip(config: &Config) -> Option<std::path::PathBuf> {
+    config::take_settings_activation()
+        .and_then(|link| config::clip_from_deeplink(&link, config.output_dir().as_deref()))
 }
 
 /// How long to wait after the first filesystem event before refreshing, so a burst (one clip
@@ -185,6 +196,57 @@ fn clip_watch_stream(dir: std::path::PathBuf) -> impl iced::futures::Stream<Item
     )
 }
 
+/// Watch the instance dir for a forwarded activation (a toast clicked while this window is
+/// open — the refused second instance drops the link there) and yield [`Message::ClipForwarded`]
+/// when the activation file lands. Events are filtered to that one file: the dir also holds the
+/// recorder's pid/status files, whose churn must not wake the UI. No debounce — the file appears
+/// in a single atomic rename, and consuming it is idempotent.
+fn activation_watch_stream() -> impl iced::futures::Stream<Item = Message> {
+    iced::stream::channel(
+        4,
+        |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+            use iced::futures::SinkExt;
+            use notify::{RecursiveMode, Watcher};
+
+            let target = config::settings_activation_path();
+            let Some(dir) = target.parent().map(std::path::Path::to_path_buf) else {
+                return;
+            };
+            let file_name = target.file_name().map(std::ffi::OsStr::to_owned);
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let mut watcher = match notify::recommended_watcher(
+                move |res: notify::Result<notify::Event>| {
+                    if let Ok(event) = res
+                        && event
+                            .paths
+                            .iter()
+                            .any(|p| p.file_name().map(std::ffi::OsStr::to_owned) == file_name)
+                    {
+                        let _ = tx.send(());
+                    }
+                },
+            ) {
+                Ok(watcher) => watcher,
+                Err(e) => {
+                    tracing::warn!(error = %e, "activation watcher unavailable; clip links from toasts need this window closed");
+                    return;
+                }
+            };
+            // The dir exists — taking the settings lock created it. Non-recursive: only the
+            // activation file matters.
+            if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
+                tracing::warn!(error = %e, "activation watch failed; clip links from toasts need this window closed");
+                return;
+            }
+            while rx.recv().await.is_some() {
+                if output.send(Message::ClipForwarded).await.is_err() {
+                    break;
+                }
+            }
+        },
+    )
+}
+
 /// Slider bounds (kept generous but sane).
 const GAIN_MAX: f32 = 4.0;
 const BUFFER_MIN_S: u32 = 5;
@@ -232,6 +294,17 @@ fn main() -> iced::Result {
         Ok(Some(lock)) => Some(lock),
         Ok(None) => {
             tracing::info!("rewynd settings is already open; not opening a second window");
+            // A clip link (a clicked "clip saved" toast) is handed to the running window
+            // instead: it opens the clip itself. Only a failed hand-off falls through to the
+            // "already open" notification.
+            if let Some(link) = deeplink_arg() {
+                match config::send_settings_activation(&link) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not hand the clip link to the running window");
+                    }
+                }
+            }
             // Blocking show is fine: no async runtime is live yet. Without this, the tray's
             // "Open settings" appears to do nothing when a window is already open.
             let mut note = notify_rust::Notification::new();
@@ -625,6 +698,9 @@ enum Message {
     WindowFocused,
     /// The clip-directory watcher fired (debounced); refresh the library.
     ClipsChanged,
+    /// A refused second instance forwarded a clip link (a toast clicked while this window is
+    /// open); consume it, open the clip, and raise the window.
+    ClipForwarded,
 }
 
 impl App {
@@ -636,8 +712,9 @@ impl App {
         let scan = app.library.refresh(&app.config).map(Message::Library);
         let mut tasks = vec![scan];
         // A rewynd://clip/<name> launch (a clicked desktop "clip saved" toast) opens that clip in
-        // the library; the detail view fills in once the scan lands.
-        if let Some(clip) = deeplink_clip(&app.config) {
+        // the library; the detail view fills in once the scan lands. An activation forwarded in
+        // the moments before the watch below arms is picked up the same way.
+        if let Some(clip) = deeplink_clip(&app.config).or_else(|| forwarded_clip(&app.config)) {
             app.view = View::Library;
             tasks.push(Task::done(Message::Library(library::Message::Open(clip))));
         }
@@ -1104,6 +1181,18 @@ impl App {
                     return self.library.refresh(&self.config).map(Message::Library);
                 }
             }
+            Message::ClipForwarded => {
+                if let Some(clip) = forwarded_clip(&self.config) {
+                    tracing::info!(clip = %clip.display(), "opening a clip link handed over by a second launch");
+                    self.view = View::Library;
+                    return Task::batch([
+                        // The user clicked a toast: bring the window forward, don't just
+                        // change it in the background.
+                        iced::window::latest().and_then(iced::window::gain_focus),
+                        Task::done(Message::Library(library::Message::Open(clip))),
+                    ]);
+                }
+            }
         }
         Task::none()
     }
@@ -1335,6 +1424,9 @@ impl App {
         });
         // Poll the recorder's status file for the top-right pill.
         let status = iced::Subscription::run(recorder_status_stream);
+        // Clip links forwarded by a refused second instance (a toast clicked while this window
+        // is open).
+        let activation = iced::Subscription::run(activation_watch_stream);
         // The library adds its own conditional subscriptions (accent-fade ticks, preview
         // playback); iced re-diffs after each update, so they vanish when idle and the software
         // renderer stops redrawing.
@@ -1349,6 +1441,7 @@ impl App {
             focus,
             clips,
             status,
+            activation,
             wizard,
             self.library.subscription().map(Message::Library),
         ])

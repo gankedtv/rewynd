@@ -154,9 +154,11 @@ pub fn acquire_recorder_lock() -> std::io::Result<Option<InstanceLock>> {
 }
 
 /// Acquire the settings app's single-instance lock (a named mutex). `Ok(None)` means a
-/// settings window is already open.
+/// settings window is already open. The instance dir is created here too — the mutex itself
+/// needs no file, but the holder watches that dir for forwarded activations.
 #[cfg(windows)]
 pub fn acquire_settings_lock() -> std::io::Result<Option<InstanceLock>> {
+    ensure_instance_dir(&instance_dir())?;
     Ok(create_instance_mutex(&mutex_name("settings"))?.map(|mutex| InstanceLock { _mutex: mutex }))
 }
 

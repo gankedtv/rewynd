@@ -20,6 +20,7 @@
 //! installation, recorder process control, and the clip store (where clips live and what they
 //! are called).
 
+mod activation;
 mod clips;
 mod desktop;
 mod devices;
@@ -31,6 +32,7 @@ mod schema;
 mod status;
 pub mod upload_history;
 
+pub use activation::{send_settings_activation, take_settings_activation};
 pub use clips::{
     CLIP_URL_PREFIX, CLIP_URL_SCHEME, ClipEntry, clip_deeplink, clip_from_deeplink,
     clip_output_path, clips_dir, ensure_private_dir, folder_name, list_clips, newest_clip_in,
@@ -54,7 +56,8 @@ pub use desktop::{autostart_path, desktop_entry, desktop_exec_value};
 pub use desktop::{install_icons, install_launcher_entry};
 pub use lock::{InstanceLock, acquire_recorder_lock, acquire_settings_lock};
 pub use paths::{
-    APP_ID, config_path, default_output_dir, recorder_pid_path, settings_lock_path, sibling_binary,
+    APP_ID, config_path, default_output_dir, recorder_pid_path, settings_activation_path,
+    settings_lock_path, sibling_binary,
 };
 #[cfg(windows)]
 pub use process::{RecorderSaveEvent, RecorderStopEvent};

@@ -147,6 +147,13 @@ pub fn settings_lock_path() -> PathBuf {
     instance_dir().path.join("settings.lock")
 }
 
+/// Path of the settings activation file: a pending `rewynd://clip/<name>` link dropped by a
+/// refused second settings instance for the running window to pick up (docs/adr/0016).
+#[must_use]
+pub fn settings_activation_path() -> PathBuf {
+    instance_dir().path.join("settings.activate")
+}
+
 /// `name` beside `exe`, with the platform's executable suffix. The testable core of
 /// [`sibling_binary`].
 fn sibling_of(exe: &Path, name: &str) -> Option<PathBuf> {
