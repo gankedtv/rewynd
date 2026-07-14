@@ -159,10 +159,63 @@ jobs:
           # The release already exists (linux-pack created it); append the Windows assets.
           gh release upload "$TAG" Releases/* --repo "$GITHUB_REPOSITORY" --clobber
 
+  macos-pack:
+    # Serialized after windows-pack for the same reason: it only appends to the release
+    # linux-pack created.
+    needs: windows-pack
+    runs-on: macos-latest # Apple Silicon — the only macOS target we ship (ADR 0015)
+    permissions:
+      contents: write # gh release upload appends the macOS assets
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: stable
+
+      - name: Resolve and verify version
+        id: ver
+        run: bash .github/scripts/release-version.sh
+
+      - name: Install vpk
+        run: dotnet tool install -g vpk --version "$VPK_VERSION"
+
+      - name: Build release binaries
+        env:
+          REWYND_YT_CLIENT_ID: ${{ secrets.REWYND_YT_CLIENT_ID }}
+          REWYND_YT_CLIENT_SECRET: ${{ secrets.REWYND_YT_CLIENT_SECRET }}
+        run: cargo build --release --locked -p rewynd -p rewynd-recorder
+
+      - name: Pack and upload (.app bundle)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir -p pack
+          cp target/release/rewynd target/release/rewynd-recorder pack/
+          # Our own Info.plist (--plist, which excludes --bundleId: the plist carries the id):
+          # Velopack's generated one has no NSMicrophoneUsageDescription, and macOS kills a
+          # bundled process the moment it touches the microphone without it. vpk does not stamp
+          # a supplied plist, so the version keys are set here (the short one must stay numeric).
+          cp packaging/Info.plist pack-info.plist
+          plutil -replace CFBundleShortVersionString -string "${VERSION%%-*}" pack-info.plist
+          plutil -replace CFBundleVersion -string "$VERSION" pack-info.plist
+          # Unsigned: no Developer ID yet, so no --signAppIdentity/--notaryProfile. Gatekeeper
+          # therefore quarantines the download (README documents the first-run steps), and the
+          # ad-hoc signature changes per build, so macOS re-asks for screen recording after an
+          # update. Both go away once a Developer ID is in place.
+          vpk pack -u rewynd -v "$VERSION" -p pack -e rewynd -i packaging/rewynd.icns \
+            --packTitle rewynd --plist pack-info.plist
+          gh release upload "$TAG" Releases/* --repo "$GITHUB_REPOSITORY" --clobber
+
   # Attach a SHA256SUMS over every published asset so testers can verify their download
   # (the beta ships unsigned; see the Defender/SmartScreen notes in the release plan).
   checksums:
-    needs: [linux-pack, windows-pack]
+    needs: [linux-pack, windows-pack, macos-pack]
     runs-on: ubuntu-latest
     permissions:
       contents: write # attach SHA256SUMS to the release

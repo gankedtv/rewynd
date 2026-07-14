@@ -79,6 +79,10 @@ png = "0.18"
 # Live-pipeline recording spike: NV12 conversion + H.264 encode of captured frames.
 rewynd-encode.workspace = true
 
+# The focus probe example logs the watcher's transitions on macOS too.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+tracing-subscriber.workspace = true
+
 [features]
 # Diagnostic probe entry points (single-frame capture, format logging) for the examples.
 probes = []

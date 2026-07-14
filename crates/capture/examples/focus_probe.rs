@@ -1,10 +1,14 @@
 //! Focus-watcher probe: print the focused fullscreen game as it changes, proving the
-//! compositor backend works. Run it, focus a fullscreen window, alt-tab around.
+//! platform backend works. Run it, focus a fullscreen window, alt-tab around.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn main() {
     tracing_subscriber::fmt::init();
-    let watcher = match rewynd_capture::linux::FocusWatcher::spawn(None) {
+    #[cfg(target_os = "linux")]
+    use rewynd_capture::linux::FocusWatcher;
+    #[cfg(target_os = "macos")]
+    use rewynd_capture::macos::FocusWatcher;
+    let watcher = match FocusWatcher::spawn(None) {
         Ok(w) => w,
         Err(e) => {
             eprintln!("focus watcher unavailable: {e}");
@@ -32,7 +36,7 @@ fn main() {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn main() {
-    eprintln!("this probe is Linux-only");
+    eprintln!("this probe runs on Linux and macOS only");
 }

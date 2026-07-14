@@ -209,6 +209,17 @@ impl AudioMixer {
         }
         self.take_frames(self.buf.len() / self.channels)
     }
+
+    /// Forget the anchored timeline and any buffered samples; the next [`add`](Self::add)
+    /// re-anchors at its buffer's PTS. Without this, a capture pause longer than the
+    /// buffering cap leaves `base_frame` frozen at the drained frontier and every resumed
+    /// source's (far-ahead) buffer is silently dropped — session-scoped capture (game-only
+    /// mode) must reset before each new session.
+    pub fn reset(&mut self) {
+        self.buf.clear();
+        self.base_frame = 0;
+        self.started = false;
+    }
 }
 
 #[cfg(test)]
@@ -229,6 +240,26 @@ mod tests {
         assert_eq!(m.frame_at(ms(1000)), 48_000);
         assert_eq!(m.frame_at(ms(10)), 480);
         assert_eq!(m.pts_of(48_000), ms(1000));
+    }
+
+    #[test]
+    fn reset_reanchors_after_a_long_pause() {
+        let mut m = AudioMixer::new(SR, CH, ms(100));
+        let pcm: Vec<f32> = (0..480 * 2).map(|_| 0.25).collect();
+        m.add(&pcm, Duration::ZERO);
+        assert!(m.drain_all().is_some());
+
+        // A resumed source far past the buffering cap is dropped against the stale
+        // anchor — the frozen-frontier failure a session pause would hit…
+        m.add(&pcm, Duration::from_secs(100));
+        assert!(m.drain_all().is_none(), "far-ahead add lands nowhere");
+
+        // …and a reset re-anchors so the next session's audio flows again.
+        m.reset();
+        m.add(&pcm, Duration::from_secs(100));
+        let (pts, out) = m.drain_all().expect("re-anchored");
+        assert_eq!(pts, Duration::from_secs(100));
+        assert_eq!(out.len(), 480 * 2);
     }
 
     #[test]

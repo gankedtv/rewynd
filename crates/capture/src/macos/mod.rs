@@ -28,6 +28,7 @@ use crate::CaptureError;
 
 pub mod audio;
 pub mod focus;
+mod resample;
 pub mod video;
 
 pub use audio::capture_audio;

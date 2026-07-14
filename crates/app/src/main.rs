@@ -2707,7 +2707,7 @@ mod macos {
     use std::ops::ControlFlow;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use anyhow::{Context, Result, anyhow};
     use global_hotkey::hotkey::{Code, HotKey, Modifiers};
@@ -2901,39 +2901,97 @@ mod macos {
         let stop = Arc::new(AtomicBool::new(false));
         let captures_done = Arc::new(AtomicBool::new(false));
 
-        // Audio: SCK system loopback + mic sum into the mixer; the mixer thread drains it.
-        let system_audio = spawn_audio_capture(
-            "rewynd-audio-system",
-            AudioSource::SinkMonitor,
-            None,
-            audio_params,
-            config.system_gain(),
-            mixer.clone(),
-            None,
-            &stop,
-            epoch,
-            Some(Box::new(|e: String| {
-                toast(
-                    "System audio lost",
-                    &format!("Clips will have no system sound: {e}"),
-                );
-            })),
-        )?;
-        let mic_audio = if mic_enabled {
-            Some(spawn_audio_capture(
-                "rewynd-audio-mic",
-                AudioSource::Microphone,
-                config.microphone().map(str::to_owned),
-                audio_params,
-                config.mic_gain(),
-                mixer.clone(),
-                mic_mixer.clone(),
-                &stop,
-                epoch,
-                None,
-            )?)
+        // Audio: SCK system loopback + mic sum into the mixer; the mixer thread drains
+        // it. The capture threads are spawnable per stop-flag so game-only mode can run
+        // them per game session (an idle recorder must hold no SCK streams). The lost-
+        // audio toast fires once per process: session-scoped captures would otherwise
+        // re-toast a persistent failure on every game.
+        let audio_lost_toasted = Arc::new(AtomicBool::new(false));
+        let spawn_audio = {
+            let mixer = mixer.clone();
+            let mic_mixer = mic_mixer.clone();
+            let system_gain = config.system_gain();
+            let mic_gain = config.mic_gain();
+            let microphone = config.microphone().map(str::to_owned);
+            move |session_stop: &Arc<AtomicBool>| -> Result<Vec<std::thread::JoinHandle<()>>> {
+                let mut handles = vec![spawn_audio_capture(
+                    "rewynd-audio-system",
+                    AudioSource::SinkMonitor,
+                    None,
+                    audio_params,
+                    system_gain,
+                    mixer.clone(),
+                    None,
+                    session_stop,
+                    epoch,
+                    Some(Box::new({
+                        let toasted = audio_lost_toasted.clone();
+                        move |e: String| {
+                            if toasted.swap(true, Ordering::Relaxed) {
+                                tracing::warn!(error = %e, "system-audio capture failed again");
+                            } else {
+                                toast(
+                                    "System audio lost",
+                                    &format!("Clips will have no system sound: {e}"),
+                                );
+                            }
+                        }
+                    })),
+                )?];
+                if mic_enabled {
+                    // Non-fatal: erroring the whole set here would drop (and detach) the
+                    // already-running system capture's handle.
+                    match spawn_audio_capture(
+                        "rewynd-audio-mic",
+                        AudioSource::Microphone,
+                        microphone.clone(),
+                        audio_params,
+                        mic_gain,
+                        mixer.clone(),
+                        mic_mixer.clone(),
+                        session_stop,
+                        epoch,
+                        None,
+                    ) {
+                        Ok(handle) => handles.push(handle),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "could not start the microphone capture thread; clips use system audio only"
+                        ),
+                    }
+                }
+                Ok(handles)
+            }
+        };
+        // Desktop capture keeps the audio streams for the process lifetime; game-only
+        // starts/stops them with the game via the supervisor, which also resets the
+        // mixers per session (their drained frontier would otherwise reject the resumed
+        // sources' far-ahead timestamps).
+        let audio_captures: Vec<std::thread::JoinHandle<()>> = if game_only {
+            let supervisor_stop = stop.clone();
+            let supervisor_recording = recording.clone();
+            let mut session_mixers = vec![mixer.clone()];
+            session_mixers.extend(mic_mixer.clone());
+            vec![
+                std::thread::Builder::new()
+                    .name("rewynd-audio-supervisor".to_owned())
+                    .spawn(move || {
+                        run_audio_sessions(
+                            &supervisor_stop,
+                            &supervisor_recording,
+                            &session_mixers,
+                            spawn_audio,
+                        );
+                    })
+                    .context("spawning the audio supervisor thread")?,
+            ]
         } else {
-            None
+            // A thread-spawn failure is non-fatal, matching the supervisor: a recorder
+            // without audio still buffers video.
+            spawn_audio(&stop).unwrap_or_else(|e| {
+                tracing::error!(error = %e, "could not start the audio capture; clips will have no audio");
+                Vec::new()
+            })
         };
         let mixer_buffer = audio_buffer.clone();
         let mixer_mixer = mixer.clone();
@@ -3003,6 +3061,7 @@ mod macos {
                     &capture_buffer,
                     &capture_stop,
                     capture_recording,
+                    game_only,
                     capture_choice,
                     &capture_status,
                 ) {
@@ -3049,9 +3108,8 @@ mod macos {
 
         stop.store(true, Ordering::Relaxed);
         let _ = capture.join();
-        let _ = system_audio.join();
-        if let Some(h) = mic_audio {
-            let _ = h.join();
+        for handle in audio_captures {
+            let _ = handle.join();
         }
         captures_done.store(true, Ordering::Relaxed);
         let _ = audio_mixer.join();
@@ -3286,22 +3344,29 @@ mod macos {
         }
     }
 
-    /// Pump captured frames into `buffer` until the stream ends. `recording` is the game
-    /// gate (kept current by the focus watcher): while false, frames are dropped before
-    /// the encoder so the desktop never enters the ring.
+    /// Fill the video ring until shutdown. Desktop capture runs one SCK stream for the
+    /// process lifetime. Game-only capture opens a stream when the focus watcher's gate
+    /// (`recording`) opens and tears it down when the game ends — an idle recorder holds
+    /// no capture stream at all, so nothing composites, nothing encodes, and macOS's
+    /// recording indicator goes dark between games (the Windows `capture_game_stream`
+    /// behavior; Linux keeps its portal stream because a new one would re-prompt).
+    #[allow(clippy::too_many_arguments)]
     fn run_capture(
         params: EncodeParams,
         epoch: Instant,
         buffer: &SharedBuffer,
         stop: &Arc<AtomicBool>,
         recording: Arc<AtomicBool>,
+        game_only: bool,
         choice: config::EncoderChoice,
         status: &crate::status::StatusPublisher,
     ) -> Result<()> {
         // Mutex like Windows: the per-frame callback runs on SCK's dispatch queue, so
-        // everything it captures must be Send.
+        // everything it captures must be Send. Built once and reused across game
+        // sessions — PTS stays on the shared epoch, and each session's first frame
+        // forces an IDR, so the stream cuts cleanly at session boundaries.
         let enc = Arc::new(Mutex::new(build_encoder(&choice, params, status)?));
-        tracing::info!("capture pipeline ready; filling the ring buffer");
+        tracing::info!(game_only, "capture pipeline ready");
 
         // SCK scales server-side to the requested size and paces delivery to the
         // requested rate — no converter and no GPU import on this platform.
@@ -3310,17 +3375,151 @@ mod macos {
             height: params.height,
             framerate: params.framerate,
         };
+
+        // The VT session requires strictly increasing PTS; each SCK stream re-anchors
+        // its own clock, so a floor shared across sessions enforces it at the boundary.
+        let pts_floor: Arc<Mutex<Duration>> = Arc::new(Mutex::new(Duration::ZERO));
+
+        if !game_only {
+            return run_capture_session(
+                prefs,
+                epoch,
+                &enc,
+                buffer,
+                stop.clone(),
+                &recording,
+                &pts_floor,
+            );
+        }
+
+        loop {
+            if !wait_for_gate(stop, &recording) {
+                return Ok(());
+            }
+            tracing::info!("game focused; opening the capture stream");
+            // The session's own stop flag: raised by the gate monitor when the game
+            // ends (or at shutdown), which stops the stream via its watchdog — frames
+            // alone can't end it, since a vacated screen may deliver none.
+            let session_stop = Arc::new(AtomicBool::new(false));
+            let session_done = Arc::new(AtomicBool::new(false));
+            let monitor = {
+                let session_stop = session_stop.clone();
+                let session_done = session_done.clone();
+                let stop = stop.clone();
+                let recording = recording.clone();
+                std::thread::Builder::new()
+                    .name("rewynd-capture-gate".to_owned())
+                    .spawn(move || {
+                        while !session_done.load(Ordering::Relaxed) {
+                            if stop.load(Ordering::Relaxed) || !recording.load(Ordering::Relaxed) {
+                                session_stop.store(true, Ordering::Relaxed);
+                                return;
+                            }
+                            std::thread::sleep(GATE_POLL);
+                        }
+                    })
+                    .context("spawning the capture gate monitor")?
+            };
+            let result = run_capture_session(
+                prefs,
+                epoch,
+                &enc,
+                buffer,
+                session_stop,
+                &recording,
+                &pts_floor,
+            );
+            session_done.store(true, Ordering::Relaxed);
+            let _ = monitor.join();
+            result?;
+            tracing::info!("game session ended; capture stream closed");
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+        }
+    }
+
+    /// How often the game-only loops poll the gate/stop flags.
+    const GATE_POLL: Duration = Duration::from_millis(200);
+
+    /// Park until the gate opens (true) or shutdown is requested (false).
+    fn wait_for_gate(stop: &Arc<AtomicBool>, recording: &Arc<AtomicBool>) -> bool {
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return false;
+            }
+            if recording.load(Ordering::Relaxed) {
+                return true;
+            }
+            std::thread::sleep(GATE_POLL);
+        }
+    }
+
+    /// The game-only audio supervisor: run the audio capture threads per game session,
+    /// so no SCK audio stream is open between games. Each session starts from reset
+    /// mixers — their drained frontier would otherwise silently reject the resumed
+    /// sources' far-ahead timestamps and mute every later clip. A thread-spawn failure
+    /// (nothing was spawned) ends supervision; later sessions would fail the same way.
+    fn run_audio_sessions(
+        stop: &Arc<AtomicBool>,
+        recording: &Arc<AtomicBool>,
+        mixers: &[SharedMixer],
+        spawn_audio: impl Fn(&Arc<AtomicBool>) -> Result<Vec<std::thread::JoinHandle<()>>>,
+    ) {
+        loop {
+            if !wait_for_gate(stop, recording) {
+                return;
+            }
+            for mixer in mixers {
+                lock_unpoisoned(mixer).reset();
+            }
+            let session_stop = Arc::new(AtomicBool::new(false));
+            let handles = match spawn_audio(&session_stop) {
+                Ok(handles) => handles,
+                Err(e) => {
+                    tracing::error!(error = %e, "could not start the session's audio capture; clips will have no audio");
+                    return;
+                }
+            };
+            while recording.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(GATE_POLL);
+            }
+            session_stop.store(true, Ordering::Relaxed);
+            for handle in handles {
+                let _ = handle.join();
+            }
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+        }
+    }
+
+    /// One SCK stream's worth of capture: pump frames into `buffer` until `session_stop`
+    /// rises or the stream ends. `recording` is double-checked per frame so a closing
+    /// gate never leaks a frame into the ring while the watchdog is still reacting.
+    #[allow(clippy::too_many_arguments)]
+    fn run_capture_session(
+        prefs: StreamPrefs,
+        epoch: Instant,
+        enc: &Arc<Mutex<VideoToolboxEncoder>>,
+        buffer: &SharedBuffer,
+        session_stop: Arc<AtomicBool>,
+        recording: &Arc<AtomicBool>,
+        pts_floor: &Arc<Mutex<Duration>>,
+    ) -> Result<()> {
         // A callback Break reads as a clean stop to the stream; record the real reason
         // so it still surfaces as this function's Err.
         let failure: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(None));
         let on_frame = {
             let enc = enc.clone();
-            let stop = stop.clone();
+            let stop = session_stop.clone();
             let buffer = buffer.clone();
             let failure = failure.clone();
+            let recording = recording.clone();
+            let pts_floor = pts_floor.clone();
             let mut frame_index: u64 = 0;
-            // Set while the gate is closed so the first frame of the next game starts a
-            // fresh, cuttable GOP instead of referencing pre-pause frames.
+            // Set while the gate is closed so the first frame of the next stretch starts
+            // a fresh, cuttable GOP instead of referencing pre-pause frames.
             let mut resume_keyframe = false;
             move |captured: CapturedPixelBuf| -> ControlFlow<()> {
                 if stop.load(Ordering::Relaxed) {
@@ -3336,12 +3535,21 @@ mod macos {
                 // dispatch callback (an FFI boundary) — catch it and stop cleanly.
                 let fresh_ring = lock_unpoisoned(&buffer).is_empty();
                 let force_keyframe = frame_index == 0 || resume_keyframe || fresh_ring;
+                // Enforce the cross-session floor: a new stream's re-anchored clock may
+                // otherwise stamp its first frame at or before the previous session's
+                // last, which the encoder rejects.
+                let pts = {
+                    let mut floor = lock_unpoisoned(&pts_floor);
+                    let pts = if captured.pts <= *floor {
+                        *floor + Duration::from_micros(1)
+                    } else {
+                        captured.pts
+                    };
+                    *floor = pts;
+                    pts
+                };
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    lock_unpoisoned(&enc).encode_pixel_buf(
-                        &captured.pixel_buf,
-                        force_keyframe,
-                        captured.pts,
-                    )
+                    lock_unpoisoned(&enc).encode_pixel_buf(&captured.pixel_buf, force_keyframe, pts)
                 }));
                 match outcome {
                     Ok(Ok(Some(chunk))) => {
@@ -3369,9 +3577,8 @@ mod macos {
                 }
             }
         };
-        rewynd_capture::macos::capture_stream(None, epoch, prefs, Some(stop.clone()), on_frame)?;
+        rewynd_capture::macos::capture_stream(None, epoch, prefs, Some(session_stop), on_frame)?;
 
-        drop(enc);
         let reason = *lock_unpoisoned(&failure);
         match reason {
             Some(reason) => Err(anyhow!("{reason} (see the log for details)")),

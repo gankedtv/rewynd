@@ -14,6 +14,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod anim;
+#[cfg(target_os = "macos")]
+mod dock;
 mod library;
 mod player;
 mod scroll;
@@ -1370,6 +1372,11 @@ impl App {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        // The Dock icon is set from here (a main-thread call after AppKit finished
+        // launching, which resets any icon set earlier); it self-limits to one call.
+        #[cfg(target_os = "macos")]
+        dock::set_icon();
+
         // The wizard is full-screen (its own steps + Skip), with no nav bar to wander off into.
         if self.view == View::Onboarding {
             return self.wizard.view(&self.config).map(Message::Wizard);

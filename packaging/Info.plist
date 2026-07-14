@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The macOS bundle's Info.plist, handed to `vpk pack --plist` (see the macos-pack job).
+  Velopack's generated default carries no usage descriptions, and macOS *terminates* a
+  bundled process the moment it touches the microphone without NSMicrophoneUsageDescription
+  — the dev builds never hit that, because an unbundled binary inherits the terminal's.
+  The two version keys are stamped from the tag by the release job.
+
+  Screen recording deliberately has no key here: it is TCC-only, with a system-generated
+  prompt and no usage-description string.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key>
+	<string>rewynd</string>
+	<key>CFBundleIconFile</key>
+	<string>rewynd.icns</string>
+	<key>CFBundleIdentifier</key>
+	<string>tv.ganked.rewynd</string>
+	<key>CFBundleName</key>
+	<string>rewynd</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>1.0.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>rewynd records your microphone into your clips when you turn the microphone on.</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>15.0</string>
+</dict>
+</plist>
