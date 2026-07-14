@@ -17,6 +17,7 @@ trap 'rm -rf "$tmp"' EXIT
 
 # Brand mark: the sizes embedded in rewynd-config (BRAND_ICONS), plus the larger packaging
 # renders (Linux vpk pack icon, macOS Dock override).
+mkdir -p "$brand" "$pkg"
 for s in 24 32 48 64 128; do
     rsvg-convert -w "$s" -h "$s" "$here/logo.svg" -o "$brand/logo-$s.png"
 done
@@ -49,7 +50,9 @@ magick -size 480x272 xc:'#0b0b0f' \
 
 # macOS .icns for the Velopack .app bundle.
 icns_python="${ICNS_PYTHON:-python3}"
+icns_done=""
 if "$icns_python" -c 'import icnsutil' 2>/dev/null; then
+    icns_done=", icns"
     for s in 16 32 64 128 512; do
         rsvg-convert -w "$s" -h "$s" "$here/logo.svg" -o "$tmp/icns-$s.png"
     done
@@ -68,4 +71,4 @@ else
     echo "warning: icnsutil not importable via '$icns_python'; skipped $pkg/rewynd.icns" >&2
 fi
 
-echo "regenerated brand PNGs, play badge, ico, splash$( "$icns_python" -c 'import icnsutil' 2>/dev/null && echo ', icns' )"
+echo "regenerated brand PNGs, play badge, ico, splash$icns_done"

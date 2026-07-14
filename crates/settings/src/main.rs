@@ -861,6 +861,9 @@ impl App {
         match message {
             Message::Tab(view) => {
                 self.view = view;
+                // Navigating away disarms the hotkey field; a stale armed state would start
+                // capturing again the moment Settings reopens.
+                self.hotkey_recording = false;
                 // The Library tab / brand logo is a home action: leave any open clip's detail for
                 // the grid, and refresh so clips saved while away appear.
                 if view == View::Library {
@@ -1476,9 +1479,10 @@ impl App {
             }
             _ => None,
         });
-        // Only while the hotkey field is armed: every key press goes to the capture logic.
-        // Diffing drops the listener the moment recording ends.
-        let hotkey = if self.hotkey_recording {
+        // Only while the hotkey field is armed AND its page is showing: every key press goes to
+        // the capture logic. Diffing drops the listener the moment recording ends, and the view
+        // gate keeps keystrokes elsewhere (the library, onboarding) from silently rebinding.
+        let hotkey = if self.hotkey_recording && matches!(self.view, View::Settings) {
             iced::event::listen_with(|event, _status, _id| match event {
                 iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
                     key, modifiers, ..
