@@ -2986,7 +2986,12 @@ mod macos {
                     .context("spawning the audio supervisor thread")?,
             ]
         } else {
-            spawn_audio(&stop)?
+            // A thread-spawn failure is non-fatal, matching the supervisor: a recorder
+            // without audio still buffers video.
+            spawn_audio(&stop).unwrap_or_else(|e| {
+                tracing::error!(error = %e, "could not start the audio capture; clips will have no audio");
+                Vec::new()
+            })
         };
         let mixer_buffer = audio_buffer.clone();
         let mixer_mixer = mixer.clone();
