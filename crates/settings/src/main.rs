@@ -372,10 +372,12 @@ fn main() -> iced::Result {
         tracing::warn!(error = %e, "could not write a desktop entry");
     }
     if let Some(recorder) = recorder_path().filter(|p| p.is_file()) {
-        // Migrate a stale autostart entry (pre-icon, or the pre-rename recorder binary on Linux;
-        // a moved binary on Windows or macOS) onto the current recorder.
-        if let Err(e) = config::refresh_autostart(&recorder) {
-            tracing::warn!(error = %e, "could not refresh the autostart entry");
+        // With the toggle on, a missing entry is recreated (one lost outside the app would
+        // otherwise disable boot silently forever); a present one is migrated onto the
+        // current recorder either way.
+        if let Err(e) = config::reconcile_autostart(&recorder, config::load_file().start_on_boot())
+        {
+            tracing::warn!(error = %e, "could not reconcile the autostart entry");
         }
     }
 
