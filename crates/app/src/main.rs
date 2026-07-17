@@ -1035,10 +1035,12 @@ mod linux {
                 if let Err(e) = config::install_launcher_entry(&launcher) {
                     tracing::warn!(error = %e, "could not write a desktop entry; the hotkey may not bind");
                 }
-                // Migrate a pre-rename autostart entry (still launching the old `rewynd`, now the
-                // GUI) onto this recorder, so start-on-boot records instead of opening a window.
-                if let Err(e) = config::refresh_autostart(&exe) {
-                    tracing::warn!(error = %e, "could not refresh the autostart entry");
+                // With the setting on, a missing entry is recreated (one lost outside the app
+                // would otherwise disable boot silently forever); a present pre-rename entry
+                // (still launching the old `rewynd`, now the GUI) is migrated onto this
+                // recorder either way, so boot records instead of opening a window.
+                if let Err(e) = config::reconcile_autostart(&exe, config.start_on_boot()) {
+                    tracing::warn!(error = %e, "could not reconcile the autostart entry");
                 }
             }
             Err(e) => tracing::warn!(error = %e, "could not locate our own binary"),

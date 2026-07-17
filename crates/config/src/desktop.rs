@@ -159,6 +159,47 @@ pub fn install_autostart(exec: &Path) -> std::io::Result<()> {
     install_autostart_at(&autostart_path_or_err()?, exec, appimage_env().as_deref())
 }
 
+/// Reconcile the start-on-boot preference with the filesystem at startup. With the preference
+/// on, recreate the entry when it is missing or unreadable as text (a failed earlier install,
+/// an entry lost or corrupted outside the app — the config and the entry are separate records,
+/// and only the entry decides what boots; the file carries our `APP_ID` name, so even a
+/// mangled one is ours to rewrite). A present entry — and everything with the preference off —
+/// goes through the [`refresh_autostart`] rules, which never create.
+#[cfg(target_os = "linux")]
+pub fn reconcile_autostart(exec: &Path, on_boot: bool) -> std::io::Result<()> {
+    reconcile_autostart_at(
+        &autostart_path_or_err()?,
+        exec,
+        appimage_env().as_deref(),
+        on_boot,
+    )
+}
+
+/// The testable core of [`reconcile_autostart`].
+#[cfg(target_os = "linux")]
+fn reconcile_autostart_at(
+    path: &Path,
+    exec: &Path,
+    appimage: Option<&Path>,
+    on_boot: bool,
+) -> std::io::Result<()> {
+    if !on_boot {
+        return refresh_autostart_at(path, exec, appimage);
+    }
+    match std::fs::read_to_string(path) {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData
+            ) =>
+        {
+            install_autostart_at(path, exec, appimage)
+        }
+        Err(e) => Err(e),
+        Ok(_) => refresh_autostart_at(path, exec, appimage),
+    }
+}
+
 /// Remove the login autostart entry (absent is fine).
 #[cfg(target_os = "linux")]
 pub fn remove_autostart() -> std::io::Result<()> {
@@ -481,6 +522,34 @@ pub fn refresh_autostart(exec: &Path) -> std::io::Result<()> {
     refresh_autostart_at(&launch_agent_path_or_err()?, exec)
 }
 
+/// Reconcile the start-on-login preference with the filesystem at startup. With the preference
+/// on, recreate a missing or unreadable agent; a present one — and everything with the
+/// preference off — goes through the [`refresh_autostart`] rules, which never create.
+#[cfg(target_os = "macos")]
+pub fn reconcile_autostart(exec: &Path, on_boot: bool) -> std::io::Result<()> {
+    reconcile_autostart_at(&launch_agent_path_or_err()?, exec, on_boot)
+}
+
+/// The testable core of [`reconcile_autostart`].
+#[cfg(target_os = "macos")]
+fn reconcile_autostart_at(path: &Path, exec: &Path, on_boot: bool) -> std::io::Result<()> {
+    if !on_boot {
+        return refresh_autostart_at(path, exec);
+    }
+    match std::fs::read_to_string(path) {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData
+            ) =>
+        {
+            install_autostart_at(path, exec)
+        }
+        Err(e) => Err(e),
+        Ok(_) => refresh_autostart_at(path, exec),
+    }
+}
+
 /// No launcher entry on macOS: the `.app` bundle owns the app's identity.
 #[cfg(target_os = "macos")]
 pub fn install_launcher_entry(_exec: &Path) -> std::io::Result<()> {
@@ -589,6 +658,34 @@ pub fn remove_autostart() -> std::io::Result<()> {
 #[cfg(windows)]
 pub fn refresh_autostart(exec: &Path) -> std::io::Result<()> {
     refresh_autostart_at_key(RUN_KEY_PATH, exec)
+}
+
+/// Reconcile the start-on-boot preference with the registry at startup. With the preference
+/// on, recreate the Run-key value when it is missing or unreadable as a string (a wrong-typed
+/// value under our name is ours to rewrite); a present one — and everything with the
+/// preference off — goes through the [`refresh_autostart`] rules, which never create.
+#[cfg(windows)]
+pub fn reconcile_autostart(exec: &Path, on_boot: bool) -> std::io::Result<()> {
+    reconcile_autostart_at_key(RUN_KEY_PATH, exec, on_boot)
+}
+
+/// The testable core of [`reconcile_autostart`].
+#[cfg(windows)]
+fn reconcile_autostart_at_key(key_path: &str, exec: &Path, on_boot: bool) -> std::io::Result<()> {
+    if !on_boot {
+        return refresh_autostart_at_key(key_path, exec);
+    }
+    let key = windows_registry::CURRENT_USER
+        .create(key_path)
+        .map_err(registry_io_err)?;
+    match key.get_string(APP_ID) {
+        // Any read failure lands here: a missing value is recreated, and a genuine access
+        // problem surfaces from the write attempt instead.
+        Err(_) => key
+            .set_string(APP_ID, run_command_value(exec))
+            .map_err(registry_io_err),
+        Ok(_) => refresh_autostart_at_key(key_path, exec),
+    }
 }
 
 /// Registry parent for AppUserModelID metadata: gives our app id a display name and
@@ -701,6 +798,11 @@ pub fn refresh_autostart(_exec: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub fn reconcile_autostart(_exec: &Path, _on_boot: bool) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
@@ -766,6 +868,26 @@ mod windows_tests {
         );
         // Idempotent re-register.
         register_toast_identity_at(&key.0, icon).expect("re-register");
+    }
+
+    #[test]
+    fn reconcile_creates_a_missing_value_only_when_on_and_defers_to_refresh_rules() {
+        let key = TestKey::new("reconcile");
+        // Missing value with the preference off: refresh rules, nothing created.
+        reconcile_autostart_at_key(&key.0, Path::new(r"C:\x\rewynd.exe"), false).expect("off ok");
+        assert_eq!(key.value(), None);
+
+        // Missing value with the preference on: created.
+        reconcile_autostart_at_key(&key.0, Path::new(r"C:\x\rewynd.exe"), true).expect("create");
+        assert_eq!(key.value().as_deref(), Some(r#""C:\x\rewynd.exe""#));
+
+        // A present value goes through the refresh rules: a user-managed wrapper stays.
+        windows_registry::CURRENT_USER
+            .create(&key.0)
+            .and_then(|k| k.set_string(crate::paths::APP_ID, r#""C:\wrapper\launcher.exe""#))
+            .expect("seed");
+        reconcile_autostart_at_key(&key.0, Path::new(r"C:\x\rewynd.exe"), true).expect("no-op");
+        assert_eq!(key.value().as_deref(), Some(r#""C:\wrapper\launcher.exe""#));
     }
 
     #[test]
@@ -854,6 +976,34 @@ mod macos_tests {
             before,
             "live-program plist stays untouched"
         );
+    }
+
+    #[test]
+    fn reconcile_creates_a_missing_agent_only_when_on_and_defers_to_refresh_rules() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("LaunchAgents").join("rewynd.plist");
+
+        // Missing agent with the preference off: refresh rules, nothing created.
+        reconcile_autostart_at(&path, Path::new("/opt/rewynd/rewynd-recorder"), false)
+            .expect("off ok");
+        assert!(!path.exists());
+
+        // Missing agent with the preference on: created.
+        reconcile_autostart_at(&path, Path::new("/opt/rewynd/rewynd-recorder"), true)
+            .expect("create");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            launch_agent_plist(Path::new("/opt/rewynd/rewynd-recorder"))
+        );
+
+        // A present agent goes through the refresh rules: a live program stays untouched.
+        let live = dir.path().join("rewynd-recorder");
+        std::fs::write(&live, b"").expect("live binary");
+        install_autostart_at(&path, &live).expect("install");
+        let before = std::fs::read_to_string(&path).expect("read");
+        reconcile_autostart_at(&path, Path::new("/elsewhere/rewynd-recorder"), true)
+            .expect("no-op");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), before);
     }
 
     #[test]
@@ -1025,6 +1175,78 @@ mod tests {
         std::fs::write(&path, bare).expect("seed bare");
         refresh_autostart_at(&path, Path::new("/opt/rewynd/rewynd"), None).expect("no-op");
         assert_eq!(std::fs::read_to_string(&path).expect("read"), bare);
+    }
+
+    #[test]
+    fn reconcile_creates_a_missing_entry_only_when_on_and_defers_to_refresh_rules() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("autostart").join("rewynd.desktop");
+
+        // Missing entry with the preference off: refresh rules, nothing created.
+        reconcile_autostart_at(&path, Path::new("/opt/rewynd/rewynd-recorder"), None, false)
+            .expect("off ok");
+        assert!(!path.exists());
+
+        // Missing entry with the preference on: created — otherwise a lost entry silently
+        // disables start-on-boot forever while the toggle still shows on.
+        reconcile_autostart_at(&path, Path::new("/opt/rewynd/rewynd-recorder"), None, true)
+            .expect("create");
+        let entry = std::fs::read_to_string(&path).expect("read entry");
+        assert!(entry.contains("Exec=\"/opt/rewynd/rewynd-recorder\"\n"));
+        assert!(entry.contains("StartupNotify=false\n"));
+
+        // A present entry goes through the refresh rules: current stays byte-identical...
+        reconcile_autostart_at(&path, Path::new("/opt/rewynd/rewynd-recorder"), None, true)
+            .expect("idempotent");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), entry);
+
+        // ...and a user-managed entry launching a live foreign program stays untouched.
+        let wrapper = dir.path().join("wrapper.sh");
+        std::fs::write(&wrapper, b"#!/bin/sh\n").expect("live wrapper");
+        let managed = format!("[Desktop Entry]\nIcon=custom\nExec={}\n", wrapper.display());
+        std::fs::write(&path, &managed).expect("seed managed");
+        reconcile_autostart_at(&path, Path::new("/opt/rewynd/rewynd-recorder"), None, true)
+            .expect("no-op");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), managed);
+    }
+
+    #[test]
+    fn reconcile_rewrites_an_unreadable_entry_when_on() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("autostart").join("rewynd.desktop");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+
+        // A non-UTF-8 entry is foreign to refresh (which never creates), but under an ON
+        // preference the file carries our name and a mangled one is broken autostart: rewritten.
+        std::fs::write(&path, [0x80u8, 0xff]).expect("seed corrupt");
+        reconcile_autostart_at(&path, Path::new("/opt/rewynd/rewynd-recorder"), None, true)
+            .expect("heal");
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("read")
+                .contains("Exec=\"/opt/rewynd/rewynd-recorder\"\n")
+        );
+
+        // With the preference off the same corrupt file stays untouched.
+        std::fs::write(&path, [0x80u8, 0xff]).expect("re-seed corrupt");
+        reconcile_autostart_at(&path, Path::new("/opt/rewynd/rewynd-recorder"), None, false)
+            .expect("off no-op");
+        assert_eq!(std::fs::read(&path).expect("read"), [0x80u8, 0xff]);
+    }
+
+    #[test]
+    fn reconcile_creates_the_image_form_under_an_appimage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("autostart").join("rewynd.desktop");
+        reconcile_autostart_at(
+            &path,
+            Path::new("/tmp/.mount_rewynd123/usr/bin/rewynd-recorder"),
+            Some(Path::new("/home/u/.local/bin/rewynd")),
+            true,
+        )
+        .expect("create");
+        let entry = std::fs::read_to_string(&path).expect("read entry");
+        assert!(entry.contains("Exec=\"/home/u/.local/bin/rewynd\" --recorder\n"));
     }
 
     #[test]
