@@ -128,5 +128,6 @@ For rebuilding or restyling the page from scratch (e.g. a fresh design pass):
 > → download band (Linux AppImage / Windows installer / macOS build-from-source) → footer.
 >
 > Be data-honest: no invented CPU %, download counts, or star totals. Keep beta/WIP
-> visible from the top. Ship as `index.html` + `styles.css` + `assets/`, zero build step.
-> The logo is the mint HUD-frame play mark. Reference implementation: `site/`.
+> visible from the top. Ship as a fully static build (`npm run build` → `dist/`,
+> hostable anywhere). The logo is the mint HUD-frame play mark. Reference
+> implementation: `site/`.

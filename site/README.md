@@ -31,6 +31,7 @@ site/
                           # Features, Pipeline, GankedStrip, OpenSource, Download,
                           # Footer, LogoMark, SvgDefs
     data/clips.ts         # the placeholder clip library shown in the hero
+    data/release.ts       # pinned release tag + download-asset URLs
     styles/global.css     # the Arena design system (tokens + all component styles)
 ```
 
@@ -56,6 +57,8 @@ Cloudflare Pages, Netlify, a bucket + CDN). No server runtime.
 ## Before it goes live — placeholders to replace
 
 - **Domain:** `rewynd.gg` in `astro.config.mjs`, the install command, links, and OG tags.
+- **Release tag:** download buttons pin `RELEASE_TAG` in `src/data/release.ts` (GitHub's
+  `/releases/latest` 404s while every release is a prerelease) — bump it each release.
 - **Product shot:** the hero "Library" is a CSS mockup (`LibraryShot.astro`), not a
   screenshot. Drop in a real capture when ready — the layout won't move.
 - **Clip titles + game grouping** (`data/clips.ts`) are aspirational — they assume

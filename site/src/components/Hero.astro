@@ -1,13 +1,14 @@
 ---
 import LibraryShot from './LibraryShot.astro';
+import { APPIMAGE_URL, WIN_SETUP_URL } from '../data/release';
 ---
 <section class="hero" style="border-top:none"><div class="wrap">
   <span class="kick">Native · Open source · Linux · Windows · macOS</span>
   <h1 class="lead h1">Instant replay for your gameplay.</h1>
   <p class="sub">The last 60 seconds, always one hotkey away. A lightweight recorder that keeps your clip buffer on the GPU and sits in the tray — quiet enough to leave running while you play.</p>
-  <div class="cmd"><span class="p">$</span> <span id="installCmd">curl -fsSL rewynd.gg/install.sh | sh</span> <button class="cp" data-copy="#installCmd" aria-label="Copy install command">copy</button></div>
+  <div class="cmd"><span class="p">$</span> <span id="installCmd">curl -fsSL https://rewynd.gg/install.sh | sh</span> <button class="cp" data-copy="#installCmd" aria-label="Copy install command">copy</button></div>
   <div class="ctas">
-    <a class="btn mint" id="dlPrimary" href="#download">↓ Download for Linux</a>
+    <a class="btn mint" id="dlPrimary" href="#download" data-linux={APPIMAGE_URL} data-win={WIN_SETUP_URL}>↓ Download for Linux</a>
     <a class="btn ghost" href="https://github.com/gankedtv/rewynd">★ Star on GitHub</a>
   </div>
   <p class="betanote"><span class="b">Beta</span> Work in progress — expect rough edges. It self-updates, so fixes land fast.</p>
@@ -22,17 +23,18 @@ import LibraryShot from './LibraryShot.astro';
 
 <script>
   // Progressive enhancement only — the page is fully functional without JS.
-  const GH = 'https://github.com/gankedtv/rewynd';
-  const REL = GH + '/releases/latest';
-
-  // Label the primary download button for the visitor's OS.
+  // Label the primary download button for the visitor's OS. Mobile keeps the
+  // generic label + #download anchor: there is no build for it to point at.
   const dl = document.getElementById('dlPrimary') as HTMLAnchorElement | null;
   if (dl) {
     const nav = navigator as Navigator & { userAgentData?: { platform?: string } };
     const p = nav.userAgentData?.platform || navigator.platform || '';
-    if (/Win/i.test(p)) { dl.textContent = '↓ Download for Windows'; dl.href = REL; }
-    else if (/Mac/i.test(p)) { dl.textContent = '↓ Build for macOS'; dl.href = GH + '#building'; }
-    else { dl.textContent = '↓ Download for Linux'; dl.href = REL; }
+    const mobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+      || (/Mac/i.test(p) && navigator.maxTouchPoints > 1); // iPadOS reports as Mac
+    if (mobile) { dl.textContent = '↓ Download'; }
+    else if (/Win/i.test(p)) { dl.textContent = '↓ Download for Windows'; dl.href = dl.dataset.win || dl.href; }
+    else if (/Mac/i.test(p)) { dl.textContent = '↓ Build for macOS'; dl.href = 'https://github.com/gankedtv/rewynd#building'; }
+    else { dl.href = dl.dataset.linux || dl.href; }
   }
 
   // Copy-to-clipboard buttons.
