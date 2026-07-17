@@ -47,7 +47,7 @@ same tokens).
 
 Positioning: **standalone, open-source recorder first**; ganked.tv is a first-class
 integration, not the headline. See the full spec:
-`../docs/superpowers/specs/2026-07-12-rewynd-landing-page-design.md`.
+`../docs/design/landing-page.md`.
 
 ## Deploy
 

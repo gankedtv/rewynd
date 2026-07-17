@@ -1,8 +1,8 @@
 # rewynd landing page — design spec
 
 **Date:** 2026-07-12
-**Status:** Agreed. Implemented as an Astro static site in [`site/`](../../../site).
-**Design system:** Arena (see [`docs/design/arena.md`](../../design/arena.md)) — shared with ganked.tv.
+**Status:** Agreed. Implemented as an Astro static site in [`site/`](../../site).
+**Design system:** Arena (see [`docs/design/arena.md`](arena.md)) — shared with ganked.tv.
 
 ---
 
