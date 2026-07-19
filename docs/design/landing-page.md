@@ -48,7 +48,7 @@ Barlow Condensed 900, with a `Beta` badge.
 
 ## 4. Page structure (one route, top → bottom)
 
-1. **Beta bar** — "rewynd is in public beta — early, evolving, built in the open →GitHub."
+1. **Beta bar** — "rewynd is in public beta — early, evolving, built in the open → GitHub."
 2. **Nav** (sticky) — logo + `Beta`, section links, ★ GitHub, `Get ganked.tv` (secondary),
    `Download` (primary mint).
 3. **Hero** (stacked, centered) — kicker, H1 "Instant replay for your gameplay.", subhead,
@@ -64,7 +64,7 @@ Barlow Condensed 900, with a `Beta` badge.
    hotkey → MP4) + the Rust/wgpu/Vulkan Video/ScreenCaptureKit note.
 8. **ganked.tv strip** — "One click to ganked.tv"; upload destinations (ganked.tv,
    YouTube, local).
-9. **Open source band** — GPL, local-first, built-in-the-open, SignPath signing incoming;
+9. **Open-source band** — GPL, local-first, built-in-the-open, SignPath signing incoming;
    a repo/terminal card.
 10. **Download band** — Linux (AppImage curl), Windows (installer), macOS (build from
     source, beta) + unsigned/SmartScreen note.
