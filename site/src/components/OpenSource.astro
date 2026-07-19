@@ -1,0 +1,27 @@
+---
+import LogoMark from './LogoMark.astro';
+import { INSTALL_CMD } from '../data/release';
+---
+<section class="sec" id="opensource"><div class="wrap">
+  <div class="os">
+    <div>
+      <span class="kick">Open source</span>
+      <h2 class="sectitle" style="margin:8px 0 6px">Free, and actually yours</h2>
+      <div class="oslist">
+        <div class="osrow"><span class="t">✓</span><span><b>GPL-3.0.</b> Read it, build it, fork it. No telemetry, no account required to record.</span></div>
+        <div class="osrow"><span class="t">✓</span><span><b>Local-first.</b> Clips live on your disk. Nothing uploads unless you press upload.</span></div>
+        <div class="osrow"><span class="t">✓</span><span><b>Built in the open.</b> Beta and moving fast — issues and roadmap are public; self-updating so fixes reach you quickly.</span></div>
+        <div class="osrow"><span class="t">✓</span><span><b>Signed builds incoming</b> via the SignPath Foundation — beta builds are unsigned for now.</span></div>
+      </div>
+      <div style="margin-top:20px;display:flex;gap:12px"><a class="btn ghost" href="https://github.com/gankedtv/rewynd">★ Star on GitHub</a><a class="btn line" href="https://github.com/gankedtv/rewynd#readme">Read the docs</a></div>
+    </div>
+    <div class="repo">
+      <div class="top"><LogoMark style="width:18px;height:18px" /><b>gankedtv / rewynd</b><span style="margin-left:auto;color:var(--ts)">GPL-3.0 · beta</span></div>
+      <div class="body">
+        <div class="ln"><span class="k">$</span> {INSTALL_CMD}</div>
+        <div class="ln" style="color:var(--ts)">↳ fetching latest AppImage…</div>
+        <div class="ln"><span class="k">✓</span> rewynd installed · run <span style="color:var(--tp)">rewynd</span> to start</div>
+      </div>
+    </div>
+  </div>
+</div></section>

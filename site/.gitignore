@@ -1,0 +1,9 @@
+# Astro build + tooling
+node_modules/
+dist/
+.astro/
+
+# Local env / OS cruft
+.env
+.env.production
+.DS_Store

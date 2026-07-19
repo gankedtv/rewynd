@@ -1,0 +1,43 @@
+---
+import LogoMark from './LogoMark.astro';
+import { library } from '../data/clips';
+import { RELEASE_TAG } from '../data/release';
+---
+<!-- Product shot: rewynd Library (placeholder art — swap for a real screenshot). -->
+<div class="shotwrap">
+  <div class="hotcallout">press <kbd class="kbd">F10</kbd> → clip saved</div>
+  <div class="app" role="img" aria-label="The rewynd clip library, grouped by game">
+    <aside class="side">
+      <div class="sbrand"><LogoMark />REWYND</div>
+      <div class="navitem active">Library</div>
+      <div class="navitem">Settings</div>
+      <div class="sfoot">
+        <div class="recline"><span class="rd"></span>Recording: Desktop</div>
+        <div class="upd">Check for updates</div>
+        <div class="ver">{RELEASE_TAG}</div>
+      </div>
+    </aside>
+    <div class="main">
+      <div class="libtitle">Library</div>
+      <div class="libsub">{library.totalLabel}</div>
+      <div class="libbar">
+        <div class="search">Search clips</div>
+        <div class="pills">
+          <span class="pill active">All</span>
+          {library.games.map((g) => <span class="pill">{g.game}</span>)}
+        </div>
+      </div>
+
+      {library.games.map((g, i) => (
+        <Fragment>
+          <div class={i === 0 ? 'grp first' : 'grp'}><span class="gd" style={`background:${g.color}`}></span><b>{g.game}</b><span>{g.clips.length}</span></div>
+          <div class="clipgrid">
+            {g.clips.map((c) => (
+              <div class="clip"><div class="th" style={`background:${c.bg}`}><span class="dur">{c.dur}</span></div><div class="meta"><div class="tt">{c.title}</div><div class="mm">{c.meta}</div></div></div>
+            ))}
+          </div>
+        </Fragment>
+      ))}
+    </div>
+  </div>
+</div>

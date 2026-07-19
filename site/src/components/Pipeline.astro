@@ -1,0 +1,14 @@
+<section class="sec"><div class="wrap">
+  <div class="sechead"><span class="kick">Why it stays light</span><h2 class="sectitle">The frame never round-trips your CPU</h2></div>
+  <p class="muted" style="margin-bottom:20px">Most recorders copy every frame back to system memory to encode it. rewynd keeps it on the GPU the whole way — so the buffer is tens of megabytes of already-encoded H.264, not gigabytes of raw frames.</p>
+  <div class="pipe">
+    <div class="pnode"><div class="lbl">Capture</div><div class="v">GPU texture</div></div>
+    <span class="parrow" aria-hidden="true">→</span>
+    <div class="pnode"><div class="lbl">Ring buffer</div><div class="v">Encoded H.264 · 60s</div></div>
+    <span class="parrow" aria-hidden="true">→</span>
+    <div class="pnode"><div class="lbl">Hotkey</div><div class="v">Flush + keyframe cut</div></div>
+    <span class="parrow" aria-hidden="true">→</span>
+    <div class="pnode"><div class="lbl">Output</div><div class="v">MP4 with real PTS</div></div>
+  </div>
+  <p class="pipe-note">Built in Rust on <b>wgpu</b> + <b>Vulkan Video</b> (NVENC / VAAPI on Linux &amp; Windows) and <b>ScreenCaptureKit + VideoToolbox</b> on Apple Silicon.</p>
+</div></section>

@@ -1,0 +1,10 @@
+---
+// The mint HUD-frame play mark. Sized via the `.logo` class (or CSS context);
+// pass `style` for one-off sizes. Requires SvgDefs.astro on the page.
+interface Props {
+  class?: string;
+  style?: string;
+}
+const { class: cls = 'logo', style } = Astro.props;
+---
+<svg class={cls} viewBox="0 0 120 120" aria-hidden="true" style={style}><use href="#mark" /></svg>

@@ -1,0 +1,15 @@
+---
+const steps = [
+  { n: '01', title: 'Set it up once', body: "A one-minute first-run wizard picks your capture source, hotkey, and replay length. Sensible defaults if you'd rather not." },
+  { n: '02', title: 'Just play', body: 'rewynd sits in the tray and keeps the last 60 seconds encoded on your GPU. No stream, no account, no fans spinning up.' },
+  { n: '03', title: 'Hit the hotkey', body: 'Something happened — press your key. The buffer flushes to a clean, keyframe-accurate MP4 you can play or share anywhere.' },
+];
+---
+<section class="sec" id="how"><div class="wrap">
+  <div class="sechead"><span class="kick">How it works</span><h2 class="sectitle">Three keys and you're rolling</h2></div>
+  <div class="steps">
+    {steps.map((s) => (
+      <div class="step"><div class="n">{s.n}</div><h3>{s.title}</h3><p>{s.body}</p></div>
+    ))}
+  </div>
+</div></section>

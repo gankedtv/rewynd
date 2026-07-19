@@ -1,0 +1,28 @@
+---
+import { APPIMAGE_URL, WIN_SETUP_URL, ALL_RELEASES_URL, INSTALL_CMD } from '../data/release';
+---
+<section class="sec" id="download"><div class="wrap">
+  <div class="sechead" style="justify-content:center;text-align:center;flex-direction:column;align-items:center;gap:6px">
+    <span class="kick">Download</span><h2 class="sectitle">Grab the beta for your OS</h2>
+    <p class="muted" style="text-align:center">Free and open source. Public beta — work in progress, and builds are currently unsigned.</p>
+  </div>
+  <div class="dl">
+    <div class="plat">
+      <h3>Linux</h3><div class="os2">Any distro · Wayland &amp; X11</div>
+      <div class="method">Self-updating AppImage:</div>
+      <div class="cmd"><span class="p">$</span> <span class="cmdtext" id="installCmdDl">{INSTALL_CMD}</span> <button class="cp" data-copy="#installCmdDl" aria-live="polite" aria-label="Copy install command">copy</button></div>
+      <a class="btn mint" href={APPIMAGE_URL}>↓ Download AppImage</a>
+    </div>
+    <div class="plat">
+      <h3>Windows</h3><div class="os2">Windows 10 / 11 · per-user, no admin</div>
+      <div class="method">Run the installer — updates itself on launch.</div>
+      <a class="btn mint" href={WIN_SETUP_URL}>↓ Download Setup.exe</a>
+    </div>
+    <div class="plat">
+      <h3>macOS <span class="badge">Beta</span></h3><div class="os2">Apple Silicon · macOS 15+</div>
+      <div class="method">Build from source for now — one command with the CLI tools.</div>
+      <a class="btn ghost" href="https://github.com/gankedtv/rewynd#building">View build guide</a>
+    </div>
+  </div>
+  <p class="notewarn">Early software: expect bugs, and please file them. First run on Windows may show a SmartScreen warning until signing lands — choose &ldquo;More info&rdquo; &rarr; &ldquo;Run anyway&rdquo;. <a href={ALL_RELEASES_URL}>All releases on GitHub →</a></p>
+</div></section>
