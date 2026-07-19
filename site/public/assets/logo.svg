@@ -7,6 +7,6 @@
   </defs>
   <path d="M30 0 L100 0 A20 20 0 0 1 120 20 L120 90 L90 120 L20 120 A20 20 0 0 1 0 100 L0 30 Z" fill="url(#f)"></path>
   <path d="M30 0 L100 0 A20 20 0 0 1 120 20 L120 90 L90 120 L20 120 A20 20 0 0 1 0 100 L0 30 Z" fill="url(#g)" opacity=".5"></path>
-  <path d="M36 14 L92 14 A14 14 0 0 1 106 28 L106 84 L84 106 L28 106 A14 14 0 0 1 14 92 L14 36 Z" fill="url(#s)"></path>
-  <path d="M49 38 L80 60 L49 82 Z" fill="url(#p)"></path>
+  <path d="M37.5 18 L90 18 A12 12 0 0 1 102 30 L102 82.5 L82.5 102 L30 102 A12 12 0 0 1 18 90 L18 37.5 Z" fill="url(#s)"></path>
+  <path d="M56 42 L34 60 L56 78 Z M78 42 L56 60 L78 78 Z" fill="url(#p)"></path>
 </svg>
