@@ -39,3 +39,35 @@ jobs:
 
       - name: build
         run: npm run build
+
+  # Build the site into a container and push it to GHCR. Runs only on merges to
+  # main (never from PRs — no registry writes on untrusted branches). New GHCR
+  # packages are private by default; keep it that way in the package settings.
+  publish:
+    name: publish image (ghcr)
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: site
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}-site:latest
+            ghcr.io/${{ github.repository }}-site:${{ github.sha }}
+          # Links the package to this repo (grants repo-based access + provenance).
+          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}

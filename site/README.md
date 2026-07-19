@@ -54,6 +54,12 @@ integration, not the headline. See the full spec:
 `npm run build` emits a fully static `dist/` — host it anywhere (GitHub Pages,
 Cloudflare Pages, Netlify, a bucket + CDN). No server runtime.
 
+On every merge to `main` that touches `site/`, CI (`.github/workflows/site.yml`) builds
+`Dockerfile` — a static build served by nginx — and pushes it to
+`ghcr.io/gankedtv/rewynd-site` (`:latest` + the commit SHA). The package is private by
+default; pull it wherever you deploy. Build/run it locally with
+`docker build -t rewynd-site site && docker run -p 8080:80 rewynd-site`.
+
 ## Before it goes live — placeholders to replace
 
 - **Domain:** `rewynd.dev` in `astro.config.mjs` drives canonical + OG URLs — repoint it
