@@ -54,8 +54,10 @@ section{border-top:1px solid var(--bd);}
 .h1{font-size:clamp(40px,5.6vw,66px);margin:0 0 18px;}
 .hero p.sub{font-size:16.5px;max-width:560px;margin:0 auto 22px}
 .ctas{display:flex;gap:12px;align-items:center;flex-wrap:wrap;justify-content:center;margin-bottom:14px}
-.cmd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;color:var(--tp);background:#0a0f0d;border:1px solid var(--mintbd);border-radius:8px;padding:11px 13px;display:inline-flex;align-items:center;gap:9px;margin-bottom:16px}
+.cmd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;color:var(--tp);background:#0a0f0d;border:1px solid var(--mintbd);border-radius:8px;padding:11px 13px;display:inline-flex;align-items:center;gap:9px;margin-bottom:16px;max-width:100%}
 .cmd .p{color:var(--mint)}
+/* Let the command scroll inside the box instead of overflowing the page (~320px). */
+.cmd .cmdtext{flex:1 1 auto;min-width:0;overflow-x:auto;white-space:nowrap}
 .cmd .cp{margin-left:6px;font-size:10.5px;color:var(--ts);border:1px solid var(--bd);border-radius:5px;padding:3px 8px;cursor:pointer}
 .cmd .cp:hover{color:var(--mint);border-color:var(--mintbd)}
 .betanote{font-size:12px;color:var(--ts);margin:0 auto 20px;display:inline-flex;align-items:center;gap:8px}
@@ -164,12 +166,15 @@ section{border-top:1px solid var(--bd);}
 .repo .body .ln .k{color:var(--mint)}
 
 /* download band */
-.dl{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
-.plat{border:1px solid var(--bd);border-radius:12px;background:var(--raised);padding:22px;}
+.dl{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+/* minmax(0,…) + min-width:0 let the card (and its non-wrapping install command) shrink below content width instead of forcing page overflow on narrow phones. */
+.plat{border:1px solid var(--bd);border-radius:12px;background:var(--raised);padding:22px;display:flex;flex-direction:column;min-width:0}
+/* Push the CTA to the card bottom so all three align regardless of copy length. */
+.plat .btn{margin-top:auto;align-self:flex-start}
+.plat .cmd{margin:2px 0 14px}
 .plat h3{font-family:'Barlow Condensed',sans-serif;font-weight:800;text-transform:uppercase;font-size:19px;margin:0 0 4px;display:flex;align-items:center;gap:8px}
 .plat .os2{font-size:11px;color:var(--ts);margin-bottom:14px}
 .plat .method{font-size:12.5px;color:var(--ts);margin-bottom:14px;min-height:34px}
-.plat .method code{font-family:ui-monospace,Menlo,monospace;color:var(--tp);font-size:11.5px}
 .badge{display:inline-block;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--mint);border:1px solid var(--mintbd);background:var(--mintbg);border-radius:999px;padding:2px 8px;}
 .notewarn{margin-top:22px;font-size:12px;color:var(--ts);text-align:center}
 .notewarn a{color:var(--mint)}
@@ -180,7 +185,7 @@ footer{padding:40px 0 60px;border-top:1px solid var(--bd);margin-top:20px}
 .fcols{display:flex;gap:50px;flex-wrap:wrap;align-items:flex-start}
 .fcols .about{max-width:280px}
 .fcols .about p{font-size:12.5px;color:var(--ts);margin:12px 0 0}
-.fcol h5{font-size:10px;letter-spacing:.13em;text-transform:uppercase;color:var(--ts);margin:0 0 12px;font-weight:700}
+.fcol h4{font-size:10px;letter-spacing:.13em;text-transform:uppercase;color:var(--ts);margin:0 0 12px;font-weight:700}
 .fcol a{display:block;font-size:13px;color:var(--ts);margin-bottom:9px}
 .fcol a:hover{color:var(--mint)}
 .fbottom{margin-top:34px;padding-top:18px;border-top:1px solid var(--bd);display:flex;justify-content:space-between;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--ts)}
@@ -191,8 +196,12 @@ footer{padding:40px 0 60px;border-top:1px solid var(--bd);margin-top:20px}
 }
 @media(max-width:680px){
   .ghublink,.nav .btn.line{display:none}
-  .steps,.feat,.dl{grid-template-columns:1fr} .os{grid-template-columns:1fr}
+  .steps,.feat,.dl{grid-template-columns:minmax(0,1fr)} .os{grid-template-columns:1fr}
   .app{grid-template-columns:1fr} .side{flex-direction:row;min-height:0;align-items:center;flex-wrap:wrap;gap:10px} .side .sfoot{display:none} .clipgrid{grid-template-columns:repeat(2,1fr)}
   .hotcallout{display:none}
+}
+@media(max-width:400px){
+  /* Keep the compact nav (brand + Download) within the smallest phones (~320px). */
+  .nav .wrap{padding:0 14px} .nav .row{gap:12px}
 }
 @media(prefers-reduced-motion:reduce){ html{scroll-behavior:auto} *{transition:none!important} }

@@ -1,4 +1,4 @@
-# rewynd.gg — landing page
+# rewynd.dev — landing page
 
 The marketing site for **rewynd**, the instant-replay clip recorder. It ships on its
 own domain but lives in this repo so the product and its site version together.
@@ -56,7 +56,9 @@ Cloudflare Pages, Netlify, a bucket + CDN). No server runtime.
 
 ## Before it goes live — placeholders to replace
 
-- **Domain:** `rewynd.gg` in `astro.config.mjs`, the install command, links, and OG tags.
+- **Domain:** `rewynd.dev` in `astro.config.mjs` drives canonical + OG URLs — repoint it
+  if the production domain differs. The install command is centralized in `src/data/release.ts`
+  (`INSTALL_CMD`) and already fetches the repo's `install.sh`, so it needs no domain.
 - **Release tag:** download buttons pin `RELEASE_TAG` in `src/data/release.ts` (GitHub's
   `/releases/latest` 404s while every release is a prerelease) — bump it each release.
 - **Product shot:** the hero "Library" is a CSS mockup (`LibraryShot.astro`), not a

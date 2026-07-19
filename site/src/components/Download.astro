@@ -1,5 +1,5 @@
 ---
-import { APPIMAGE_URL, WIN_SETUP_URL, ALL_RELEASES_URL } from '../data/release';
+import { APPIMAGE_URL, WIN_SETUP_URL, ALL_RELEASES_URL, INSTALL_CMD } from '../data/release';
 ---
 <section class="sec" id="download"><div class="wrap">
   <div class="sechead" style="justify-content:center;text-align:center;flex-direction:column;align-items:center;gap:6px">
@@ -9,7 +9,8 @@ import { APPIMAGE_URL, WIN_SETUP_URL, ALL_RELEASES_URL } from '../data/release';
   <div class="dl">
     <div class="plat">
       <h3>Linux</h3><div class="os2">Any distro · Wayland &amp; X11</div>
-      <div class="method">Self-updating AppImage:<br><code>curl -fsSL https://rewynd.gg/install.sh | sh</code></div>
+      <div class="method">Self-updating AppImage:</div>
+      <div class="cmd"><span class="p">$</span> <span class="cmdtext" id="installCmdDl">{INSTALL_CMD}</span> <button class="cp" data-copy="#installCmdDl" aria-live="polite" aria-label="Copy install command">copy</button></div>
       <a class="btn mint" href={APPIMAGE_URL}>↓ Download AppImage</a>
     </div>
     <div class="plat">

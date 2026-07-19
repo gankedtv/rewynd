@@ -1,5 +1,6 @@
 ---
 import LogoMark from './LogoMark.astro';
+import { INSTALL_CMD } from '../data/release';
 ---
 <section class="sec" id="opensource"><div class="wrap">
   <div class="os">
@@ -17,7 +18,7 @@ import LogoMark from './LogoMark.astro';
     <div class="repo">
       <div class="top"><LogoMark style="width:18px;height:18px" /><b>gankedtv / rewynd</b><span style="margin-left:auto;color:var(--ts)">GPL-3.0 · beta</span></div>
       <div class="body">
-        <div class="ln"><span class="k">$</span> curl -fsSL https://rewynd.gg/install.sh | sh</div>
+        <div class="ln"><span class="k">$</span> {INSTALL_CMD}</div>
         <div class="ln" style="color:var(--ts)">↳ fetching latest AppImage…</div>
         <div class="ln"><span class="k">✓</span> rewynd installed · run <span style="color:var(--tp)">rewynd</span> to start</div>
       </div>

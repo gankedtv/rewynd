@@ -1,12 +1,12 @@
 ---
 import LibraryShot from './LibraryShot.astro';
-import { APPIMAGE_URL, WIN_SETUP_URL } from '../data/release';
+import { APPIMAGE_URL, WIN_SETUP_URL, INSTALL_CMD } from '../data/release';
 ---
 <section class="hero" style="border-top:none"><div class="wrap">
   <span class="kick">Native · Open source · Linux · Windows · macOS</span>
   <h1 class="lead h1">Instant replay for your gameplay.</h1>
   <p class="sub">The last 60 seconds, always one hotkey away. A lightweight recorder that keeps your clip buffer on the GPU and sits in the tray — quiet enough to leave running while you play.</p>
-  <div class="cmd"><span class="p">$</span> <span id="installCmd">curl -fsSL https://rewynd.gg/install.sh | sh</span> <button class="cp" data-copy="#installCmd" aria-label="Copy install command">copy</button></div>
+  <div class="cmd"><span class="p">$</span> <span class="cmdtext" id="installCmd">{INSTALL_CMD}</span> <button class="cp" data-copy="#installCmd" aria-live="polite" aria-label="Copy install command">copy</button></div>
   <div class="ctas">
     <a class="btn mint" id="dlPrimary" href="#download" data-linux={APPIMAGE_URL} data-win={WIN_SETUP_URL}>↓ Download for Linux</a>
     <a class="btn ghost" href="https://github.com/gankedtv/rewynd">★ Star on GitHub</a>
@@ -37,16 +37,18 @@ import { APPIMAGE_URL, WIN_SETUP_URL } from '../data/release';
     else { dl.href = dl.dataset.linux || dl.href; }
   }
 
-  // Copy-to-clipboard buttons.
+  // Copy-to-clipboard buttons. Without the Clipboard API (insecure context / old
+  // browser) the button is a dead affordance, so hide it rather than no-op silently.
   document.querySelectorAll<HTMLButtonElement>('.cp[data-copy]').forEach((btn) => {
+    if (!navigator.clipboard) { btn.hidden = true; return; }
+    const original = btn.textContent; // captured once, so rapid clicks can't stick on "copied"
     btn.addEventListener('click', () => {
       const sel = btn.getAttribute('data-copy');
       const el = sel ? document.querySelector(sel) : null;
-      if (!el || !navigator.clipboard) return;
+      if (!el) return;
       navigator.clipboard.writeText((el.textContent || '').trim()).then(() => {
-        const prev = btn.textContent;
         btn.textContent = 'copied';
-        setTimeout(() => { btn.textContent = prev; }, 1400);
+        setTimeout(() => { btn.textContent = original; }, 1400);
       });
     });
   });
