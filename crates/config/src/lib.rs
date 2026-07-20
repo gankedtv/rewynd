@@ -55,7 +55,7 @@ pub use desktop::{autostart_path, desktop_entry, desktop_exec_value};
 // (the .app bundle owns the app's identity and icons).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use desktop::{install_icons, install_launcher_entry};
-pub use lock::{InstanceLock, acquire_recorder_lock, acquire_settings_lock};
+pub use lock::{InstanceLock, acquire_recorder_lock, acquire_settings_lock, settings_running};
 pub use paths::{
     APP_ID, config_path, default_output_dir, recorder_pid_path, settings_activation_path,
     settings_lock_path, sibling_binary,

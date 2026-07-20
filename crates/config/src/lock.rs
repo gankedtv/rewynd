@@ -88,6 +88,27 @@ pub fn acquire_settings_lock() -> std::io::Result<Option<InstanceLock>> {
     Ok(lock_file(&settings_lock_path())?.map(|file| InstanceLock { _file: file }))
 }
 
+/// Whether a settings lock at `path` is currently held. Probes by briefly taking the lock;
+/// the flock is dropped with the returned file before this returns. The testable core of
+/// [`settings_running`].
+#[cfg(unix)]
+fn settings_running_at(path: &Path) -> bool {
+    !matches!(lock_file(path), Ok(Some(_)))
+}
+
+/// Whether a settings window is currently open (its single-instance lock is held). Errors count
+/// as open: callers use this to avoid disturbing a live window, so an unreadable lock must fail
+/// toward caution. The probe briefly acquires the lock, so a settings app launching in that same
+/// instant can misread it as an open window — a benign, retryable race.
+#[cfg(unix)]
+#[must_use]
+pub fn settings_running() -> bool {
+    if ensure_instance_dir(&instance_dir()).is_err() {
+        return true;
+    }
+    settings_running_at(&settings_lock_path())
+}
+
 /// A held single-instance lock (a named kernel mutex in the per-session `Local\`
 /// namespace). Keep it alive for the whole run: dropping it closes the handle, and the
 /// kernel destroys the named object once the last handle (including a crashed holder's)
@@ -168,6 +189,23 @@ pub fn acquire_settings_lock() -> std::io::Result<Option<InstanceLock>> {
     Ok(Some(InstanceLock { _mutex: mutex }))
 }
 
+/// Whether the settings mutex `name` is currently held. Probes by briefly creating the mutex;
+/// the fresh handle drops before this returns, leaving a holder's object alone. The testable
+/// core of [`settings_running`].
+#[cfg(windows)]
+fn settings_running_named(name: &str) -> bool {
+    !matches!(create_instance_mutex(name), Ok(Some(_)))
+}
+
+/// Whether a settings window is currently open (its single-instance mutex exists). Errors count
+/// as open: callers use this to avoid disturbing a live window, so a failed probe must fail
+/// toward caution.
+#[cfg(windows)]
+#[must_use]
+pub fn settings_running() -> bool {
+    settings_running_named(&mutex_name("settings"))
+}
+
 // No guard on other targets; stubs keep the public API total so callers need no `#[cfg]`.
 #[cfg(not(any(unix, windows)))]
 pub struct InstanceLock;
@@ -180,6 +218,11 @@ pub fn acquire_recorder_lock() -> std::io::Result<Option<InstanceLock>> {
 #[cfg(not(any(unix, windows)))]
 pub fn acquire_settings_lock() -> std::io::Result<Option<InstanceLock>> {
     Ok(Some(InstanceLock))
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn settings_running() -> bool {
+    false
 }
 
 #[cfg(all(test, windows))]
@@ -228,6 +271,27 @@ mod windows_tests {
             "a peer is refused while the lock is held"
         );
         drop(lock);
+    }
+
+    #[test]
+    fn settings_probe_tracks_the_mutex_holder() {
+        let name = unique_name("settings-probe");
+        assert!(
+            !settings_running_named(&name),
+            "a free mutex reads as not running"
+        );
+        let held = create_instance_mutex(&name)
+            .expect("io ok")
+            .expect("acquires");
+        assert!(
+            settings_running_named(&name),
+            "a held mutex reads as running"
+        );
+        drop(held);
+        assert!(
+            !settings_running_named(&name),
+            "a released mutex reads as not running"
+        );
     }
 
     #[test]
@@ -294,6 +358,23 @@ mod tests {
             format!("{}\n", std::process::id())
         );
         drop(lock);
+    }
+
+    #[test]
+    fn settings_probe_tracks_the_lock_holder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.lock");
+        assert!(
+            !settings_running_at(&path),
+            "free lock reads as not running"
+        );
+        let held = lock_file(&path).expect("io ok").expect("acquires");
+        assert!(settings_running_at(&path), "held lock reads as running");
+        drop(held);
+        assert!(
+            !settings_running_at(&path),
+            "released lock reads as not running"
+        );
     }
 
     #[test]

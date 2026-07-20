@@ -39,6 +39,9 @@ mod overlay;
 #[cfg(target_os = "windows")]
 mod toast;
 
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+mod updater;
+
 /// The clip-saved chime (generated two-note pling, mono 16-bit WAV), embedded once and shared by
 /// all platforms: Windows plays it from memory (`overlay::play_chime`), Linux and macOS decode and
 /// play it through rodio (`chime::play`).
@@ -50,7 +53,11 @@ fn main() -> anyhow::Result<()> {
     // Must be first: on a packaged install this handles Velopack's install/update hook args and
     // may exit or restart the process. A normal launch passes straight through, and it is inert
     // (no hooks, no output) for dev/cargo runs, so the pristine-stdout probe below is unaffected.
-    velopack::VelopackApp::build().run();
+    // Auto-apply stays off: the updater module applies pending updates itself, after the
+    // single-instance lock and the open-settings-window check.
+    velopack::VelopackApp::build()
+        .set_auto_apply_on_startup(false)
+        .run();
 
     // As a windows-subsystem exe we start with no console; reconnect to the launching one (if any)
     // so `cargo run` / terminal launches still show tracing output and `--version`. A no-op when
@@ -869,6 +876,14 @@ mod linux {
                 None
             }
         };
+
+        // A previously downloaded update installs now, before the capture pipeline exists
+        // (a successful apply replaces this process). Lock holders only: a degraded start
+        // must never yank a running peer out from under its buffer.
+        if _instance.is_some() {
+            crate::updater::apply_pending_update(&config);
+        }
+        crate::updater::spawn_background_check(&config);
 
         // Resolution / framerate / bitrate stay parameters (PLAN §9), sourced from the config.
         let params = encode_params(config.video());
@@ -1927,6 +1942,14 @@ mod windows {
             }
         };
 
+        // A previously downloaded update installs now, before the capture pipeline exists
+        // (a successful apply replaces this process). Lock holders only: a degraded start
+        // must never yank a running peer out from under its buffer.
+        if _instance.is_some() {
+            crate::updater::apply_pending_update(&config);
+        }
+        crate::updater::spawn_background_check(&config);
+
         // Resolution / framerate / bitrate stay parameters (PLAN §9), sourced from the config.
         let params = encode_params(config.video());
         let buffer_window = config.buffer_window();
@@ -2761,6 +2784,14 @@ mod macos {
                 None
             }
         };
+
+        // A previously downloaded update installs now, before the capture pipeline exists
+        // (a successful apply replaces this process). Lock holders only: a degraded start
+        // must never yank a running peer out from under its buffer.
+        if _instance.is_some() {
+            crate::updater::apply_pending_update(&config);
+        }
+        crate::updater::spawn_background_check(&config);
 
         // AppKit wants the main thread; everything below assumes we own it.
         let mtm = MainThreadMarker::new()

@@ -293,7 +293,11 @@ fn main() -> iced::Result {
     // Must be first: Velopack's install/update hooks run here and may exit/restart the process.
     // `on_restarted` fires after an update relaunch — the update flow stopped the recorder before
     // applying, so bring it back on the new version. Inert for dev/cargo runs (no receipt).
+    // Auto-apply stays off: the recorder downloads updates in the background, and a pending one
+    // must never install at window launch — the apply force-kills the running recorder (possibly
+    // mid-MP4-write). The sidebar flow stops the recorder first; the recorder applies at boot.
     velopack::VelopackApp::build()
+        .set_auto_apply_on_startup(false)
         .on_restarted(|_ver| spawn_recorder_detached())
         .run();
 
@@ -707,6 +711,7 @@ enum Message {
     CaptureDesktop(bool),
     GameFolders(bool),
     StartOnBoot(bool),
+    AutoInstallUpdates(bool),
     ApiKeyEdited(String),
     ApiUrlEdited(String),
     ShareUrlEdited(String),
@@ -1003,6 +1008,10 @@ impl App {
             }
             Message::StartOnBoot(on) => {
                 self.config.set_start_on_boot(on);
+                self.touch();
+            }
+            Message::AutoInstallUpdates(on) => {
+                self.config.set_auto_install_updates(on);
                 self.touch();
             }
             Message::ApiKeyEdited(s) => {
@@ -1795,6 +1804,25 @@ impl App {
                     .on_toggle(Message::StartOnBoot)
                     .style(arena_check),
             );
+        // Only in a Velopack install: everything else (dev runs, package managers) has no
+        // self-update to configure.
+        let output_capture = if self.is_velopack {
+            output_capture.push(
+                column![
+                    checkbox(self.config.auto_install_updates())
+                        .label("Install updates automatically")
+                        .on_toggle(Message::AutoInstallUpdates)
+                        .style(arena_check),
+                    hint(
+                        "Updates download in the background and install the next time \
+                         rewynd starts. The sidebar button updates right away.",
+                    ),
+                ]
+                .spacing(6),
+            )
+        } else {
+            output_capture
+        };
         // Advanced sits at the bottom of the card (the per-start monitor prompt is a Linux-only,
         // rarely-used detail).
         #[cfg(target_os = "linux")]

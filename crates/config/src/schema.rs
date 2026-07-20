@@ -300,6 +300,22 @@ struct StartupConfig {
     on_boot: bool,
 }
 
+/// Automatic update behaviour. Only meaningful in a Velopack install; package-manager
+/// installs have no receipt and never self-update regardless of this setting.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct UpdatesConfig {
+    /// Download updates in the background and install them at the next recorder start.
+    /// The settings window's manual check works either way.
+    auto_install: bool,
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self { auto_install: true }
+    }
+}
+
 /// ganked.tv upload settings. `api_key` is a secret — `save_to` tightens the file mode for it.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -372,6 +388,7 @@ pub struct Config {
     hotkey: HotkeyConfig,
     capture: CaptureConfig,
     startup: StartupConfig,
+    updates: UpdatesConfig,
     upload: UploadConfig,
     youtube: YouTubeConfig,
 }
@@ -608,6 +625,17 @@ impl Config {
     /// Set whether the recorder starts automatically at login.
     pub fn set_start_on_boot(&mut self, on_boot: bool) {
         self.startup.on_boot = on_boot;
+    }
+
+    /// Whether downloaded updates install automatically at the next recorder start.
+    #[must_use]
+    pub fn auto_install_updates(&self) -> bool {
+        self.updates.auto_install
+    }
+
+    /// Set whether downloaded updates install automatically at the next recorder start.
+    pub fn set_auto_install_updates(&mut self, auto_install: bool) {
+        self.updates.auto_install = auto_install;
     }
 
     /// The validated upload settings: `enabled` requires an API key (fail closed), and empty
@@ -1230,6 +1258,21 @@ mod tests {
         c.set_start_on_boot(true);
         let back = Config::from_toml_str(&c.to_toml_string().expect("serialize")).expect("reparse");
         assert!(back.start_on_boot());
+    }
+
+    #[test]
+    fn auto_install_updates_defaults_on_and_round_trips() {
+        let mut c = Config::default();
+        assert!(c.auto_install_updates(), "auto-install defaults on");
+        c.set_auto_install_updates(false);
+        let back = Config::from_toml_str(&c.to_toml_string().expect("serialize")).expect("reparse");
+        assert!(!back.auto_install_updates());
+    }
+
+    #[test]
+    fn config_without_updates_section_defaults_auto_install_on() {
+        let c = Config::from_toml_str("").expect("empty config parses");
+        assert!(c.auto_install_updates());
     }
 
     #[test]
