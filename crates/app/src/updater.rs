@@ -1,34 +1,20 @@
-//! Background auto-updates (Velopack installs only; dev runs and package-manager
-//! installs have no receipt, so every entry point here is inert for them).
-//!
-//! The recorder never interrupts a session to update: a new release is only
-//! downloaded in the background, and a previously downloaded one is applied at the
-//! next recorder start, before any capture begins. Applying restarts through the
-//! GUI binary's `--recorder` hand-off (the package's main exe is the GUI), so no
-//! settings window appears at boot. While a settings window is open the apply is
-//! skipped entirely: Velopack's updater force-kills every process left in the
-//! install dir, and an open window must not die that way.
+//! Background auto-updates (Velopack installs only; without a receipt every entry point
+//! is inert). Downloads happen in the background; a downloaded update is applied only at
+//! the next recorder start, never mid-session.
 
 use std::time::Duration;
 
 use rewynd_config::Config;
 
-/// The GitHub repo whose Releases are the update feed (the settings app's manual
-/// "Check for updates" reads the same feed).
+/// The update feed; the settings app's manual check reads the same repo.
 const UPDATE_REPO: &str = "https://github.com/gankedtv/rewynd";
 
-/// Delay before the first background check, leaving startup I/O and the first
-/// capture frames undisturbed.
 const FIRST_CHECK_DELAY: Duration = Duration::from_secs(2 * 60);
-
-/// Interval between background checks while the recorder stays up. Anonymous
-/// GitHub API calls are limited to 60/h per IP; one a day is nothing.
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// The update manager for this install, or `None` outside a real Velopack install
-/// (no receipt): dev runs and package-manager installs land there.
+/// `None` outside a real Velopack install (dev runs, package managers).
 fn update_manager() -> Option<velopack::UpdateManager> {
-    // Prereleases are offered only to a prerelease build, matching the settings app.
+    // Prerelease builds track the prerelease channel, matching the settings app.
     let source = velopack::sources::GithubSource::new(
         UPDATE_REPO,
         None,
@@ -37,10 +23,8 @@ fn update_manager() -> Option<velopack::UpdateManager> {
     velopack::UpdateManager::new(source, None, None).ok()
 }
 
-/// Install an update a previous run downloaded, restarting the recorder on the new
-/// version. Called after the single-instance lock and before the capture pipeline
-/// exists, so nothing is mid-write when the process is replaced. A no-op unless the
-/// config allows it, an update is actually pending, and no settings window is open.
+/// Apply a previously downloaded update and restart the recorder on the new version.
+/// Call after the single-instance lock, before the capture pipeline exists.
 pub(crate) fn apply_pending_update(config: &Config) {
     if !config.auto_install_updates() {
         return;
@@ -51,25 +35,19 @@ pub(crate) fn apply_pending_update(config: &Config) {
     let Some(pending) = manager.get_update_pending_restart() else {
         return;
     };
+    // Velopack's apply force-kills processes in the install dir; spare an open window.
     if rewynd_config::settings_running() {
-        tracing::info!(
-            version = %pending.Version,
-            "an update is ready, but a settings window is open; it installs at the next start"
-        );
+        tracing::info!(version = %pending.Version, "update ready; deferred while a settings window is open");
         return;
     }
     tracing::info!(version = %pending.Version, "installing the downloaded update");
-    // On success this exits the process; the updater relaunches the GUI with
-    // `--recorder`, which hands straight off to the new recorder without a window.
+    // The updater restarts the package's main exe (the GUI); --recorder hands off windowless.
     if let Err(e) = manager.apply_updates_and_restart_with_args(&pending, ["--recorder"]) {
-        tracing::warn!(error = %e, "could not install the downloaded update; continuing on this version");
+        tracing::warn!(error = %e, "could not install the downloaded update");
     }
 }
 
-/// Check for and download updates in the background, never applying them: a
-/// download installs at the next recorder start (or right away via the settings
-/// window). The thread is detached and dies with the process. A no-op unless the
-/// config allows it and this is a Velopack install.
+/// Check and download on a detached daily timer; applying waits for the next start.
 pub(crate) fn spawn_background_check(config: &Config) {
     if !config.auto_install_updates() || update_manager().is_none() {
         return;
@@ -88,8 +66,6 @@ pub(crate) fn spawn_background_check(config: &Config) {
     }
 }
 
-/// One check-and-download pass. Network failures are routine (an offline boot), so
-/// they log at debug and the next interval retries.
 fn check_and_download() {
     let Some(manager) = update_manager() else {
         return;
@@ -99,14 +75,14 @@ fn check_and_download() {
             let version = info.TargetFullRelease.Version.clone();
             tracing::info!(%version, "downloading an update in the background");
             match manager.download_updates(&info, None) {
-                Ok(()) => tracing::info!(
-                    %version,
-                    "update downloaded; it installs at the next recorder start"
-                ),
+                Ok(()) => {
+                    tracing::info!(%version, "update downloaded; installs at the next recorder start")
+                }
                 Err(e) => tracing::warn!(error = %e, "could not download the update"),
             }
         }
         Ok(_) => tracing::debug!("no update available"),
+        // Offline boots are routine; the next interval retries.
         Err(e) => tracing::debug!(error = %e, "update check failed"),
     }
 }

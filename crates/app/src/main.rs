@@ -53,8 +53,7 @@ fn main() -> anyhow::Result<()> {
     // Must be first: on a packaged install this handles Velopack's install/update hook args and
     // may exit or restart the process. A normal launch passes straight through, and it is inert
     // (no hooks, no output) for dev/cargo runs, so the pristine-stdout probe below is unaffected.
-    // Auto-apply stays off: the updater module applies pending updates itself, after the
-    // single-instance lock and the open-settings-window check.
+    // Auto-apply off: the updater module owns apply timing.
     velopack::VelopackApp::build()
         .set_auto_apply_on_startup(false)
         .run();
@@ -877,9 +876,7 @@ mod linux {
             }
         };
 
-        // A previously downloaded update installs now, before the capture pipeline exists
-        // (a successful apply replaces this process). Lock holders only: a degraded start
-        // must never yank a running peer out from under its buffer.
+        // Install any downloaded update now, before capture exists; lock holders only.
         if _instance.is_some() {
             crate::updater::apply_pending_update(&config);
         }
@@ -1942,9 +1939,7 @@ mod windows {
             }
         };
 
-        // A previously downloaded update installs now, before the capture pipeline exists
-        // (a successful apply replaces this process). Lock holders only: a degraded start
-        // must never yank a running peer out from under its buffer.
+        // Install any downloaded update now, before capture exists; lock holders only.
         if _instance.is_some() {
             crate::updater::apply_pending_update(&config);
         }
@@ -2785,9 +2780,7 @@ mod macos {
             }
         };
 
-        // A previously downloaded update installs now, before the capture pipeline exists
-        // (a successful apply replaces this process). Lock holders only: a degraded start
-        // must never yank a running peer out from under its buffer.
+        // Install any downloaded update now, before capture exists; lock holders only.
         if _instance.is_some() {
             crate::updater::apply_pending_update(&config);
         }
