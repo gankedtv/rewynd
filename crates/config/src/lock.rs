@@ -88,18 +88,13 @@ pub fn acquire_settings_lock() -> std::io::Result<Option<InstanceLock>> {
     Ok(lock_file(&settings_lock_path())?.map(|file| InstanceLock { _file: file }))
 }
 
-/// Whether a settings lock at `path` is currently held. Probes by briefly taking the lock;
-/// the flock is dropped with the returned file before this returns. The testable core of
-/// [`settings_running`].
+/// Whether the settings lock at `path` is held (briefly takes it). Core of [`settings_running`].
 #[cfg(unix)]
 fn settings_running_at(path: &Path) -> bool {
     !matches!(lock_file(path), Ok(Some(_)))
 }
 
-/// Whether a settings window is currently open (its single-instance lock is held). Errors count
-/// as open: callers use this to avoid disturbing a live window, so an unreadable lock must fail
-/// toward caution. The probe briefly acquires the lock, so a settings app launching in that same
-/// instant can misread it as an open window — a benign, retryable race.
+/// Whether a settings window is open. Errors count as open: callers must not disturb a live one.
 #[cfg(unix)]
 #[must_use]
 pub fn settings_running() -> bool {
@@ -189,17 +184,13 @@ pub fn acquire_settings_lock() -> std::io::Result<Option<InstanceLock>> {
     Ok(Some(InstanceLock { _mutex: mutex }))
 }
 
-/// Whether the settings mutex `name` is currently held. Probes by briefly creating the mutex;
-/// the fresh handle drops before this returns, leaving a holder's object alone. The testable
-/// core of [`settings_running`].
+/// Whether the settings mutex `name` is held (briefly creates it). Core of [`settings_running`].
 #[cfg(windows)]
 fn settings_running_named(name: &str) -> bool {
     !matches!(create_instance_mutex(name), Ok(Some(_)))
 }
 
-/// Whether a settings window is currently open (its single-instance mutex exists). Errors count
-/// as open: callers use this to avoid disturbing a live window, so a failed probe must fail
-/// toward caution.
+/// Whether a settings window is open. Errors count as open: callers must not disturb a live one.
 #[cfg(windows)]
 #[must_use]
 pub fn settings_running() -> bool {

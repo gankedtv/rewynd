@@ -293,9 +293,8 @@ fn main() -> iced::Result {
     // Must be first: Velopack's install/update hooks run here and may exit/restart the process.
     // `on_restarted` fires after an update relaunch — the update flow stopped the recorder before
     // applying, so bring it back on the new version. Inert for dev/cargo runs (no receipt).
-    // Auto-apply stays off: the recorder downloads updates in the background, and a pending one
-    // must never install at window launch — the apply force-kills the running recorder (possibly
-    // mid-MP4-write). The sidebar flow stops the recorder first; the recorder applies at boot.
+    // Auto-apply off: it would force-kill a recording peer; the sidebar flow and the
+    // recorder's own startup own apply timing.
     velopack::VelopackApp::build()
         .set_auto_apply_on_startup(false)
         .on_restarted(|_ver| spawn_recorder_detached())
@@ -1804,8 +1803,7 @@ impl App {
                     .on_toggle(Message::StartOnBoot)
                     .style(arena_check),
             );
-        // Only in a Velopack install: everything else (dev runs, package managers) has no
-        // self-update to configure.
+        // Only Velopack installs can self-update.
         let output_capture = if self.is_velopack {
             output_capture.push(
                 column![

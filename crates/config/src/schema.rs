@@ -300,13 +300,11 @@ struct StartupConfig {
     on_boot: bool,
 }
 
-/// Automatic update behaviour. Only meaningful in a Velopack install; package-manager
-/// installs have no receipt and never self-update regardless of this setting.
+/// Automatic update behaviour (meaningless without a Velopack receipt).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct UpdatesConfig {
-    /// Download updates in the background and install them at the next recorder start.
-    /// The settings window's manual check works either way.
+    /// Download in the background and install at the next recorder start.
     auto_install: bool,
 }
 
@@ -1277,8 +1275,7 @@ mod tests {
 
     #[test]
     fn updates_section_without_auto_install_defaults_on() {
-        // The container-level serde default fills missing fields from Self::default(),
-        // so a hand-edited bare [updates] section must not read as "off".
+        // A hand-edited bare [updates] section must not read as "off".
         let c = Config::from_toml_str("[updates]\n").expect("bare section parses");
         assert!(c.auto_install_updates());
     }
