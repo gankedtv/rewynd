@@ -1276,6 +1276,14 @@ mod tests {
     }
 
     #[test]
+    fn updates_section_without_auto_install_defaults_on() {
+        // The container-level serde default fills missing fields from Self::default(),
+        // so a hand-edited bare [updates] section must not read as "off".
+        let c = Config::from_toml_str("[updates]\n").expect("bare section parses");
+        assert!(c.auto_install_updates());
+    }
+
+    #[test]
     fn video_is_sanitized_to_encodable_values() {
         let c = Config::from_toml_str(
             "[video]\nwidth = 1921\nheight = 4\nframerate = 0\nbitrate_bps = 1\nidr_period = 100000\n",
