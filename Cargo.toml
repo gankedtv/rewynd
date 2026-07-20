@@ -19,7 +19,7 @@ members = [
 exclude = ["vendor/mp4"]
 
 [workspace.package]
-version = "1.0.0-beta.4"
+version = "1.0.0-beta.5"
 edition = "2024"
 # Tracks the real floor of the tree (iced 0.14 needs 1.88; notify-rust 4.18 needs 1.89). Keeping
 # this honest matters: MSRV-aware resolution otherwise pins vulnerable transitive versions (it
