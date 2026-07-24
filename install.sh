@@ -82,13 +82,21 @@ install_macos() {
   fi
 
   mkdir -p "$APPDIR"
-  rm -rf "$APPDIR/rewynd.app"
-  mv "$app" "$APPDIR/rewynd.app"
+  # Stage the new bundle beside the target, then swap it in with same-directory
+  # renames, so a failed (or cross-volume) copy leaves any existing install intact.
+  target="$APPDIR/rewynd.app"
+  staged="$target.new"
+  backup="$target.bak"
+  rm -rf "$staged" "$backup"
+  mv "$app" "$staged"
   # The build is unsigned; clearing quarantine lets it open on a plain double-click
   # instead of Gatekeeper's "damaged" wall.
-  xattr -dr com.apple.quarantine "$APPDIR/rewynd.app" 2>/dev/null || true
+  xattr -dr com.apple.quarantine "$staged" 2>/dev/null || true
+  if [ -e "$target" ]; then mv "$target" "$backup"; fi
+  mv "$staged" "$target"
+  rm -rf "$backup"
 
-  echo "Installed rewynd to $APPDIR/rewynd.app"
+  echo "Installed rewynd to $target"
   echo "Open rewynd from Spotlight or Launchpad. It self-updates from GitHub Releases."
 }
 

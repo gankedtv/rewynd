@@ -54,7 +54,7 @@ It installs `rewynd.app` to `~/Applications` and clears the quarantine flag, so 
 unsigned build opens directly — launch it from Spotlight or Launchpad. Prefer to do it
 by hand? Download `rewynd-osx-Portable.zip` from the
 [latest release](https://github.com/gankedtv/rewynd/releases), unzip it, and move
-`rewynd.app` to Applications; a manual download stays quarantined, so its first launch
+`rewynd.app` to `~/Applications`; a manual download stays quarantined, so its first launch
 needs **right-click → Open** (Gatekeeper offers no Open button on a plain double-click).
 Either way macOS asks for Screen Recording permission on first run — grant it and
 relaunch. Because unsigned builds get a fresh identity on every update, macOS asks for
