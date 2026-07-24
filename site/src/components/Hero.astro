@@ -1,6 +1,6 @@
 ---
 import LibraryShot from './LibraryShot.astro';
-import { APPIMAGE_URL, WIN_SETUP_URL, INSTALL_CMD } from '../data/release';
+import { APPIMAGE_URL, WIN_SETUP_URL, OSX_SETUP_URL, INSTALL_CMD } from '../data/release';
 ---
 <section class="hero" style="border-top:none"><div class="wrap">
   <span class="kick">Native · Open source · Linux · Windows · macOS</span>
@@ -8,7 +8,7 @@ import { APPIMAGE_URL, WIN_SETUP_URL, INSTALL_CMD } from '../data/release';
   <p class="sub">The last 60 seconds, always one hotkey away. A lightweight recorder that keeps your clip buffer on the GPU and sits in the tray — quiet enough to leave running while you play.</p>
   <div class="cmd"><span class="p">$</span> <span class="cmdtext" id="installCmd">{INSTALL_CMD}</span> <button class="cp" data-copy="#installCmd" aria-live="polite" aria-label="Copy install command">copy</button></div>
   <div class="ctas">
-    <a class="btn mint" id="dlPrimary" href="#download" data-linux={APPIMAGE_URL} data-win={WIN_SETUP_URL}>↓ Download for Linux</a>
+    <a class="btn mint" id="dlPrimary" href="#download" data-linux={APPIMAGE_URL} data-win={WIN_SETUP_URL} data-mac={OSX_SETUP_URL}>↓ Download for Linux</a>
     <a class="btn ghost" href="https://github.com/gankedtv/rewynd">★ Star on GitHub</a>
   </div>
   <p class="betanote"><span class="b">Beta</span> Work in progress — expect rough edges. It self-updates, so fixes land fast.</p>
@@ -33,7 +33,7 @@ import { APPIMAGE_URL, WIN_SETUP_URL, INSTALL_CMD } from '../data/release';
       || (/Mac/i.test(p) && navigator.maxTouchPoints > 1); // iPadOS reports as Mac
     if (mobile) { dl.textContent = '↓ Download'; }
     else if (/Win/i.test(p)) { dl.textContent = '↓ Download for Windows'; dl.href = dl.dataset.win || dl.href; }
-    else if (/Mac/i.test(p)) { dl.textContent = '↓ Build for macOS'; dl.href = 'https://github.com/gankedtv/rewynd#building'; }
+    else if (/Mac/i.test(p)) { dl.textContent = '↓ Download for macOS'; dl.href = dl.dataset.mac || dl.href; }
     else { dl.href = dl.dataset.linux || dl.href; }
   }
 
