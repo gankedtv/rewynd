@@ -1,5 +1,5 @@
 ---
-import { APPIMAGE_URL, WIN_SETUP_URL, ALL_RELEASES_URL, INSTALL_CMD } from '../data/release';
+import { APPIMAGE_URL, WIN_SETUP_URL, OSX_SETUP_URL, ALL_RELEASES_URL, INSTALL_CMD } from '../data/release';
 ---
 <section class="sec" id="download"><div class="wrap">
   <div class="sechead" style="justify-content:center;text-align:center;flex-direction:column;align-items:center;gap:6px">
@@ -20,9 +20,10 @@ import { APPIMAGE_URL, WIN_SETUP_URL, ALL_RELEASES_URL, INSTALL_CMD } from '../d
     </div>
     <div class="plat">
       <h3>macOS <span class="badge">Beta</span></h3><div class="os2">Apple Silicon · macOS 15+</div>
-      <div class="method">Build from source for now — one command with the CLI tools.</div>
-      <a class="btn ghost" href="https://github.com/gankedtv/rewynd#building">View build guide</a>
+      <div class="method">Self-updating installer:</div>
+      <div class="cmd"><span class="p">$</span> <span class="cmdtext" id="installCmdMac">{INSTALL_CMD}</span> <button class="cp" data-copy="#installCmdMac" aria-live="polite" aria-label="Copy install command">copy</button></div>
+      <a class="btn mint" href={OSX_SETUP_URL}>↓ Download Setup.pkg</a>
     </div>
   </div>
-  <p class="notewarn">Early software: expect bugs, and please file them. First run on Windows may show a SmartScreen warning until signing lands — choose &ldquo;More info&rdquo; &rarr; &ldquo;Run anyway&rdquo;. <a href={ALL_RELEASES_URL}>All releases on GitHub →</a></p>
+  <p class="notewarn">Early software: expect bugs, and please file them. First run on Windows may show a SmartScreen warning until signing lands — choose &ldquo;More info&rdquo; &rarr; &ldquo;Run anyway&rdquo;. On macOS the downloaded <code>.pkg</code> is unsigned, so open it with right-click &rarr; Open; the one-liner installer skips that. <a href={ALL_RELEASES_URL}>All releases on GitHub →</a></p>
 </div></section>

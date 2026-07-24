@@ -44,13 +44,21 @@ Or grab `rewynd.AppImage` from the [latest release](https://github.com/gankedtv/
 admin rights needed). Prefer a one-click unattended install? `rewynd-win-Setup.exe` is
 the same install without the window.
 
-**macOS** (Apple Silicon, macOS 15+): download `rewynd-osx-Portable.zip` from the
+**macOS** (Apple Silicon, macOS 15+), via the same self-updating installer:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gankedtv/rewynd/main/install.sh | sh
+```
+
+It installs `rewynd.app` to `~/Applications` and clears the quarantine flag, so the
+unsigned build opens directly — launch it from Spotlight or Launchpad. Prefer to do it
+by hand? Download `rewynd-osx-Portable.zip` from the
 [latest release](https://github.com/gankedtv/rewynd/releases), unzip it, and move
-`rewynd.app` to Applications. The build is unsigned, so the first launch needs
-**right-click → Open** (Gatekeeper offers no Open button on a plain double-click), and
-macOS asks for Screen Recording permission — grant it and relaunch. Because unsigned
-builds get a fresh identity on every update, macOS asks for that permission again after
-each update; a Developer ID signature (planned) fixes that.
+`rewynd.app` to `~/Applications`; a manual download stays quarantined, so its first launch
+needs **right-click → Open** (Gatekeeper offers no Open button on a plain double-click).
+Either way macOS asks for Screen Recording permission on first run — grant it and
+relaunch. Because unsigned builds get a fresh identity on every update, macOS asks for
+that permission again after each update; a Developer ID signature (planned) fixes that.
 
 The app checks for updates on launch; one click updates both binaries in place.
 

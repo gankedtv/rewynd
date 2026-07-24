@@ -33,7 +33,10 @@ import { APPIMAGE_URL, WIN_SETUP_URL, INSTALL_CMD } from '../data/release';
       || (/Mac/i.test(p) && navigator.maxTouchPoints > 1); // iPadOS reports as Mac
     if (mobile) { dl.textContent = '↓ Download'; }
     else if (/Win/i.test(p)) { dl.textContent = '↓ Download for Windows'; dl.href = dl.dataset.win || dl.href; }
-    else if (/Mac/i.test(p)) { dl.textContent = '↓ Build for macOS'; dl.href = 'https://github.com/gankedtv/rewynd#building'; }
+    // Mac stays on the #download anchor: the build is Apple-Silicon-only and the
+    // browser can't tell Apple Silicon from Intel (both report "MacIntel"), so we
+    // route to the labelled card rather than hand an Intel Mac an arm64 package.
+    else if (/Mac/i.test(p)) { dl.textContent = '↓ Download for macOS'; }
     else { dl.href = dl.dataset.linux || dl.href; }
   }
 
