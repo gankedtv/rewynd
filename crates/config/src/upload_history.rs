@@ -110,39 +110,13 @@ pub fn forget(key: &ClipKey, destination: &str) -> std::io::Result<()> {
     })
 }
 
-/// Run a read-modify-write against the history file while holding an exclusive advisory lock on a
-/// sidecar `.lock` file, so two processes can't interleave load/save and lose records. Blocking:
-/// the critical section is a couple of tiny file operations. Non-unix has no advisory lock here,
-/// so it just runs the body (the practical contention — tray + GUI — is a Linux desktop concern).
-#[cfg(unix)]
+/// Run a read-modify-write against the history file under its sidecar lock, so two processes
+/// can't interleave load/save and lose records.
 fn with_history_lock<T>(
     path: &Path,
     body: impl FnOnce() -> std::io::Result<T>,
 ) -> std::io::Result<T> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(path.with_extension("json.lock"))?;
-    // SAFETY: `file` owns a valid fd for the whole call; the lock releases when it drops (close).
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    body()
-}
-
-#[cfg(not(unix))]
-fn with_history_lock<T>(
-    _path: &Path,
-    body: impl FnOnce() -> std::io::Result<T>,
-) -> std::io::Result<T> {
-    body()
+    crate::lock::with_exclusive_lock(&path.with_extension("json.lock"), body)
 }
 
 fn no_path() -> std::io::Error {

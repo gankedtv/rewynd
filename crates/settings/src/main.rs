@@ -1336,8 +1336,8 @@ impl App {
     }
 
     /// Remember the clip-length cap ganked.tv reported, so the next upload's pre-check matches
-    /// this deployment. Nobody asked for this write, so it goes through a fresh read of the file
-    /// (the recorder's own writes work the same way) rather than serializing this window's state.
+    /// this deployment. Nobody asked for this write, so it edits the stored file in place rather
+    /// than saving this window's state over it.
     fn learn_clip_cap(&mut self, secs: u64) {
         if self.config.upload_max_clip_secs() == Some(secs) {
             return;
@@ -1346,9 +1346,7 @@ impl App {
         let Some(path) = config::config_path() else {
             return;
         };
-        let mut stored = config::load_file();
-        stored.set_upload_max_clip_secs(secs);
-        if let Err(e) = stored.save_to(&path) {
+        if let Err(e) = config::update_stored(&path, |c| c.set_upload_max_clip_secs(secs)) {
             tracing::warn!(error = %e, "could not store the clip length cap ganked.tv reported");
         }
     }

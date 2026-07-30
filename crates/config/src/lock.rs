@@ -197,6 +197,40 @@ pub fn settings_running() -> bool {
     settings_running_named(&mutex_name("settings"))
 }
 
+/// Run `body` holding an exclusive advisory lock on `lock_path`, so two processes can't interleave
+/// a read-modify-write of the file it guards. Blocking; non-unix runs the body unlocked (the
+/// practical contention — tray + GUI — is a Linux desktop concern).
+#[cfg(unix)]
+pub(crate) fn with_exclusive_lock<T>(
+    lock_path: &Path,
+    body: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(lock_path)?;
+    // SAFETY: `file` owns a valid fd for the whole call; the lock releases when it drops (close).
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    body()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn with_exclusive_lock<T>(
+    _lock_path: &std::path::Path,
+    body: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    body()
+}
+
 // No guard on other targets; stubs keep the public API total so callers need no `#[cfg]`.
 #[cfg(not(any(unix, windows)))]
 pub struct InstanceLock;

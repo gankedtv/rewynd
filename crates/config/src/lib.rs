@@ -66,7 +66,7 @@ pub use process::{read_recorder_pid, request_recorder_save, stop_recorder};
 pub use schema::{
     AudioSettings, Config, DEFAULT_HOTKEY_TRIGGER, DEFAULT_TEMPLATE, DEFAULT_UPLOAD_API_URL,
     DEFAULT_UPLOAD_SHARE_URL, EncoderPreference, MAX_BUFFER_SECONDS, UploadSettings, VideoSettings,
-    YouTubeSettings, ensure_default_file, load, load_file, non_empty_or,
+    YouTubeSettings, ensure_default_file, load, load_file, non_empty_or, update_stored,
 };
 pub use status::{
     RECORDER_STATUS_VERSION, RecorderState, RecorderStatus, clear_recorder_status,

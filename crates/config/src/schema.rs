@@ -894,12 +894,17 @@ impl Config {
     /// file may hold the upload API key, so on unix the temp is created 0600 and the rename
     /// carries that mode over any looser pre-existing file.
     pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
+        with_config_lock(path, || self.write_to(path))
+    }
+
+    fn write_to(&self, path: &Path) -> std::io::Result<()> {
         use std::io::Write;
         let toml = self
             .to_toml_string()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         create_parent_dirs(path)?;
-        let tmp = path.with_extension("toml.tmp");
+        // Per-process temp name: a writer that skipped the lock still can't corrupt ours.
+        let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
         // Drop any stale temp from a crashed save: `mode` below only applies at creation.
         let _ = std::fs::remove_file(&tmp);
         let result = secret_file_options()
@@ -960,31 +965,52 @@ fn create_parent_dirs(path: &Path) -> std::io::Result<()> {
 /// missing file falls back to the built-in defaults; a malformed one keeps whatever sections
 /// still parse (logging why). The testable core of [`load`].
 fn load_from(path: Option<&Path>, get_env: impl Fn(&str) -> Option<String>) -> Config {
-    let mut config = match path {
-        Some(path) => match std::fs::read_to_string(path) {
-            Ok(text) => match Config::from_toml_str(&text) {
-                Ok(c) => {
-                    tracing::info!(path = %path.display(), "loaded config");
-                    c
-                }
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "invalid config; salvaging valid sections");
-                    salvage_sections(&text)
-                }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tracing::info!(path = %path.display(), "no config file; using defaults");
-                Config::default()
-            }
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "could not read config; using defaults");
-                Config::default()
-            }
-        },
-        None => Config::default(),
-    };
+    let mut config = path.map_or_else(Config::default, read_stored);
     config.apply_env_overrides(get_env);
     config
+}
+
+/// The config as stored, without environment overrides — what a write-back must be based on, so
+/// this process's `REWYND_*` values never end up baked into the file.
+fn read_stored(path: &Path) -> Config {
+    match std::fs::read_to_string(path) {
+        Ok(text) => match Config::from_toml_str(&text) {
+            Ok(c) => {
+                tracing::info!(path = %path.display(), "loaded config");
+                c
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "invalid config; salvaging valid sections");
+                salvage_sections(&text)
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(path = %path.display(), "no config file; using defaults");
+            Config::default()
+        }
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "could not read config; using defaults");
+            Config::default()
+        }
+    }
+}
+
+/// Apply `edit` to the config stored at `path` and write it back, all under the config lock: a
+/// concurrent writer (the tray and the settings window both save) can't lose the other's change.
+pub fn update_stored<T>(path: &Path, edit: impl FnOnce(&mut Config) -> T) -> std::io::Result<T> {
+    with_config_lock(path, || {
+        let mut config = read_stored(path);
+        let out = edit(&mut config);
+        config.write_to(path)?;
+        Ok(out)
+    })
+}
+
+fn with_config_lock<T>(
+    path: &Path,
+    body: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    crate::lock::with_exclusive_lock(&path.with_extension("toml.lock"), body)
 }
 
 /// Per-section salvage for a file that fails the strict parse: each known section that still
@@ -1460,6 +1486,66 @@ mod tests {
         assert_eq!(back.upload_visibility(), "unlisted");
         assert_eq!(back.upload_max_clip_secs(), Some(120));
         assert_eq!(back.upload().max_clip_secs, Some(120));
+    }
+
+    #[test]
+    fn update_stored_edits_the_file_and_ignores_the_environment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        Config::default().save_to(&path).expect("seed");
+
+        // A live override is a runtime value, never something a write-back may persist.
+        let env = std::collections::HashMap::from([("REWYND_WIDTH", "800")]);
+        let loaded = load_from(Some(&path), |k| env.get(k).map(|s| (*s).to_owned()));
+        assert_eq!(loaded.video().width, 800);
+
+        let out = update_stored(&path, |c| {
+            c.set_upload_max_clip_secs(120);
+            c.upload_max_clip_secs()
+        })
+        .expect("update");
+        assert_eq!(out, Some(120));
+
+        let stored = read_stored(&path);
+        assert_eq!(stored.upload_max_clip_secs(), Some(120));
+        assert_eq!(
+            stored.video().width,
+            1920,
+            "the override stayed out of the file"
+        );
+    }
+
+    #[test]
+    fn concurrent_updates_do_not_lose_each_other() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        Config::default().save_to(&path).expect("seed");
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    update_stored(&path, |c| {
+                        let next = c.upload_max_clip_secs().unwrap_or(0) + 1;
+                        c.set_upload_max_clip_secs(next);
+                    })
+                    .expect("update");
+                });
+            }
+        });
+        assert_eq!(read_stored(&path).upload_max_clip_secs(), Some(8));
+    }
+
+    #[test]
+    fn saving_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        Config::default().save_to(&path).expect("save");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|name| name.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[test]
