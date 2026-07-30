@@ -180,6 +180,15 @@ pub struct StatusOutcome {
     failed: bool,
     link: Option<String>,
     message: String,
+    server_max_clip_secs: Option<u64>,
+}
+
+impl StatusOutcome {
+    /// The clip-length cap this deployment reported, for the caller to remember.
+    #[must_use]
+    pub fn server_max_clip_secs(&self) -> Option<u64> {
+        self.server_max_clip_secs
+    }
 }
 
 /// How often to poll ganked.tv processing status, and for how many reads (≈5 minutes total).
@@ -2283,6 +2292,15 @@ fn dest_statuses(config: &Config) -> (DestStatus, DestStatus) {
     )
 }
 
+/// The ganked.tv client for these settings, carrying the clip-length cap the server last reported.
+fn ganked_client(up: &rewynd_config::UploadSettings) -> Result<GankedClient, String> {
+    let client = GankedClient::new(&up.api_url, &up.api_key).map_err(|e| e.to_string())?;
+    Ok(match up.max_clip_secs {
+        Some(secs) => client.with_max_clip_secs(secs),
+        None => client,
+    })
+}
+
 /// Upload to ganked.tv with the same flow (and outcome wording) as the tray.
 async fn upload_ganked(
     up: rewynd_config::UploadSettings,
@@ -2290,7 +2308,7 @@ async fn upload_ganked(
     title: String,
     visibility: Visibility,
 ) -> Result<Uploaded, String> {
-    let client = GankedClient::new(&up.api_url, &up.api_key).map_err(|e| e.to_string())?;
+    let client = ganked_client(&up)?;
     let clip = client
         .upload(&path, &title, visibility)
         .await
@@ -2320,7 +2338,7 @@ async fn poll_ganked(
     clip_id: String,
 ) -> (PathBuf, Result<StatusOutcome, String>) {
     let outcome = async {
-        let client = GankedClient::new(&up.api_url, &up.api_key).map_err(|e| e.to_string())?;
+        let client = ganked_client(&up)?;
         let report = client
             .poll_status(&clip_id, POLL_INTERVAL, POLL_MAX_READS)
             .await
@@ -2336,6 +2354,7 @@ async fn poll_ganked(
             failed: report.failed(),
             link: report.share_url(&up.share_url),
             message,
+            server_max_clip_secs: report.max_clip_duration_secs.map(u64::from),
         })
     }
     .await;
@@ -2350,7 +2369,7 @@ async fn verify_ganked(
     clip_id: String,
 ) -> (PathBuf, Result<bool, String>) {
     let exists = async {
-        let client = GankedClient::new(&up.api_url, &up.api_key).map_err(|e| e.to_string())?;
+        let client = ganked_client(&up)?;
         client
             .clip_exists(&clip_id)
             .await

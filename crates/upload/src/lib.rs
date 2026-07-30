@@ -16,10 +16,12 @@ use thiserror::Error;
 /// Server-side upload cap (500 MiB by default); pre-checked here so an oversized clip fails fast
 /// instead of after the whole PUT.
 const DEFAULT_MAX_UPLOAD_BYTES: u64 = 524_288_000;
-/// ganked.tv's clip-length cap (its `MAX_CLIP_DURATION_SECS`); pre-checked here so a too-long
-/// clip fails before the upload instead of server-side after the whole PUT. Deliberately not
-/// configurable: the platform's limit is not the client's to change.
-const MAX_CLIP_SECS: u64 = 60;
+/// Clip-length cap until the server reports its own (per-deployment `MAX_CLIP_DURATION_SECS`,
+/// fed back through [`GankedClient::with_max_clip_secs`]); pre-checked so a too-long clip fails
+/// before the upload instead of server-side after the whole PUT.
+pub const DEFAULT_MAX_CLIP_SECS: u64 = 120;
+/// The range the server accepts for its own cap; outside it, config is stale or corrupt.
+const SERVER_CLIP_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=3600;
 /// Server-side title length cap (characters).
 const MAX_TITLE_CHARS: usize = 255;
 
@@ -238,6 +240,7 @@ pub struct GankedClient {
     api_base: String,
     api_key: String,
     max_upload_bytes: u64,
+    max_clip_secs: u64,
 }
 
 // Manual Debug: the API key must never reach logs through an innocent `{:?}`.
@@ -260,6 +263,7 @@ impl GankedClient {
             api_base: checked_base(api_base)?,
             api_key: api_key.to_owned(),
             max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
+            max_clip_secs: DEFAULT_MAX_CLIP_SECS,
         })
     }
 
@@ -267,6 +271,19 @@ impl GankedClient {
     #[must_use]
     pub fn with_max_upload_bytes(mut self, max: u64) -> Self {
         self.max_upload_bytes = max;
+        self
+    }
+
+    /// Pre-check lengths against the cap this deployment reported
+    /// ([`ClipStatusReport::max_clip_duration_secs`]) instead of drifting from it. A cap the
+    /// server itself would reject falls back to [`DEFAULT_MAX_CLIP_SECS`].
+    #[must_use]
+    pub fn with_max_clip_secs(mut self, max: u64) -> Self {
+        self.max_clip_secs = if SERVER_CLIP_SECS_RANGE.contains(&max) {
+            max
+        } else {
+            DEFAULT_MAX_CLIP_SECS
+        };
         self
     }
 
@@ -297,11 +314,11 @@ impl GankedClient {
                 .flatten()
         };
         if let Some(duration) = duration
-            && duration.as_secs() > MAX_CLIP_SECS
+            && duration.as_secs() > self.max_clip_secs
         {
             return Err(UploadError::TooLong {
                 secs: duration.as_secs(),
-                max: MAX_CLIP_SECS,
+                max: self.max_clip_secs,
             });
         }
 
@@ -776,14 +793,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_too_long_clip_is_refused_before_any_request() {
-        let path = mp4_spanning(61);
+        let path = mp4_spanning(DEFAULT_MAX_CLIP_SECS + 1);
         // Port 9 (discard) is never a ganked.tv server: reaching it at all would fail the
         // test with an Http error instead of the expected pre-check.
         let client = GankedClient::new("http://127.0.0.1:9", "gtv_k").expect("client");
         match client.upload(&path, "t", Visibility::Unlisted).await {
             Err(UploadError::TooLong { secs, max }) => {
-                assert_eq!(max, 60);
-                assert!(secs >= 61, "{secs}");
+                assert_eq!(max, DEFAULT_MAX_CLIP_SECS);
+                assert!(secs > DEFAULT_MAX_CLIP_SECS, "{secs}");
             }
             other => panic!("expected TooLong, got {other:?}"),
         }
@@ -795,11 +812,52 @@ mod tests {
         let path = mp4_spanning(5);
         let client = GankedClient::new("http://127.0.0.1:9", "gtv_k").expect("client");
         match client.upload(&path, "t", Visibility::Unlisted).await {
-            Err(UploadError::TooLong { .. }) => panic!("5s must pass a 60s guard"),
+            Err(UploadError::TooLong { .. }) => panic!("5s must pass the default guard"),
             Err(_) => {}
             Ok(_) => panic!("nothing is listening on the discard port"),
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn the_length_guard_follows_the_cap_the_server_reported() {
+        let path = mp4_spanning(90);
+        let client = GankedClient::new("http://127.0.0.1:9", "gtv_k").expect("client");
+
+        // Under the default cap, a 90s clip is fine...
+        if let Err(UploadError::TooLong { .. }) = client
+            .clone()
+            .upload(&path, "t", Visibility::Unlisted)
+            .await
+        {
+            panic!("90s is under the {DEFAULT_MAX_CLIP_SECS}s default");
+        }
+        // ...but a deployment that reported a lower cap must be honored.
+        match client
+            .with_max_clip_secs(60)
+            .upload(&path, "t", Visibility::Unlisted)
+            .await
+        {
+            Err(UploadError::TooLong { secs, max }) => {
+                assert_eq!(max, 60);
+                assert!(secs >= 90, "{secs}");
+            }
+            other => panic!("expected TooLong, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_cap_the_server_would_not_accept_falls_back_to_the_default() {
+        let client = GankedClient::new("https://api.ganked.tv", "gtv_k").expect("client");
+        for bogus in [0, 3601, u64::MAX] {
+            assert_eq!(
+                client.clone().with_max_clip_secs(bogus).max_clip_secs,
+                DEFAULT_MAX_CLIP_SECS,
+                "{bogus}"
+            );
+        }
+        assert_eq!(client.with_max_clip_secs(3600).max_clip_secs, 3600);
     }
 
     #[test]

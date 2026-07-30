@@ -68,6 +68,9 @@ pub struct UploadSettings {
     /// `"public"`, `"unlisted"` or `"private"`. Consumers fail closed: anything else is treated
     /// as private, so a typo can never widen a clip's visibility.
     pub visibility: String,
+    /// The clip-length cap this server last reported, if one was learned; `None` leaves the
+    /// consumer on its own default.
+    pub max_clip_secs: Option<u64>,
 }
 
 // Manual Debug: the API key must never reach logs through an innocent `{:?}`.
@@ -79,6 +82,7 @@ impl std::fmt::Debug for UploadSettings {
             .field("share_url", &self.share_url)
             .field("api_key", &"gtv_***")
             .field("visibility", &self.visibility)
+            .field("max_clip_secs", &self.max_clip_secs)
             .finish()
     }
 }
@@ -323,6 +327,10 @@ struct UploadConfig {
     share_url: String,
     api_key: String,
     visibility: String,
+    /// Learned from the server, not user-facing: the clip-length cap is per-deployment, so the
+    /// client caches it rather than hard-coding a number that drifts. Absent until first learned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_clip_secs: Option<u64>,
 }
 
 // Manual Debug (also covering Config's derived Debug): the key must never reach logs.
@@ -334,6 +342,7 @@ impl std::fmt::Debug for UploadConfig {
             .field("share_url", &self.share_url)
             .field("api_key", &"gtv_***")
             .field("visibility", &self.visibility)
+            .field("max_clip_secs", &self.max_clip_secs)
             .finish()
     }
 }
@@ -346,6 +355,7 @@ impl Default for UploadConfig {
             share_url: DEFAULT_UPLOAD_SHARE_URL.to_owned(),
             api_key: String::new(),
             visibility: "unlisted".to_owned(),
+            max_clip_secs: None,
         }
     }
 }
@@ -647,6 +657,8 @@ impl Config {
             share_url: non_empty_or(&self.upload.share_url, DEFAULT_UPLOAD_SHARE_URL).to_owned(),
             api_key: key.to_owned(),
             visibility: self.upload.visibility.clone(),
+            // A hand-typed 0 would otherwise pin the pre-check to "nothing is short enough".
+            max_clip_secs: self.upload.max_clip_secs.filter(|secs| *secs > 0),
         }
     }
 
@@ -834,6 +846,17 @@ impl Config {
     /// Set the upload visibility string.
     pub fn set_upload_visibility(&mut self, visibility: String) {
         self.upload.visibility = visibility;
+    }
+
+    /// The clip-length cap last learned from the server, if any.
+    #[must_use]
+    pub fn upload_max_clip_secs(&self) -> Option<u64> {
+        self.upload.max_clip_secs
+    }
+
+    /// Remember the clip-length cap the server reported.
+    pub fn set_upload_max_clip_secs(&mut self, secs: u64) {
+        self.upload.max_clip_secs = Some(secs);
     }
 
     /// Switch YouTube uploads on/off (takes effect only once a refresh token is stored).
@@ -1427,6 +1450,7 @@ mod tests {
         c.set_upload_api_url("http://localhost:5050".to_owned());
         c.set_upload_share_url("http://localhost:5173".to_owned());
         c.set_upload_visibility("unlisted".to_owned());
+        c.set_upload_max_clip_secs(120);
         let back = Config::from_toml_str(&c.to_toml_string().expect("serialize")).expect("reparse");
         assert_eq!(back, c);
         assert!(back.upload_enabled());
@@ -1434,6 +1458,27 @@ mod tests {
         assert_eq!(back.upload_api_url(), "http://localhost:5050");
         assert_eq!(back.upload_share_url(), "http://localhost:5173");
         assert_eq!(back.upload_visibility(), "unlisted");
+        assert_eq!(back.upload_max_clip_secs(), Some(120));
+        assert_eq!(back.upload().max_clip_secs, Some(120));
+    }
+
+    #[test]
+    fn an_unlearned_clip_cap_leaves_the_client_on_its_default() {
+        // Configs written before the cap was learned (and a hand-typed 0) must not pin the
+        // pre-check to "no clip is short enough".
+        let c = Config::from_toml_str("[upload]\nenabled = true\napi_key = \"gtv_k\"\n")
+            .expect("parses");
+        assert_eq!(c.upload_max_clip_secs(), None);
+        assert_eq!(c.upload().max_clip_secs, None);
+        assert!(
+            !c.to_toml_string()
+                .expect("serialize")
+                .contains("max_clip_secs"),
+            "an unlearned cap stays out of the user's config file"
+        );
+
+        let zeroed = Config::from_toml_str("[upload]\nmax_clip_secs = 0\n").expect("parses");
+        assert_eq!(zeroed.upload().max_clip_secs, None);
     }
 
     #[cfg(unix)]

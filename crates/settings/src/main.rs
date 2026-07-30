@@ -884,6 +884,11 @@ impl App {
                 self.mic_options = mics;
             }
             Message::Library(message) => {
+                if let library::Message::StatusPolled(_, Ok(outcome)) = &message
+                    && let Some(secs) = outcome.server_max_clip_secs()
+                {
+                    self.learn_clip_cap(secs);
+                }
                 return self
                     .library
                     .update(message, &self.config)
@@ -1327,6 +1332,24 @@ impl App {
         match std::mem::replace(&mut self.yt_login, YtLoginState::Idle) {
             YtLoginState::Starting { abort } | YtLoginState::Waiting { abort, .. } => abort.abort(),
             _ => {}
+        }
+    }
+
+    /// Remember the clip-length cap ganked.tv reported, so the next upload's pre-check matches
+    /// this deployment. Nobody asked for this write, so it goes through a fresh read of the file
+    /// (the recorder's own writes work the same way) rather than serializing this window's state.
+    fn learn_clip_cap(&mut self, secs: u64) {
+        if self.config.upload_max_clip_secs() == Some(secs) {
+            return;
+        }
+        self.config.set_upload_max_clip_secs(secs);
+        let Some(path) = config::config_path() else {
+            return;
+        };
+        let mut stored = config::load_file();
+        stored.set_upload_max_clip_secs(secs);
+        if let Err(e) = stored.save_to(&path) {
+            tracing::warn!(error = %e, "could not store the clip length cap ganked.tv reported");
         }
     }
 
