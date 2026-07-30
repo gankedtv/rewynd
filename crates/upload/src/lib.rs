@@ -924,10 +924,12 @@ mod tests {
             .mount(&server)
             .await;
         // The real server echoes id + size; the client reads neither (the failed-status test
-        // covers a body-less 204).
+        // covers a body-less 204). The request body must stay empty: trimming happens locally,
+        // and the API-key path rejects a trim body with 400 trim_not_supported.
         Mock::given(method("POST"))
             .and(path("/clips/clip-1/complete"))
             .and(auth())
+            .and(wiremock::matchers::body_bytes(Vec::new()))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "clip-1",
                 "fileSizeBytes": 4,
