@@ -561,7 +561,7 @@ mod tray_common {
             toast("Microphone", "Could not find the config file.");
             return;
         };
-        let now_on = match config::update_stored(&path, flip_mic) {
+        let now_on = match config::update_stored(&path, crate::flip_mic) {
             Ok(on) => on,
             Err(e) => {
                 tracing::warn!(error = %e, "could not save the microphone toggle");
