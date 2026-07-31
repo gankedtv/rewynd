@@ -95,13 +95,18 @@ fn read_plane(
     packed
 }
 
-/// A solid-colour RGBA8 source texture (usable as converter input).
+/// A square solid-colour RGBA8 source texture (usable as converter input).
 fn make_rgba(gpu: &GpuContext, color: [u8; 4]) -> wgpu::Texture {
+    make_rgba_sized(gpu, color, SIZE, SIZE)
+}
+
+/// A solid-colour RGBA8 source texture of an arbitrary size.
+fn make_rgba_sized(gpu: &GpuContext, color: [u8; 4], width: u32, height: u32) -> wgpu::Texture {
     let rgba = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("test rgba source"),
         size: wgpu::Extent3d {
-            width: SIZE,
-            height: SIZE,
+            width,
+            height,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -115,7 +120,7 @@ fn make_rgba(gpu: &GpuContext, color: [u8; 4]) -> wgpu::Texture {
         .iter()
         .copied()
         .cycle()
-        .take((SIZE * SIZE * 4) as usize)
+        .take((width * height * 4) as usize)
         .collect();
     gpu.queue.write_texture(
         wgpu::TexelCopyTextureInfo {
@@ -127,12 +132,12 @@ fn make_rgba(gpu: &GpuContext, color: [u8; 4]) -> wgpu::Texture {
         &pixels,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(SIZE * 4),
-            rows_per_image: Some(SIZE),
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
         },
         wgpu::Extent3d {
-            width: SIZE,
-            height: SIZE,
+            width,
+            height,
             depth_or_array_layers: 1,
         },
     );
@@ -210,6 +215,68 @@ fn grey_rgba_converts_to_bt709_limited_nv12() {
         assert!(
             close(v, EXPECTED_Y),
             "scaled Y[{i}] = {v}, expected ~{EXPECTED_Y} (±{TOLERANCE})"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU; run with --ignored on the dev box"]
+fn a_mismatched_aspect_ratio_is_letterboxed_not_stretched() {
+    let gpu = pollster::block_on(GpuContext::new()).expect("create shared wgpu device");
+    let converter = Nv12Converter::new(&gpu).expect("build BT.709 limited RGBA->NV12 converter");
+    let close = |actual: u8, expected: u8| actual.abs_diff(expected) <= TOLERANCE;
+
+    // A 4:1 "ultrawide" grey source pinned into a 1:1 frame. Contain-fitted, the picture spans
+    // the full width and a quarter of the height — rows 24..40 of 64 — with black above and
+    // below. A stretch would instead fill every row with grey, which is what this catches.
+    const SRC_W: u32 = SIZE * 2;
+    const SRC_H: u32 = SIZE / 2;
+    const EXPECTED_BAR_Y: u8 = 16; // limited-range black
+    let src = make_rgba_sized(&gpu, GREY, SRC_W, SRC_H);
+    let nv12 = converter.convert(&gpu, &src, SIZE, SIZE);
+    assert_eq!(
+        (nv12.width(), nv12.height()),
+        (SIZE, SIZE),
+        "the output keeps the requested size; only the picture inside it is fitted"
+    );
+
+    let y = read_plane(&gpu, &nv12, wgpu::TextureAspect::Plane0, SIZE, SIZE, 1);
+    let row = |r: u32| &y[(r * SIZE) as usize..((r + 1) * SIZE) as usize];
+    // Sampled clear of the picture's edges, so bilinear filtering at the boundary can't make
+    // the assertion flaky.
+    for r in [2, 8, 20] {
+        for (x, &v) in row(r).iter().enumerate() {
+            assert!(
+                close(v, EXPECTED_BAR_Y),
+                "top bar Y[{r}][{x}] = {v}, expected ~{EXPECTED_BAR_Y} (±{TOLERANCE})"
+            );
+        }
+    }
+    for r in [28, 32, 36] {
+        for (x, &v) in row(r).iter().enumerate() {
+            assert!(
+                close(v, EXPECTED_Y),
+                "picture Y[{r}][{x}] = {v}, expected ~{EXPECTED_Y} (±{TOLERANCE})"
+            );
+        }
+    }
+    for r in [44, 56, 62] {
+        for (x, &v) in row(r).iter().enumerate() {
+            assert!(
+                close(v, EXPECTED_BAR_Y),
+                "bottom bar Y[{r}][{x}] = {v}, expected ~{EXPECTED_BAR_Y} (±{TOLERANCE})"
+            );
+        }
+    }
+
+    // A matching aspect on the same converter must still take the plain path and fill the frame.
+    let src = make_rgba(&gpu, GREY);
+    let full = converter.convert(&gpu, &src, SIZE, SIZE);
+    let yf = read_plane(&gpu, &full, wgpu::TextureAspect::Plane0, SIZE, SIZE, 1);
+    for (i, &v) in yf.iter().enumerate() {
+        assert!(
+            close(v, EXPECTED_Y),
+            "unfitted Y[{i}] = {v}, expected ~{EXPECTED_Y} (±{TOLERANCE})"
         );
     }
 }

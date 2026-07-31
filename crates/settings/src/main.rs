@@ -43,6 +43,12 @@ use crate::theme::{
     window_icon,
 };
 
+/// A seed for one of the custom width/height boxes: the configured resolution as it resolves
+/// before any display has been measured. The recorder's status refines the real numbers later.
+fn initial_custom_dim(config: &Config, pick: fn((u32, u32)) -> u32) -> String {
+    pick(config.resolution_mode().resolve(None)).to_string()
+}
+
 /// Whether a stored URL points somewhere other than the shipped default (empty means "use the
 /// default" and an explicitly spelled-out default is still the default).
 fn is_custom_url(stored: &str, default: &str) -> bool {
@@ -428,37 +434,51 @@ fn main() -> iced::Result {
         .run()
 }
 
-/// A resolution preset, mapped to concrete width/height.
+/// A resolution choice: follow the display, a quality height (whose width comes from the
+/// display's aspect ratio), or an exact size typed in by hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Resolution {
+    MatchDisplay,
     P720,
     P1080,
     P1440,
     P2160,
+    Custom,
 }
 
 impl Resolution {
-    const ALL: [Resolution; 4] = [
-        Resolution::P720,
-        Resolution::P1080,
-        Resolution::P1440,
+    const ALL: [Resolution; 6] = [
+        Resolution::MatchDisplay,
         Resolution::P2160,
+        Resolution::P1440,
+        Resolution::P1080,
+        Resolution::P720,
+        Resolution::Custom,
     ];
 
-    fn dims(self) -> (u32, u32) {
+    /// The number of lines this preset records at, or `None` for the two that have no fixed
+    /// height of their own.
+    fn height(self) -> Option<u32> {
         match self {
-            Resolution::P720 => (1280, 720),
-            Resolution::P1080 => (1920, 1080),
-            Resolution::P1440 => (2560, 1440),
-            Resolution::P2160 => (3840, 2160),
+            Resolution::MatchDisplay | Resolution::Custom => None,
+            Resolution::P720 => Some(720),
+            Resolution::P1080 => Some(1080),
+            Resolution::P1440 => Some(1440),
+            Resolution::P2160 => Some(2160),
         }
     }
 
-    /// The preset matching exact dimensions, if any (a custom resolution maps to `None`).
-    fn from_dims(width: u32, height: u32) -> Option<Resolution> {
-        Resolution::ALL
-            .into_iter()
-            .find(|r| r.dims() == (width, height))
+    /// The preset a stored [`config::ResolutionMode`] corresponds to. A pinned size is `Custom`;
+    /// a height with no matching preset is `Custom` too, so the fields show what is really set.
+    fn from_mode(mode: config::ResolutionMode) -> Resolution {
+        match mode {
+            config::ResolutionMode::MatchDisplay => Resolution::MatchDisplay,
+            config::ResolutionMode::Height(h) => Resolution::ALL
+                .into_iter()
+                .find(|r| r.height() == Some(h))
+                .unwrap_or(Resolution::Custom),
+            config::ResolutionMode::Fixed { .. } => Resolution::Custom,
+        }
     }
 }
 
@@ -466,11 +486,27 @@ impl fmt::Display for Resolution {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // The concrete W×H is shown next to the dropdown, so the option label stays clean.
         f.write_str(match self {
+            Resolution::MatchDisplay => "Match display",
             Resolution::P2160 => "2160p (4K)",
             Resolution::P1440 => "1440p (QHD)",
             Resolution::P1080 => "1080p (Full HD)",
             Resolution::P720 => "720p (HD)",
+            Resolution::Custom => "Custom",
         })
+    }
+}
+
+/// One entry in the resolution dropdown: the preset plus the size it lands on for this display,
+/// so "1080p" reads as the 2560x1080 it really means on an ultrawide.
+#[derive(Clone, PartialEq, Eq)]
+struct ResolutionOption {
+    preset: Resolution,
+    label: String,
+}
+
+impl fmt::Display for ResolutionOption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.label)
     }
 }
 
@@ -582,6 +618,10 @@ struct App {
     output_dir: String,
     /// Mirror of the hotkey trigger for the capture field.
     hotkey: String,
+    /// Mirrors of the custom width/height boxes, shown when the resolution preset is `Custom`.
+    /// Kept as text so a half-typed number doesn't get clamped out from under the cursor.
+    custom_width: String,
+    custom_height: String,
     /// Whether the hotkey field is armed and the next key press becomes the trigger.
     hotkey_recording: bool,
     /// Active input devices for the microphone picker (Windows WASAPI endpoints, Linux PipeWire
@@ -687,6 +727,9 @@ enum Message {
     MicrophonePicked(String),
     BufferSeconds(u32),
     ResolutionPicked(Resolution),
+    /// An edit to one of the custom width/height boxes (digits only, kept as text).
+    CustomWidthEdited(String),
+    CustomHeightEdited(String),
     FpsPicked(u32),
     BitrateMbps(u32),
     EncoderPicked(String),
@@ -780,6 +823,10 @@ impl App {
             output_dir: config.output_directory().unwrap_or_default().to_owned(),
             hotkey: config.hotkey_trigger().to_owned(),
             hotkey_recording: false,
+            // Seeded from whatever the resolution resolves to today, so switching to Custom
+            // starts from the current size rather than an empty pair of boxes.
+            custom_width: initial_custom_dim(&config, |(w, _)| w),
+            custom_height: initial_custom_dim(&config, |(_, h)| h),
             mic_options: Vec::new(),
             probes_started: false,
             api_key: config.upload_api_key().to_owned(),
@@ -816,6 +863,71 @@ impl App {
             recorder_status: None,
             is_velopack: is_velopack_install(),
             update: UpdateState::Idle,
+        }
+    }
+
+    /// The captured display's size, as best this window knows it: whatever the running recorder
+    /// measured. `None` before the recorder has run (or when it couldn't measure), which the
+    /// resolution maths reads as "assume the 1080p reference".
+    fn display_geometry(&self) -> Option<(u32, u32)> {
+        let status = self.recorder_status.as_ref()?;
+        Some((status.display_width?, status.display_height?))
+    }
+
+    /// What `preset` would record at on this display — the numbers shown beside its label.
+    fn preset_dims(&self, preset: Resolution) -> (u32, u32) {
+        self.mode_for(preset).resolve(self.display_geometry())
+    }
+
+    /// The resolution dropdown's entries. Presets taller than the display are dropped — they
+    /// would all resolve to the same size, which reads as a bug rather than a choice — except the
+    /// one currently selected, which must stay selectable to be shown.
+    fn resolution_options(&self, selected: Resolution) -> Vec<ResolutionOption> {
+        let display_height = self.display_geometry().map(|(_, h)| h);
+        Resolution::ALL
+            .into_iter()
+            .filter(|&preset| {
+                preset == selected
+                    || match (preset.height(), display_height) {
+                        (Some(h), Some(max)) => h <= max,
+                        _ => true,
+                    }
+            })
+            .map(|preset| {
+                let label = match preset {
+                    // The typed size is right there in the boxes below; repeating it would only
+                    // lag a keystroke behind.
+                    Resolution::Custom => preset.to_string(),
+                    _ => {
+                        let (w, h) = self.preset_dims(preset);
+                        format!("{preset} — {w}x{h}")
+                    }
+                };
+                ResolutionOption { preset, label }
+            })
+            .collect()
+    }
+
+    /// The stored resolution intent a picked preset maps to. `Custom` carries the typed
+    /// width/height; anything unparseable falls back to what is currently resolved, so the
+    /// config never gets a zero from a half-typed box.
+    fn mode_for(&self, preset: Resolution) -> config::ResolutionMode {
+        match preset {
+            Resolution::Custom => {
+                let (w, h) = self
+                    .config
+                    .resolution_mode()
+                    .resolve(self.display_geometry());
+                config::ResolutionMode::Fixed {
+                    width: self.custom_width.trim().parse().unwrap_or(w),
+                    height: self.custom_height.trim().parse().unwrap_or(h),
+                }
+            }
+            other => other
+                .height()
+                .map_or(config::ResolutionMode::MatchDisplay, |h| {
+                    config::ResolutionMode::Height(h)
+                }),
         }
     }
 
@@ -933,11 +1045,36 @@ impl App {
                 self.touch();
             }
             Message::ResolutionPicked(r) => {
-                let (width, height) = r.dims();
-                let mut v = self.config.video_stored();
-                v.width = width;
-                v.height = height;
-                self.config.set_video(v);
+                // Switching to Custom prefills the boxes with what was being recorded, so the
+                // pinned size starts where the user left off rather than at whatever was typed
+                // and abandoned earlier.
+                if r == Resolution::Custom {
+                    let (w, h) = self
+                        .config
+                        .resolution_mode()
+                        .resolve(self.display_geometry());
+                    self.custom_width = w.to_string();
+                    self.custom_height = h.to_string();
+                }
+                let mode = self.mode_for(r);
+                self.config.set_resolution_mode(mode);
+                self.touch();
+            }
+            Message::CustomWidthEdited(v) | Message::CustomHeightEdited(v)
+                if !v.chars().all(|c| c.is_ascii_digit()) =>
+            {
+                // Ignore anything that isn't a plain pixel count rather than storing junk.
+            }
+            Message::CustomWidthEdited(v) => {
+                self.custom_width = v;
+                let mode = self.mode_for(Resolution::Custom);
+                self.config.set_resolution_mode(mode);
+                self.touch();
+            }
+            Message::CustomHeightEdited(v) => {
+                self.custom_height = v;
+                let mode = self.mode_for(Resolution::Custom);
+                self.config.set_resolution_mode(mode);
                 self.touch();
             }
             Message::FpsPicked(fps) => {
@@ -1709,6 +1846,55 @@ impl App {
             setting("Recording method", String::new(), encoder_control)
         };
 
+        // Resolution: follow the display, a quality height at the display's aspect ratio, or an
+        // exact size typed in. The value beside the label is always what will actually be
+        // recorded, so the abstract preset never hides the concrete result.
+        let selected_preset = Resolution::from_mode(self.config.resolution_mode());
+        let (effective_w, effective_h) = self.preset_dims(selected_preset);
+        let resolution_opts = self.resolution_options(selected_preset);
+        let selected_resolution = resolution_opts
+            .iter()
+            .find(|o| o.preset == selected_preset)
+            .cloned();
+        let resolution_control = pick_list(
+            resolution_opts,
+            selected_resolution,
+            |o: ResolutionOption| Message::ResolutionPicked(o.preset),
+        )
+        .style(arena_pick)
+        .width(Length::Fill);
+        let resolution_setting: Element<Message> = if selected_preset == Resolution::Custom {
+            column![
+                setting(
+                    "Resolution",
+                    format!("{effective_w}x{effective_h}"),
+                    resolution_control,
+                ),
+                row![
+                    text_input("Width", &self.custom_width)
+                        .on_input(Message::CustomWidthEdited)
+                        .style(arena_input),
+                    text("x").size(12).style(tinted(palette::MUTED)),
+                    text_input("Height", &self.custom_height)
+                        .on_input(Message::CustomHeightEdited)
+                        .style(arena_input),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+                hint(
+                    "A size that doesn't match your screen's shape is letterboxed, never stretched."
+                ),
+            ]
+            .spacing(7)
+            .into()
+        } else {
+            setting(
+                "Resolution",
+                format!("{effective_w}x{effective_h}"),
+                resolution_control,
+            )
+        };
+
         let recording = card(
             "RECORDING",
             column![
@@ -1718,17 +1904,7 @@ impl App {
                     slider(BUFFER_MIN_S..=BUFFER_MAX_S, secs, Message::BufferSeconds)
                         .style(arena_slider),
                 ),
-                setting(
-                    "Resolution",
-                    format!("{}x{}", v.width, v.height),
-                    pick_list(
-                        &Resolution::ALL[..],
-                        Resolution::from_dims(v.width, v.height),
-                        Message::ResolutionPicked,
-                    )
-                    .style(arena_pick)
-                    .width(Length::Fill),
-                ),
+                resolution_setting,
                 setting(
                     "Frame rate",
                     format!("{} fps", v.framerate),
@@ -2557,12 +2733,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolution_dims_round_trip() {
-        for r in Resolution::ALL {
-            let (w, h) = r.dims();
-            assert_eq!(Resolution::from_dims(w, h), Some(r));
+    fn resolution_presets_round_trip_through_the_stored_mode() {
+        for preset in Resolution::ALL {
+            let mode = match preset {
+                Resolution::MatchDisplay => config::ResolutionMode::MatchDisplay,
+                Resolution::Custom => config::ResolutionMode::Fixed {
+                    width: 2560,
+                    height: 1080,
+                },
+                other => config::ResolutionMode::Height(other.height().expect("has a height")),
+            };
+            assert_eq!(Resolution::from_mode(mode), preset);
         }
-        assert_eq!(Resolution::from_dims(800, 600), None, "non-preset → None");
+    }
+
+    #[test]
+    fn an_unrecognised_height_shows_as_custom() {
+        assert_eq!(
+            Resolution::from_mode(config::ResolutionMode::Height(900)),
+            Resolution::Custom,
+            "a hand-edited height with no preset must still be visible in the fields"
+        );
     }
 
     #[test]
@@ -2624,6 +2815,8 @@ mod tests {
             state: RecorderState::Recording,
             game: Some("Hades II".to_owned()),
             detail: None,
+            display_width: None,
+            display_height: None,
         };
         assert_eq!(status_pill_parts(None).0, "Not recording");
         assert_eq!(status_pill_parts(Some(&base)).0, "Recording: Hades II");

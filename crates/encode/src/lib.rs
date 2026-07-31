@@ -91,6 +91,10 @@ pub use software::{I420Frame, SoftwareEncoder};
 // though today only the VideoToolbox backend consumes them.
 pub mod annexb;
 
+// Aspect-fit maths for the capture-size → encode-size step. Pure arithmetic (no wgpu), so it
+// stays unconditional and CI-tested even though only the GPU converter consumes it.
+pub mod fit;
+
 // The VideoToolbox H.264 backend takes CoreVideo pixel buffers straight from
 // ScreenCaptureKit, so it lives outside the wgpu-texture `Encoder` trait.
 #[cfg(target_os = "macos")]

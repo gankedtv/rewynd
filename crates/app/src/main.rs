@@ -21,6 +21,10 @@
 #[cfg(target_os = "linux")]
 mod badge;
 
+/// Measuring the captured monitor on Wayland (the Linux half of the resolution auto-detection).
+#[cfg(target_os = "linux")]
+mod display;
+
 /// The macOS in-game save badge (an AppKit panel over fullscreen games); named apart
 /// from the Linux `badge` module because the file name must differ.
 #[cfg(target_os = "macos")]
@@ -421,7 +425,9 @@ mod game_gate {
 /// Config → encoder parameter mapping, shared by the platform recorders.
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 mod params {
-    use rewynd_config::{AudioSettings, VideoSettings};
+    use rewynd_config::{
+        AudioSettings, Config, EncoderChoice, ProbeAdapter, VideoSettings, resolution,
+    };
     use rewynd_encode::{AudioEncodeParams, EncodeParams};
 
     /// Map the GPU-free [`VideoSettings`] from the config onto the encoder's [`EncodeParams`].
@@ -436,6 +442,72 @@ mod params {
         }
     }
 
+    /// The encode parameters for this session: the config's settings with the resolution resolved
+    /// against the measured display (`None` when it couldn't be measured) and then held inside
+    /// what the chosen encoder can actually do.
+    ///
+    /// The adapter cap matters now that "match display" is the default — a 4K panel in front of an
+    /// encoder that tops out at 1080p would otherwise fail at encoder init and drop the whole
+    /// session to the CPU, when scaling down would have kept it on the GPU.
+    ///
+    /// `measured` is not called `display`: tracing's macros bring their own `display` helper into
+    /// scope, and a local of that name shadows it inside the `info!` below.
+    pub(crate) fn session_params(
+        config: &Config,
+        measured: Option<(u32, u32)>,
+        choice: &EncoderChoice,
+        adapters: &[ProbeAdapter],
+    ) -> EncodeParams {
+        let mut params = encode_params(config.video_for_display(measured));
+        if let Some((max_w, max_h)) = encoder_limits(choice, adapters) {
+            let capped = fit_within(params.width, params.height, max_w, max_h);
+            if capped != (params.width, params.height) {
+                tracing::warn!(
+                    from = ?(params.width, params.height),
+                    to = ?capped,
+                    max = ?(max_w, max_h),
+                    "resolution scaled down to the encoder's maximum frame size"
+                );
+                (params.width, params.height) = capped;
+            }
+        }
+        tracing::info!(
+            width = params.width,
+            height = params.height,
+            ?measured,
+            mode = ?config.resolution_mode(),
+            "resolved the recording resolution"
+        );
+        params
+    }
+
+    /// The chosen GPU's maximum encode frame size, when it advertises a usable one. The CPU
+    /// encoder has no such limit, and an adapter reporting zeroes is telling us nothing.
+    fn encoder_limits(choice: &EncoderChoice, adapters: &[ProbeAdapter]) -> Option<(u32, u32)> {
+        let EncoderChoice::Gpu(name) = choice else {
+            return None;
+        };
+        adapters
+            .iter()
+            .find(|a| &a.name == name)
+            .filter(|a| a.max_width > 0 && a.max_height > 0)
+            .map(|a| (a.max_width, a.max_height))
+    }
+
+    /// `width`×`height` shrunk (aspect intact) until it fits inside `max_w`×`max_h`. Already-small
+    /// frames are returned untouched.
+    fn fit_within(width: u32, height: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+        if width <= max_w && height <= max_h {
+            return (width, height);
+        }
+        // The tallest frame the width cap allows, floored so the resulting width can't exceed it;
+        // the binding constraint is whichever of that and the height cap is smaller.
+        let height_at_max_width =
+            u32::try_from(u64::from(height) * u64::from(max_w) / u64::from(width.max(1)))
+                .unwrap_or(max_h);
+        resolution::scale_to_height(width, height, height.min(max_h).min(height_at_max_width))
+    }
+
     /// Map [`AudioSettings`] onto [`AudioEncodeParams`] (frame size stays at the encoder default).
     pub(crate) fn audio_encode_params(a: AudioSettings) -> AudioEncodeParams {
         AudioEncodeParams {
@@ -448,15 +520,26 @@ mod params {
 
     #[cfg(test)]
     mod tests {
-        use super::{audio_encode_params, encode_params};
-        use rewynd_config::Config;
+        use super::{audio_encode_params, encode_params, fit_within, session_params};
+        use rewynd_config::{Config, EncoderChoice, ProbeAdapter};
         use rewynd_encode::{AudioEncodeParams, EncodeParams};
+
+        fn adapter(name: &str, max_width: u32, max_height: u32) -> ProbeAdapter {
+            ProbeAdapter {
+                name: name.to_owned(),
+                device_type: "discrete".to_owned(),
+                h264_encode: true,
+                max_width,
+                max_height,
+            }
+        }
 
         #[test]
         fn config_defaults_map_to_encoder_defaults() {
             // rewynd-config is GPU-free and mirrors the encoder defaults as its own constants;
             // this guards that the two never drift (a new EncodeParams default must be reflected
-            // in the config crate, or this fails).
+            // in the config crate, or this fails). With no display detected the resolution falls
+            // back to the reference 1080p target, which is the encoder's default too.
             let c = Config::default();
             let v = encode_params(c.video());
             let d = EncodeParams::default();
@@ -470,6 +553,57 @@ mod params {
                 (a.sample_rate, a.channels, a.bitrate_bps),
                 (ad.sample_rate, ad.channels, ad.bitrate_bps)
             );
+        }
+
+        #[test]
+        fn a_measured_display_sets_the_session_resolution() {
+            let c = Config::default();
+            let p = session_params(&c, Some((3440, 1440)), &EncoderChoice::Cpu, &[]);
+            assert_eq!((p.width, p.height), (3440, 1440));
+        }
+
+        #[test]
+        fn the_cpu_encoder_has_no_frame_size_cap() {
+            let c = Config::default();
+            let p = session_params(&c, Some((7680, 4320)), &EncoderChoice::Cpu, &[]);
+            // Capped by "match display"'s own 4K ceiling, not by an adapter.
+            assert_eq!((p.width, p.height), (3840, 2160));
+        }
+
+        #[test]
+        fn a_resolution_beyond_the_gpus_limit_is_scaled_down() {
+            let c = Config::default();
+            let adapters = [adapter("Test GPU", 1920, 1088)];
+            let choice = EncoderChoice::Gpu("Test GPU".to_owned());
+            let p = session_params(&c, Some((3440, 1440)), &choice, &adapters);
+            assert!(p.width <= 1920 && p.height <= 1088, "{p:?} exceeds the cap");
+            assert_eq!(
+                (p.width, p.height),
+                (1918, 802),
+                "scaled just under the width cap (both dimensions even), aspect intact"
+            );
+        }
+
+        #[test]
+        fn an_adapter_without_limits_does_not_cap() {
+            let c = Config::default();
+            let adapters = [adapter("Unknown GPU", 0, 0)];
+            let choice = EncoderChoice::Gpu("Unknown GPU".to_owned());
+            let p = session_params(&c, Some((3440, 1440)), &choice, &adapters);
+            assert_eq!((p.width, p.height), (3440, 1440));
+        }
+
+        #[test]
+        fn fit_within_leaves_a_frame_that_already_fits() {
+            assert_eq!(fit_within(1920, 1080, 4096, 4096), (1920, 1080));
+        }
+
+        #[test]
+        fn fit_within_respects_whichever_cap_binds() {
+            // Height-bound: a tall 4:3 frame against a wide-but-short cap.
+            assert_eq!(fit_within(1600, 1200, 4096, 600), (800, 600));
+            // Width-bound: an ultrawide against a narrow cap.
+            assert_eq!(fit_within(5120, 1440, 2048, 4096), (2048, 576));
         }
     }
 }
@@ -691,6 +825,8 @@ mod status {
         state: RecorderState,
         game: Option<String>,
         detail: Option<String>,
+        /// The captured display's measured size, once known.
+        display: Option<(u32, u32)>,
     }
 
     impl StatusPublisher {
@@ -702,10 +838,19 @@ mod status {
                     state,
                     game: None,
                     detail: None,
+                    display: None,
                 })),
             };
             publisher.write();
             publisher
+        }
+
+        /// Publish the captured display's measured size, so the settings window can resolve its
+        /// resolution presets against the real screen. `None` (unmeasurable) is published as
+        /// absent rather than a guess.
+        pub(crate) fn set_display(&self, display: Option<(u32, u32)>) {
+            lock_unpoisoned(&self.inner).display = display;
+            self.write();
         }
 
         /// Recording a game (`Some`) or the whole desktop (`None`).
@@ -755,6 +900,8 @@ mod status {
                 state: inner.state,
                 game: inner.game.clone(),
                 detail: inner.detail.clone(),
+                display_width: inner.display.map(|(w, _)| w),
+                display_height: inner.display.map(|(_, h)| h),
             };
             if let Err(e) = write_recorder_status(&status) {
                 tracing::debug!(error = %e, "could not publish recorder status");
@@ -787,7 +934,7 @@ mod linux {
 
     use crate::audio_pipeline::{AUDIO_SETTLE, SharedMixer, run_audio_mixer, spawn_audio_capture};
     use crate::badge;
-    use crate::params::{audio_encode_params, encode_params};
+    use crate::params::{audio_encode_params, session_params};
     use crate::tray;
     use rewynd_buffer::{AudioRingBuffer, EncodedChunk, RingBuffer};
     use rewynd_gpu::{DmabufImport, GpuContext};
@@ -889,17 +1036,6 @@ mod linux {
         }
         crate::updater::spawn_background_check(&config);
 
-        // Resolution / framerate / bitrate stay parameters (PLAN §9), sourced from the config.
-        let params = encode_params(config.video());
-        tracing::info!(
-            width = params.width,
-            height = params.height,
-            fps = params.framerate,
-            bitrate_bps = params.bitrate_bps,
-            idr_period = params.idr_period,
-            "encode parameters"
-        );
-
         // Pick the encoder backend up front: probe the machine's adapters, honour the config
         // override, and log both. The capture thread builds the actual encoder from this; a
         // mid-run GPU-init failure still falls back to the CPU inside that thread.
@@ -911,10 +1047,20 @@ mod linux {
             choice = %encoder_choice.label(),
             "encoder capability and selection"
         );
+
+        // Resolution / framerate / bitrate stay parameters (PLAN §9), sourced from the config.
+        // The resolution is provisional here: on Wayland the captured monitor isn't known until
+        // the ScreenCast portal has run, so this is recomputed once the portal reports which
+        // output it handed us.
+        let mut params = session_params(&config, None, &encoder_choice, &adapters);
+        tracing::info!(
+            fps = params.framerate,
+            bitrate_bps = params.bitrate_bps,
+            idr_period = params.idr_period,
+            "encode parameters"
+        );
         if matches!(encoder_choice, config::EncoderChoice::Cpu) {
             tracing::warn!(
-                width = params.width,
-                height = params.height,
                 fps = params.framerate,
                 "software H.264 encoding is CPU-heavy at high resolutions; expect high CPU use"
             );
@@ -1089,6 +1235,15 @@ mod linux {
             badge::set_capture_origin(origin);
         }
         tracing::info!(node_id, "screencast portal established");
+
+        // Now that the portal has named the monitor, measure it and settle the encode resolution:
+        // "match display" and the quality presets both take their aspect ratio (and, for the
+        // former, its size) from here. Everything downstream — the encoder, the capture
+        // negotiation and the MP4 track — uses the result.
+        let display = crate::display::capture_geometry(portal.position, portal.size);
+        params = session_params(&config, display, &encoder_choice, &adapters);
+        saver.set_dimensions(params.width, params.height);
+        status.set_display(display);
 
         let stop = Arc::new(AtomicBool::new(false));
         let captures_done = Arc::new(AtomicBool::new(false));
@@ -1894,7 +2049,7 @@ mod windows {
 
     use crate::audio_pipeline::{AUDIO_SETTLE, SharedMixer, run_audio_mixer, spawn_audio_capture};
     use crate::overlay;
-    use crate::params::{audio_encode_params, encode_params};
+    use crate::params::{audio_encode_params, session_params};
 
     /// Our one thread-queue hotkey registration.
     const HOTKEY_ID: i32 = 1;
@@ -1952,20 +2107,6 @@ mod windows {
         }
         crate::updater::spawn_background_check(&config);
 
-        // Resolution / framerate / bitrate stay parameters (PLAN §9), sourced from the config.
-        let params = encode_params(config.video());
-        let buffer_window = config.buffer_window();
-        let output_dir = config.output_dir();
-        tracing::info!(
-            width = params.width,
-            height = params.height,
-            fps = params.framerate,
-            bitrate_bps = params.bitrate_bps,
-            idr_period = params.idr_period,
-            buffer_s = buffer_window.as_secs(),
-            "encode parameters"
-        );
-
         // Pick the encoder backend up front: probe adapters, honour the config override, log
         // both. The capture thread builds the actual encoder, falling back to the CPU there if
         // the chosen GPU device/encoder can't be created.
@@ -1976,6 +2117,21 @@ mod windows {
             adapters = ?adapters,
             choice = %encoder_choice.label(),
             "encoder capability and selection"
+        );
+
+        // Resolution / framerate / bitrate stay parameters (PLAN §9), sourced from the config.
+        // WGC always captures the monitor at its native size, so measuring it up front is what
+        // makes "match display" (and the quality presets' aspect ratio) land on the real screen.
+        let display = rewynd_capture::windows::display_geometry(None);
+        let params = session_params(&config, display, &encoder_choice, &adapters);
+        let buffer_window = config.buffer_window();
+        let output_dir = config.output_dir();
+        tracing::info!(
+            fps = params.framerate,
+            bitrate_bps = params.bitrate_bps,
+            idr_period = params.idr_period,
+            buffer_s = buffer_window.as_secs(),
+            "encode parameters"
         );
         if matches!(encoder_choice, config::EncoderChoice::Cpu) {
             tracing::warn!(
@@ -2057,6 +2213,7 @@ mod windows {
             config::RecorderState::Idle
         };
         let status = crate::status::StatusPublisher::new(encoder_choice.label(), initial_state);
+        status.set_display(display);
 
         let on_game: Option<rewynd_capture::windows::GameCallback> = if capture_desktop {
             None
@@ -2754,7 +2911,7 @@ mod macos {
     use crate::audio_pipeline::{AUDIO_SETTLE, SharedMixer, run_audio_mixer, spawn_audio_capture};
     use crate::badge_macos;
     use crate::chime;
-    use crate::params::{audio_encode_params, encode_params};
+    use crate::params::{audio_encode_params, session_params};
 
     /// How long one AppKit pump slice may block waiting for an event before the loop
     /// re-checks the menu/hotkey/command channels — the worst-case added latency on a
@@ -2805,20 +2962,6 @@ mod macos {
             &NSString::from_str("rewynd is recording the replay buffer"),
         );
 
-        // Resolution / framerate / bitrate stay parameters (PLAN §9), sourced from the config.
-        let params = encode_params(config.video());
-        let buffer_window = config.buffer_window();
-        let output_dir = config.output_dir();
-        tracing::info!(
-            width = params.width,
-            height = params.height,
-            fps = params.framerate,
-            bitrate_bps = params.bitrate_bps,
-            idr_period = params.idr_period,
-            buffer_s = buffer_window.as_secs(),
-            "encode parameters"
-        );
-
         // Pick the encoder backend up front: probe VideoToolbox, honour the config
         // override, log both. `Cpu` maps to Apple's software VT encoder rather than
         // openh264 — same session API, no GPU requirement either way (ADR 0015).
@@ -2829,6 +2972,21 @@ mod macos {
             adapters = ?adapters,
             choice = %encoder_choice.label(),
             "encoder capability and selection"
+        );
+
+        // Resolution / framerate / bitrate stay parameters (PLAN §9), sourced from the config.
+        // SCK scales server-side to whatever size we ask for, so measuring the display first is
+        // what makes "match display" mean the panel's real pixels rather than a 16:9 guess.
+        let display = rewynd_capture::macos::display_geometry(None);
+        let params = session_params(&config, display, &encoder_choice, &adapters);
+        let buffer_window = config.buffer_window();
+        let output_dir = config.output_dir();
+        tracing::info!(
+            fps = params.framerate,
+            bitrate_bps = params.bitrate_bps,
+            idr_period = params.idr_period,
+            buffer_s = buffer_window.as_secs(),
+            "encode parameters"
         );
         if let Some(warning) = &encoder_warning {
             tracing::warn!(warning, "encoder selection fell back");
@@ -2899,6 +3057,7 @@ mod macos {
             config::RecorderState::Recording
         };
         let status = crate::status::StatusPublisher::new(encoder_choice.label(), initial_state);
+        status.set_display(display);
 
         let _focus_watcher = if game_only || game_folders {
             let reaction = crate::game_gate::reaction(

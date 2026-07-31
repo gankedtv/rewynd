@@ -411,17 +411,42 @@ pub fn capture_stream<F>(
 where
     F: FnMut(CapturedD3d11Frame) -> ControlFlow<()> + Send + 'static,
 {
-    let monitor = match monitor_index {
-        Some(index) => Monitor::from_index(index),
-        None => Monitor::primary(),
-    }
-    .map_err(|e| CaptureError::Wgc(format!("monitor selection: {e}")))?;
+    let monitor = select_monitor(monitor_index)?;
     tracing::info!(
         monitor = monitor.name().unwrap_or_default(),
         "starting WGC monitor capture"
     );
     let refresh = monitor.refresh_rate().unwrap_or(0);
     run_session(monitor, refresh, epoch, prefs, stop, on_frame)
+}
+
+/// The monitor `monitor_index` names (one-based, per the Win32 display enumeration); `None`
+/// selects the primary one.
+fn select_monitor(monitor_index: Option<usize>) -> Result<Monitor, CaptureError> {
+    match monitor_index {
+        Some(index) => Monitor::from_index(index),
+        None => Monitor::primary(),
+    }
+    .map_err(|e| CaptureError::Wgc(format!("monitor selection: {e}")))
+}
+
+/// The monitor's native size in pixels, for deriving the encode resolution before capture
+/// starts. `None` when the monitor can't be found or queried — the caller then falls back to
+/// the configured size rather than failing.
+///
+/// This is the size WGC will deliver: it always captures the monitor at its native resolution.
+#[must_use]
+pub fn display_geometry(monitor_index: Option<usize>) -> Option<(u32, u32)> {
+    let monitor = select_monitor(monitor_index)
+        .inspect_err(|e| tracing::warn!(error = %e, "could not select a monitor to measure"))
+        .ok()?;
+    match (monitor.width(), monitor.height()) {
+        (Ok(w), Ok(h)) if w > 0 && h > 0 => Some((w, h)),
+        _ => {
+            tracing::warn!("could not read the monitor's size; using the configured resolution");
+            None
+        }
+    }
 }
 
 /// Runs on the capture thread when game capture starts (`Some`, with what the
