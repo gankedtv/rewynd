@@ -531,6 +531,13 @@ mod probe {
     }
 }
 
+/// Flip the stored microphone flag, returning its new state (shared by both trays).
+fn flip_mic(cfg: &mut rewynd_config::Config) -> bool {
+    let on = !cfg.mic_enabled();
+    cfg.set_mic_enabled(on);
+    on
+}
+
 /// Tray plumbing shared by the platforms whose tray is `tray-icon` (Windows + macOS):
 /// the brand icon and the synchronous menu commands. Linux keeps its async ksni
 /// variants. `toast` is the platform's notification fn (their identity setup differs).
@@ -554,14 +561,14 @@ mod tray_common {
             toast("Microphone", "Could not find the config file.");
             return;
         };
-        let mut cfg = config::load_file();
-        let now_on = !cfg.mic_enabled();
-        cfg.set_mic_enabled(now_on);
-        if let Err(e) = cfg.save_to(&path) {
-            tracing::warn!(error = %e, "could not save the microphone toggle");
-            toast("Microphone", "Could not save the change.");
-            return;
-        }
+        let now_on = match config::update_stored(&path, crate::flip_mic) {
+            Ok(on) => on,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not save the microphone toggle");
+                toast("Microphone", "Could not save the change.");
+                return;
+            }
+        };
         let bin =
             config::sibling_binary("rewynd-recorder").or_else(|| std::env::current_exe().ok());
         match bin.and_then(|bin| {
@@ -1390,14 +1397,14 @@ mod linux {
             tray::toast("Microphone", "Could not find the config file.").await;
             return;
         };
-        let mut cfg = config::load_file();
-        let now_on = !cfg.mic_enabled();
-        cfg.set_mic_enabled(now_on);
-        if let Err(e) = cfg.save_to(&path) {
-            tracing::warn!(error = %e, "could not save the microphone toggle");
-            tray::toast("Microphone", "Could not save the change.").await;
-            return;
-        }
+        let now_on = match config::update_stored(&path, crate::flip_mic) {
+            Ok(on) => on,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not save the microphone toggle");
+                tray::toast("Microphone", "Could not save the change.").await;
+                return;
+            }
+        };
         // A fresh recorder (`--restart` stops this one first) picks up the new setting.
         let bin =
             config::sibling_binary("rewynd-recorder").or_else(|| std::env::current_exe().ok());

@@ -197,6 +197,97 @@ pub fn settings_running() -> bool {
     settings_running_named(&mutex_name("settings"))
 }
 
+/// Run `body` holding an exclusive advisory lock on `lock_path`, so two processes can't interleave
+/// a read-modify-write of the file it guards. Blocking; non-unix runs the body unlocked (the
+/// practical contention — tray + GUI — is a Linux desktop concern).
+#[cfg(unix)]
+pub(crate) fn with_exclusive_lock<T>(
+    lock_path: &Path,
+    body: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(lock_path)?;
+    // SAFETY: `file` owns a valid fd for the whole call; the lock releases when it drops (close).
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    body()
+}
+
+/// Windows has no advisory file lock, so the same guarantee comes from a named mutex — owned
+/// here, unlike the single-instance guards, since this one is about waiting rather than existence.
+#[cfg(windows)]
+pub(crate) fn with_exclusive_lock<T>(
+    lock_path: &Path,
+    body: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{
+        CreateMutexW, INFINITE, ReleaseMutex, WaitForSingleObject,
+    };
+    use windows::core::PCWSTR;
+
+    struct Held(HANDLE);
+    impl Drop for Held {
+        fn drop(&mut self) {
+            // SAFETY: we created this handle and hold it for the whole guard's life. Releasing a
+            // mutex we never took (a failed wait) errors harmlessly.
+            unsafe {
+                let _ = ReleaseMutex(self.0);
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    let name = path_mutex_name(lock_path);
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: FFI; `wide` is NUL-terminated and outlives the call.
+    let handle = unsafe { CreateMutexW(None, false, PCWSTR(wide.as_ptr())) }
+        .map_err(std::io::Error::other)?;
+    // Guard first: it closes the handle even if the wait below fails.
+    let held = Held(handle);
+    // SAFETY: `held` owns a valid mutex handle for the duration of the wait.
+    let wait = unsafe { WaitForSingleObject(held.0, INFINITE) };
+    // WAIT_ABANDONED: the previous holder died mid-write. Ownership passes to us either way, and
+    // the temp-and-rename write leaves nothing half-applied to recover from.
+    if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
+        return Err(std::io::Error::other(format!(
+            "could not take the lock for {}: {wait:?}",
+            lock_path.display()
+        )));
+    }
+    body()
+}
+
+/// A mutex name standing in for `path`: FNV-1a over the lowercased path, so two processes naming
+/// the same file (Windows paths are case-insensitive) agree, and distinct files never share a lock.
+#[cfg(windows)]
+fn path_mutex_name(path: &Path) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in path.to_string_lossy().to_lowercase().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("Local\\{}.filelock.{hash:016x}", crate::paths::APP_ID)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn with_exclusive_lock<T>(
+    _lock_path: &std::path::Path,
+    body: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    body()
+}
+
 // No guard on other targets; stubs keep the public API total so callers need no `#[cfg]`.
 #[cfg(not(any(unix, windows)))]
 pub struct InstanceLock;
