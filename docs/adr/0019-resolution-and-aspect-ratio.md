@@ -46,10 +46,11 @@ Two properties fall out of this that a separate "auto" flag would not have given
 
 - **Fresh installs match the display.** The shipped template is `width = 0` / `height = 0`, so an
   ultrawide records 3440×1440 out of the box.
-- **Existing configs are fixed without a migration step.** Every config written before this
-  contains `width = 1920` / `height = 1080` and no `match_display` key, which serde defaults to
-  `true` — so they read as `Height(1080)` and start following the display's aspect ratio at the
-  quality the user already had. 16:9 users see no change at all.
+- **Existing configs are fixed without a migration step.** Every config written before this has
+  no `match_display` key, which serde defaults to `true` — so whatever height was stored (1080 for
+  the old default, or 720/1440/2160 for the other presets) is read as `Height(N)`, preserving that
+  quality while starting to follow the display's aspect ratio instead of a hard-coded 16:9. 16:9
+  users see no change at all.
 
 The one config this quietly changes behavior for: a TOML hand-edited to a non-16:9 pin before
 this landed (e.g. `width = 2560` / `height = 1080`, the only way to get a non-16:9 size at all
