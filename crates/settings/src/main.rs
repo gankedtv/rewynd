@@ -398,8 +398,17 @@ fn main() -> iced::Result {
         spawn_recorder_detached();
     }
 
+    // Tagged in debug builds: the window is otherwise indistinguishable from the installed
+    // app, and the two share a single-instance lock with the recorder, so it's easy to lose
+    // track of which one is actually running.
+    let window_title = if cfg!(debug_assertions) {
+        "rewynd (Dev)"
+    } else {
+        "rewynd"
+    };
+
     iced::application(App::load, App::update, App::view)
-        .title("rewynd")
+        .title(window_title)
         .theme(App::theme)
         .subscription(App::subscription)
         // Bundled faces (both OFL, licenses beside the files): the Arena design is set in

@@ -679,6 +679,15 @@ fn flip_mic(cfg: &mut rewynd_config::Config) -> bool {
 mod tray_common {
     use rewynd_config::{self as config};
 
+    /// The tray tooltip. Tagged in debug builds so a dev build running alongside (or instead
+    /// of) the installed recorder is never mistaken for it — they share the same single-instance
+    /// lock, so only one can be running at a time, and this is the only visible difference.
+    pub(crate) const TRAY_TOOLTIP: &str = if cfg!(debug_assertions) {
+        "rewynd (Dev) — instant replay"
+    } else {
+        "rewynd — instant replay"
+    };
+
     /// The brand mark as a tray icon, from the PNG ladder the config crate owns.
     pub(crate) fn tray_brand_icon() -> Option<tray_icon::Icon> {
         let png = config::brand_png(32);
@@ -2687,7 +2696,7 @@ mod windows {
             .and_then(|()| {
                 let mut builder = tray_icon::TrayIconBuilder::new()
                     .with_menu(Box::new(menu))
-                    .with_tooltip("rewynd — instant replay");
+                    .with_tooltip(crate::tray_common::TRAY_TOOLTIP);
                 if let Some(icon) = crate::tray_common::tray_brand_icon() {
                     builder = builder.with_icon(icon);
                 }
@@ -3389,7 +3398,7 @@ mod macos {
             .and_then(|()| {
                 let mut builder = tray_icon::TrayIconBuilder::new()
                     .with_menu(Box::new(menu))
-                    .with_tooltip("rewynd — instant replay");
+                    .with_tooltip(crate::tray_common::TRAY_TOOLTIP);
                 if let Some(icon) = crate::tray_common::tray_brand_icon() {
                     builder = builder.with_icon(icon);
                 }
