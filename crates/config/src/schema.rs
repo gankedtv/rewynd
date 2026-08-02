@@ -1638,10 +1638,13 @@ mod tests {
         let path = dir.path().join("config.toml");
         Config::default().save_to(&path).expect("seed");
 
-        // A live override is a runtime value, never something a write-back may persist.
-        let env = std::collections::HashMap::from([("REWYND_WIDTH", "800")]);
+        // A live override is a runtime value, never something a write-back may persist. Both
+        // dimensions are set: match_display treats a bare width with no height as "not a size"
+        // and leaves it derived, so a real pin needs the pair.
+        let env =
+            std::collections::HashMap::from([("REWYND_WIDTH", "800"), ("REWYND_HEIGHT", "600")]);
         let loaded = load_from(Some(&path), |k| env.get(k).map(|s| (*s).to_owned()));
-        assert_eq!(loaded.video().width, 800);
+        assert_eq!((loaded.video().width, loaded.video().height), (800, 600));
 
         let out = update_stored(&path, |c| {
             c.set_upload_max_clip_secs(120);

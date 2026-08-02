@@ -943,7 +943,7 @@ mod linux {
 
     use crate::audio_pipeline::{AUDIO_SETTLE, SharedMixer, run_audio_mixer, spawn_audio_capture};
     use crate::badge;
-    use crate::params::{audio_encode_params, session_params};
+    use crate::params::{audio_encode_params, encode_params, session_params};
     use crate::tray;
     use rewynd_buffer::{AudioRingBuffer, EncodedChunk, RingBuffer};
     use rewynd_gpu::{DmabufImport, GpuContext};
@@ -1057,11 +1057,12 @@ mod linux {
             "encoder capability and selection"
         );
 
-        // Resolution / framerate / bitrate stay parameters (PLAN §9), sourced from the config.
-        // The resolution is provisional here: on Wayland the captured monitor isn't known until
-        // the ScreenCast portal has run, so this is recomputed once the portal reports which
-        // output it handed us.
-        let mut params = session_params(&config, None, &encoder_choice, &adapters);
+        // Framerate / bitrate stay parameters (PLAN §9), sourced from the config. The resolution
+        // isn't resolved yet: on Wayland the captured monitor isn't known until the ScreenCast
+        // portal has run, and logging a guess here would just be a second, contradictory line
+        // once `session_params` resolves it for real below — so this skips straight to
+        // `encode_params` rather than calling `session_params` (which always logs) twice.
+        let mut params = encode_params(config.video());
         tracing::info!(
             fps = params.framerate,
             bitrate_bps = params.bitrate_bps,

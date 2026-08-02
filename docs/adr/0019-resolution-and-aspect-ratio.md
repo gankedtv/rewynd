@@ -51,6 +51,14 @@ Two properties fall out of this that a separate "auto" flag would not have given
   `true` — so they read as `Height(1080)` and start following the display's aspect ratio at the
   quality the user already had. 16:9 users see no change at all.
 
+The one config this quietly changes behavior for: a TOML hand-edited to a non-16:9 pin before
+this landed (e.g. `width = 2560` / `height = 1080`, the only way to get a non-16:9 size at all
+under the old scheme) has no `match_display` key either, so it is read the same way — as
+`Height(1080)`, not `Fixed`. The pinned width is discarded and the recording follows the
+display's aspect ratio at 1080 lines instead. That's a silent change for exactly the users the
+"no way out" bullet above describes, though arguably the better default now that there's a real
+`Fixed` mode to switch to.
+
 The 4K cap on `MatchDisplay` keeps an 8K panel from asking every encoder for a frame size it
 cannot take (and a bitrate nobody wants). `Height` never upscales: extra lines cost bitrate and
 encoder time without adding a pixel of detail.

@@ -49,6 +49,18 @@ fn initial_custom_dim(config: &Config, pick: fn((u32, u32)) -> u32) -> String {
     pick(config.resolution_mode().resolve(None)).to_string()
 }
 
+/// One custom-resolution box, parsed. A parsed `0` is treated the same as unparseable/empty
+/// text: `ResolutionMode::from_stored` reads a `0` as "not a size", which would silently read
+/// `Fixed { width: 0, .. }` back as `Height`/`MatchDisplay` and drop the user out of Custom
+/// mid-keystroke the moment either box is cleared and a leading zero typed.
+fn parsed_dim(text: &str, fallback: u32) -> u32 {
+    text.trim()
+        .parse()
+        .ok()
+        .filter(|&v: &u32| v > 0)
+        .unwrap_or(fallback)
+}
+
 /// Whether a stored URL points somewhere other than the shipped default (empty means "use the
 /// default" and an explicitly spelled-out default is still the default).
 fn is_custom_url(stored: &str, default: &str) -> bool {
@@ -918,8 +930,8 @@ impl App {
     }
 
     /// The stored resolution intent a picked preset maps to. `Custom` carries the typed
-    /// width/height; anything unparseable falls back to what is currently resolved, so the
-    /// config never gets a zero from a half-typed box.
+    /// width/height; anything unparseable or zero falls back to what is currently resolved, so
+    /// the config never gets a zero from a half-typed box.
     fn mode_for(&self, preset: Resolution) -> config::ResolutionMode {
         match preset {
             Resolution::Custom => {
@@ -928,8 +940,8 @@ impl App {
                     .resolution_mode()
                     .resolve(self.display_geometry());
                 config::ResolutionMode::Fixed {
-                    width: self.custom_width.trim().parse().unwrap_or(w),
-                    height: self.custom_height.trim().parse().unwrap_or(h),
+                    width: parsed_dim(&self.custom_width, w),
+                    height: parsed_dim(&self.custom_height, h),
                 }
             }
             other => other
@@ -2383,8 +2395,9 @@ impl App {
 /// Clamp the editable numeric settings into the ranges the controls can represent, so the view
 /// (which reads these back) and Save (which writes them) agree — no control that shows a value
 /// the file doesn't actually hold. Gains are sanitized and capped, the buffer window is clamped
-/// to the daemon's own range, and the bitrate is snapped to whole Mbps. Resolution, frame rate,
-/// and the keyframe interval are left as stored (a custom resolution stays custom).
+/// to the daemon's own range, and the bitrate is snapped to whole Mbps. Frame rate and the
+/// keyframe interval are left as stored. A resolution mode that shows as Custom is pinned to
+/// match (see below); anything else stays as stored.
 fn normalize(c: &mut Config) {
     c.set_mic_gain(c.mic_gain().clamp(0.0, GAIN_MAX));
     c.set_system_gain(c.system_gain().clamp(0.0, GAIN_MAX));
@@ -2396,6 +2409,19 @@ fn normalize(c: &mut Config) {
     let mbps = (v.bitrate_bps / BITS_PER_MBIT).clamp(BITRATE_MIN_MBPS, BITRATE_MAX_MBPS);
     v.bitrate_bps = mbps * BITS_PER_MBIT;
     c.set_video(v);
+
+    // A hand-edited height with no matching preset (e.g. `height = 900`) displays as Custom in
+    // the picker (see `Resolution::from_mode`), but the stored mode is still `Height`, which
+    // derives its width from the display at record time. Pin it to what's actually shown so the
+    // two never disagree — without this, the label could read one size while the recorder
+    // produces another, and saving without touching the fields would leave that mismatch in
+    // place.
+    if matches!(c.resolution_mode(), config::ResolutionMode::Height(_))
+        && Resolution::from_mode(c.resolution_mode()) == Resolution::Custom
+    {
+        let (width, height) = c.resolution_mode().resolve(None);
+        c.set_resolution_mode(config::ResolutionMode::Fixed { width, height });
+    }
 }
 
 /// An "Advanced options" disclosure toggle, link-styled and labelled by its open state.
@@ -2762,6 +2788,55 @@ mod tests {
             Resolution::from_mode(config::ResolutionMode::Height(900)),
             Resolution::Custom,
             "a hand-edited height with no preset must still be visible in the fields"
+        );
+    }
+
+    #[test]
+    fn normalize_pins_an_unmatched_height_to_what_custom_would_show() {
+        let mut c = config::Config::from_toml_str("[video]\nheight = 900\n").expect("parses");
+        assert_eq!(c.resolution_mode(), config::ResolutionMode::Height(900));
+
+        normalize(&mut c);
+
+        let expected = config::ResolutionMode::Height(900).resolve(None);
+        assert_eq!(
+            c.resolution_mode(),
+            config::ResolutionMode::Fixed {
+                width: expected.0,
+                height: expected.1,
+            },
+            "the stored mode now matches what the picker shows as Custom"
+        );
+    }
+
+    #[test]
+    fn normalize_leaves_a_matched_height_alone() {
+        let mut c = config::Config::from_toml_str("[video]\nheight = 1080\n").expect("parses");
+        normalize(&mut c);
+        assert_eq!(
+            c.resolution_mode(),
+            config::ResolutionMode::Height(1080),
+            "1080 has a preset, so it isn't Custom and normalize must not touch it"
+        );
+    }
+
+    #[test]
+    fn parsed_dim_rejects_zero_and_keeps_the_fallback() {
+        assert_eq!(
+            parsed_dim("0", 1920),
+            1920,
+            "a leading zero is not a size yet"
+        );
+        assert_eq!(
+            parsed_dim("", 1920),
+            1920,
+            "an empty box keeps the fallback"
+        );
+        assert_eq!(parsed_dim("not-a-number", 1920), 1920);
+        assert_eq!(
+            parsed_dim("2560", 1920),
+            2560,
+            "a real value is used verbatim"
         );
     }
 
