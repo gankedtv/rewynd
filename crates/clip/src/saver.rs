@@ -44,6 +44,10 @@ pub struct ClipSaver {
     /// alongside the system+mic mix. `None` = single mixed track.
     mic_audio: Option<SharedAudioBuffer>,
     params: EncodeParams,
+    /// The dimensions written into the MP4 track, overriding `params` once the recorder has
+    /// measured the display. The saver is built before the capture source is known on Linux
+    /// (the portal picks the monitor later), so the size arrives after construction.
+    dimensions: Mutex<(u32, u32)>,
     audio_params: AudioEncodeParams,
     window: Duration,
     output_dir: Option<PathBuf>,
@@ -74,6 +78,7 @@ impl ClipSaver {
             audio,
             mic_audio,
             params,
+            dimensions: Mutex::new((params.width, params.height)),
             audio_params,
             window,
             output_dir,
@@ -81,6 +86,12 @@ impl ClipSaver {
             last_clip: Mutex::new(None),
             game_folder: Mutex::new(None),
         })
+    }
+
+    /// Tell the saver what the encoder is actually producing, so the MP4 track's dimensions match
+    /// the stream. Called once the recorder has measured the captured display.
+    pub fn set_dimensions(&self, width: u32, height: u32) {
+        *lock_unpoisoned(&self.dimensions) = (width, height);
     }
 
     /// Set (or clear) the per-game subfolder for subsequent saves. The name is
@@ -152,7 +163,8 @@ impl ClipSaver {
             },
         ];
 
-        let muxer = Mp4Muxer::new(self.params.width, self.params.height, self.params.framerate);
+        let (width, height) = *lock_unpoisoned(&self.dimensions);
+        let muxer = Mp4Muxer::new(width, height, self.params.framerate);
         let result = if audio_chunks.is_empty() && mic_chunks.is_empty() {
             muxer.write_mp4(&chunks, &path)
         } else {

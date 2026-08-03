@@ -204,6 +204,64 @@ pub(crate) fn select_display(
         .map_err(|e| CaptureError::Sck(format!("display {slot}: {e}")))
 }
 
+/// The selected display's native size **in pixels**, for deriving the encode resolution before
+/// the stream starts. `None` when SCK can't be reached or the display can't be measured — the
+/// caller then falls back to the configured size rather than failing.
+///
+/// SCK reports display sizes in points, and `SCStreamConfiguration`'s width/height are pixels, so
+/// a Retina panel needs the backing scale applied or it would be captured at half its resolution.
+/// The scale comes from the current display mode's pixel width; a mode that can't be read leaves
+/// the point size, which is still the right *aspect ratio*.
+#[must_use]
+pub fn display_geometry(index: Option<usize>) -> Option<(u32, u32)> {
+    // Without the TCC grant SCK enumerates nothing; preflighting here names that as the reason
+    // instead of leaving a bare "no displays" in the log.
+    let content = ensure_screen_capture_access()
+        .and_then(|()| shareable_content())
+        .inspect_err(|e| tracing::warn!(error = %e, "could not enumerate displays to measure"))
+        .ok()?;
+    let display = select_display(&content, index)
+        .inspect_err(|e| tracing::warn!(error = %e, "could not select a display to measure"))
+        .ok()?;
+    let (points_w, points_h) = (
+        u32::try_from(display.width()).ok()?,
+        u32::try_from(display.height()).ok()?,
+    );
+    if points_w == 0 || points_h == 0 {
+        return None;
+    }
+    let scale = backing_scale(display.display_id(), points_w);
+    Some((points_w * scale, points_h * scale))
+}
+
+/// The display's pixels-per-point, from its current mode. Falls back to 1 when the mode is
+/// unavailable or reports something implausible, so a bad read never inflates the capture size.
+fn backing_scale(id: cg::DirectDisplayId, points_wide: u32) -> u32 {
+    // SAFETY: `id` came from SCK's display list, so it names a live display; a display without a
+    // mode returns null, which we check before dereferencing anything.
+    let mode = unsafe { CGDisplayCopyDisplayMode(id) };
+    if mode.is_null() {
+        return 1;
+    }
+    // SAFETY: `mode` is a non-null CGDisplayMode owned by us until the release below.
+    let pixels_wide = unsafe { CGDisplayModeGetPixelWidth(mode) };
+    // SAFETY: same, and the handle is not used afterwards.
+    unsafe { CGDisplayModeRelease(mode) };
+    u32::try_from(pixels_wide)
+        .ok()
+        .map(|px| px / points_wide.max(1))
+        .filter(|&scale| (1..=4).contains(&scale))
+        .unwrap_or(1)
+}
+
+// CoreGraphics is already linked through cidre's `cg` module, which binds display bounds but not
+// display modes. `CGDisplayMode` is opaque, so it is handled as a raw pointer.
+unsafe extern "C-unwind" {
+    fn CGDisplayCopyDisplayMode(display: cg::DirectDisplayId) -> *mut std::ffi::c_void;
+    fn CGDisplayModeGetPixelWidth(mode: *mut std::ffi::c_void) -> usize;
+    fn CGDisplayModeRelease(mode: *mut std::ffi::c_void);
+}
+
 /// Park the calling thread until the session ends: callback `Break`, the stop
 /// flag, a recorded stream failure, or (audio) an idle timeout with no samples.
 pub(crate) fn watch_session(
@@ -243,5 +301,41 @@ pub(crate) fn session_result(shared: &SessionShared) -> Result<(), CaptureError>
         Err(CaptureError::Sck(shared.take_error().unwrap_or_else(
             || "capture ended without a stop request".to_owned(),
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Needs the live window server + the screen-recording grant, so it is `#[ignore]`d like the
+    /// GPU tests; run on a Mac with `cargo test -p rewynd-capture -- --ignored`.
+    ///
+    /// Run from a terminal, the grant belongs to the terminal (TCC attributes an unbundled
+    /// binary to its parent), so the subscriber is wired up here — a missing grant otherwise
+    /// looks identical to an unmeasurable display.
+    #[test]
+    #[ignore = "requires a live window server and screen-recording permission"]
+    fn the_main_display_measures_in_pixels() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let (w, h) = super::display_geometry(None)
+            .expect("main display measurable (check the warning above for why not)");
+        assert!(w >= 640 && h >= 480, "implausible display size {w}x{h}");
+
+        // What SCK itself reports, which is points — the size the stream must NOT be configured
+        // with on a Retina panel. The measurement has to be an exact integer multiple of it (the
+        // backing scale), so this catches both a missing scale and a bogus one.
+        let content = super::shareable_content().expect("shareable content");
+        let display = super::select_display(&content, None).expect("main display");
+        let (pw, ph) = (display.width() as u32, display.height() as u32);
+        assert_eq!(
+            (w % pw, h % ph),
+            (0, 0),
+            "{w}x{h} is not a whole multiple of the {pw}x{ph} point size"
+        );
+        assert_eq!(w / pw, h / ph, "the two axes disagree on the backing scale");
+        assert!((1..=4).contains(&(w / pw)), "implausible scale {}", w / pw);
+        println!(
+            "main display: {pw}x{ph} points, {w}x{h} pixels ({}x)",
+            w / pw
+        );
     }
 }

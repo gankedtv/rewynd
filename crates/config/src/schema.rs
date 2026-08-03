@@ -7,10 +7,16 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::paths::config_path;
+use crate::resolution::ResolutionMode;
 
-/// Built-in video defaults (must match `rewynd_encode::EncodeParams::default`; the app guards it).
-const DEFAULT_WIDTH: u32 = 1920;
-const DEFAULT_HEIGHT: u32 = 1080;
+/// Built-in video defaults. Width/height default to the `0` "auto" sentinel, which
+/// [`ResolutionMode`] reads as "match the display" — an undetectable display falls back to
+/// [`crate::resolution::FALLBACK_DIMS`], which must match `rewynd_encode::EncodeParams::default`
+/// (the app guards it).
+const DEFAULT_WIDTH: u32 = 0;
+const DEFAULT_HEIGHT: u32 = 0;
+/// Derive the width from the captured display's aspect ratio instead of pinning the stored pair.
+const DEFAULT_MATCH_DISPLAY: bool = true;
 const DEFAULT_FRAMERATE: u32 = 60;
 const DEFAULT_VIDEO_BITRATE_BPS: u32 = 12_000_000;
 const DEFAULT_IDR_PERIOD: u32 = 60;
@@ -121,8 +127,14 @@ impl std::fmt::Debug for YouTubeSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct VideoConfig {
+    /// `0` = derive from the display. Only pinned (used verbatim) with `match_display = false`.
     width: u32,
+    /// `0` = the display's own height; otherwise the quality target in lines.
     height: u32,
+    /// Take the width from the captured display's aspect ratio. Defaults on, so an upgrade from a
+    /// config written before this existed starts matching the display instead of stretching into
+    /// its stored 16:9 pair. See [`ResolutionMode`].
+    match_display: bool,
     framerate: u32,
     bitrate_bps: u32,
     idr_period: u32,
@@ -137,6 +149,7 @@ impl Default for VideoConfig {
         Self {
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
+            match_display: DEFAULT_MATCH_DISPLAY,
             framerate: DEFAULT_FRAMERATE,
             bitrate_bps: DEFAULT_VIDEO_BITRATE_BPS,
             idr_period: DEFAULT_IDR_PERIOD,
@@ -423,11 +436,23 @@ impl Config {
                 .and_then(|v| v.parse::<u32>().ok())
                 .filter(|&v| v > 0)
         };
-        if let Some(v) = u32_of("REWYND_WIDTH") {
+        let env_width = u32_of("REWYND_WIDTH");
+        if let Some(v) = env_width {
             self.video.width = v;
         }
         if let Some(v) = u32_of("REWYND_HEIGHT") {
             self.video.height = v;
+        }
+        // A width is only meaningful as a pin (with match_display on it is derived from the
+        // display), so naming one in the environment turns the derivation off — that keeps
+        // `REWYND_WIDTH=… REWYND_HEIGHT=…` meaning "record exactly this", as it always has. A
+        // width with no height to pair it with isn't a size, so it leaves the mode alone.
+        if env_width.is_some() && self.video.height > 0 {
+            self.video.match_display = false;
+        }
+        // Applied last so an explicit REWYND_MATCH_DISPLAY wins over the implicit pin above.
+        if let Some(on) = bool_of(&get("REWYND_MATCH_DISPLAY")) {
+            self.video.match_display = on;
         }
         if let Some(v) = u32_of("REWYND_FPS") {
             self.video.framerate = v;
@@ -457,12 +482,30 @@ impl Config {
         }
     }
 
-    /// The video encode settings, sanitized to encodable values: dimensions clamped to
-    /// `[16, 7680]` and rounded down to even (4:2:0 subsampling), framerate `[1, 240]`, bitrate
-    /// `[100 kbps, 100 Mbps]`, IDR period `[1, 1000]`. The stored values stay untouched, so an
-    /// editor round-trip doesn't rewrite the file.
+    /// How the stored dimensions should be read — see [`ResolutionMode`].
+    #[must_use]
+    pub fn resolution_mode(&self) -> ResolutionMode {
+        ResolutionMode::from_stored(
+            self.video.match_display,
+            self.video.width,
+            self.video.height,
+        )
+    }
+
+    /// The video encode settings with the resolution resolved against a display that could not be
+    /// detected — i.e. [`crate::resolution::FALLBACK_DIMS`]. The recorder, which *has* detected the
+    /// display, calls [`video_for_display`](Self::video_for_display) instead.
     #[must_use]
     pub fn video(&self) -> VideoSettings {
+        self.video_for_display(None)
+    }
+
+    /// The video encode settings, sanitized to encodable values: the resolution resolved against
+    /// `display` (the captured monitor's pixel size, `None` when undetectable), framerate
+    /// `[1, 240]`, bitrate `[100 kbps, 100 Mbps]`, IDR period `[1, 1000]`. The stored values stay
+    /// untouched, so an editor round-trip doesn't rewrite the file.
+    #[must_use]
+    pub fn video_for_display(&self, display: Option<(u32, u32)>) -> VideoSettings {
         let raw = VideoSettings {
             width: self.video.width,
             height: self.video.height,
@@ -470,14 +513,22 @@ impl Config {
             bitrate_bps: self.video.bitrate_bps,
             idr_period: self.video.idr_period,
         };
+        let (width, height) = self.resolution_mode().resolve(display);
         let sanitized = VideoSettings {
-            width: raw.width.clamp(16, 7680) & !1,
-            height: raw.height.clamp(16, 7680) & !1,
+            width,
+            height,
             framerate: raw.framerate.clamp(1, 240),
             bitrate_bps: raw.bitrate_bps.clamp(100_000, 100_000_000),
             idr_period: raw.idr_period.clamp(1, 1000),
         };
-        if sanitized != raw {
+        // The resolution is *resolved*, not merely clamped — the recorder logs it with the
+        // detected geometry — so only the untouched-by-design fields warrant a warning here.
+        if (
+            sanitized.framerate,
+            sanitized.bitrate_bps,
+            sanitized.idr_period,
+        ) != (raw.framerate, raw.bitrate_bps, raw.idr_period)
+        {
             tracing::warn!(
                 ?raw,
                 ?sanitized,
@@ -758,14 +809,30 @@ impl Config {
         &self.youtube.visibility
     }
 
-    /// Replace the video settings. The encoder selection is preserved (it isn't part of
-    /// [`VideoSettings`]).
+    /// Replace the video settings. The encoder selection and the resolution mode are preserved
+    /// (neither is part of [`VideoSettings`]); use [`set_resolution_mode`](Self::set_resolution_mode)
+    /// for the resolution.
     pub fn set_video(&mut self, v: VideoSettings) {
         self.video.width = v.width;
         self.video.height = v.height;
         self.video.framerate = v.framerate;
         self.video.bitrate_bps = v.bitrate_bps;
         self.video.idr_period = v.idr_period;
+    }
+
+    /// Store a resolution intent, flattened back onto the `width`/`height`/`match_display` trio
+    /// that [`resolution_mode`](Self::resolution_mode) reads.
+    pub fn set_resolution_mode(&mut self, mode: ResolutionMode) {
+        let (match_display, width, height) = match mode {
+            ResolutionMode::MatchDisplay => (true, 0, 0),
+            // The width stays 0: with match_display on it is derived, and storing a stale one
+            // would only mislead anyone reading the file.
+            ResolutionMode::Height(h) => (true, 0, h),
+            ResolutionMode::Fixed { width, height } => (false, width, height),
+        };
+        self.video.match_display = match_display;
+        self.video.width = width;
+        self.video.height = height;
     }
 
     /// Set the microphone mix gain.
@@ -1067,8 +1134,13 @@ pub const DEFAULT_TEMPLATE: &str = "\
 # variables override the video/audio/output settings.
 
 [video]
-width = 1920
-height = 1080
+# Recording resolution. 0 = follow the display: `height = 0` records it at its native size
+# (up to about 4K worth of pixels), `height = 1080` records 1080 lines at its aspect ratio.
+# Set match_display = false and give both a non-zero value to pin an exact size — the picture
+# is letterboxed into it rather than stretched.
+width = 0
+height = 0
+match_display = true
 framerate = 60
 bitrate_bps = 12000000
 idr_period = 60
@@ -1226,12 +1298,15 @@ mod tests {
 
     #[test]
     fn partial_file_fills_missing_with_defaults() {
-        let c = Config::from_toml_str("[video]\nwidth = 1280\nframerate = 30\n").expect("parses");
+        let c = Config::from_toml_str(
+            "[video]\nmatch_display = false\nwidth = 1280\nheight = 720\nframerate = 30\n",
+        )
+        .expect("parses");
         let v = c.video();
-        assert_eq!(v.width, 1280); // set
+        assert_eq!((v.width, v.height), (1280, 720)); // set
         assert_eq!(v.framerate, 30); // set
-        assert_eq!(v.height, 1080); // default
         assert_eq!(v.bitrate_bps, 12_000_000); // default
+        assert_eq!(v.idr_period, 60); // default
     }
 
     #[test]
@@ -1332,7 +1407,8 @@ mod tests {
     #[test]
     fn video_is_sanitized_to_encodable_values() {
         let c = Config::from_toml_str(
-            "[video]\nwidth = 1921\nheight = 4\nframerate = 0\nbitrate_bps = 1\nidr_period = 100000\n",
+            "[video]\nmatch_display = false\nwidth = 1921\nheight = 4\n\
+             framerate = 0\nbitrate_bps = 1\nidr_period = 100000\n",
         )
         .expect("parses");
         let v = c.video();
@@ -1345,6 +1421,74 @@ mod tests {
         let toml = c.to_toml_string().expect("serialize");
         assert!(toml.contains("width = 1921"));
         assert!(toml.contains("framerate = 0"));
+    }
+
+    #[test]
+    fn a_fresh_config_matches_the_display() {
+        let c = Config::default();
+        assert_eq!(c.resolution_mode(), ResolutionMode::MatchDisplay);
+        assert_eq!(
+            (
+                c.video_for_display(Some((3440, 1440))).width,
+                c.video_for_display(Some((3440, 1440))).height
+            ),
+            (3440, 1440),
+            "an ultrawide records natively out of the box"
+        );
+    }
+
+    #[test]
+    fn a_config_written_before_match_display_existed_keeps_its_quality_and_gains_the_aspect() {
+        // Exactly what the pre-#165 template wrote: a 16:9 pair and no match_display key.
+        let c = Config::from_toml_str("[video]\nwidth = 1920\nheight = 1080\n").expect("parses");
+        assert_eq!(c.resolution_mode(), ResolutionMode::Height(1080));
+        let v = c.video_for_display(Some((3440, 1440)));
+        assert_eq!(
+            (v.width, v.height),
+            (2580, 1080),
+            "the stored 1080 lines survive; the width follows the ultrawide"
+        );
+    }
+
+    #[test]
+    fn clearing_match_display_pins_the_stored_size() {
+        let c =
+            Config::from_toml_str("[video]\nmatch_display = false\nwidth = 1920\nheight = 1080\n")
+                .expect("parses");
+        let v = c.video_for_display(Some((3440, 1440)));
+        assert_eq!(
+            (v.width, v.height),
+            (1920, 1080),
+            "a pinned size is honoured; the record path letterboxes it"
+        );
+    }
+
+    #[test]
+    fn setting_a_resolution_mode_round_trips_through_toml() {
+        let mut c = Config::default();
+        c.set_resolution_mode(ResolutionMode::Height(1440));
+        let toml = c.to_toml_string().expect("serialize");
+        assert!(toml.contains("height = 1440"));
+        assert!(toml.contains("width = 0"), "the width stays derived");
+        let back = Config::from_toml_str(&toml).expect("parses");
+        assert_eq!(back.resolution_mode(), ResolutionMode::Height(1440));
+
+        c.set_resolution_mode(ResolutionMode::Fixed {
+            width: 2560,
+            height: 1080,
+        });
+        let back = Config::from_toml_str(&c.to_toml_string().expect("serialize")).expect("parses");
+        assert_eq!(
+            back.resolution_mode(),
+            ResolutionMode::Fixed {
+                width: 2560,
+                height: 1080
+            }
+        );
+
+        c.set_resolution_mode(ResolutionMode::MatchDisplay);
+        let back = Config::from_toml_str(&c.to_toml_string().expect("serialize")).expect("parses");
+        assert_eq!(back.resolution_mode(), ResolutionMode::MatchDisplay);
     }
 
     #[test]
@@ -1494,10 +1638,13 @@ mod tests {
         let path = dir.path().join("config.toml");
         Config::default().save_to(&path).expect("seed");
 
-        // A live override is a runtime value, never something a write-back may persist.
-        let env = std::collections::HashMap::from([("REWYND_WIDTH", "800")]);
+        // A live override is a runtime value, never something a write-back may persist. Both
+        // dimensions are set: match_display treats a bare width with no height as "not a size"
+        // and leaves it derived, so a real pin needs the pair.
+        let env =
+            std::collections::HashMap::from([("REWYND_WIDTH", "800"), ("REWYND_HEIGHT", "600")]);
         let loaded = load_from(Some(&path), |k| env.get(k).map(|s| (*s).to_owned()));
-        assert_eq!(loaded.video().width, 800);
+        assert_eq!((loaded.video().width, loaded.video().height), (800, 600));
 
         let out = update_stored(&path, |c| {
             c.set_upload_max_clip_secs(120);
@@ -1672,8 +1819,10 @@ mod tests {
 
         // An unparseable numeric override is ignored, leaving the file/default value intact; an
         // unrecognized boolean likewise leaves the desktop-capture flag as the file has it.
-        let mut c2 = Config::from_toml_str("[video]\nwidth = 1600\n[capture]\ndesktop = true\n")
-            .expect("parses");
+        let mut c2 = Config::from_toml_str(
+            "[video]\nmatch_display = false\nwidth = 1600\nheight = 900\n[capture]\ndesktop = true\n",
+        )
+        .expect("parses");
         let bad = std::collections::HashMap::from([
             ("REWYND_WIDTH", "not-a-number"),
             ("REWYND_CAPTURE_DESKTOP", "maybe"),
@@ -1684,6 +1833,22 @@ mod tests {
             c2.video().width,
             1600,
             "unparseable override ignored → file value"
+        );
+    }
+
+    #[test]
+    fn match_display_env_override_beats_an_implicit_pin() {
+        let mut c = Config::default();
+        let env = std::collections::HashMap::from([
+            ("REWYND_WIDTH", "1920"),
+            ("REWYND_HEIGHT", "1080"),
+            ("REWYND_MATCH_DISPLAY", "1"),
+        ]);
+        c.apply_env_overrides(|k| env.get(k).map(|s| (*s).to_owned()));
+        assert_eq!(
+            c.resolution_mode(),
+            ResolutionMode::Height(1080),
+            "an explicit REWYND_MATCH_DISPLAY overrides the width's implicit pin"
         );
     }
 
@@ -1700,10 +1865,11 @@ mod tests {
 
     #[test]
     fn load_from_none_is_defaults_plus_env() {
-        let env = std::collections::HashMap::from([("REWYND_WIDTH", "800")]);
+        let env =
+            std::collections::HashMap::from([("REWYND_WIDTH", "800"), ("REWYND_HEIGHT", "600")]);
         let c = load_from(None, |k| env.get(k).map(|s| (*s).to_owned()));
-        assert_eq!(c.video().width, 800);
-        assert_eq!(c.video().height, 1080); // default survives
+        assert_eq!((c.video().width, c.video().height), (800, 600));
+        assert_eq!(c.video().framerate, 60); // default survives
     }
 
     #[test]
@@ -1744,7 +1910,11 @@ mod tests {
         )
         .expect("write");
         let c = load_from(Some(&path), |_| None);
-        assert_eq!(c.video().width, 1280, "section before the bad one survives");
+        assert_eq!(
+            c.video_stored().width,
+            1280,
+            "section before the bad one survives"
+        );
         assert_eq!(c.buffer_seconds(), 45, "section after the bad one survives");
         assert_eq!(c.mic_gain(), 1.0, "the bad section falls back to defaults");
     }
@@ -1755,7 +1925,11 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "[video]\nwidth = 1280\n[nonsense]\nx = 1\n").expect("write");
         let c = load_from(Some(&path), |_| None);
-        assert_eq!(c.video().width, 1280, "known section survives the stranger");
+        assert_eq!(
+            c.video_stored().width,
+            1280,
+            "known section survives the stranger"
+        );
         assert_eq!(c.audio(), Config::default().audio());
     }
 
@@ -1795,6 +1969,10 @@ mod tests {
             framerate: 144,
             bitrate_bps: 25_000_000,
             idr_period: 144,
+        });
+        c.set_resolution_mode(ResolutionMode::Fixed {
+            width: 2560,
+            height: 1440,
         });
 
         let toml = c.to_toml_string().expect("serialize");

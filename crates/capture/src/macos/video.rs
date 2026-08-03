@@ -52,6 +52,8 @@ struct VideoOutputInner {
     anchor: Option<(cm::Time, Duration)>,
     last_pts: Option<Duration>,
     frames: u64,
+    /// The size asked of SCK, checked against the first delivered frame.
+    requested: (u32, u32),
 }
 
 impl VideoOutputInner {
@@ -83,6 +85,16 @@ impl VideoOutputInner {
 
         if self.frames == 0 {
             tracing::debug!(width, height, "first SCK frame delivered");
+            // The encoder session is built for the requested size, so a disagreement is worth
+            // saying out loud rather than leaving to look like a mysterious encode failure.
+            if (width, height) != self.requested {
+                tracing::warn!(
+                    width,
+                    height,
+                    requested = ?self.requested,
+                    "SCK delivered a different frame size than requested"
+                );
+            }
         }
         self.frames += 1;
 
@@ -199,6 +211,12 @@ where
     cfg.set_pixel_format(cv::PixelFormat::_420V);
     cfg.set_width(prefs.width as usize);
     cfg.set_height(prefs.height as usize);
+    // Scale the display into exactly that frame, but never distort doing it: a size whose aspect
+    // differs from the display's is bordered instead. The recorder normally derives the size from
+    // the display so this is a no-op, but a pinned size can still disagree — and the Linux/Windows
+    // NV12 pre-pass makes the same promise.
+    cfg.set_scales_to_fit(true);
+    cfg.set_preserves_aspect_ratio(true);
     if prefs.framerate > 0 {
         cfg.set_minimum_frame_interval(cm::Time::new(1, prefs.framerate as i32));
     }
@@ -219,6 +237,7 @@ where
         anchor: None,
         last_pts: None,
         frames: 0,
+        requested: (prefs.width, prefs.height),
     });
 
     let windows = ns::Array::new();

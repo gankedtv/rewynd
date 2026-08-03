@@ -46,6 +46,13 @@ pub struct RecorderStatus {
     /// Extra detail (e.g. a failure message) when relevant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The captured display's measured size in pixels, so the settings window can resolve its
+    /// resolution presets against the real screen instead of guessing 16:9. Absent when the
+    /// display couldn't be measured, and in a status file written by an older recorder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_height: Option<u32>,
 }
 
 /// Path to the status file, next to `recorder.pid`.
@@ -97,6 +104,8 @@ mod tests {
             state: RecorderState::Recording,
             game: Some("Hades II".to_owned()),
             detail: None,
+            display_width: Some(3440),
+            display_height: Some(1440),
         }
     }
 
@@ -133,6 +142,22 @@ mod tests {
     #[test]
     fn missing_file_is_none() {
         assert!(read_status_from(Path::new("/nonexistent/status.json"), |_| true).is_none());
+    }
+
+    #[test]
+    fn a_status_without_dimensions_still_reads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("status.json");
+        // What an older recorder wrote, before the resolution was published.
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":{RECORDER_STATUS_VERSION},"pid":7,"encoder":"cpu","state":"idle"}}"#
+            ),
+        )
+        .unwrap();
+        let read = read_status_from(&path, |_| true).expect("reads");
+        assert_eq!((read.display_width, read.display_height), (None, None));
     }
 
     #[test]
