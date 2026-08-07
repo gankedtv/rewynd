@@ -108,6 +108,9 @@ pub struct Wizard {
     start_on_boot: bool,
     /// Whether to record the whole desktop instead of only the active game (the capture-mode step).
     capture_desktop: bool,
+    /// A `StartRecording` task is in flight (spawning + confirming the recorder is up). Hides
+    /// the button so a slow confirm can't be double-fired into two racing recorders.
+    recording_starting: bool,
     /// Whether the recorder has been asked to start (so the test-clip step can proceed).
     recording_started: bool,
     recording_error: Option<String>,
@@ -158,6 +161,7 @@ impl Wizard {
                 as u32,
             start_on_boot: config.start_on_boot(),
             capture_desktop: config.capture_desktop(),
+            recording_starting: false,
             recording_started: false,
             recording_error: None,
             test: TestState::Idle,
@@ -230,6 +234,13 @@ impl Wizard {
             Message::StartOnBoot(on) => self.start_on_boot = on,
             Message::CaptureDesktop(on) => self.capture_desktop = on,
             Message::StartRecording => {
+                // The confirm-it's-up poll can take several seconds; the button is hidden while
+                // this is true (see `screen_share`), but guard re-entrancy too in case a message
+                // is already queued when it disappears.
+                if self.recording_starting || self.recording_started {
+                    return Task::none();
+                }
+                self.recording_starting = true;
                 self.recording_error = None;
                 return Task::perform(
                     async {
@@ -241,6 +252,7 @@ impl Wizard {
                 );
             }
             Message::RecordingStarted(Ok(())) => {
+                self.recording_starting = false;
                 self.recording_started = true;
                 // The recorder start is async; the wash only makes sense on the step that
                 // shows the result, not wherever the user has navigated meanwhile.
@@ -248,7 +260,10 @@ impl Wizard {
                     self.pulse = Some(Fade::new(PULSE));
                 }
             }
-            Message::RecordingStarted(Err(e)) => self.recording_error = Some(e),
+            Message::RecordingStarted(Err(e)) => {
+                self.recording_starting = false;
+                self.recording_error = Some(e);
+            }
             Message::OpenClipFolder => {
                 self.open_error = None;
                 if let TestState::Saved { path, .. } = &self.test
@@ -475,6 +490,8 @@ impl Wizard {
                     .size(13)
                     .style(tinted(palette::ACCENT))
             ]
+        } else if self.recording_starting {
+            row![body("Starting recording…")]
         } else {
             row![cta("Start recording", Message::StartRecording)]
         };
@@ -720,19 +737,80 @@ fn spawn_recorder_capturing_desktop() -> Result<(), String> {
     let _ = rewynd_config::stop_recorder(Duration::from_secs(3), Duration::from_secs(2));
     let recorder = rewynd_config::sibling_binary("rewynd-recorder")
         .ok_or_else(|| "could not locate the recorder binary".to_owned())?;
-    std::process::Command::new(&recorder)
+    let mut child = std::process::Command::new(&recorder)
         .env("REWYND_CAPTURE_DESKTOP", "1")
         .spawn()
-        .map(|mut child| {
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-        })
-        .map_err(|e| format!("could not start the recorder: {e}"))
+        .map_err(|e| format!("could not start the recorder: {e}"))?;
+    let pid = child.id();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    wait_for_recorder_up(pid, Duration::from_secs(8))
+}
+
+/// One status poll's read on whether the process we just spawned (`pid`) is actually up.
+enum RecorderLaunch {
+    /// No status from `pid` yet — still starting, or a stale status from the process we just
+    /// stopped (rejected on `pid` alone; `read_recorder_status` also drops it once that process
+    /// is dead).
+    Pending,
+    /// `pid` published a status and isn't reporting a failure.
+    Up,
+    /// `pid` came up and immediately failed its capture pipeline.
+    Failed(String),
+}
+
+/// `status.detail`, or `fallback` when the recorder failed without leaving one.
+fn detail_or(status: &rewynd_config::RecorderStatus, fallback: &str) -> String {
+    status.detail.clone().unwrap_or_else(|| fallback.to_owned())
+}
+
+/// The testable core of [`wait_for_recorder_up`]: classify one status read against the pid we're
+/// waiting on.
+fn recorder_launch_outcome(
+    status: Option<&rewynd_config::RecorderStatus>,
+    pid: u32,
+) -> RecorderLaunch {
+    match status {
+        Some(s) if s.pid == pid && s.state == rewynd_config::RecorderState::Failed => {
+            RecorderLaunch::Failed(detail_or(s, "the recorder failed to start"))
+        }
+        Some(s) if s.pid == pid => RecorderLaunch::Up,
+        _ => RecorderLaunch::Pending,
+    }
+}
+
+/// Poll the recorder's published status until the freshly spawned `pid` reports in, so the wizard
+/// never declares "Recording is running." right after a doomed spawn (e.g. a single-instance lock
+/// conflict with the recorder we just asked to stop, or an encoder/capture init failure).
+fn wait_for_recorder_up(pid: u32, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match recorder_launch_outcome(rewynd_config::read_recorder_status().as_ref(), pid) {
+            RecorderLaunch::Up => return Ok(()),
+            RecorderLaunch::Failed(detail) => return Err(detail),
+            RecorderLaunch::Pending => {}
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                "The recorder didn't report as running in time. It may still be starting; try again in a moment.".to_owned(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// The recorder's capture pipeline failure detail, if `status` reports one. The testable core of
+/// the early-exit check in [`save_and_wait_for_clip`]'s poll loop.
+fn failed_detail(status: Option<&rewynd_config::RecorderStatus>) -> Option<String> {
+    status
+        .filter(|s| s.state == rewynd_config::RecorderState::Failed)
+        .map(|s| detail_or(s, "the recorder's capture pipeline failed"))
 }
 
 /// Ask the recorder to save a clip and wait for a new one to appear under `dir`. `Ok(None)` means
-/// none showed up in time (the ring may still be filling); `Err` means the recorder isn't running.
+/// none showed up in time (the ring may still be filling); `Err` means the recorder isn't running,
+/// or its capture pipeline failed while we were waiting.
 fn save_and_wait_for_clip(dir: &Path) -> Result<Option<(PathBuf, Option<String>)>, String> {
     let before = rewynd_config::newest_clip_in(dir);
     let requested = rewynd_config::request_recorder_save().map_err(|e| e.to_string())?;
@@ -750,6 +828,9 @@ fn save_and_wait_for_clip(dir: &Path) -> Result<Option<(PathBuf, Option<String>)
         {
             let encoder = rewynd_config::read_recorder_status().map(|s| s.encoder);
             return Ok(Some((path, encoder)));
+        }
+        if let Some(detail) = failed_detail(rewynd_config::read_recorder_status().as_ref()) {
+            return Err(detail);
         }
     }
     Ok(None)
@@ -821,6 +902,40 @@ mod tests {
     }
 
     #[test]
+    fn start_recording_ignores_re_entry_while_already_starting() {
+        let mut w = Wizard::new(&Config::default());
+        let _ = w.update(Message::StartRecording, &Config::default());
+        assert!(w.recording_starting, "first click begins starting");
+        // A stray double-click before the confirm-it's-up poll resolves must not fire a second
+        // spawn_recorder_capturing_desktop task racing the first.
+        let _ = w.update(Message::StartRecording, &Config::default());
+        assert!(w.recording_starting);
+        assert!(!w.recording_started);
+    }
+
+    #[test]
+    fn recording_started_ok_clears_the_starting_flag() {
+        let mut w = Wizard::new(&Config::default());
+        let _ = w.update(Message::StartRecording, &Config::default());
+        let _ = w.update(Message::RecordingStarted(Ok(())), &Config::default());
+        assert!(w.recording_started);
+        assert!(!w.recording_starting);
+    }
+
+    #[test]
+    fn recording_started_err_clears_the_starting_flag_and_reports_it() {
+        let mut w = Wizard::new(&Config::default());
+        let _ = w.update(Message::StartRecording, &Config::default());
+        let _ = w.update(
+            Message::RecordingStarted(Err("boom".to_owned())),
+            &Config::default(),
+        );
+        assert!(!w.recording_starting);
+        assert!(!w.recording_started);
+        assert_eq!(w.recording_error.as_deref(), Some("boom"));
+    }
+
+    #[test]
     fn entrance_fade_drives_animating_until_it_completes() {
         let mut w = Wizard::new(&Config::default());
         assert!(!w.animating(), "idle wizard needs no frame ticks");
@@ -834,5 +949,79 @@ mod tests {
             &Config::default(),
         );
         assert!(!w.animating(), "the finished fade is dropped");
+    }
+
+    fn sample_status(
+        pid: u32,
+        state: rewynd_config::RecorderState,
+    ) -> rewynd_config::RecorderStatus {
+        rewynd_config::RecorderStatus {
+            version: rewynd_config::RECORDER_STATUS_VERSION,
+            pid,
+            encoder: "cpu".to_owned(),
+            state,
+            game: None,
+            detail: None,
+            display_width: None,
+            display_height: None,
+        }
+    }
+
+    #[test]
+    fn recorder_launch_outcome_is_pending_without_a_matching_status() {
+        assert!(matches!(
+            recorder_launch_outcome(None, 42),
+            RecorderLaunch::Pending
+        ));
+        // A stale status from the process we just stopped (or a different pid entirely) must
+        // never read as our freshly spawned recorder coming up.
+        let other = sample_status(7, rewynd_config::RecorderState::Recording);
+        assert!(matches!(
+            recorder_launch_outcome(Some(&other), 42),
+            RecorderLaunch::Pending
+        ));
+    }
+
+    #[test]
+    fn recorder_launch_outcome_reports_up_for_a_matching_pid() {
+        let recording = sample_status(42, rewynd_config::RecorderState::Recording);
+        assert!(matches!(
+            recorder_launch_outcome(Some(&recording), 42),
+            RecorderLaunch::Up
+        ));
+        let idle = sample_status(42, rewynd_config::RecorderState::Idle);
+        assert!(matches!(
+            recorder_launch_outcome(Some(&idle), 42),
+            RecorderLaunch::Up
+        ));
+    }
+
+    #[test]
+    fn recorder_launch_outcome_surfaces_a_matching_failure() {
+        let mut failed = sample_status(42, rewynd_config::RecorderState::Failed);
+        failed.detail = Some("no GPU adapter found".to_owned());
+        match recorder_launch_outcome(Some(&failed), 42) {
+            RecorderLaunch::Failed(detail) => assert_eq!(detail, "no GPU adapter found"),
+            _ => panic!("expected Failed"),
+        }
+        // No detail at all still yields a readable message rather than losing the failure.
+        let bare = sample_status(42, rewynd_config::RecorderState::Failed);
+        match recorder_launch_outcome(Some(&bare), 42) {
+            RecorderLaunch::Failed(detail) => assert!(!detail.is_empty()),
+            _ => panic!("expected Failed"),
+        }
+    }
+
+    #[test]
+    fn failed_detail_only_fires_on_a_failed_state() {
+        assert_eq!(failed_detail(None), None);
+        let recording = sample_status(1, rewynd_config::RecorderState::Recording);
+        assert_eq!(failed_detail(Some(&recording)), None);
+        let mut failed = sample_status(1, rewynd_config::RecorderState::Failed);
+        failed.detail = Some("WGC session lost".to_owned());
+        assert_eq!(
+            failed_detail(Some(&failed)),
+            Some("WGC session lost".to_owned())
+        );
     }
 }
