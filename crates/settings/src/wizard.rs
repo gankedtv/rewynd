@@ -385,7 +385,7 @@ impl Wizard {
             .on_press_maybe((!self.recording_starting).then_some(Message::SkipSetup))
             .style(link_button)
             .padding(0);
-        let header = row![
+        let mut header = row![
             self.stepper(),
             text(format!(
                 "STEP {} OF {}",
@@ -396,10 +396,16 @@ impl Wizard {
             .font(UI_SEMIBOLD)
             .style(tinted(palette::MUTED)),
             iced::widget::Space::new().width(Length::Fill),
-            skip,
-        ]
-        .spacing(14)
-        .align_y(iced::Alignment::Center);
+        ];
+        // The launch outlives the screen-share step the user started it from, so the reason Skip
+        // is dead has to travel with the header rather than live in that step's copy.
+        if self.recording_starting {
+            header = header.push(hint("Starting recording…"));
+        }
+        let header = header
+            .push(skip)
+            .spacing(14)
+            .align_y(iced::Alignment::Center);
 
         let step = match self.step {
             Step::Welcome => self.welcome(),
@@ -930,6 +936,21 @@ fn failed_detail(
         .map(|s| detail_or(s, "the recorder's capture pipeline failed"))
 }
 
+/// The testable core of [`save_and_wait_for_clip`]'s poll loop: what one status read says about
+/// the recorder we asked to save. A confirmed recorder that stopped publishing has exited, which
+/// is a different (and more urgent) answer than a reported capture failure.
+fn clip_wait_failure(
+    status: Option<&rewynd_config::RecorderStatus>,
+    pid: Option<u32>,
+) -> Option<ClipFailure> {
+    if pid.is_some() && status.is_none() {
+        return Some(ClipFailure::gone(
+            "The recorder stopped before the clip was saved. Go back a step and start recording.",
+        ));
+    }
+    failed_detail(status, pid).map(ClipFailure::failed)
+}
+
 /// Ask the recorder to save a clip and wait for a new one to appear under `dir`. `Ok(None)` means
 /// none showed up in time (the ring may still be filling); `Err` means the recorder isn't running,
 /// or its capture pipeline failed and nothing landed afterwards.
@@ -955,13 +976,17 @@ fn save_and_wait_for_clip(
         {
             return Ok(Some((path, status.map(|s| s.encoder))));
         }
-        if failure.is_none()
-            && let Some(detail) = failed_detail(status.as_ref(), pid)
-        {
-            // The save we asked for may still be muxing buffered footage; report the failure
-            // sooner than the full timeout, but not sooner than the clip can land.
-            failure = Some(detail);
-            deadline = deadline.min(Instant::now() + CLIP_FAILURE_GRACE);
+        if let Some(f) = clip_wait_failure(status.as_ref(), pid) {
+            // A gone recorder ends the wait: nothing is coming, and only saying so reopens the
+            // start button. A reported failure might still be muxing the buffered footage we
+            // asked for, so it shortens the wait rather than ending it.
+            if f.recorder_gone {
+                return Err(f);
+            }
+            if failure.is_none() {
+                failure = Some(f.message);
+                deadline = deadline.min(Instant::now() + CLIP_FAILURE_GRACE);
+            }
         }
     }
     match failure {
@@ -1236,6 +1261,23 @@ mod tests {
             failed_detail(Some(&failed), Some(1)),
             Some("WGC session lost".to_owned())
         );
+    }
+
+    #[test]
+    fn a_confirmed_recorder_that_stops_publishing_reads_as_gone() {
+        let gone = clip_wait_failure(None, Some(42)).expect("a confirmed recorder must be missed");
+        assert!(gone.recorder_gone);
+        // Nothing was confirmed, so there is no recorder to have lost: keep waiting.
+        assert!(clip_wait_failure(None, None).is_none());
+    }
+
+    #[test]
+    fn a_reported_capture_failure_does_not_read_as_gone() {
+        let mut failed = sample_status(42, rewynd_config::RecorderState::Failed);
+        failed.detail = Some("WGC session lost".to_owned());
+        let f = clip_wait_failure(Some(&failed), Some(42)).expect("the failure is reported");
+        assert!(!f.recorder_gone, "the save may still be muxing");
+        assert_eq!(f.message, "WGC session lost");
     }
 
     #[test]
