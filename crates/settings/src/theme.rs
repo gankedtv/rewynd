@@ -287,6 +287,7 @@ pub fn link_button(_theme: &Theme, status: button::Status) -> button::Style {
         background: None,
         text_color: match status {
             button::Status::Hovered | button::Status::Pressed => palette::ACCENT,
+            button::Status::Disabled => palette::MUTED,
             _ => palette::TEXT_SECONDARY,
         },
         ..button::Style::default()

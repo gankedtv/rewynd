@@ -72,5 +72,5 @@ pub use schema::{
 };
 pub use status::{
     RECORDER_STATUS_VERSION, RecorderState, RecorderStatus, clear_recorder_status,
-    read_recorder_status, recorder_status_path, write_recorder_status,
+    publish_starting_status, read_recorder_status, recorder_status_path, write_recorder_status,
 };

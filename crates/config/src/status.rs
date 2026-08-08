@@ -20,6 +20,8 @@ pub const RECORDER_STATUS_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecorderState {
+    /// Launched, but capture isn't live yet (share picker, GPU and encoder init).
+    Starting,
     /// Actively buffering (a game, or the whole desktop — see [`RecorderStatus::game`]).
     Recording,
     /// Running but waiting for a game to focus (game-only capture, nothing detected yet).
@@ -73,9 +75,35 @@ pub fn write_recorder_status(status: &RecorderStatus) -> std::io::Result<()> {
     crate::paths::write_file_atomic(&dir.path.join("status.json"), json.as_bytes())
 }
 
+/// Publish a bare [`Starting`](RecorderState::Starting) status for this process, before the
+/// encoder backend (and so the full [`RecorderStatus`]) is known. A GUI waiting on a launch it
+/// just made needs this beacon to tell "still coming up" from "never got off the ground";
+/// everything before the first real publish (update install, adapter probe) can take seconds.
+pub fn publish_starting_status() {
+    let _ = write_recorder_status(&RecorderStatus {
+        version: RECORDER_STATUS_VERSION,
+        pid: std::process::id(),
+        encoder: String::new(),
+        state: RecorderState::Starting,
+        game: None,
+        detail: None,
+        display_width: None,
+        display_height: None,
+    });
+}
+
 /// Remove the status file (recorder shutdown). Best-effort.
 pub fn clear_recorder_status() {
-    let _ = std::fs::remove_file(recorder_status_path());
+    clear_status_at(&recorder_status_path(), std::process::id());
+}
+
+/// Testable core of [`clear_recorder_status`]. An outgoing recorder must leave an incoming one's
+/// beacon alone: unlinking it would read as "the recorder we just launched never started".
+fn clear_status_at(path: &Path, me: u32) {
+    if read_status_from(path, |_| true).is_some_and(|s| s.pid != me) {
+        return;
+    }
+    let _ = std::fs::remove_file(path);
 }
 
 /// Read the recorder's status, or `None` if absent, unparseable, the wrong version, or written
@@ -158,6 +186,51 @@ mod tests {
         .unwrap();
         let read = read_status_from(&path, |_| true).expect("reads");
         assert_eq!((read.display_width, read.display_height), (None, None));
+    }
+
+    #[test]
+    fn a_starting_status_round_trips() {
+        let status = RecorderStatus {
+            encoder: String::new(),
+            state: RecorderState::Starting,
+            game: None,
+            display_width: None,
+            display_height: None,
+            ..sample(9)
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains(r#""state":"starting""#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<RecorderStatus>(&json).unwrap(),
+            status
+        );
+    }
+
+    #[test]
+    fn clearing_removes_our_own_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("status.json");
+        std::fs::write(&path, serde_json::to_string(&sample(11)).unwrap()).unwrap();
+        clear_status_at(&path, 11);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn clearing_leaves_an_incoming_recorders_status_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("status.json");
+        std::fs::write(&path, serde_json::to_string(&sample(22)).unwrap()).unwrap();
+        clear_status_at(&path, 11);
+        assert!(path.exists(), "the newer recorder's beacon must survive");
+    }
+
+    #[test]
+    fn clearing_an_unreadable_status_still_removes_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("status.json");
+        std::fs::write(&path, b"not json").unwrap();
+        clear_status_at(&path, 11);
+        assert!(!path.exists());
     }
 
     #[test]

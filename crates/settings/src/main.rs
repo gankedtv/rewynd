@@ -585,6 +585,7 @@ fn status_pill_parts(status: Option<&config::RecorderStatus>) -> (String, iced::
     match status {
         None => ("Not recording".to_owned(), palette::MUTED),
         Some(s) => match s.state {
+            RecorderState::Starting => ("Starting up".to_owned(), palette::MUTED),
             RecorderState::Recording => match &s.game {
                 Some(game) => (
                     format!("Recording: {}", truncate_mic_label(game)),
@@ -1637,15 +1638,15 @@ impl App {
     }
 
     /// Skip setup: persist the (default) config so the wizard doesn't reappear next launch, then
-    /// open the library. If the wizard had started the recorder (in desktop-capture mode for the
+    /// open the library. If the wizard had launched a recorder (in desktop-capture mode for the
     /// test clip), restart it so it applies the real config instead of continuing to record the
-    /// desktop.
+    /// desktop — including when that launch never confirmed, since the process may be up anyway.
     fn skip_onboarding(&mut self) -> Task<Message> {
-        let started = self.wizard.recording_started();
+        let spawned = self.wizard.recorder_spawned();
         self.save();
         self.view = View::Library;
         let refresh = self.library.refresh(&self.config).map(Message::Library);
-        if !started {
+        if !spawned {
             return refresh;
         }
         Task::batch([refresh, Self::restart_task()])

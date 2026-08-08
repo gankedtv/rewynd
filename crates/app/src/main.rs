@@ -836,10 +836,15 @@ mod status {
         detail: Option<String>,
         /// The captured display's measured size, once known.
         display: Option<(u32, u32)>,
+        /// Until the capture pipeline is live, `state` is tracked but published as `Starting`, so
+        /// a GUI that just launched us can't read "up" off a recorder that still has the share
+        /// picker, the GPU device and the encoder ahead of it.
+        starting: bool,
     }
 
     impl StatusPublisher {
-        /// Create the publisher with the chosen backend and initial state, writing it once.
+        /// Create the publisher with the chosen backend and the state capture will start in,
+        /// publishing `Starting` until [`set_capture_live`](Self::set_capture_live).
         pub(crate) fn new(encoder: String, state: RecorderState) -> Self {
             let publisher = Self {
                 inner: Arc::new(Mutex::new(Inner {
@@ -848,10 +853,17 @@ mod status {
                     game: None,
                     detail: None,
                     display: None,
+                    starting: true,
                 })),
             };
             publisher.write();
             publisher
+        }
+
+        /// The capture pipeline is up: publish the real state from here on.
+        pub(crate) fn set_capture_live(&self) {
+            lock_unpoisoned(&self.inner).starting = false;
+            self.write();
         }
 
         /// Publish the captured display's measured size, so the settings window can resolve its
@@ -884,12 +896,14 @@ mod status {
             self.write();
         }
 
-        /// The capture pipeline failed.
+        /// The capture pipeline failed. A failure during startup is exactly what a waiting GUI
+        /// needs to see, so this ends the `Starting` hold too.
         pub(crate) fn set_failed(&self, detail: String) {
             {
                 let mut inner = lock_unpoisoned(&self.inner);
                 inner.state = RecorderState::Failed;
                 inner.detail = Some(detail);
+                inner.starting = false;
             }
             self.write();
         }
@@ -906,7 +920,11 @@ mod status {
                 version: RECORDER_STATUS_VERSION,
                 pid: std::process::id(),
                 encoder: inner.encoder.clone(),
-                state: inner.state,
+                state: if inner.starting {
+                    RecorderState::Starting
+                } else {
+                    inner.state
+                },
                 game: inner.game.clone(),
                 detail: inner.detail.clone(),
                 display_width: inner.display.map(|(w, _)| w),
@@ -1043,6 +1061,10 @@ mod linux {
         if _instance.is_some() {
             crate::updater::apply_pending_update(&config);
         }
+        // Past the update (which would have restarted us under a different pid), so this pid is
+        // the one that will record: say so before the adapter probe, which can take seconds a
+        // GUI waiting on the launch would otherwise read as a dead start.
+        config::publish_starting_status();
         crate::updater::spawn_background_check(&config);
 
         // Pick the encoder backend up front: probe the machine's adapters, honour the config
@@ -1686,6 +1708,7 @@ mod linux {
         let (gpu, enc) = build_encoder(&choice, params, events, status)?;
         let conv = Rc::new(Nv12Converter::new(&gpu)?);
         let enc = Rc::new(RefCell::new(enc));
+        status.set_capture_live();
         tracing::info!("capture pipeline ready; filling the ring buffer");
 
         // Ask the compositor for the configured size/rate; whatever it actually delivers is
@@ -2115,6 +2138,10 @@ mod windows {
         if _instance.is_some() {
             crate::updater::apply_pending_update(&config);
         }
+        // Past the update (which would have restarted us under a different pid), so this pid is
+        // the one that will record: say so before the adapter probe, which can take seconds a
+        // GUI waiting on the launch would otherwise read as a dead start.
+        config::publish_starting_status();
         crate::updater::spawn_background_check(&config);
 
         // Pick the encoder backend up front: probe adapters, honour the config override, log
@@ -2557,6 +2584,7 @@ mod windows {
         // capture thread, so everything it captures must be Send (+Sync via Arc).
         let conv = Arc::new(Mutex::new(Nv12Converter::new(&gpu)?));
         let enc = Arc::new(Mutex::new(enc));
+        status.set_capture_live();
         tracing::info!(desktop, "capture pipeline ready; filling the ring buffer");
 
         // WGC captures the source at its native size; whatever arrives is scaled to the
@@ -2958,6 +2986,10 @@ mod macos {
         if _instance.is_some() {
             crate::updater::apply_pending_update(&config);
         }
+        // Past the update (which would have restarted us under a different pid), so this pid is
+        // the one that will record: say so before the adapter probe, which can take seconds a
+        // GUI waiting on the launch would otherwise read as a dead start.
+        config::publish_starting_status();
         crate::updater::spawn_background_check(&config);
 
         // AppKit wants the main thread; everything below assumes we own it.
@@ -3591,9 +3623,13 @@ mod macos {
                 stop.clone(),
                 &recording,
                 &pts_floor,
+                status,
             );
         }
 
+        // Game-only capture opens no stream until a game focuses, so there is no frame to wait
+        // for: an idle recorder with a built encoder and a running watcher is as live as it gets.
+        status.set_capture_live();
         loop {
             if !wait_for_gate(stop, &recording) {
                 return Ok(());
@@ -3630,6 +3666,7 @@ mod macos {
                 session_stop,
                 &recording,
                 &pts_floor,
+                status,
             );
             session_done.store(true, Ordering::Relaxed);
             let _ = monitor.join();
@@ -3708,6 +3745,7 @@ mod macos {
         session_stop: Arc<AtomicBool>,
         recording: &Arc<AtomicBool>,
         pts_floor: &Arc<Mutex<Duration>>,
+        status: &crate::status::StatusPublisher,
     ) -> Result<()> {
         // A callback Break reads as a clean stop to the stream; record the real reason
         // so it still surfaces as this function's Err.
@@ -3719,11 +3757,20 @@ mod macos {
             let failure = failure.clone();
             let recording = recording.clone();
             let pts_floor = pts_floor.clone();
+            let status = status.clone();
+            let mut published_live = false;
             let mut frame_index: u64 = 0;
             // Set while the gate is closed so the first frame of the next stretch starts
             // a fresh, cuttable GOP instead of referencing pre-pause frames.
             let mut resume_keyframe = false;
             move |captured: CapturedPixelBuf| -> ControlFlow<()> {
+                // A delivered frame is the only proof SCK granted the screen-recording
+                // permission and the stream really started; both are decided inside the
+                // blocking `capture_stream` call below, so there is nowhere else to say it.
+                if !published_live {
+                    published_live = true;
+                    status.set_capture_live();
+                }
                 if stop.load(Ordering::Relaxed) {
                     return ControlFlow::Break(());
                 }
