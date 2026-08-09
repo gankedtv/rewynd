@@ -39,7 +39,7 @@ things, and the recorder resolves it against the measured display:
 | Stored | Mode | Records |
 |---|---|---|
 | `match_display = true`, `height = 0` | `MatchDisplay` | The display's native size, scaled down only if it exceeds ~4K worth of pixels |
-| `match_display = true`, `height = N` | `Height(N)` | N lines at the display's aspect ratio, never upscaled |
+| `match_display = true`, `height = N` | `Height(N)` | N lines at the display's aspect ratio, never upscaled, and scaled down further if N lines would exceed ~4K worth of pixels |
 | `match_display = false`, both non-zero | `Fixed` | Exactly that size, letterboxed if the shapes differ |
 
 Two properties fall out of this that a separate "auto" flag would not have given:
@@ -60,9 +60,12 @@ display's aspect ratio at 1080 lines instead. That's a silent change for exactly
 "no way out" bullet above describes, though arguably the better default now that there's a real
 `Fixed` mode to switch to.
 
-The 4K cap on `MatchDisplay` keeps an 8K panel from asking every encoder for a frame size it
-cannot take (and a bitrate nobody wants). `Height` never upscales: extra lines cost bitrate and
-encoder time without adding a pixel of detail.
+The 4K cap keeps an 8K panel from asking every encoder for a frame size it cannot take (and a
+bitrate nobody wants). It binds `Height` too, not just `MatchDisplay`: a line count says nothing
+about width, so "2160p" on a 32:9 7680×2160 panel is 16.6 MP, twice the budget, and picking a
+preset is not a request to blow past the encoder's limits. `Height` also never upscales, since
+extra lines cost bitrate and encoder time without adding a pixel of detail. One clamp covers both
+rules, because a source already inside the budget budgets to exactly its own height.
 
 `REWYND_WIDTH` keeps meaning "record exactly this" — naming a width in the environment implies
 `match_display = false` when there is a height to pair it with. `REWYND_MATCH_DISPLAY` overrides

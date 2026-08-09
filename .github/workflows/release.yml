@@ -254,3 +254,70 @@ jobs:
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*' --skip-existing
           sha256sum * > SHA256SUMS
           gh release upload "$TAG" SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+
+  # The download buttons on rewynd.dev pin a tag (/releases/latest 404s while every release is a
+  # prerelease), so point them at this one; the commit under site/ republishes the site image.
+  site-pin:
+    needs: checksums
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # commits the new tag to site/src/data/release.ts on main
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: main
+          # The push below authenticates explicitly, so no credential lingers in .git/config.
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Point the site at this release
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          # Same token choice as the bump workflow: a PAT lets the resulting push trigger the
+          # Site workflow (GITHUB_TOKEN pushes never trigger another workflow), so without the
+          # secret the pin still lands but the site image only rebuilds on the next site/ change.
+          TOKEN: ${{ secrets.RELEASE_PAT || github.token }}
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::'$TAG' is not a release tag"
+            exit 1
+          fi
+          pin=site/src/data/release.ts
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          remote="https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          # main can move while the release builds, so each attempt redoes the edit on top of it.
+          for attempt in 1 2 3; do
+            if ! git fetch --depth=1 "$remote" main; then
+              echo "could not fetch main (attempt $attempt)"
+              continue
+            fi
+            git reset --hard FETCH_HEAD
+            # Rechecked every attempt: a newer release racing this one must not be downgraded.
+            newest=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=1" --jq '.[0].tag_name' || true)
+            if [[ -z "$newest" ]]; then
+              echo "::error::could not read the newest release"
+              exit 1
+            fi
+            if [[ "$newest" != "$TAG" ]]; then
+              echo "newest release is $newest, not $TAG; leaving the site pin as it is"
+              exit 0
+            fi
+            sed -i -E "s|^(export const RELEASE_TAG = ')[^']*(';)$|\1$TAG\2|" "$pin"
+            if ! grep -qF "RELEASE_TAG = '$TAG'" "$pin"; then
+              echo "::error::could not rewrite $pin"
+              exit 1
+            fi
+            if git diff --quiet -- "$pin"; then
+              echo "site already pinned to $TAG"
+              exit 0
+            fi
+            git commit -m "Point the site downloads at $TAG" -- "$pin"
+            if git push "$remote" HEAD:main; then
+              exit 0
+            fi
+            echo "push rejected (attempt $attempt), redoing the pin on top of main"
+          done
+          echo "::error::could not push the site pin to main"
+          exit 1

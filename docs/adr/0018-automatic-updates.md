@@ -1,6 +1,8 @@
 # ADR 0018 — Automatic updates: background download, install at recorder start
 
-- **Status:** Accepted (issue #161)
+- **Status:** Accepted (issue #161), amended by ADR 0020 — the boot-time apply is now preceded by
+  a bounded check + download, so a release installs at the first boot after it ships rather than
+  the second. Everything else here still holds.
 - **Supersedes / superseded by:** none
 - **Relates to:** ADR 0008 (single-instance guard), ADR 0017 (branded Windows installer)
 
