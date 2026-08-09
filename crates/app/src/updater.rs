@@ -72,8 +72,9 @@ pub(crate) fn update_at_boot(config: &Config) {
     }
     let start = Instant::now();
     let mut deadline = start + BOOT_CHECK_WAIT;
-    while Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_secs(1)) {
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        // Slices keep the settings probe fresh without letting the last one overshoot.
+        match rx.recv_timeout(remaining.min(Duration::from_secs(1))) {
             // The feed answered; what is left of the budget is the download's.
             Ok(BootPhase::Available) => deadline = start + BOOT_UPDATE_WAIT,
             Ok(BootPhase::Downloaded(true)) => {

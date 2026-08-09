@@ -283,16 +283,6 @@ jobs:
             echo "::error::'$TAG' is not a release tag"
             exit 1
           fi
-          # Re-running an old tag's workflow must not downgrade the public download links.
-          newest=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=1" --jq '.[0].tag_name' || true)
-          if [[ -z "$newest" ]]; then
-            echo "::error::could not read the newest release"
-            exit 1
-          fi
-          if [[ "$newest" != "$TAG" ]]; then
-            echo "newest release is $newest, not $TAG; leaving the site pin as it is"
-            exit 0
-          fi
           pin=site/src/data/release.ts
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -304,6 +294,16 @@ jobs:
               continue
             fi
             git reset --hard FETCH_HEAD
+            # Rechecked every attempt: a newer release racing this one must not be downgraded.
+            newest=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=1" --jq '.[0].tag_name' || true)
+            if [[ -z "$newest" ]]; then
+              echo "::error::could not read the newest release"
+              exit 1
+            fi
+            if [[ "$newest" != "$TAG" ]]; then
+              echo "newest release is $newest, not $TAG; leaving the site pin as it is"
+              exit 0
+            fi
             sed -i -E "s|^(export const RELEASE_TAG = ')[^']*(';)$|\1$TAG\2|" "$pin"
             if ! grep -qF "RELEASE_TAG = '$TAG'" "$pin"; then
               echo "::error::could not rewrite $pin"
