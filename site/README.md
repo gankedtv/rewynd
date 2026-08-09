@@ -66,7 +66,9 @@ default; pull it wherever you deploy. Build/run it locally with
   if the production domain differs. The install command is centralized in `src/data/release.ts`
   (`INSTALL_CMD`) and already fetches the repo's `install.sh`, so it needs no domain.
 - **Release tag:** download buttons pin `RELEASE_TAG` in `src/data/release.ts` (GitHub's
-  `/releases/latest` 404s while every release is a prerelease) — bump it each release.
+  `/releases/latest` 404s while every release is a prerelease). The release workflow
+  (`.github/workflows/release.yml`, job `site-pin`) commits the new tag to `main` once the
+  assets are uploaded, which rebuilds the site image; bump it by hand only if that fails.
 - **Product shot:** the hero "Library" is a CSS mockup (`LibraryShot.astro`), not a
   screenshot. Drop in a real capture when ready — the layout won't move.
 - **Clip titles + game grouping** (`data/clips.ts`) are aspirational — they assume
