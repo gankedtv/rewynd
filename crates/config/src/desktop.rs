@@ -586,15 +586,28 @@ fn run_command_value(exec: &Path) -> String {
     format!("\"{}\"", exec.display())
 }
 
+/// The executables an autostart value of ours can point at: the recorder that boot launches,
+/// and the GUI that pre-rename installs launched.
+#[cfg(any(windows, test))]
+const AUTOSTART_EXE_NAMES: &[&str] = &["rewynd-recorder.exe", "rewynd.exe"];
+
 /// Whether an existing Run-key command points at a rewynd binary (ours to manage);
 /// a user-managed wrapper stays untouched.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn is_rewynd_command(command: &str) -> bool {
-    command
-        .trim()
-        .trim_matches('"')
-        .to_ascii_lowercase()
-        .ends_with("rewynd.exe")
+    let command = command.trim();
+    // `"<path>" [args]` once quoted; unquoted, the whole value is the path (spaces and all) —
+    // our own values are always quoted, so an unquoted one with arguments is not ours.
+    let exe = match command.strip_prefix('"') {
+        Some(rest) => rest.split('"').next(),
+        None => Some(command),
+    };
+    exe.and_then(|exe| exe.rsplit(['\\', '/']).next())
+        .is_some_and(|name| {
+            AUTOSTART_EXE_NAMES
+                .iter()
+                .any(|owned| name.eq_ignore_ascii_case(owned))
+        })
 }
 
 /// Set the autostart value under `key_path`. The testable core of [`install_autostart`].
@@ -801,6 +814,43 @@ pub fn refresh_autostart(_exec: &Path) -> std::io::Result<()> {
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn reconcile_autostart(_exec: &Path, _on_boot: bool) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod autostart_command_tests {
+    use super::*;
+
+    #[test]
+    fn owned_run_commands_cover_both_binaries_and_any_casing() {
+        for command in [
+            r#""C:\Program Files\rewynd\rewynd-recorder.exe""#,
+            r#""C:\apps\re wynd\rewynd.exe""#,
+            r"C:\apps\rewynd-recorder.exe",
+            r"C:\Program Files\rewynd\rewynd.exe",
+            r#""C:\apps\rewynd.exe" --recorder"#,
+            r#"  "C:\apps\REWYND-Recorder.EXE"  "#,
+            "C:/apps/rewynd-recorder.exe",
+        ] {
+            assert!(is_rewynd_command(command), "{command} is ours to manage");
+        }
+    }
+
+    #[test]
+    fn user_managed_run_commands_stay_untouched() {
+        for command in [
+            r#""C:\wrapper\launcher.exe""#,
+            r#""C:\wrapper\notrewynd.exe""#,
+            r#""C:\wrapper\launcher.exe" C:\apps\rewynd-recorder.exe"#,
+            r#""C:\apps\rewynd-recorder.exe.bak""#,
+            // Ours are always quoted, so an unquoted value with arguments is someone else's.
+            r"C:\apps\rewynd-recorder.exe --recorder",
+            r"C:\apps\myrewynd.exe",
+            "",
+            r#""""#,
+        ] {
+            assert!(!is_rewynd_command(command), "{command} is not ours");
+        }
+    }
 }
 
 #[cfg(all(test, windows))]

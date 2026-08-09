@@ -1057,9 +1057,9 @@ mod linux {
             }
         };
 
-        // Install any downloaded update now, before capture exists; lock holders only.
+        // Update now, before capture exists; lock holders only.
         if _instance.is_some() {
-            crate::updater::apply_pending_update(&config);
+            crate::updater::update_at_boot(&config);
         }
         // Past the update (which would have restarted us under a different pid), so this pid is
         // the one that will record: say so before the adapter probe, which can take seconds a
@@ -2134,9 +2134,9 @@ mod windows {
             }
         };
 
-        // Install any downloaded update now, before capture exists; lock holders only.
+        // Update now, before capture exists; lock holders only.
         if _instance.is_some() {
-            crate::updater::apply_pending_update(&config);
+            crate::updater::update_at_boot(&config);
         }
         // Past the update (which would have restarted us under a different pid), so this pid is
         // the one that will record: say so before the adapter probe, which can take seconds a
@@ -2982,9 +2982,9 @@ mod macos {
             }
         };
 
-        // Install any downloaded update now, before capture exists; lock holders only.
+        // Update now, before capture exists; lock holders only.
         if _instance.is_some() {
-            crate::updater::apply_pending_update(&config);
+            crate::updater::update_at_boot(&config);
         }
         // Past the update (which would have restarted us under a different pid), so this pid is
         // the one that will record: say so before the adapter probe, which can take seconds a
