@@ -901,17 +901,17 @@ impl App {
         self.mode_for(preset).resolve(self.display_geometry())
     }
 
-    /// The resolution dropdown's entries. Presets taller than the display are dropped — they
-    /// would all resolve to the same size, which reads as a bug rather than a choice — except the
-    /// one currently selected, which must stay selectable to be shown.
+    /// The resolution dropdown's entries. A preset the resolver would shrink anyway (past the
+    /// display's own height or the pixel budget) is dropped: it renders as a duplicate of a
+    /// smaller row. The selected one always stays, since it has to be shown.
     fn resolution_options(&self, selected: Resolution) -> Vec<ResolutionOption> {
-        let display_height = self.display_geometry().map(|(_, h)| h);
+        let geometry = self.display_geometry();
         Resolution::ALL
             .into_iter()
             .filter(|&preset| {
                 preset == selected
-                    || match (preset.height(), display_height) {
-                        (Some(h), Some(max)) => h <= max,
+                    || match (preset.height(), geometry) {
+                        (Some(h), Some(geo)) => self.mode_for(preset).resolve(Some(geo)).1 == h,
                         _ => true,
                     }
             })
@@ -2838,6 +2838,60 @@ mod tests {
             parsed_dim("2560", 1920),
             2560,
             "a real value is used verbatim"
+        );
+    }
+
+    fn app_on_display(size: Option<(u32, u32)>) -> App {
+        let mut app = App::new();
+        app.recorder_status = size.map(|(w, h)| config::RecorderStatus {
+            version: config::RECORDER_STATUS_VERSION,
+            pid: 1,
+            encoder: "cpu".to_owned(),
+            state: config::RecorderState::Idle,
+            game: None,
+            detail: None,
+            display_width: Some(w),
+            display_height: Some(h),
+        });
+        app
+    }
+
+    fn offered_presets(app: &App, selected: Resolution) -> Vec<Resolution> {
+        app.resolution_options(selected)
+            .into_iter()
+            .map(|o| o.preset)
+            .collect()
+    }
+
+    #[test]
+    fn resolution_options_drop_presets_the_resolver_would_shrink() {
+        // 11520x2160 is well past the pixel budget, so 2160p and 1440p both collapse onto the
+        // same budgeted height and would show as duplicate rows.
+        let wide = app_on_display(Some((11520, 2160)));
+        let offered = offered_presets(&wide, Resolution::MatchDisplay);
+        assert!(!offered.contains(&Resolution::P2160), "{offered:?}");
+        assert!(!offered.contains(&Resolution::P1440), "{offered:?}");
+        assert!(offered.contains(&Resolution::P1080), "{offered:?}");
+        assert!(offered.contains(&Resolution::P720), "{offered:?}");
+
+        // A plain 1080p panel drops everything above it.
+        let small = app_on_display(Some((1920, 1080)));
+        let offered = offered_presets(&small, Resolution::MatchDisplay);
+        assert!(!offered.contains(&Resolution::P1440), "{offered:?}");
+        assert!(offered.contains(&Resolution::P1080), "{offered:?}");
+    }
+
+    #[test]
+    fn resolution_options_keep_the_selection_and_everything_without_geometry() {
+        let wide = app_on_display(Some((11520, 2160)));
+        assert!(
+            offered_presets(&wide, Resolution::P2160).contains(&Resolution::P2160),
+            "the selected preset must stay selectable"
+        );
+        assert_eq!(
+            offered_presets(&app_on_display(None), Resolution::MatchDisplay).len(),
+            Resolution::ALL.len(),
+            "no measured display means no filtering"
         );
     }
 

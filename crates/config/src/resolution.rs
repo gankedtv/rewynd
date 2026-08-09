@@ -7,7 +7,7 @@
 //! per-platform detection lives in `rewynd-capture` / the recorder.
 
 /// Ceiling on an auto-derived frame, as a pixel count: 3840×2160. Matching an 8K panel 1:1 would
-/// blow past every consumer encoder's limits (and any sane bitrate), so "match display" tops out
+/// blow past every consumer encoder's limits (and any sane bitrate), so both auto modes top out
 /// around 4K.
 ///
 /// A budget rather than a line count, because displays are not all 16:9. A 3440×2236 laptop panel
@@ -31,8 +31,8 @@ pub const FALLBACK_DIMS: (u32, u32) = (1920, 1080);
 pub enum ResolutionMode {
     /// Record the display at its native size, scaled down only if it exceeds [`MAX_AUTO_PIXELS`].
     MatchDisplay,
-    /// Record at this many lines, taking the width from the display's aspect ratio. Never
-    /// upscales: a 1080-line display asked for 1440 stays at 1080.
+    /// Record at this many lines, taking the width from the display's aspect ratio. Never upscales
+    /// and never exceeds [`MAX_AUTO_PIXELS`] — a 32:9 panel's "2160p" would be 16.6 MP, not 8.3.
     Height(u32),
     /// Record at exactly these dimensions. The record path letterboxes when the source aspect
     /// differs, so a pinned size is honoured without distorting the picture.
@@ -65,10 +65,10 @@ impl ResolutionMode {
         match self {
             Self::Fixed { width, height } => sanitize_dims(width, height),
             // Both auto modes are "the display's aspect at N lines"; they differ only in where N
-            // comes from. Capping at the source height keeps us from upscaling — extra lines cost
-            // bitrate and encoder time without adding a single pixel of detail.
+            // comes from. `budgeted_height` is the source height until the budget bites, so it is
+            // also the never-upscale clamp.
             Self::MatchDisplay => scale_to_height(src_w, src_h, budgeted_height(src_w, src_h)),
-            Self::Height(h) => scale_to_height(src_w, src_h, h.min(src_h)),
+            Self::Height(h) => scale_to_height(src_w, src_h, h.min(budgeted_height(src_w, src_h))),
         }
     }
 
@@ -143,6 +143,8 @@ mod tests {
     const EIGHT_K: (u32, u32) = (7680, 4320);
     /// A 3:2 laptop panel: taller than 4K but well under its pixel count.
     const RETINA_3_2: (u32, u32) = (3440, 2236);
+    /// A 32:9 panel: only 2160 lines, yet twice 4K's pixel count.
+    const SUPER_ULTRAWIDE_2160: (u32, u32) = (7680, 2160);
 
     #[test]
     fn stored_zeroes_mean_match_display() {
@@ -247,6 +249,37 @@ mod tests {
             (UHD, 720, (1280, 720)),
         ];
         for (panel, height, expected) in cases {
+            assert_eq!(
+                ResolutionMode::Height(height).resolve(Some(panel)),
+                expected,
+                "{height}p on {panel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_quality_height_also_obeys_the_pixel_budget() {
+        // 2160 lines is within reach of a 32:9 panel's height, but not of its area.
+        let (w, h) = SUPER_ULTRAWIDE_2160;
+        assert!(u64::from(w) * u64::from(h) > MAX_AUTO_PIXELS);
+        let (rw, rh) = ResolutionMode::Height(2160).resolve(Some(SUPER_ULTRAWIDE_2160));
+        assert_eq!((rw, rh), (5428, 1526));
+        assert!(
+            u64::from(rw) * u64::from(rh) <= MAX_AUTO_PIXELS,
+            "2160p on {SUPER_ULTRAWIDE_2160:?} resolved to {rw}x{rh}, over the budget"
+        );
+        let ratio = (f64::from(rw) / f64::from(rh)) / (f64::from(w) / f64::from(h));
+        assert!((ratio - 1.0).abs() < 0.01, "{rw}x{rh} changed shape");
+    }
+
+    #[test]
+    fn a_quality_height_under_the_budget_is_untouched() {
+        // The budget only ever bites when it has to: an in-budget request resolves as before.
+        for (panel, height, expected) in [
+            (SUPER_ULTRAWIDE, 1080, (3840, 1080)),
+            (SUPER_ULTRAWIDE_2160, 1080, (3840, 1080)),
+            (UHD, 2160, UHD),
+        ] {
             assert_eq!(
                 ResolutionMode::Height(height).resolve(Some(panel)),
                 expected,
