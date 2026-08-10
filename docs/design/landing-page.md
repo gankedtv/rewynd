@@ -52,7 +52,9 @@ Barlow Condensed 900, with a `Beta` badge.
 2. **Nav** (sticky) — logo + `Beta`, section links, ★ GitHub, `Get ganked.tv` (secondary),
    `Download` (primary mint).
 3. **Hero** (stacked, centered) — kicker, H1 "Instant replay for your gameplay.", subhead,
-   one-line `curl … | sh` install (copy button), Download + Star CTAs, beta/WIP note,
+   one-line `curl … | sh` install with a copy button (shown outright on Linux, folded
+   behind an "Install from the terminal" toggle on macOS, dropped on Windows and mobile),
+   Download + Star CTAs, beta/WIP note,
    platform chips, then a large **product shot** of the Library (see §5) with a soft mint
    glow and a "press F10 → clip saved" callout.
 4. **Trust strip** — 4 honest stat tiles: 60s buffered · zero-copy GPU · 1080p60 H.264 ·
@@ -95,8 +97,11 @@ visible from the top, not buried.
   list in `src/data/clips.ts`, and the Arena system in `src/styles/global.css`. Assets
   in `public/assets/`. `npm run build` → static `dist/`, hostable anywhere.
 - Google Fonts (Barlow Condensed + Inter) via `<link>` in `Base.astro`.
-- Minimal progressive-enhancement JS (inline `<script>` in `Hero.astro`): OS-detect the
-  primary download label + copy buttons. Page is fully functional without JS.
+- Minimal progressive-enhancement JS. An inline `<script>` at the top of `Base.astro`'s
+  head stamps `<html data-os>` before first paint (so the OS-specific hero install rules in
+  CSS never flash) and delegates the macOS install fold's toggle; `Hero.astro` reads the
+  stamp for the primary download label and wires the copy buttons. Page is fully functional
+  without JS: no `data-os` means the one-liner renders plainly, as it does on Linux.
 - Accessibility: semantic landmarks, focus-visible rings, reduced-motion honored.
 
 ## 8. Open items
