@@ -9,5 +9,5 @@ export const OSX_SETUP_URL = `${base}/rewynd-osx-Setup.pkg`;
 export const ALL_RELEASES_URL = 'https://github.com/gankedtv/rewynd/releases';
 
 // One-line installer, shown in the hero, download card, and open-source strip.
-// Points at the checked-in install.sh so it works today — no custom domain needed.
+// Points at the checked-in install.sh so it works today, no custom domain needed.
 export const INSTALL_CMD = 'curl -fsSL https://raw.githubusercontent.com/gankedtv/rewynd/main/install.sh | sh';
