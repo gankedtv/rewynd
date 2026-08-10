@@ -5,7 +5,7 @@ import { APPIMAGE_URL, WIN_SETUP_URL, INSTALL_CMD } from '../data/release';
 <section class="hero" style="border-top:none"><div class="wrap">
   <span class="kick">Native · Open source · Linux · Windows · macOS</span>
   <h1 class="lead h1">Instant replay for your gameplay.</h1>
-  <p class="sub">The last 60 seconds, always one hotkey away. A lightweight recorder that keeps your clip buffer on the GPU and sits in the tray — quiet enough to leave running while you play.</p>
+  <p class="sub">The last 60 seconds, always one hotkey away. A lightweight recorder that keeps your clip buffer on the GPU and sits in the tray, quiet enough to leave running while you play.</p>
   <div class="cmdfold">
     <button class="cmdtoggle" type="button" aria-expanded="false" aria-controls="heroCmd">Install from the terminal</button>
     <div class="cmd" id="heroCmd"><span class="p">$</span> <span class="cmdtext" id="installCmd">{INSTALL_CMD}</span> <button class="cp" data-copy="#installCmd" aria-live="polite" aria-label="Copy install command">copy</button></div>
@@ -14,7 +14,7 @@ import { APPIMAGE_URL, WIN_SETUP_URL, INSTALL_CMD } from '../data/release';
     <a class="btn mint" id="dlPrimary" href="#download" data-linux={APPIMAGE_URL} data-win={WIN_SETUP_URL}>↓ Download</a>
     <a class="btn ghost" href="https://github.com/gankedtv/rewynd">★ Star on GitHub</a>
   </div>
-  <p class="betanote"><span class="b">Beta</span> Work in progress — expect rough edges. It self-updates, so fixes land fast.</p>
+  <p class="betanote"><span class="b">Beta</span> Work in progress, so expect rough edges. It self-updates, and fixes land fast.</p>
   <div class="platrow">
     <span class="chip"><span class="dot"></span>Linux · AppImage, self-updating</span>
     <span class="chip">Windows · installer</span>
@@ -25,7 +25,7 @@ import { APPIMAGE_URL, WIN_SETUP_URL, INSTALL_CMD } from '../data/release';
 </div></section>
 
 <script>
-  // Progressive enhancement only — the page is fully functional without JS.
+  // Progressive enhancement only: the page is fully functional without JS.
   const os = document.documentElement.dataset.os;
   const dl = document.getElementById('dlPrimary') as HTMLAnchorElement | null;
   // Mobile keeps the generic label + #download anchor: there is no build to point it at.
