@@ -31,8 +31,7 @@ const ogImage = new URL('/assets/logo-512.png', Astro.site).href;
   <meta property="og:image" content={ogImage} />
   <meta property="og:url" content={canonical} />
   <meta name="twitter:card" content="summary_large_image" />
-  <!-- Ahead of the font links: a classic script can't run while a stylesheet above it is
-       still loading, and the stamp has to land before the first paint of the hero. -->
+  <!-- Above the font links: a classic script can't run while an earlier stylesheet loads. -->
   <script is:inline>
     (function () {
       var p = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '';
@@ -41,7 +40,7 @@ const ogImage = new URL('/assets/logo-512.png', Astro.site).href;
       document.documentElement.dataset.os =
         mobile ? 'mobile' : /Win/i.test(p) ? 'win' : /Mac/i.test(p) ? 'mac' : 'linux';
 
-      // The fold is wired here too, so the toggle CSS reveals can never outlive its handler.
+      // Delegated here so the toggle CSS reveals always has a handler.
       document.addEventListener('click', function (e) {
         var btn = e.target instanceof Element ? e.target.closest('.cmdtoggle') : null;
         var fold = btn && btn.closest('.cmdfold');

@@ -60,7 +60,7 @@ section{border-top:1px solid var(--bd);}
 .cmd .cmdtext{flex:1 1 auto;min-width:0;overflow-x:auto;white-space:nowrap}
 .cmd .cp{margin-left:6px;font-size:10.5px;color:var(--ts);border:1px solid var(--bd);border-radius:5px;padding:3px 8px;cursor:pointer}
 .cmd .cp:hover{color:var(--mint);border-color:var(--mintbd)}
-/* Hero one-liner: bare on Linux, folded behind the toggle on macOS, dropped on Windows/mobile. */
+/* Hero one-liner: bare on Linux, folded on macOS, dropped on Windows/mobile. */
 .cmdfold{display:flex;flex-direction:column;align-items:center}
 .cmdtoggle{display:none;font-size:12px;font-weight:600;color:var(--mint);border:1px solid var(--mintbd);background:var(--mintbg);border-radius:999px;padding:6px 13px;margin-bottom:16px;align-items:center;gap:7px}
 .cmdtoggle:hover{border-color:var(--mint)}

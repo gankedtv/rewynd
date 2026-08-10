@@ -11,7 +11,7 @@ import { APPIMAGE_URL, WIN_SETUP_URL, INSTALL_CMD } from '../data/release';
     <div class="cmd" id="heroCmd"><span class="p">$</span> <span class="cmdtext" id="installCmd">{INSTALL_CMD}</span> <button class="cp" data-copy="#installCmd" aria-live="polite" aria-label="Copy install command">copy</button></div>
   </div>
   <div class="ctas">
-    <a class="btn mint" id="dlPrimary" href="#download" data-linux={APPIMAGE_URL} data-win={WIN_SETUP_URL}>↓ Download for Linux</a>
+    <a class="btn mint" id="dlPrimary" href="#download" data-linux={APPIMAGE_URL} data-win={WIN_SETUP_URL}>↓ Download</a>
     <a class="btn ghost" href="https://github.com/gankedtv/rewynd">★ Star on GitHub</a>
   </div>
   <p class="betanote"><span class="b">Beta</span> Work in progress — expect rough edges. It self-updates, so fixes land fast.</p>
@@ -26,19 +26,14 @@ import { APPIMAGE_URL, WIN_SETUP_URL, INSTALL_CMD } from '../data/release';
 
 <script>
   // Progressive enhancement only — the page is fully functional without JS.
-  // Label the primary download button for the visitor's OS, stamped on <html>
-  // in the head. Mobile keeps the generic label + #download anchor: there is no
-  // build for it to point at.
   const os = document.documentElement.dataset.os;
   const dl = document.getElementById('dlPrimary') as HTMLAnchorElement | null;
+  // Mobile keeps the generic label + #download anchor: there is no build to point it at.
   if (dl) {
-    if (os === 'mobile') { dl.textContent = '↓ Download'; }
-    else if (os === 'win') { dl.textContent = '↓ Download for Windows'; dl.href = dl.dataset.win || dl.href; }
-    // Mac stays on the #download anchor: the build is Apple-Silicon-only and the
-    // browser can't tell Apple Silicon from Intel (both report "MacIntel"), so we
-    // route to the labelled card rather than hand an Intel Mac an arm64 package.
+    if (os === 'win') { dl.textContent = '↓ Download for Windows'; dl.href = dl.dataset.win || dl.href; }
+    // Intel and Apple Silicon both report "MacIntel", so Macs go to the labelled card.
     else if (os === 'mac') { dl.textContent = '↓ Download for macOS'; }
-    else { dl.href = dl.dataset.linux || dl.href; }
+    else if (os === 'linux') { dl.textContent = '↓ Download for Linux'; dl.href = dl.dataset.linux || dl.href; }
   }
 
   // Copy-to-clipboard buttons. Without the Clipboard API (insecure context / old

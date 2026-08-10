@@ -52,8 +52,8 @@ Barlow Condensed 900, with a `Beta` badge.
 2. **Nav** (sticky) — logo + `Beta`, section links, ★ GitHub, `Get ganked.tv` (secondary),
    `Download` (primary mint).
 3. **Hero** (stacked, centered) — kicker, H1 "Instant replay for your gameplay.", subhead,
-   one-line `curl … | sh` install with a copy button (Linux only — folded behind an
-   "Install from the terminal" toggle on macOS, dropped on Windows and mobile),
+   one-line `curl … | sh` install with a copy button (shown outright on Linux, folded
+   behind an "Install from the terminal" toggle on macOS, dropped on Windows and mobile),
    Download + Star CTAs, beta/WIP note,
    platform chips, then a large **product shot** of the Library (see §5) with a soft mint
    glow and a "press F10 → clip saved" callout.
