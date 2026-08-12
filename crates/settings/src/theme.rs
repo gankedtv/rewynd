@@ -6,7 +6,9 @@
 
 use std::sync::LazyLock;
 
-use iced::widget::{button, checkbox, column, container, pick_list, row, slider, text, text_input};
+use iced::widget::{
+    button, checkbox, column, container, pick_list, row, slider, text, text_editor, text_input,
+};
 use iced::{Background, Border, Element, Font, Length, Theme, font};
 
 use rewynd_config as config;
@@ -361,6 +363,26 @@ pub fn arena_input(_theme: &Theme, status: text_input::Status) -> text_input::St
             radius: 6.0.into(),
         },
         icon: palette::TEXT_SECONDARY,
+        placeholder: palette::MUTED,
+        value: palette::TEXT,
+        selection: palette::ACCENT_BORDER,
+    }
+}
+
+/// Multi-line input shell, matching [`arena_input`] so a description sits beside a title.
+pub fn arena_editor(_theme: &Theme, status: text_editor::Status) -> text_editor::Style {
+    let border_color = match status {
+        text_editor::Status::Focused { .. } => palette::ACCENT,
+        text_editor::Status::Hovered => palette::BORDER_STRONG,
+        _ => palette::BORDER,
+    };
+    text_editor::Style {
+        background: Background::Color(palette::HIGH),
+        border: Border {
+            color: border_color,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
         placeholder: palette::MUTED,
         value: palette::TEXT,
         selection: palette::ACCENT_BORDER,
