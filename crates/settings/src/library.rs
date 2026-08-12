@@ -19,7 +19,7 @@ use rewynd_upload::youtube::{
 };
 use rewynd_upload::{
     ClipMetadata, Game, GankedClient, MAX_DESCRIPTION_CHARS, MAX_TAGS, TagSuggestion, Visibility,
-    default_title, normalize_tag, titled, user_facing_upload_error,
+    default_title, game_search_name, normalize_tag, titled, user_facing_upload_error,
 };
 
 use crate::anim::lerp_color;
@@ -559,7 +559,7 @@ impl Library {
                 self.upload = UploadState::Idle;
                 self.accent_fade = None;
                 self.title = self.title_hint.clone();
-                self.reset_metadata(detected.clone());
+                self.reset_metadata(detected);
                 let (ganked, youtube) = dest_statuses(config);
                 self.dest = if !ganked.ready() && youtube.ready() {
                     Dest::YouTube
@@ -570,7 +570,7 @@ impl Library {
                 let mut tasks = vec![self.load_open_media(path)];
                 // A detected game is only a name; look it up so the upload can carry the
                 // catalogue id ganked.tv actually stores.
-                if detected.is_some() {
+                if !self.game_input.is_empty() {
                     tasks.push(self.find_games(config));
                 }
                 return Task::batch(tasks);
@@ -1185,8 +1185,12 @@ impl Library {
         self.tag_suggestions.clear();
         self.game = None;
         self.game_results.clear();
-        self.game_autopick = detected_game.is_some();
-        self.game_input = detected_game.unwrap_or_default();
+        // The detected name seeds the catalogue search, minus the trademark decoration a
+        // window title carries.
+        self.game_input = detected_game
+            .map(|g| game_search_name(&g))
+            .unwrap_or_default();
+        self.game_autopick = !self.game_input.is_empty();
         // New generations, so an answer still in flight for the previous clip is dropped.
         self.game_gen = self.game_gen.wrapping_add(1);
         self.tag_gen = self.tag_gen.wrapping_add(1);
@@ -3486,11 +3490,12 @@ mod tests {
         });
         let (game_gen, tag_gen) = (lib.game_gen, lib.tag_gen);
 
-        lib.reset_metadata(Some("Overwatch 2".to_owned()));
+        lib.reset_metadata(Some("Overwatch®".to_owned()));
         assert!(lib.tags.is_empty() && lib.tag_input.is_empty());
         assert_eq!(lib.game, None);
-        // The detected name seeds the search and may still auto-pick its catalogue entry.
-        assert_eq!(lib.game_input, "Overwatch 2");
+        // The detected name seeds the search (searchable, so no trademark mark) and may
+        // still auto-pick its catalogue entry.
+        assert_eq!(lib.game_input, "Overwatch");
         assert!(lib.game_autopick);
         assert_ne!(lib.game_gen, game_gen, "a late answer must not land here");
         assert_ne!(lib.tag_gen, tag_gen);

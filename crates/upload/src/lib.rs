@@ -207,6 +207,23 @@ pub fn normalize_tags<S: AsRef<str>>(raw: &[S]) -> Vec<String> {
     out
 }
 
+/// A detected game name as a catalogue search term. Window titles carry trademark decoration
+/// ("Overwatch®") that a catalogue storing the plain name never matches, so it comes off.
+#[must_use]
+pub fn game_search_name(raw: &str) -> String {
+    let stripped: String = raw
+        .chars()
+        .map(|c| {
+            if matches!(c, '®' | '™' | '©') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    stripped.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// One game from ganked.tv's catalogue, for the upload form's picker.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -1118,6 +1135,15 @@ mod tests {
         assert_eq!(normalize_tag("!!"), None);
         assert_eq!(normalize_tag(&"x".repeat(25)), None);
         assert_eq!(normalize_tag(&"x".repeat(24)).map(|t| t.len()), Some(24));
+    }
+
+    #[test]
+    fn a_detected_game_name_loses_its_trademark_decoration() {
+        // The recorder's own folder name for this game; the catalogue stores "Overwatch".
+        assert_eq!(game_search_name("Overwatch®"), "Overwatch");
+        assert_eq!(game_search_name("Command & Conquer™ "), "Command & Conquer");
+        assert_eq!(game_search_name("  Elden   Ring  "), "Elden Ring");
+        assert_eq!(game_search_name("®"), "");
     }
 
     #[test]
