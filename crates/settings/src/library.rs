@@ -3549,8 +3549,10 @@ mod tests {
         let name = temp.file_name().and_then(|n| n.to_str()).expect("name");
         assert!(name.starts_with('.') && name.ends_with(".tmp"), "{name}");
         assert!(name.contains(UPLOAD_TEMP_MARK), "{name}");
-        // Two goes at one clip must not collide.
-        assert_ne!(temp, upload_temp_path(Path::new("/clips/rewynd-1-0.mp4")));
+        // Two goes at the same clip must not collide.
+        let again = upload_temp_path(Path::new("/clips/Elden Ring/rewynd-1-0.mp4"));
+        assert_eq!(again.parent(), temp.parent());
+        assert_ne!(again, temp);
     }
 
     #[test]
