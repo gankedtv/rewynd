@@ -24,6 +24,18 @@ pub const DEFAULT_MAX_CLIP_SECS: u64 = 120;
 const SERVER_CLIP_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=3600;
 /// Server-side title length cap (characters).
 const MAX_TITLE_CHARS: usize = 255;
+/// Description cap, matching what ganked.tv's own upload form allows (the API's hard ceiling is
+/// higher, but the form is what this mirrors).
+pub const MAX_DESCRIPTION_CHARS: usize = 500;
+/// Tag slug bounds and the per-clip count, mirrored from the server's normalizer; a list longer
+/// than this is rejected outright rather than truncated server-side.
+const MIN_TAG_CHARS: usize = 2;
+const MAX_TAG_CHARS: usize = 24;
+pub const MAX_TAGS: usize = 5;
+/// Suggestions pulled per keystroke for the game and tag pickers.
+const SUGGESTION_LIMIT: u32 = 8;
+/// Server-side cap on a `?search=` term; a longer one is a 400, so trim locally.
+const MAX_SEARCH_CHARS: usize = 100;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const API_TIMEOUT: Duration = Duration::from_secs(30);
@@ -90,6 +102,144 @@ impl std::fmt::Display for Visibility {
             Self::Private => "Private",
         })
     }
+}
+
+/// What gets published alongside the clip file: the fields ganked.tv's own upload form offers.
+/// Both destinations read it, each taking what it supports (YouTube has no game catalogue).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClipMetadata {
+    pub title: String,
+    pub description: String,
+    /// Free text as typed; [`normalize_tags`] slugs it on the way out.
+    pub tags: Vec<String>,
+    /// The ganked.tv catalogue id of the game, when one was picked.
+    pub game_id: Option<i32>,
+    pub visibility: Visibility,
+}
+
+impl ClipMetadata {
+    /// Bare metadata: a title at the given visibility, nothing else set.
+    #[must_use]
+    pub fn new(title: impl Into<String>, visibility: Visibility) -> Self {
+        Self {
+            title: title.into(),
+            visibility,
+            ..Self::default()
+        }
+    }
+
+    /// The title as it will be sent (clamped to the server's cap).
+    #[must_use]
+    pub fn sent_title(&self) -> &str {
+        truncate_chars(&self.title, MAX_TITLE_CHARS)
+    }
+
+    /// The description as it will be sent: trimmed, clamped, possibly empty.
+    #[must_use]
+    pub fn sent_description(&self) -> &str {
+        truncate_chars(self.description.trim(), MAX_DESCRIPTION_CHARS)
+    }
+
+    /// The `POST /clips` body. Optional fields are omitted rather than sent empty, so a clip
+    /// without them looks the same as one created before they existed.
+    fn create_body(&self) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "title": self.sent_title(),
+            "visibility": self.visibility.as_str(),
+        });
+        let fields = body
+            .as_object_mut()
+            .expect("json! built an object literal here");
+        let description = self.sent_description();
+        if !description.is_empty() {
+            fields.insert("description".to_owned(), description.into());
+        }
+        if let Some(id) = self.game_id {
+            fields.insert("gameId".to_owned(), id.into());
+        }
+        let tags = normalize_tags(&self.tags);
+        if !tags.is_empty() {
+            fields.insert("tags".to_owned(), tags.into());
+        }
+        body
+    }
+}
+
+/// Normalize one raw tag into the slug ganked.tv stores, mirroring the server: ASCII letters
+/// lowercase, digits kept, whitespace/`-`/`_` collapsing to a single `-`, everything else
+/// dropped. `None` when what survives falls outside the server's length range, i.e. the tag
+/// would be rejected.
+#[must_use]
+pub fn normalize_tag(raw: &str) -> Option<String> {
+    let mut slug = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if (ch == '-' || ch == '_' || ch.is_whitespace())
+            && !slug.is_empty()
+            && !slug.ends_with('-')
+        {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_end_matches('-');
+    // Slugs are ASCII by construction, so byte length is the character count the server counts.
+    (MIN_TAG_CHARS..=MAX_TAG_CHARS)
+        .contains(&slug.len())
+        .then(|| slug.to_owned())
+}
+
+/// The tag list actually sent: normalized, de-duplicated, and capped at [`MAX_TAGS`].
+#[must_use]
+pub fn normalize_tags<S: AsRef<str>>(raw: &[S]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for tag in raw {
+        let Some(slug) = normalize_tag(tag.as_ref()) else {
+            continue;
+        };
+        if !out.contains(&slug) {
+            out.push(slug);
+            if out.len() == MAX_TAGS {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// A detected game name as a catalogue search term. Window titles carry trademark decoration
+/// ("Overwatch®") that a catalogue storing the plain name never matches, so it comes off.
+#[must_use]
+pub fn game_search_name(raw: &str) -> String {
+    let stripped: String = raw
+        .chars()
+        .map(|c| {
+            if matches!(c, '®' | '™' | '©') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    stripped.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// One game from ganked.tv's catalogue, for the upload form's picker.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Game {
+    pub id: i32,
+    pub name: String,
+    pub slug: String,
+}
+
+/// One tag ganked.tv already knows, for the tag field's autocomplete.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TagSuggestion {
+    pub slug: String,
+    #[serde(default)]
+    pub clip_count: u32,
 }
 
 /// Errors from talking to ganked.tv.
@@ -291,8 +441,7 @@ impl GankedClient {
     pub async fn upload(
         &self,
         path: &Path,
-        title: &str,
-        visibility: Visibility,
+        meta: &ClipMetadata,
     ) -> Result<UploadedClip, UploadError> {
         // Size check up front (before a clip record exists); the file itself is read only once
         // the presigned URL is in hand, to keep the in-memory window as short as possible.
@@ -323,10 +472,7 @@ impl GankedClient {
         }
 
         let created: CreatedClip = self
-            .api_json(self.http.post(self.url("/clips")).json(&serde_json::json!({
-                "title": clamp_title(title),
-                "visibility": visibility.as_str(),
-            })))
+            .api_json(self.http.post(self.url("/clips")).json(&meta.create_body()))
             .await?;
 
         let target: UploadTarget = self
@@ -378,6 +524,33 @@ impl GankedClient {
             share_code: status.share_code,
             status: status.status,
         })
+    }
+
+    /// Search the game catalogue for the upload form's picker. An empty query lists the
+    /// catalogue's head, which is what the field shows before the user types.
+    pub async fn search_games(&self, query: &str) -> Result<Vec<Game>, UploadError> {
+        let mut req = self
+            .http
+            .get(self.url("/games"))
+            .query(&[("limit", SUGGESTION_LIMIT)]);
+        let query = truncate_chars(query.trim(), MAX_SEARCH_CHARS);
+        if !query.is_empty() {
+            req = req.query(&[("search", query)]);
+        }
+        self.api_json(req).await
+    }
+
+    /// Tags ganked.tv already knows that start with `prefix` (the server normalizes it, so the
+    /// user's literal keystrokes can go straight out).
+    pub async fn suggest_tags(&self, prefix: &str) -> Result<Vec<TagSuggestion>, UploadError> {
+        let prefix = truncate_chars(prefix.trim(), MAX_TAG_CHARS);
+        self.api_json(
+            self.http
+                .get(self.url("/tags"))
+                .query(&[("prefix", prefix)])
+                .query(&[("limit", SUGGESTION_LIMIT)]),
+        )
+        .await
     }
 
     /// Read a clip's current processing status (a richer view than [`upload`](Self::upload)
@@ -699,11 +872,6 @@ fn clip_duration(path: &Path) -> Option<Duration> {
     Some(reader.duration())
 }
 
-/// Truncate to the server's title cap on a character boundary.
-fn clamp_title(title: &str) -> &str {
-    truncate_chars(title, MAX_TITLE_CHARS)
-}
-
 /// A short slice of a non-JSON error body for diagnostics.
 pub(crate) fn snippet(body: &str) -> &str {
     let trimmed = body.trim();
@@ -797,7 +965,10 @@ mod tests {
         // Port 9 (discard) is never a ganked.tv server: reaching it at all would fail the
         // test with an Http error instead of the expected pre-check.
         let client = GankedClient::new("http://127.0.0.1:9", "gtv_k").expect("client");
-        match client.upload(&path, "t", Visibility::Unlisted).await {
+        match client
+            .upload(&path, &ClipMetadata::new("t", Visibility::Unlisted))
+            .await
+        {
             Err(UploadError::TooLong { secs, max }) => {
                 assert_eq!(max, DEFAULT_MAX_CLIP_SECS);
                 assert!(secs > DEFAULT_MAX_CLIP_SECS, "{secs}");
@@ -811,7 +982,10 @@ mod tests {
     async fn a_short_clip_passes_the_length_guard() {
         let path = mp4_spanning(5);
         let client = GankedClient::new("http://127.0.0.1:9", "gtv_k").expect("client");
-        match client.upload(&path, "t", Visibility::Unlisted).await {
+        match client
+            .upload(&path, &ClipMetadata::new("t", Visibility::Unlisted))
+            .await
+        {
             Err(UploadError::TooLong { .. }) => panic!("5s must pass the default guard"),
             Err(_) => {}
             Ok(_) => panic!("nothing is listening on the discard port"),
@@ -827,7 +1001,7 @@ mod tests {
         // Under the default cap, a 90s clip is fine...
         if let Err(UploadError::TooLong { .. }) = client
             .clone()
-            .upload(&path, "t", Visibility::Unlisted)
+            .upload(&path, &ClipMetadata::new("t", Visibility::Unlisted))
             .await
         {
             panic!("90s is under the {DEFAULT_MAX_CLIP_SECS}s default");
@@ -835,7 +1009,7 @@ mod tests {
         // ...but a deployment that reported a lower cap must be honored.
         match client
             .with_max_clip_secs(60)
-            .upload(&path, "t", Visibility::Unlisted)
+            .upload(&path, &ClipMetadata::new("t", Visibility::Unlisted))
             .await
         {
             Err(UploadError::TooLong { secs, max }) => {
@@ -927,10 +1101,93 @@ mod tests {
     }
 
     #[test]
-    fn titles_are_clamped_on_char_boundaries() {
-        assert_eq!(clamp_title("short"), "short");
-        let long: String = "é".repeat(300);
-        assert_eq!(clamp_title(&long).chars().count(), 255);
+    fn titles_and_descriptions_are_clamped_on_char_boundaries() {
+        let short = ClipMetadata {
+            description: "  hi  ".to_owned(),
+            ..ClipMetadata::new("short", Visibility::Public)
+        };
+        assert_eq!(short.sent_title(), "short");
+        assert_eq!(short.sent_description(), "hi");
+
+        let long = ClipMetadata {
+            description: "é".repeat(900),
+            ..ClipMetadata::new("é".repeat(300), Visibility::Public)
+        };
+        assert_eq!(long.sent_title().chars().count(), MAX_TITLE_CHARS);
+        assert_eq!(
+            long.sent_description().chars().count(),
+            MAX_DESCRIPTION_CHARS
+        );
+    }
+
+    #[test]
+    fn tags_normalize_the_way_the_server_does() {
+        assert_eq!(normalize_tag("Clutch Play").as_deref(), Some("clutch-play"));
+        assert_eq!(normalize_tag("  ACE  ").as_deref(), Some("ace"));
+        assert_eq!(
+            normalize_tag("one__two--three").as_deref(),
+            Some("one-two-three")
+        );
+        assert_eq!(normalize_tag("héro!").as_deref(), Some("hro"));
+        // Outside the server's 2..=24 range, so it would be rejected.
+        assert_eq!(normalize_tag("a"), None);
+        assert_eq!(normalize_tag("  "), None);
+        assert_eq!(normalize_tag("!!"), None);
+        assert_eq!(normalize_tag(&"x".repeat(25)), None);
+        assert_eq!(normalize_tag(&"x".repeat(24)).map(|t| t.len()), Some(24));
+    }
+
+    #[test]
+    fn a_detected_game_name_loses_its_trademark_decoration() {
+        // The recorder's own folder name for this game; the catalogue stores "Overwatch".
+        assert_eq!(game_search_name("Overwatch®"), "Overwatch");
+        assert_eq!(game_search_name("Command & Conquer™ "), "Command & Conquer");
+        assert_eq!(game_search_name("  Elden   Ring  "), "Elden Ring");
+        assert_eq!(game_search_name("®"), "");
+    }
+
+    #[test]
+    fn the_tag_list_is_deduped_and_capped() {
+        let raw = [
+            "Clutch Play",
+            "clutch-play", // the same slug typed differently
+            "a",           // too short to survive
+            "one",
+            "two",
+            "three",
+            "four",
+            "five", // past the cap
+        ];
+        assert_eq!(
+            normalize_tags(&raw),
+            ["clutch-play", "one", "two", "three", "four"]
+        );
+        assert!(normalize_tags::<&str>(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_create_body_omits_the_fields_that_were_left_empty() {
+        let bare = ClipMetadata::new("t", Visibility::Public);
+        assert_eq!(
+            bare.create_body(),
+            serde_json::json!({ "title": "t", "visibility": "public" })
+        );
+        let full = ClipMetadata {
+            description: "context".to_owned(),
+            tags: vec!["Clutch Play".to_owned(), "!".to_owned()],
+            game_id: Some(42),
+            ..ClipMetadata::new("t", Visibility::Unlisted)
+        };
+        assert_eq!(
+            full.create_body(),
+            serde_json::json!({
+                "title": "t",
+                "visibility": "unlisted",
+                "description": "context",
+                "gameId": 42,
+                "tags": ["clutch-play"],
+            })
+        );
     }
 
     #[test]
@@ -1011,7 +1268,7 @@ mod tests {
         let client =
             GankedClient::new(&format!("{}/", server.uri()), "gtv_testkey").expect("client");
         let clip = client
-            .upload(&file, "my clip", Visibility::Unlisted)
+            .upload(&file, &ClipMetadata::new("my clip", Visibility::Unlisted))
             .await
             .expect("upload succeeds");
         assert_eq!(clip.id, "clip-1");
@@ -1022,6 +1279,109 @@ mod tests {
             Some("https://ganked.tv/c/zz99".to_owned())
         );
         let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn the_full_form_reaches_the_clip_record() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/clips"))
+            .and(body_json(serde_json::json!({
+                "title": "my clip",
+                "visibility": "public",
+                "description": "the last round",
+                "gameId": 7,
+                "tags": ["clutch-play", "ace"],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "c"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The flow stops at the upload-url step; the create body is what this asserts.
+        let file = clip_file(b"mp4!");
+        let client = GankedClient::new(&server.uri(), "gtv_k").expect("client");
+        let meta = ClipMetadata {
+            description: "  the last round  ".to_owned(),
+            tags: vec!["Clutch Play".to_owned(), "ACE".to_owned()],
+            game_id: Some(7),
+            ..ClipMetadata::new("my clip", Visibility::Public)
+        };
+        let _ = client.upload(&file, &meta).await;
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn game_search_and_tag_suggestions_carry_the_query_and_the_key() {
+        let server = MockServer::start().await;
+        let auth = || header("authorization", "Bearer gtv_testkey");
+        use wiremock::matchers::query_param;
+
+        Mock::given(method("GET"))
+            .and(path("/games"))
+            .and(auth())
+            .and(query_param("search", "elden"))
+            .and(query_param("limit", SUGGESTION_LIMIT.to_string()))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": 12,
+                    "name": "Elden Ring",
+                    "slug": "elden-ring",
+                    "tag": "eldenring",
+                    "coverUrl": null,
+                }])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/tags"))
+            .and(auth())
+            .and(query_param("prefix", "clu"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": 3,
+                    "slug": "clutch-play",
+                    "name": "clutch-play",
+                    "clipCount": 9,
+                }])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = GankedClient::new(&server.uri(), "gtv_testkey").expect("client");
+        let games = client.search_games("  elden  ").await.expect("games");
+        assert_eq!(
+            games,
+            [Game {
+                id: 12,
+                name: "Elden Ring".to_owned(),
+                slug: "elden-ring".to_owned(),
+            }]
+        );
+        let tags = client.suggest_tags("clu").await.expect("tags");
+        assert_eq!(
+            tags,
+            [TagSuggestion {
+                slug: "clutch-play".to_owned(),
+                clip_count: 9,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_game_query_lists_the_catalogue_head() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/games"))
+            // No `search` at all, rather than an empty one the server would LIKE-match.
+            .and(|req: &wiremock::Request| !req.url.query_pairs().any(|(k, _)| k == "search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = GankedClient::new(&server.uri(), "gtv_k").expect("client");
+        assert!(client.search_games("   ").await.expect("games").is_empty());
     }
 
     #[tokio::test]
@@ -1065,7 +1425,7 @@ mod tests {
         let file = clip_file(b"mp4!");
         let client = GankedClient::new(&server.uri(), "gtv_k").expect("client");
         let clip = client
-            .upload(&file, "t", Visibility::Public)
+            .upload(&file, &ClipMetadata::new("t", Visibility::Public))
             .await
             .expect("flow completes");
         assert!(clip.failed(), "failed status must surface to the caller");
@@ -1196,7 +1556,7 @@ mod tests {
         let file = clip_file(b"mp4!");
         let client = GankedClient::new(&server.uri(), "gtv_bad").expect("client");
         let err = client
-            .upload(&file, "t", Visibility::Public)
+            .upload(&file, &ClipMetadata::new("t", Visibility::Public))
             .await
             .expect_err("401 fails");
         match err {
@@ -1223,7 +1583,7 @@ mod tests {
             .mount(&server)
             .await;
         let err = client
-            .upload(&file, "t", Visibility::Public)
+            .upload(&file, &ClipMetadata::new("t", Visibility::Public))
             .await
             .expect_err("400 fails");
         match err {
@@ -1243,7 +1603,7 @@ mod tests {
             .mount(&server)
             .await;
         let err = client
-            .upload(&file, "t", Visibility::Public)
+            .upload(&file, &ClipMetadata::new("t", Visibility::Public))
             .await
             .expect_err("400 fails");
         match err {
@@ -1268,7 +1628,7 @@ mod tests {
         let file = clip_file(b"mp4!");
         let client = GankedClient::new(&server.uri(), "gtv_k").expect("client");
         match client
-            .upload(&file, "t", Visibility::Public)
+            .upload(&file, &ClipMetadata::new("t", Visibility::Public))
             .await
             .expect_err("502 fails")
         {
@@ -1312,7 +1672,7 @@ mod tests {
         let file = clip_file(b"mp4!");
         let client = GankedClient::new(&server.uri(), "gtv_k").expect("client");
         match client
-            .upload(&file, "t", Visibility::Public)
+            .upload(&file, &ClipMetadata::new("t", Visibility::Public))
             .await
             .expect_err("storage 403 fails")
         {
@@ -1331,7 +1691,7 @@ mod tests {
             .expect("client")
             .with_max_upload_bytes(3);
         match client
-            .upload(&file, "t", Visibility::Public)
+            .upload(&file, &ClipMetadata::new("t", Visibility::Public))
             .await
             .expect_err("too large")
         {
@@ -1516,7 +1876,10 @@ mod tests {
     async fn missing_file_is_an_io_error() {
         let client = GankedClient::new("http://127.0.0.1:1", "gtv_k").expect("client");
         match client
-            .upload(Path::new("/nonexistent/clip.mp4"), "t", Visibility::Public)
+            .upload(
+                Path::new("/nonexistent/clip.mp4"),
+                &ClipMetadata::new("t", Visibility::Public),
+            )
             .await
             .expect_err("missing file")
         {

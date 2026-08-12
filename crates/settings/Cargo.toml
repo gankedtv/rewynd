@@ -21,7 +21,8 @@ rewynd-mux.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 # Runs the stop-and-relaunch off the UI thread (spawn_blocking) so the window never freezes.
-tokio.workspace = true
+# `time` drives the debounce behind the upload form's game/tag autocomplete.
+tokio = { workspace = true, features = ["time"] }
 # In-app updater: VelopackApp install/update hooks run first in main, and the nav-bar
 # "Check for updates" button drives check → download → stop recorder → apply/restart.
 velopack.workspace = true

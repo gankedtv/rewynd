@@ -12,7 +12,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::Visibility;
+use crate::{ClipMetadata, normalize_tags};
 
 /// Compile-time default OAuth client id (a desktop-app client id is not a secret; Google's
 /// installed-app model embeds it). Empty when the build didn't provide one.
@@ -153,13 +153,13 @@ impl YouTubeClient {
         })
     }
 
-    /// Upload the MP4 at `path` with `title` and return the video id. Visibility maps 1:1 onto
-    /// YouTube's `privacyStatus` (the config strings are Google's exact values).
+    /// Upload the MP4 at `path` with `meta` and return the video id. Visibility maps 1:1 onto
+    /// YouTube's `privacyStatus` (the config strings are Google's exact values); the game is
+    /// ganked.tv's alone and has no YouTube counterpart.
     pub async fn upload(
         &self,
         path: &Path,
-        title: &str,
-        visibility: Visibility,
+        meta: &ClipMetadata,
     ) -> Result<UploadedVideo, YouTubeError> {
         let size = tokio::fs::metadata(path).await?.len();
         if size > MAX_UPLOAD_BYTES {
@@ -181,9 +181,9 @@ impl YouTubeClient {
                 .header("X-Upload-Content-Length", size)
                 .header("X-Upload-Content-Type", "video/mp4")
                 .json(&serde_json::json!({
-                    "snippet": { "title": title },
+                    "snippet": snippet(meta),
                     "status": {
-                        "privacyStatus": visibility.as_str(),
+                        "privacyStatus": meta.visibility.as_str(),
                         "selfDeclaredMadeForKids": false,
                     },
                 })),
@@ -606,6 +606,25 @@ fn map_token_error(status: u16, body: &str) -> YouTubeError {
     }
 }
 
+/// The `videos.insert` snippet for `meta`. Description and tags are omitted when empty so a
+/// clip without them carries no blank fields, and the tags go out as the same slugs ganked.tv
+/// stores, well inside YouTube's own per-tag and total length limits.
+fn snippet(meta: &ClipMetadata) -> serde_json::Value {
+    let mut snippet = serde_json::json!({ "title": meta.sent_title() });
+    let fields = snippet
+        .as_object_mut()
+        .expect("json! built an object literal here");
+    let description = meta.sent_description();
+    if !description.is_empty() {
+        fields.insert("description".to_owned(), description.into());
+    }
+    let tags = normalize_tags(&meta.tags);
+    if !tags.is_empty() {
+        fields.insert("tags".to_owned(), tags.into());
+    }
+    snippet
+}
+
 /// Total-request deadline for the video PUT, scaled to the file size.
 fn put_timeout(size: u64) -> Duration {
     PUT_BASE_TIMEOUT + Duration::from_secs(size / PUT_MIN_RATE_BYTES_PER_SEC)
@@ -679,6 +698,7 @@ pub fn user_facing_youtube_error(e: &YouTubeError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Visibility;
     use wiremock::matchers::{body_string_contains, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -931,6 +951,28 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn the_snippet_carries_the_description_and_tags_when_set() {
+        let bare = ClipMetadata::new("t", Visibility::Public);
+        assert_eq!(snippet(&bare), serde_json::json!({ "title": "t" }));
+
+        let full = ClipMetadata {
+            description: "  the last round  ".to_owned(),
+            tags: vec!["Clutch Play".to_owned(), "!".to_owned()],
+            // The game is ganked.tv's alone; YouTube's snippet must not grow a field for it.
+            game_id: Some(7),
+            ..ClipMetadata::new("t", Visibility::Public)
+        };
+        assert_eq!(
+            snippet(&full),
+            serde_json::json!({
+                "title": "t",
+                "description": "the last round",
+                "tags": ["clutch-play"],
+            })
+        );
+    }
+
     #[tokio::test]
     async fn happy_path_refreshes_inits_and_puts_with_the_bearer() {
         let server = MockServer::start().await;
@@ -971,7 +1013,7 @@ mod tests {
         let file = clip_file(b"mp4!");
         let client = test_client(&server);
         let video = client
-            .upload(&file, "my clip", Visibility::Unlisted)
+            .upload(&file, &ClipMetadata::new("my clip", Visibility::Unlisted))
             .await
             .expect("upload succeeds");
         assert_eq!(video.id, "vid123");
@@ -1004,7 +1046,7 @@ mod tests {
         let client = test_client(&server);
         for _ in 0..2 {
             client
-                .upload(&file, "t", Visibility::Public)
+                .upload(&file, &ClipMetadata::new("t", Visibility::Public))
                 .await
                 .expect("upload succeeds");
         }
@@ -1026,7 +1068,9 @@ mod tests {
         let file = clip_file(b"mp4!");
         let client = test_client(&server);
         assert!(matches!(
-            client.upload(&file, "t", Visibility::Public).await,
+            client
+                .upload(&file, &ClipMetadata::new("t", Visibility::Public))
+                .await,
             Err(YouTubeError::NeedsReauth)
         ));
         let _ = std::fs::remove_file(&file);
@@ -1050,7 +1094,9 @@ mod tests {
         let file = clip_file(b"mp4!");
         let client = test_client(&server);
         assert!(matches!(
-            client.upload(&file, "t", Visibility::Public).await,
+            client
+                .upload(&file, &ClipMetadata::new("t", Visibility::Public))
+                .await,
             Err(YouTubeError::QuotaExceeded)
         ));
 
@@ -1069,7 +1115,9 @@ mod tests {
             .await;
         let client = test_client(&server);
         assert!(matches!(
-            client.upload(&file, "t", Visibility::Public).await,
+            client
+                .upload(&file, &ClipMetadata::new("t", Visibility::Public))
+                .await,
             Err(YouTubeError::UploadLimitExceeded)
         ));
         let _ = std::fs::remove_file(&file);
@@ -1092,7 +1140,10 @@ mod tests {
             .await;
         let file = clip_file(b"mp4!");
         let client = test_client(&server);
-        match client.upload(&file, "t", Visibility::Public).await {
+        match client
+            .upload(&file, &ClipMetadata::new("t", Visibility::Public))
+            .await
+        {
             Err(YouTubeError::Api {
                 status,
                 reason,
@@ -1119,7 +1170,9 @@ mod tests {
         let file = clip_file(b"mp4!");
         let client = test_client(&server);
         assert!(matches!(
-            client.upload(&file, "t", Visibility::Public).await,
+            client
+                .upload(&file, &ClipMetadata::new("t", Visibility::Public))
+                .await,
             Err(YouTubeError::NoUploadUrl)
         ));
         let _ = std::fs::remove_file(&file);
@@ -1130,7 +1183,10 @@ mod tests {
         let client = YouTubeClient::new("cid", "s", "rt").expect("client");
         assert!(matches!(
             client
-                .upload(Path::new("/nonexistent/clip.mp4"), "t", Visibility::Public)
+                .upload(
+                    Path::new("/nonexistent/clip.mp4"),
+                    &ClipMetadata::new("t", Visibility::Public)
+                )
                 .await,
             Err(YouTubeError::Io(_))
         ));

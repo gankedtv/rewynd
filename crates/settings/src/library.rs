@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use iced::widget::{
-    Space, button, column, container, pick_list, row, scrollable, text, text_input,
+    Space, button, column, container, pick_list, row, scrollable, text, text_editor, text_input,
 };
 use iced::{Background, Border, Element, Length, Task, Theme};
 
@@ -17,7 +17,10 @@ use rewynd_config::{ClipEntry, Config};
 use rewynd_upload::youtube::{
     DEFAULT_CLIENT_ID, DEFAULT_CLIENT_SECRET, YouTubeClient, user_facing_youtube_error,
 };
-use rewynd_upload::{GankedClient, Visibility, default_title, titled, user_facing_upload_error};
+use rewynd_upload::{
+    ClipMetadata, Game, GankedClient, MAX_DESCRIPTION_CHARS, MAX_TAGS, TagSuggestion, Visibility,
+    default_title, game_search_name, normalize_tag, titled, user_facing_upload_error,
+};
 
 use crate::anim::lerp_color;
 use crate::player;
@@ -64,6 +67,17 @@ const PREVIEW_HEIGHT: f32 = 240.0;
 
 /// Buckets in the timeline's audio-peak lane.
 const WAVEFORM_BUCKETS: usize = 300;
+
+/// How far a trim handle must sit from the clip's edge to count as a cut, in seconds. Below
+/// this the range is the whole clip and saving it would only copy the file.
+const TRIM_EPSILON: f32 = 0.05;
+
+/// The shortest range a trim may keep, in seconds.
+const MIN_TRIM_SECS: f32 = 0.2;
+
+/// How long the game/tag fields wait after the last keystroke before asking ganked.tv, so a
+/// typed word is one request instead of one per letter.
+const SUGGEST_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// An upload destination the detail page can send a clip to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +236,20 @@ pub enum Message {
         result: Result<PathBuf, String>,
     },
     TitleEdited(String),
+    DescriptionEdited(text_editor::Action),
+    GameSearchEdited(String),
+    /// The debounce for generation `n` elapsed; the search runs only if `n` is still current.
+    GameSearchFired(u64),
+    GamesFound(u64, Vec<Game>),
+    GamePicked(Game),
+    GameCleared,
+    TagInputEdited(String),
+    /// Commit whatever is in the tag field (Enter, a comma, or the Add button).
+    TagCommitted,
+    TagAdded(String),
+    TagRemoved(String),
+    TagSearchFired(u64),
+    TagsSuggested(u64, Vec<TagSuggestion>),
     DestPicked(Dest),
     VisibilityPicked(Visibility),
     UploadPressed,
@@ -338,6 +366,24 @@ pub struct Library {
     /// The suggested title, snapshotted when the detail page opens (recomputing it per
     /// `view()` would make the placeholder's minute stamp tick while the page sits open).
     title_hint: String,
+    description: text_editor::Content,
+    /// The description's length, kept alongside it so the counter costs no per-frame text read.
+    description_chars: usize,
+    /// Committed tags, already in ganked.tv's slug form, at most [`MAX_TAGS`].
+    tags: Vec<String>,
+    tag_input: String,
+    tag_suggestions: Vec<TagSuggestion>,
+    /// The game picked from ganked.tv's catalogue, if any (YouTube has no counterpart).
+    game: Option<Game>,
+    game_input: String,
+    game_results: Vec<Game>,
+    /// Whether a catalogue answer may still auto-pick the detected game (cleared once the
+    /// user types, so their own search is never overruled).
+    game_autopick: bool,
+    /// Newest issued generation per picker: a keystroke bumps it, so a debounce that fires
+    /// late (or an answer that lands late) is dropped instead of overwriting fresher input.
+    game_gen: u64,
+    tag_gen: u64,
     dest: Dest,
     /// An in-flight destination-accent fade, or `None` when the panel sits on a fixed brand.
     accent_fade: Option<AccentFade>,
@@ -385,6 +431,17 @@ impl Library {
             action_error: None,
             title: String::new(),
             title_hint: String::new(),
+            description: text_editor::Content::new(),
+            description_chars: 0,
+            tags: Vec::new(),
+            tag_input: String::new(),
+            tag_suggestions: Vec::new(),
+            game: None,
+            game_input: String::new(),
+            game_results: Vec::new(),
+            game_autopick: false,
+            game_gen: 0,
+            tag_gen: 0,
             dest: Dest::Ganked,
             accent_fade: None,
             visibility: Visibility::default(),
@@ -495,12 +552,14 @@ impl Library {
                     Some(game) => titled(game),
                     None => default_title(),
                 };
+                let detected = self.entry(&path).and_then(|e| e.game.clone());
                 self.open = Some(path.clone());
                 self.confirm_delete = false;
                 self.action_error = None;
                 self.upload = UploadState::Idle;
                 self.accent_fade = None;
                 self.title = self.title_hint.clone();
+                self.reset_metadata(detected);
                 let (ganked, youtube) = dest_statuses(config);
                 self.dest = if !ganked.ready() && youtube.ready() {
                     Dest::YouTube
@@ -508,7 +567,13 @@ impl Library {
                     Dest::Ganked
                 };
                 self.visibility = self.default_visibility(config);
-                return self.load_open_media(path);
+                let mut tasks = vec![self.load_open_media(path)];
+                // A detected game is only a name; look it up so the upload can carry the
+                // catalogue id ganked.tv actually stores.
+                if !self.game_input.is_empty() {
+                    tasks.push(self.find_games(config));
+                }
+                return Task::batch(tasks);
             }
             Message::Back => self.show_grid(),
             Message::SummaryLoaded(path, dur) => {
@@ -574,7 +639,7 @@ impl Library {
             }
             Message::TrimStartChanged(v) => {
                 // Keep at least a small gap below the end.
-                self.trim_start = v.clamp(0.0, (self.trim_end - 0.2).max(0.0));
+                self.trim_start = v.clamp(0.0, (self.trim_end - MIN_TRIM_SECS).max(0.0));
                 self.trim = TrimState::Idle;
                 // Editing the range pauses playback; the preview scrubs to the handle instead.
                 self.play_range = None;
@@ -585,7 +650,7 @@ impl Library {
             }
             Message::TrimEndChanged(v) => {
                 let hi = self.open_duration();
-                self.trim_end = v.clamp(self.trim_start + 0.2, hi.max(0.2));
+                self.trim_end = v.clamp(self.trim_start + MIN_TRIM_SECS, hi.max(MIN_TRIM_SECS));
                 self.trim = TrimState::Idle;
                 self.play_range = None;
                 self.play_frame = None;
@@ -640,6 +705,96 @@ impl Library {
                 }
             }
             Message::TitleEdited(s) => self.title = s,
+            Message::DescriptionEdited(action) => {
+                if let Some(action) = self.within_description_cap(action) {
+                    self.description.perform(action);
+                    self.description_chars = self.description.text().chars().count();
+                }
+            }
+            Message::GameSearchEdited(query) => {
+                self.game_input = query;
+                self.game_autopick = false;
+                self.game_results.clear();
+                return debounce(&mut self.game_gen, Message::GameSearchFired);
+            }
+            Message::GameSearchFired(issued) => {
+                if issued == self.game_gen {
+                    return self.find_games(config);
+                }
+            }
+            Message::GamesFound(issued, games) => {
+                if issued != self.game_gen {
+                    return Task::none();
+                }
+                // The detected game name is a local guess; only an exact catalogue name takes
+                // it, so a near-miss stays a suggestion the user confirms.
+                let exact = self
+                    .game_autopick
+                    .then(|| {
+                        games
+                            .iter()
+                            .find(|g| g.name.eq_ignore_ascii_case(self.game_input.trim()))
+                            .cloned()
+                    })
+                    .flatten();
+                self.game_autopick = false;
+                match exact {
+                    Some(game) => {
+                        self.game_input = game.name.clone();
+                        self.game = Some(game);
+                        self.drop_pending_games();
+                    }
+                    None => self.game_results = games,
+                }
+            }
+            Message::GamePicked(game) => {
+                self.game_input = game.name.clone();
+                self.game = Some(game);
+                self.drop_pending_games();
+            }
+            Message::GameCleared => {
+                self.game = None;
+                self.game_input.clear();
+                self.game_autopick = false;
+                self.drop_pending_games();
+            }
+            Message::TagInputEdited(input) => {
+                // A comma ends a tag, the way every tag field does; a pasted list ends all
+                // but its trailing fragment, which stays in the box.
+                if input.contains(',') {
+                    let mut parts: Vec<&str> = input.split(',').collect();
+                    let trailing = parts.pop().unwrap_or_default().to_owned();
+                    for part in parts {
+                        self.add_tag(part);
+                    }
+                    self.tag_input = trailing;
+                    self.drop_pending_tags();
+                    return Task::none();
+                }
+                self.tag_input = input;
+                return debounce(&mut self.tag_gen, Message::TagSearchFired);
+            }
+            Message::TagCommitted => {
+                let raw = std::mem::take(&mut self.tag_input);
+                self.add_tag(&raw);
+                self.drop_pending_tags();
+            }
+            Message::TagAdded(raw) => {
+                self.add_tag(&raw);
+                self.tag_input.clear();
+                self.drop_pending_tags();
+            }
+            Message::TagRemoved(slug) => self.tags.retain(|t| t != &slug),
+            Message::TagSearchFired(issued) => {
+                if issued == self.tag_gen {
+                    return self.suggest_tags(config);
+                }
+            }
+            Message::TagsSuggested(issued, suggestions) => {
+                if issued == self.tag_gen {
+                    self.tag_suggestions = suggestions;
+                }
+            }
             Message::DestPicked(dest) => {
                 if self.dest != dest {
                     let from = self.current_accent();
@@ -1020,6 +1175,146 @@ impl Library {
         }
     }
 
+    /// Empty the upload form for a freshly opened clip, seeding the game field with the name
+    /// the recorder detected (a lookup then turns it into a catalogue entry).
+    fn reset_metadata(&mut self, detected_game: Option<String>) {
+        self.description = text_editor::Content::new();
+        self.description_chars = 0;
+        self.tags.clear();
+        self.tag_input.clear();
+        self.tag_suggestions.clear();
+        self.game = None;
+        self.game_results.clear();
+        // The detected name seeds the catalogue search, minus the trademark decoration a
+        // window title carries.
+        self.game_input = detected_game
+            .map(|g| game_search_name(&g))
+            .unwrap_or_default();
+        self.game_autopick = !self.game_input.is_empty();
+        // New generations, so an answer still in flight for the previous clip is dropped.
+        self.game_gen = self.game_gen.wrapping_add(1);
+        self.tag_gen = self.tag_gen.wrapping_add(1);
+    }
+
+    /// `action` as the description field may apply it: a paste is cut to what still fits, and
+    /// a keystroke with no room left is dropped. Anything that cannot grow the text passes
+    /// through. Text the cap would have swallowed never reaches the field, so what the counter
+    /// shows is what the upload sends.
+    fn within_description_cap(&self, action: text_editor::Action) -> Option<text_editor::Action> {
+        use text_editor::{Action, Edit};
+        let grows = matches!(
+            &action,
+            Action::Edit(Edit::Insert(_) | Edit::Paste(_) | Edit::Enter | Edit::Indent)
+        );
+        if !grows {
+            return Some(action);
+        }
+        // An edit replaces the selection, so those characters are room as well.
+        let selected = self
+            .description
+            .selection()
+            .map_or(0, |s| s.chars().count());
+        let room = (MAX_DESCRIPTION_CHARS + selected).saturating_sub(self.description_chars);
+        if room == 0 {
+            return None;
+        }
+        match action {
+            Action::Edit(Edit::Paste(text)) if text.chars().count() > room => Some(Action::Edit(
+                Edit::Paste(std::sync::Arc::new(text.chars().take(room).collect())),
+            )),
+            other => Some(other),
+        }
+    }
+
+    /// Forget any catalogue answer still in flight and drop the results on screen: the picker
+    /// has moved on, so a late answer must not repopulate a dropdown the user closed.
+    fn drop_pending_games(&mut self) {
+        self.game_gen = self.game_gen.wrapping_add(1);
+        self.game_results.clear();
+    }
+
+    /// The tag field's counterpart to [`drop_pending_games`](Self::drop_pending_games).
+    fn drop_pending_tags(&mut self) {
+        self.tag_gen = self.tag_gen.wrapping_add(1);
+        self.tag_suggestions.clear();
+    }
+
+    /// Search ganked.tv's game catalogue for whatever is in the game field.
+    fn find_games(&mut self, config: &Config) -> Task<Message> {
+        let up = config.upload();
+        if up.api_key.is_empty() {
+            return Task::none();
+        }
+        let query = self.game_input.clone();
+        let generation = self.game_gen;
+        Task::perform(
+            async move {
+                let client = ganked_client(&up).ok()?;
+                client.search_games(&query).await.ok()
+            },
+            move |games| Message::GamesFound(generation, games.unwrap_or_default()),
+        )
+    }
+
+    /// Commit one raw tag as ganked.tv's slug form, ignoring what the server would reject: an
+    /// unusable slug, a duplicate, or one past the cap.
+    fn add_tag(&mut self, raw: &str) {
+        if let Some(slug) = normalize_tag(raw)
+            && self.tags.len() < MAX_TAGS
+            && !self.tags.contains(&slug)
+        {
+            self.tags.push(slug);
+        }
+    }
+
+    /// Ask ganked.tv which known tags start with what is in the tag field.
+    fn suggest_tags(&mut self, config: &Config) -> Task<Message> {
+        let up = config.upload();
+        let prefix = self.tag_input.trim().to_owned();
+        if up.api_key.is_empty() || prefix.is_empty() {
+            self.tag_suggestions.clear();
+            return Task::none();
+        }
+        let generation = self.tag_gen;
+        Task::perform(
+            async move {
+                let client = ganked_client(&up).ok()?;
+                client.suggest_tags(&prefix).await.ok()
+            },
+            move |tags| Message::TagsSuggested(generation, tags.unwrap_or_default()),
+        )
+    }
+
+    /// The metadata the upload will publish: the typed title (or its placeholder), plus the
+    /// description, tags and game the form collected.
+    fn metadata(&self) -> ClipMetadata {
+        let title = self.title.trim();
+        ClipMetadata {
+            title: if title.is_empty() {
+                self.title_hint.clone()
+            } else {
+                title.to_owned()
+            },
+            description: self.description.text(),
+            tags: self.tags.clone(),
+            game_id: self.game.as_ref().map(|g| g.id),
+            visibility: self.visibility,
+        }
+    }
+
+    /// The `[start, end]` the upload should cut to, when the timeline shows a real trim. What
+    /// the timeline shows is what gets uploaded, saved copy or not.
+    fn upload_trim(&self) -> Option<(Duration, Duration)> {
+        let dur = self.open_duration();
+        let cut = self.trim_start > TRIM_EPSILON || self.trim_end < dur - TRIM_EPSILON;
+        (cut && self.trim_end - self.trim_start >= MIN_TRIM_SECS).then(|| {
+            (
+                Duration::from_secs_f32(self.trim_start.max(0.0)),
+                Duration::from_secs_f32(self.trim_end.max(0.0)),
+            )
+        })
+    }
+
     /// Kick off the upload for the open clip: the client is built from the config at click
     /// time, exactly as the tray does. Only the destination-specific upload future differs;
     /// the readiness check and task scaffolding are shared.
@@ -1043,22 +1338,15 @@ impl Library {
             };
             return Task::none();
         }
-        let title = {
-            let t = self.title.trim();
-            if t.is_empty() {
-                self.title_hint.clone()
-            } else {
-                t.to_owned()
-            }
-        };
-        let visibility = self.visibility;
+        let meta = self.metadata();
+        // The clip actually sent is the trimmed range when the timeline shows one, so an
+        // unsaved (or saved-as-a-copy) trim can't quietly upload the whole recording.
+        let trim = self.upload_trim();
         let upload: std::pin::Pin<Box<dyn Future<Output = Result<Uploaded, String>> + Send>> = {
             let clip = path.clone();
             match dest {
-                Dest::Ganked => Box::pin(upload_ganked(config.upload(), clip, title, visibility)),
-                Dest::YouTube => {
-                    Box::pin(upload_youtube(config.youtube(), clip, title, visibility))
-                }
+                Dest::Ganked => Box::pin(upload_ganked(config.upload(), clip, meta, trim)),
+                Dest::YouTube => Box::pin(upload_youtube(config.youtube(), clip, meta, trim)),
             }
         };
         let (task, abort) = Task::perform(upload, Message::UploadDone).abortable();
@@ -1865,7 +2153,7 @@ impl Library {
 
     /// The trim panel: a start/end range over the clip, and a lossless "save a trimmed copy" action.
     fn trim_panel(&self) -> Element<'_, Message> {
-        let dur = self.open_dur.max(0.2);
+        let dur = self.open_dur.max(MIN_TRIM_SECS);
         let start = self.trim_start.clamp(0.0, dur);
         let end = self.trim_end.clamp(0.0, dur);
         let length = (end - start).max(0.0);
@@ -1904,8 +2192,8 @@ impl Library {
 
         let busy = matches!(self.trim, TrimState::Saving);
         // Saving an untouched range would only copy the clip; wait until a handle moved.
-        let changed = start > 0.05 || end < dur - 0.05;
-        let ready = !busy && length >= 0.2 && changed;
+        let changed = start > TRIM_EPSILON || end < dur - TRIM_EPSILON;
+        let ready = !busy && length >= MIN_TRIM_SECS && changed;
         let mut save = button(text("Save").size(13).font(UI_BOLD))
             .style(primary_button)
             .padding([11, 24]);
@@ -1940,7 +2228,7 @@ impl Library {
                 path,
             } => panel.push(
                 column![
-                    text("Saved a trimmed copy.")
+                    text("Saved a trimmed copy. The upload below sends this same range.")
                         .size(12)
                         .style(tinted(palette::ACCENT)),
                     hint(path.display().to_string()),
@@ -1993,7 +2281,8 @@ impl Library {
         .into()
     }
 
-    /// The upload panel: title, destination, visibility, and the upload state line.
+    /// The upload panel: the clip's metadata (the same fields ganked.tv's own form offers),
+    /// destination, visibility, and the upload state line.
     fn upload_panel<'a>(
         &'a self,
         entry: &'a ClipEntry,
@@ -2113,10 +2402,178 @@ impl Library {
             });
         }
 
-        let mut panel = column![title, destination, visibility].spacing(16);
+        let mut panel = column![title, self.description_field()].spacing(16);
+        // The catalogue behind the game picker is ganked.tv's; YouTube has nothing to map it to.
+        if self.dest == Dest::Ganked && ganked.ready() {
+            panel = panel.push(self.game_field());
+        }
+        panel = panel.push(self.tags_field());
+        panel = panel.push(destination).push(visibility);
+        if let Some((start, end)) = self.upload_trim() {
+            panel = panel.push(hint(format!(
+                "Only the trimmed range ({} to {}) is uploaded.",
+                secs_label(start.as_secs_f32()),
+                secs_label(end.as_secs_f32()),
+            )));
+        }
         panel = panel.push(container(send).center_x(Length::Fill));
         panel = panel.push(self.upload_status(entry, accent));
         theme::card_accent("UPLOAD", accent, panel)
+    }
+
+    /// The description box, with a live character count that turns red at the cap.
+    fn description_field(&self) -> Element<'_, Message> {
+        let at_cap = self.description_chars >= MAX_DESCRIPTION_CHARS;
+        let counter = text(format!(
+            "{}/{MAX_DESCRIPTION_CHARS}",
+            self.description_chars
+        ))
+        .size(11)
+        .font(UI_SEMIBOLD)
+        .style(tinted(if at_cap {
+            palette::DANGER
+        } else {
+            palette::MUTED
+        }));
+        column![
+            row![
+                field_label("Description"),
+                Space::new().width(Length::Fill),
+                counter,
+            ]
+            .align_y(iced::Alignment::Center),
+            text_editor(&self.description)
+                .placeholder("Add context, callouts, settings, anything worth knowing")
+                .on_action(Message::DescriptionEdited)
+                .height(Length::Fixed(88.0))
+                .padding(10)
+                .size(13)
+                .style(theme::arena_editor),
+        ]
+        .spacing(6)
+        .into()
+    }
+
+    /// The game picker: the catalogue entry once one is chosen, else a search field over
+    /// ganked.tv's games with the matches underneath.
+    fn game_field(&self) -> Element<'_, Message> {
+        let mut field = column![
+            row![
+                field_label("Game"),
+                Space::new().width(Length::Fill),
+                hint("optional"),
+            ]
+            .align_y(iced::Alignment::Center)
+        ]
+        .spacing(6);
+
+        if let Some(game) = &self.game {
+            return field
+                .push(
+                    row![
+                        accent_chip(game.name.clone()),
+                        button(text("Change").size(11).font(UI_SEMIBOLD))
+                            .on_press(Message::GameCleared)
+                            .style(link_button)
+                            .padding([6, 4]),
+                    ]
+                    .spacing(10)
+                    .align_y(iced::Alignment::Center),
+                )
+                .into();
+        }
+
+        field = field.push(
+            text_input("Search ganked.tv's games", &self.game_input)
+                .on_input(Message::GameSearchEdited)
+                .style(theme::arena_input),
+        );
+        if !self.game_results.is_empty() {
+            let mut results = column![].spacing(2);
+            for game in &self.game_results {
+                results = results.push(
+                    button(text(game.name.clone()).size(12))
+                        .on_press(Message::GamePicked(game.clone()))
+                        .style(suggestion_style)
+                        .width(Length::Fill)
+                        .padding([7, 10]),
+                );
+            }
+            field = field.push(
+                container(results)
+                    .padding(4)
+                    .style(|_: &Theme| container::Style {
+                        background: Some(Background::Color(palette::HIGH)),
+                        border: Border {
+                            color: palette::BORDER,
+                            width: 1.0,
+                            radius: 8.0.into(),
+                        },
+                        ..container::Style::default()
+                    }),
+            );
+        }
+        field.into()
+    }
+
+    /// The tag field: the committed tags as removable chips, an entry box while there is room
+    /// for more, and whatever ganked.tv already knows under it.
+    fn tags_field(&self) -> Element<'_, Message> {
+        let full = self.tags.len() >= MAX_TAGS;
+        let mut field = column![
+            row![
+                field_label("Tags"),
+                Space::new().width(Length::Fill),
+                hint(format!("optional, up to {MAX_TAGS}")),
+            ]
+            .align_y(iced::Alignment::Center)
+        ]
+        .spacing(6);
+
+        if !self.tags.is_empty() {
+            let mut chips = row![].spacing(6).align_y(iced::Alignment::Center);
+            for tag in &self.tags {
+                chips = chips.push(
+                    button(text(format!("{tag}  ×")).size(11).font(UI_SEMIBOLD))
+                        .on_press(Message::TagRemoved(tag.clone()))
+                        .style(|_: &Theme, status| chip_style(status, true))
+                        .padding([5, 11]),
+                );
+            }
+            field = field.push(chips);
+        }
+
+        if full {
+            return field
+                .push(hint("That is the maximum ganked.tv accepts."))
+                .into();
+        }
+        field = field.push(
+            text_input("Add a tag", &self.tag_input)
+                .on_input(Message::TagInputEdited)
+                .on_submit(Message::TagCommitted)
+                .style(theme::arena_input),
+        );
+        // Only tags ganked.tv already has, so the suggestions are real; anything typed still
+        // gets created on upload.
+        let fresh: Vec<&TagSuggestion> = self
+            .tag_suggestions
+            .iter()
+            .filter(|s| !self.tags.contains(&s.slug))
+            .collect();
+        if !fresh.is_empty() {
+            let mut suggestions = row![].spacing(6).align_y(iced::Alignment::Center);
+            for suggestion in fresh {
+                suggestions = suggestions.push(
+                    button(text(suggestion.slug.clone()).size(11).font(UI_SEMIBOLD))
+                        .on_press(Message::TagAdded(suggestion.slug.clone()))
+                        .style(|_: &Theme, status| chip_style(status, false))
+                        .padding([5, 11]),
+                );
+            }
+            field = field.push(suggestions);
+        }
+        field.into()
     }
 
     /// The status line under the upload button, for whatever upload concerns this clip. `accent`
@@ -2305,18 +2762,16 @@ fn ganked_client(up: &rewynd_config::UploadSettings) -> Result<GankedClient, Str
 async fn upload_ganked(
     up: rewynd_config::UploadSettings,
     path: PathBuf,
-    title: String,
-    visibility: Visibility,
+    meta: ClipMetadata,
+    trim: Option<(Duration, Duration)>,
 ) -> Result<Uploaded, String> {
     let client = ganked_client(&up)?;
-    let clip = client
-        .upload(&path, &title, visibility)
-        .await
-        .map_err(|e| {
-            // The user-facing copy is shared with the tray; the full error goes to the log.
-            tracing::error!(error = %e, "upload failed");
-            user_facing_upload_error(&e)
-        })?;
+    let prepared = PreparedClip::of(path, trim).await?;
+    let clip = client.upload(prepared.path(), &meta).await.map_err(|e| {
+        // The user-facing copy is shared with the tray; the full error goes to the log.
+        tracing::error!(error = %e, "upload failed");
+        user_facing_upload_error(&e)
+    })?;
     if clip.failed() {
         return Err(
             "ganked.tv could not process the clip (check its length and format).".to_owned(),
@@ -2383,8 +2838,8 @@ async fn verify_ganked(
 async fn upload_youtube(
     yt: rewynd_config::YouTubeSettings,
     path: PathBuf,
-    title: String,
-    visibility: Visibility,
+    meta: ClipMetadata,
+    trim: Option<(Duration, Duration)>,
 ) -> Result<Uploaded, String> {
     let client = YouTubeClient::new(
         rewynd_config::non_empty_or(&yt.client_id, DEFAULT_CLIENT_ID),
@@ -2392,13 +2847,11 @@ async fn upload_youtube(
         &yt.refresh_token,
     )
     .map_err(|e| e.to_string())?;
-    let video = client
-        .upload(&path, &title, visibility)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "YouTube upload failed");
-            user_facing_youtube_error(&e)
-        })?;
+    let prepared = PreparedClip::of(path, trim).await?;
+    let video = client.upload(prepared.path(), &meta).await.map_err(|e| {
+        tracing::error!(error = %e, "YouTube upload failed");
+        user_facing_youtube_error(&e)
+    })?;
     Ok(Uploaded {
         remote_id: video.id.clone(),
         link: video.watch_url(),
@@ -2498,6 +2951,29 @@ fn chip_style(status: iced::widget::button::Status, active: bool) -> iced::widge
     }
 }
 
+/// One row of a search dropdown: quiet until hovered, then the accent tint.
+fn suggestion_style(
+    _theme: &Theme,
+    status: iced::widget::button::Status,
+) -> iced::widget::button::Style {
+    use iced::widget::button::{Status, Style};
+    let (background, text_color) = match status {
+        Status::Hovered | Status::Pressed => {
+            (Some(Background::Color(palette::ACCENT_BG)), palette::ACCENT)
+        }
+        _ => (None, palette::TEXT),
+    };
+    Style {
+        background,
+        text_color,
+        border: Border {
+            radius: 6.0.into(),
+            ..Border::default()
+        },
+        ..Style::default()
+    }
+}
+
 /// The clip card shell: a raised panel that is also a button (hover lifts the border to the
 /// accent tint, the design's one sanctioned hover cue).
 fn clip_card_style(
@@ -2578,6 +3054,112 @@ fn save_trim(
             result
         }
     }
+}
+
+/// Bump `generation` and hand back a task that fires `message` with it once the debounce
+/// elapses. The handler drops it unless the generation is still the newest, so only a pause in
+/// typing reaches the network.
+fn debounce(generation: &mut u64, message: fn(u64) -> Message) -> Task<Message> {
+    *generation = generation.wrapping_add(1);
+    let current = *generation;
+    Task::perform(tokio::time::sleep(SUGGEST_DEBOUNCE), move |()| {
+        message(current)
+    })
+}
+
+/// Marks the throwaway trim one upload sends. Hidden and `.tmp`-suffixed, so the clip store
+/// (which lists `rewynd-*.mp4`) never shows one.
+const UPLOAD_TEMP_MARK: &str = ".uploading.";
+
+/// How long a leftover upload trim may sit before the next upload sweeps it: an upload
+/// cancelled mid-trim leaves one behind (the blocking cut outlives the dropped task).
+const UPLOAD_TEMP_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A sibling temp path for the trim, in the clip's own directory the way the in-place trim
+/// does it: that filesystem holds the clips already, so it has the room a clip-sized cut needs
+/// and no other user's `/tmp` can be in the way.
+fn upload_temp_path(src: &Path) -> PathBuf {
+    // Unique per attempt: two clips (or two goes at one) must not race over the same file.
+    static ATTEMPT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("clip");
+    src.with_file_name(format!(
+        ".{name}{UPLOAD_TEMP_MARK}{}-{n}.tmp",
+        std::process::id()
+    ))
+}
+
+/// Drop the upload temps in `dir` older than [`UPLOAD_TEMP_MAX_AGE`]. Blocking, and
+/// deliberately silent: a sweep that fails must not fail the upload behind it.
+fn sweep_upload_temps_in(dir: &Path, now: SystemTime) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .contains(UPLOAD_TEMP_MARK)
+        {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|m| now.duration_since(m).is_ok_and(|a| a > UPLOAD_TEMP_MAX_AGE));
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// The file an upload actually sends: the clip itself, or a throwaway trim of it that is
+/// deleted once the upload future finishes (or is dropped, e.g. by Cancel).
+struct PreparedClip {
+    path: PathBuf,
+    temp: bool,
+}
+
+impl PreparedClip {
+    /// The clip at `src`, cut to `trim` first when the timeline shows a range.
+    async fn of(src: PathBuf, trim: Option<(Duration, Duration)>) -> Result<Self, String> {
+        let Some((start, end)) = trim else {
+            return Ok(Self {
+                path: src,
+                temp: false,
+            });
+        };
+        let path = tokio::task::spawn_blocking(move || trim_for_upload(&src, start, end))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()))?;
+        Ok(Self { path, temp: true })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PreparedClip {
+    fn drop(&mut self) {
+        if self.temp {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Cut `src` to `[start, end]` into a throwaway file for one upload. Blocking.
+fn trim_for_upload(src: &Path, start: Duration, end: Duration) -> Result<PathBuf, String> {
+    if let Some(dir) = src.parent() {
+        sweep_upload_temps_in(dir, SystemTime::now());
+    }
+    let dst = upload_temp_path(src);
+    rewynd_mux::read::trim_clip(src, &dst, start, end)
+        .map(|_| dst.clone())
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&dst);
+            format!("Could not trim the clip for upload: {e}")
+        })
 }
 
 /// `n` evenly spaced, centred sample positions in `0.0..1.0` (cell i samples its own midpoint),
@@ -2831,6 +3413,246 @@ mod tests {
         };
         assert_eq!(group_label(&with_game), "Elden Ring");
         assert_eq!(group_label(&rootless), ROOT_GROUP);
+    }
+
+    #[test]
+    fn only_a_real_cut_makes_the_upload_trim() {
+        let mut lib = Library::new();
+        lib.open_dur = 30.0;
+        lib.trim_start = 0.0;
+        lib.trim_end = 30.0;
+        assert_eq!(lib.upload_trim(), None, "the whole clip is not a trim");
+
+        // Handles within the epsilon of the edges are still the whole clip.
+        lib.trim_start = TRIM_EPSILON / 2.0;
+        lib.trim_end = 30.0 - TRIM_EPSILON / 2.0;
+        assert_eq!(lib.upload_trim(), None);
+
+        lib.trim_start = 5.0;
+        lib.trim_end = 12.0;
+        assert_eq!(
+            lib.upload_trim(),
+            Some((Duration::from_secs(5), Duration::from_secs(12)))
+        );
+
+        // A range too short to keep anything must not reach the trimmer.
+        lib.trim_start = 5.0;
+        lib.trim_end = 5.05;
+        assert_eq!(lib.upload_trim(), None);
+    }
+
+    #[test]
+    fn tags_commit_as_slugs_and_stop_at_the_cap() {
+        let mut lib = Library::new();
+        lib.add_tag("Clutch Play");
+        lib.add_tag("clutch-play"); // the same slug typed differently
+        lib.add_tag("a"); // too short for the server
+        assert_eq!(lib.tags, ["clutch-play"]);
+
+        for n in 0..10 {
+            lib.add_tag(&format!("tag{n}"));
+        }
+        assert_eq!(lib.tags.len(), MAX_TAGS);
+
+        lib.tags.retain(|t| t != "clutch-play");
+        assert_eq!(lib.tags.len(), MAX_TAGS - 1);
+    }
+
+    #[test]
+    fn metadata_falls_back_to_the_title_placeholder() {
+        let mut lib = Library::new();
+        lib.title_hint = "rewynd 2026-01-01 12:00".to_owned();
+        lib.title = "   ".to_owned();
+        lib.tags = vec!["ace".to_owned()];
+        lib.game = Some(Game {
+            id: 7,
+            name: "Elden Ring".to_owned(),
+            slug: "elden-ring".to_owned(),
+        });
+        let meta = lib.metadata();
+        assert_eq!(meta.title, "rewynd 2026-01-01 12:00");
+        assert_eq!(meta.tags, ["ace"]);
+        assert_eq!(meta.game_id, Some(7));
+
+        lib.title = "  My clip  ".to_owned();
+        assert_eq!(lib.metadata().title, "My clip");
+    }
+
+    #[test]
+    fn opening_another_clip_empties_the_form() {
+        let mut lib = Library::new();
+        lib.tags = vec!["ace".to_owned()];
+        lib.tag_input = "clu".to_owned();
+        lib.game = Some(Game {
+            id: 7,
+            name: "Elden Ring".to_owned(),
+            slug: "elden-ring".to_owned(),
+        });
+        let (game_gen, tag_gen) = (lib.game_gen, lib.tag_gen);
+
+        lib.reset_metadata(Some("Overwatch®".to_owned()));
+        assert!(lib.tags.is_empty() && lib.tag_input.is_empty());
+        assert_eq!(lib.game, None);
+        // The detected name seeds the search (searchable, so no trademark mark) and may
+        // still auto-pick its catalogue entry.
+        assert_eq!(lib.game_input, "Overwatch");
+        assert!(lib.game_autopick);
+        assert_ne!(lib.game_gen, game_gen, "a late answer must not land here");
+        assert_ne!(lib.tag_gen, tag_gen);
+
+        lib.reset_metadata(None);
+        assert!(lib.game_input.is_empty() && !lib.game_autopick);
+    }
+
+    #[test]
+    fn a_prepared_clip_removes_only_its_own_temp() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let original = dir.path().join("clip.mp4");
+        let cut = dir.path().join("cut.mp4");
+        std::fs::write(&original, b"x").expect("write");
+        std::fs::write(&cut, b"x").expect("write");
+
+        drop(PreparedClip {
+            path: original.clone(),
+            temp: false,
+        });
+        drop(PreparedClip {
+            path: cut.clone(),
+            temp: true,
+        });
+        assert!(original.exists(), "the library's own clip must survive");
+        assert!(!cut.exists(), "the throwaway trim must be cleaned up");
+    }
+
+    #[test]
+    fn the_temp_sweep_drops_only_stale_upload_temps() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let clip = dir.path().join("rewynd-1-0.mp4");
+        std::fs::write(&clip, b"x").expect("write");
+        let temp = upload_temp_path(&clip);
+        std::fs::write(&temp, b"x").expect("write");
+        // Sweeping "from" far enough ahead makes both files look old.
+        let far_future = SystemTime::now() + UPLOAD_TEMP_MAX_AGE + Duration::from_secs(60);
+
+        sweep_upload_temps_in(dir.path(), SystemTime::now());
+        assert!(temp.exists(), "a fresh temp is left alone");
+
+        sweep_upload_temps_in(dir.path(), far_future);
+        assert!(!temp.exists(), "a temp past the age is removed");
+        assert!(clip.exists(), "the clip beside it is never touched");
+    }
+
+    /// Reads the live catalogue, so it only runs where the config points at a real server.
+    /// Read-only: nothing is created or published.
+    #[test]
+    #[ignore = "talks to the configured ganked.tv server"]
+    fn the_live_catalogue_answers_the_pickers() {
+        let config = rewynd_config::load();
+        let client = ganked_client(&config.upload()).expect("client");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            // The name the recorder detects for this game carries a ® the catalogue does not.
+            let games = client
+                .search_games(&game_search_name("Overwatch®"))
+                .await
+                .expect("games");
+            assert!(
+                games.iter().any(|g| g.name == "Overwatch"),
+                "no Overwatch in {games:?}"
+            );
+            let tags = client.suggest_tags("c").await.expect("tags");
+            assert!(
+                tags.iter().all(|t| t.slug.starts_with('c')),
+                "prefix ignored: {tags:?}"
+            );
+        });
+    }
+
+    /// Needs a real saved clip, so it only runs on a box that has recorded one.
+    #[test]
+    #[ignore = "needs a saved clip in the configured clip directory"]
+    fn an_upload_trim_really_cuts_the_clip() {
+        let dir = rewynd_config::clips_dir(None);
+        let Some(clip) = rewynd_config::list_clips(&dir)
+            .into_iter()
+            .find(|c| c.path.parent() == Some(dir.as_path()))
+        else {
+            panic!("no clip in {}", dir.display());
+        };
+        let whole = rewynd_mux::read::clip_summary(&clip.path).expect("read the clip");
+        let end = whole.duration.min(Duration::from_secs(3));
+        let start = Duration::from_secs(1);
+        assert!(end > start, "the clip is too short to trim");
+
+        let cut = trim_for_upload(&clip.path, start, end).expect("trim");
+        let trimmed = rewynd_mux::read::clip_summary(&cut).expect("read the trim");
+        assert!(
+            trimmed.duration < whole.duration,
+            "{:?} is not shorter than {:?}",
+            trimmed.duration,
+            whole.duration
+        );
+        // The start snaps back to a keyframe, so the kept span is the requested one plus at
+        // most one keyframe interval (about a second at the recorder's defaults).
+        let wanted = end - start;
+        assert!(
+            trimmed.duration >= wanted && trimmed.duration <= wanted + Duration::from_secs(2),
+            "kept {:?}, wanted about {:?}",
+            trimmed.duration,
+            wanted
+        );
+
+        drop(PreparedClip {
+            path: cut.clone(),
+            temp: true,
+        });
+        assert!(!cut.exists(), "the temp must not outlive the upload");
+    }
+
+    #[test]
+    fn the_upload_temp_is_a_hidden_sibling_the_clip_store_ignores() {
+        let temp = upload_temp_path(Path::new("/clips/Elden Ring/rewynd-1-0.mp4"));
+        assert_eq!(temp.parent(), Some(Path::new("/clips/Elden Ring")));
+        let name = temp.file_name().and_then(|n| n.to_str()).expect("name");
+        assert!(name.starts_with('.') && name.ends_with(".tmp"), "{name}");
+        assert!(name.contains(UPLOAD_TEMP_MARK), "{name}");
+        // Two goes at the same clip must not collide.
+        let again = upload_temp_path(Path::new("/clips/Elden Ring/rewynd-1-0.mp4"));
+        assert_eq!(again.parent(), temp.parent());
+        assert_ne!(again, temp);
+    }
+
+    #[test]
+    fn the_description_stops_growing_at_the_cap() {
+        use iced::widget::text_editor::{Action, Edit};
+        let mut lib = Library::new();
+        let paste = |s: &str| Action::Edit(Edit::Paste(std::sync::Arc::new(s.to_owned())));
+
+        // An oversized paste is cut to what fits instead of overflowing the field.
+        let long = "x".repeat(MAX_DESCRIPTION_CHARS + 200);
+        let capped = lib.within_description_cap(paste(&long)).expect("accepted");
+        match capped {
+            Action::Edit(Edit::Paste(text)) => {
+                assert_eq!(text.chars().count(), MAX_DESCRIPTION_CHARS);
+            }
+            other => panic!("expected a paste, got {other:?}"),
+        }
+
+        // At the cap, growing edits are refused but everything else still works.
+        lib.description_chars = MAX_DESCRIPTION_CHARS;
+        assert!(lib.within_description_cap(paste("more")).is_none());
+        assert!(
+            lib.within_description_cap(Action::Edit(Edit::Insert('a')))
+                .is_none()
+        );
+        assert!(
+            lib.within_description_cap(Action::Edit(Edit::Backspace))
+                .is_some()
+        );
+        assert!(lib.within_description_cap(Action::SelectAll).is_some());
     }
 
     #[test]
