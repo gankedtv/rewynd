@@ -706,18 +706,7 @@ impl Library {
             }
             Message::TitleEdited(s) => self.title = s,
             Message::DescriptionEdited(action) => {
-                // The field stops at the cap rather than letting text be typed that the
-                // upload would silently drop.
-                let grows = matches!(
-                    &action,
-                    text_editor::Action::Edit(
-                        text_editor::Edit::Insert(_)
-                            | text_editor::Edit::Paste(_)
-                            | text_editor::Edit::Enter
-                            | text_editor::Edit::Indent
-                    )
-                );
-                if !grows || self.description_chars < MAX_DESCRIPTION_CHARS {
+                if let Some(action) = self.within_description_cap(action) {
                     self.description.perform(action);
                     self.description_chars = self.description.text().chars().count();
                 }
@@ -725,6 +714,7 @@ impl Library {
             Message::GameSearchEdited(query) => {
                 self.game_input = query;
                 self.game_autopick = false;
+                self.game_results.clear();
                 return debounce(&mut self.game_gen, Message::GameSearchFired);
             }
             Message::GameSearchFired(issued) => {
@@ -752,7 +742,7 @@ impl Library {
                     Some(game) => {
                         self.game_input = game.name.clone();
                         self.game = Some(game);
-                        self.game_results.clear();
+                        self.drop_pending_games();
                     }
                     None => self.game_results = games,
                 }
@@ -760,13 +750,13 @@ impl Library {
             Message::GamePicked(game) => {
                 self.game_input = game.name.clone();
                 self.game = Some(game);
-                self.game_results.clear();
+                self.drop_pending_games();
             }
             Message::GameCleared => {
                 self.game = None;
                 self.game_input.clear();
-                self.game_results.clear();
                 self.game_autopick = false;
+                self.drop_pending_games();
             }
             Message::TagInputEdited(input) => {
                 // A comma ends a tag, the way every tag field does; a pasted list ends all
@@ -778,7 +768,7 @@ impl Library {
                         self.add_tag(part);
                     }
                     self.tag_input = trailing;
-                    self.tag_suggestions.clear();
+                    self.drop_pending_tags();
                     return Task::none();
                 }
                 self.tag_input = input;
@@ -787,12 +777,12 @@ impl Library {
             Message::TagCommitted => {
                 let raw = std::mem::take(&mut self.tag_input);
                 self.add_tag(&raw);
-                self.tag_suggestions.clear();
+                self.drop_pending_tags();
             }
             Message::TagAdded(raw) => {
                 self.add_tag(&raw);
                 self.tag_input.clear();
-                self.tag_suggestions.clear();
+                self.drop_pending_tags();
             }
             Message::TagRemoved(slug) => self.tags.retain(|t| t != &slug),
             Message::TagSearchFired(issued) => {
@@ -1200,6 +1190,49 @@ impl Library {
         // New generations, so an answer still in flight for the previous clip is dropped.
         self.game_gen = self.game_gen.wrapping_add(1);
         self.tag_gen = self.tag_gen.wrapping_add(1);
+    }
+
+    /// `action` as the description field may apply it: a paste is cut to what still fits, and
+    /// a keystroke with no room left is dropped. Anything that cannot grow the text passes
+    /// through. Text the cap would have swallowed never reaches the field, so what the counter
+    /// shows is what the upload sends.
+    fn within_description_cap(&self, action: text_editor::Action) -> Option<text_editor::Action> {
+        use text_editor::{Action, Edit};
+        let grows = matches!(
+            &action,
+            Action::Edit(Edit::Insert(_) | Edit::Paste(_) | Edit::Enter | Edit::Indent)
+        );
+        if !grows {
+            return Some(action);
+        }
+        // An edit replaces the selection, so those characters are room as well.
+        let selected = self
+            .description
+            .selection()
+            .map_or(0, |s| s.chars().count());
+        let room = (MAX_DESCRIPTION_CHARS + selected).saturating_sub(self.description_chars);
+        if room == 0 {
+            return None;
+        }
+        match action {
+            Action::Edit(Edit::Paste(text)) if text.chars().count() > room => Some(Action::Edit(
+                Edit::Paste(std::sync::Arc::new(text.chars().take(room).collect())),
+            )),
+            other => Some(other),
+        }
+    }
+
+    /// Forget any catalogue answer still in flight and drop the results on screen: the picker
+    /// has moved on, so a late answer must not repopulate a dropdown the user closed.
+    fn drop_pending_games(&mut self) {
+        self.game_gen = self.game_gen.wrapping_add(1);
+        self.game_results.clear();
+    }
+
+    /// The tag field's counterpart to [`drop_pending_games`](Self::drop_pending_games).
+    fn drop_pending_tags(&mut self) {
+        self.tag_gen = self.tag_gen.wrapping_add(1);
+        self.tag_suggestions.clear();
     }
 
     /// Search ganked.tv's game catalogue for whatever is in the game field.
@@ -2729,8 +2762,8 @@ async fn upload_ganked(
     trim: Option<(Duration, Duration)>,
 ) -> Result<Uploaded, String> {
     let client = ganked_client(&up)?;
-    let clip = PreparedClip::of(path, trim).await?;
-    let clip = client.upload(clip.path(), &meta).await.map_err(|e| {
+    let prepared = PreparedClip::of(path, trim).await?;
+    let clip = client.upload(prepared.path(), &meta).await.map_err(|e| {
         // The user-facing copy is shared with the tray; the full error goes to the log.
         tracing::error!(error = %e, "upload failed");
         user_facing_upload_error(&e)
@@ -2810,8 +2843,8 @@ async fn upload_youtube(
         &yt.refresh_token,
     )
     .map_err(|e| e.to_string())?;
-    let clip = PreparedClip::of(path, trim).await?;
-    let video = client.upload(clip.path(), &meta).await.map_err(|e| {
+    let prepared = PreparedClip::of(path, trim).await?;
+    let video = client.upload(prepared.path(), &meta).await.map_err(|e| {
         tracing::error!(error = %e, "YouTube upload failed");
         user_facing_youtube_error(&e)
     })?;
@@ -3030,22 +3063,42 @@ fn debounce(generation: &mut u64, message: fn(u64) -> Message) -> Task<Message> 
     })
 }
 
-/// Where an upload's throwaway trims live, so they never land next to the user's clips.
-fn upload_temp_dir() -> PathBuf {
-    std::env::temp_dir().join("rewynd-upload")
-}
+/// Marks the throwaway trim one upload sends. Hidden and `.tmp`-suffixed, so the clip store
+/// (which lists `rewynd-*.mp4`) never shows one.
+const UPLOAD_TEMP_MARK: &str = ".uploading.";
 
 /// How long a leftover upload trim may sit before the next upload sweeps it: an upload
 /// cancelled mid-trim leaves one behind (the blocking cut outlives the dropped task).
 const UPLOAD_TEMP_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Drop anything in `dir` older than [`UPLOAD_TEMP_MAX_AGE`]. Blocking, and deliberately
-/// silent: a sweep that fails must not fail the upload behind it.
+/// A sibling temp path for the trim, in the clip's own directory the way the in-place trim
+/// does it: that filesystem holds the clips already, so it has the room a clip-sized cut needs
+/// and no other user's `/tmp` can be in the way.
+fn upload_temp_path(src: &Path) -> PathBuf {
+    // Unique per attempt: two clips (or two goes at one) must not race over the same file.
+    static ATTEMPT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("clip");
+    src.with_file_name(format!(
+        ".{name}{UPLOAD_TEMP_MARK}{}-{n}.tmp",
+        std::process::id()
+    ))
+}
+
+/// Drop the upload temps in `dir` older than [`UPLOAD_TEMP_MAX_AGE`]. Blocking, and
+/// deliberately silent: a sweep that fails must not fail the upload behind it.
 fn sweep_upload_temps_in(dir: &Path, now: SystemTime) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .contains(UPLOAD_TEMP_MARK)
+        {
+            continue;
+        }
         let stale = entry
             .metadata()
             .and_then(|m| m.modified())
@@ -3093,13 +3146,10 @@ impl Drop for PreparedClip {
 
 /// Cut `src` to `[start, end]` into a throwaway file for one upload. Blocking.
 fn trim_for_upload(src: &Path, start: Duration, end: Duration) -> Result<PathBuf, String> {
-    let dir = upload_temp_dir();
-    sweep_upload_temps_in(&dir, SystemTime::now());
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    // Unique per attempt: two clips (or two goes at one) must not race over the same file.
-    static ATTEMPT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let n = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dst = dir.join(format!("upload-{}-{n}.mp4", std::process::id()));
+    if let Some(dir) = src.parent() {
+        sweep_upload_temps_in(dir, SystemTime::now());
+    }
+    let dst = upload_temp_path(src);
     rewynd_mux::read::trim_clip(src, &dst, start, end)
         .map(|_| dst.clone())
         .map_err(|e| {
@@ -3470,17 +3520,62 @@ mod tests {
     }
 
     #[test]
-    fn the_temp_sweep_drops_only_what_is_stale() {
+    fn the_temp_sweep_drops_only_stale_upload_temps() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let old = dir.path().join("old.mp4");
-        std::fs::write(&old, b"x").expect("write");
-        // Sweeping "from" far enough in the future makes the fresh file look stale.
+        let clip = dir.path().join("rewynd-1-0.mp4");
+        std::fs::write(&clip, b"x").expect("write");
+        let temp = upload_temp_path(&clip);
+        std::fs::write(&temp, b"x").expect("write");
+        // Sweeping "from" far enough ahead makes both files look old.
         let far_future = SystemTime::now() + UPLOAD_TEMP_MAX_AGE + Duration::from_secs(60);
 
         sweep_upload_temps_in(dir.path(), SystemTime::now());
-        assert!(old.exists(), "a fresh temp is left alone");
+        assert!(temp.exists(), "a fresh temp is left alone");
+
         sweep_upload_temps_in(dir.path(), far_future);
-        assert!(!old.exists(), "a temp past the age is removed");
+        assert!(!temp.exists(), "a temp past the age is removed");
+        assert!(clip.exists(), "the clip beside it is never touched");
+    }
+
+    #[test]
+    fn the_upload_temp_is_a_hidden_sibling_the_clip_store_ignores() {
+        let temp = upload_temp_path(Path::new("/clips/Elden Ring/rewynd-1-0.mp4"));
+        assert_eq!(temp.parent(), Some(Path::new("/clips/Elden Ring")));
+        let name = temp.file_name().and_then(|n| n.to_str()).expect("name");
+        assert!(name.starts_with('.') && name.ends_with(".tmp"), "{name}");
+        assert!(name.contains(UPLOAD_TEMP_MARK), "{name}");
+        // Two goes at one clip must not collide.
+        assert_ne!(temp, upload_temp_path(Path::new("/clips/rewynd-1-0.mp4")));
+    }
+
+    #[test]
+    fn the_description_stops_growing_at_the_cap() {
+        use iced::widget::text_editor::{Action, Edit};
+        let mut lib = Library::new();
+        let paste = |s: &str| Action::Edit(Edit::Paste(std::sync::Arc::new(s.to_owned())));
+
+        // An oversized paste is cut to what fits instead of overflowing the field.
+        let long = "x".repeat(MAX_DESCRIPTION_CHARS + 200);
+        let capped = lib.within_description_cap(paste(&long)).expect("accepted");
+        match capped {
+            Action::Edit(Edit::Paste(text)) => {
+                assert_eq!(text.chars().count(), MAX_DESCRIPTION_CHARS);
+            }
+            other => panic!("expected a paste, got {other:?}"),
+        }
+
+        // At the cap, growing edits are refused but everything else still works.
+        lib.description_chars = MAX_DESCRIPTION_CHARS;
+        assert!(lib.within_description_cap(paste("more")).is_none());
+        assert!(
+            lib.within_description_cap(Action::Edit(Edit::Insert('a')))
+                .is_none()
+        );
+        assert!(
+            lib.within_description_cap(Action::Edit(Edit::Backspace))
+                .is_some()
+        );
+        assert!(lib.within_description_cap(Action::SelectAll).is_some());
     }
 
     #[test]
