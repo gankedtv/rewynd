@@ -3542,6 +3542,76 @@ mod tests {
         assert!(clip.exists(), "the clip beside it is never touched");
     }
 
+    /// Reads the live catalogue, so it only runs where the config points at a real server.
+    /// Read-only: nothing is created or published.
+    #[test]
+    #[ignore = "talks to the configured ganked.tv server"]
+    fn the_live_catalogue_answers_the_pickers() {
+        let config = rewynd_config::load();
+        let client = ganked_client(&config.upload()).expect("client");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            // The name the recorder detects for this game carries a ® the catalogue does not.
+            let games = client
+                .search_games(&game_search_name("Overwatch®"))
+                .await
+                .expect("games");
+            assert!(
+                games.iter().any(|g| g.name == "Overwatch"),
+                "no Overwatch in {games:?}"
+            );
+            let tags = client.suggest_tags("c").await.expect("tags");
+            assert!(
+                tags.iter().all(|t| t.slug.starts_with('c')),
+                "prefix ignored: {tags:?}"
+            );
+        });
+    }
+
+    /// Needs a real saved clip, so it only runs on a box that has recorded one.
+    #[test]
+    #[ignore = "needs a saved clip in the configured clip directory"]
+    fn an_upload_trim_really_cuts_the_clip() {
+        let dir = rewynd_config::clips_dir(None);
+        let Some(clip) = rewynd_config::list_clips(&dir)
+            .into_iter()
+            .find(|c| c.path.parent() == Some(dir.as_path()))
+        else {
+            panic!("no clip in {}", dir.display());
+        };
+        let whole = rewynd_mux::read::clip_summary(&clip.path).expect("read the clip");
+        let end = whole.duration.min(Duration::from_secs(3));
+        let start = Duration::from_secs(1);
+        assert!(end > start, "the clip is too short to trim");
+
+        let cut = trim_for_upload(&clip.path, start, end).expect("trim");
+        let trimmed = rewynd_mux::read::clip_summary(&cut).expect("read the trim");
+        assert!(
+            trimmed.duration < whole.duration,
+            "{:?} is not shorter than {:?}",
+            trimmed.duration,
+            whole.duration
+        );
+        // The start snaps back to a keyframe, so the kept span is the requested one plus at
+        // most one keyframe interval (about a second at the recorder's defaults).
+        let wanted = end - start;
+        assert!(
+            trimmed.duration >= wanted && trimmed.duration <= wanted + Duration::from_secs(2),
+            "kept {:?}, wanted about {:?}",
+            trimmed.duration,
+            wanted
+        );
+
+        drop(PreparedClip {
+            path: cut.clone(),
+            temp: true,
+        });
+        assert!(!cut.exists(), "the temp must not outlive the upload");
+    }
+
     #[test]
     fn the_upload_temp_is_a_hidden_sibling_the_clip_store_ignores() {
         let temp = upload_temp_path(Path::new("/clips/Elden Ring/rewynd-1-0.mp4"));
