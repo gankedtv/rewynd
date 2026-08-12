@@ -32,8 +32,9 @@ pub const MAX_DESCRIPTION_CHARS: usize = 500;
 const MIN_TAG_CHARS: usize = 2;
 const MAX_TAG_CHARS: usize = 24;
 pub const MAX_TAGS: usize = 5;
-/// Suggestions pulled per keystroke for the game and tag pickers.
-const SUGGESTION_LIMIT: u32 = 8;
+/// Suggestions pulled per keystroke for the game and tag pickers. Public because a caller
+/// cannot otherwise tell a complete answer from a page that hit the limit.
+pub const SUGGESTION_LIMIT: u32 = 8;
 /// Server-side cap on a `?search=` term; a longer one is a 400, so trim locally.
 const MAX_SEARCH_CHARS: usize = 100;
 

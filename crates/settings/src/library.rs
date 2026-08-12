@@ -730,12 +730,7 @@ impl Library {
                 // it, so a near-miss stays a suggestion the user confirms.
                 let exact = self
                     .game_autopick
-                    .then(|| {
-                        games
-                            .iter()
-                            .find(|g| g.name.eq_ignore_ascii_case(self.game_input.trim()))
-                            .cloned()
-                    })
+                    .then(|| sole_exact_match(&games, self.game_input.trim()))
                     .flatten();
                 self.game_autopick = false;
                 match exact {
@@ -2491,8 +2486,20 @@ impl Library {
         if !self.game_results.is_empty() {
             let mut results = column![].spacing(2);
             for game in &self.game_results {
+                // Two catalogue entries can carry the same name; a name alone would leave
+                // their rows indistinguishable, so those get their slug alongside it.
+                let mut label = row![text(game.name.clone()).size(12)]
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center);
+                if name_is_shared(&self.game_results, game) {
+                    label = label.push(
+                        text(game.slug.clone())
+                            .size(11)
+                            .style(tinted(palette::MUTED)),
+                    );
+                }
                 results = results.push(
-                    button(text(game.name.clone()).size(12))
+                    button(label)
                         .on_press(Message::GamePicked(game.clone()))
                         .style(suggestion_style)
                         .width(Length::Fill)
@@ -2949,6 +2956,32 @@ fn chip_style(status: iced::widget::button::Status, active: bool) -> iced::widge
         },
         ..Style::default()
     }
+}
+
+/// The one catalogue entry named exactly `name`, or `None` when nothing matches, when more
+/// than one does, or when the answer could be hiding a second one. The catalogue holds
+/// same-named games (an upstream rename lands beside a seeded row) and the server leaves that
+/// tie unordered, so taking "the first" would bind a clip to a different game id from run to
+/// run. Ambiguity stays the user's call.
+fn sole_exact_match(games: &[Game], name: &str) -> Option<Game> {
+    // A full page is a page that may have been cut off, so a lone match inside one proves
+    // nothing: the twin could be the row that did not fit.
+    if games.len() >= rewynd_upload::SUGGESTION_LIMIT as usize {
+        return None;
+    }
+    let mut exact = games.iter().filter(|g| g.name.eq_ignore_ascii_case(name));
+    let first = exact.next()?;
+    exact.next().is_none().then(|| first.clone())
+}
+
+/// Whether `game`'s name is shared with another entry in `results`, i.e. its row needs more
+/// than the name to be told apart.
+fn name_is_shared(results: &[Game], game: &Game) -> bool {
+    results
+        .iter()
+        .filter(|g| g.name.eq_ignore_ascii_case(&game.name))
+        .nth(1)
+        .is_some()
 }
 
 /// One row of a search dropdown: quiet until hovered, then the accent tint.
@@ -3456,6 +3489,48 @@ mod tests {
 
         lib.tags.retain(|t| t != "clutch-play");
         assert_eq!(lib.tags.len(), MAX_TAGS - 1);
+    }
+
+    #[test]
+    fn a_name_two_catalogue_entries_share_is_never_auto_picked() {
+        let game = |id, name: &str, slug: &str| Game {
+            id,
+            name: name.to_owned(),
+            slug: slug.to_owned(),
+        };
+        // The catalogue really holds these: an upstream rename landed beside a seeded row.
+        let games = [
+            game(110, "Overwatch", "overwatch"),
+            game(404, "Overwatch", "overwatch-125174"),
+            game(7, "Overwatch 2", "overwatch-2"),
+        ];
+
+        // Two rows answer to "Overwatch", and the server leaves that tie unordered, so
+        // neither may be taken silently.
+        assert_eq!(sole_exact_match(&games, "Overwatch"), None);
+        assert_eq!(sole_exact_match(&games, "overwatch"), None);
+        // A name only one entry carries still auto-picks, case-insensitively.
+        assert_eq!(
+            sole_exact_match(&games, "overwatch 2"),
+            Some(games[2].clone())
+        );
+        assert_eq!(sole_exact_match(&games, "Elden Ring"), None);
+
+        // Only the rows that need telling apart carry their slug.
+        assert!(name_is_shared(&games, &games[0]));
+        assert!(name_is_shared(&games, &games[1]));
+        assert!(!name_is_shared(&games, &games[2]));
+
+        // A page that hit the limit may have left a same-named twin off the end, so even a
+        // lone match in it is not proof.
+        let full: Vec<Game> = (0..rewynd_upload::SUGGESTION_LIMIT)
+            .map(|n| game(n as i32, &format!("Game {n}"), &format!("game-{n}")))
+            .collect();
+        assert_eq!(sole_exact_match(&full, "Game 0"), None);
+        assert_eq!(
+            sole_exact_match(&full[..full.len() - 1], "Game 0"),
+            Some(full[0].clone())
+        );
     }
 
     #[test]
