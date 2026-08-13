@@ -1,6 +1,6 @@
 // Pinned release artifacts (/releases/latest 404s while every release is a prerelease).
 // The release workflow bumps RELEASE_TAG after upload; edit it by hand only as a fallback.
-export const RELEASE_TAG = 'v1.0.0-beta.7';
+export const RELEASE_TAG = 'v1.0.0-beta.8';
 
 const base = `https://github.com/gankedtv/rewynd/releases/download/${RELEASE_TAG}`;
 export const APPIMAGE_URL = `${base}/rewynd.AppImage`;
