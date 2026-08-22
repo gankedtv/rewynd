@@ -260,8 +260,8 @@ pub enum UploadError {
         code: String,
         detail: String,
     },
-    #[error("storage rejected the upload (HTTP {status})")]
-    Storage { status: u16 },
+    #[error("storage rejected the upload (HTTP {status}): {detail}")]
+    Storage { status: u16, detail: String },
     #[error("the login request expired; start again")]
     LoginExpired,
     #[error("invalid API URL {url:?}: {reason}")]
@@ -500,8 +500,11 @@ impl GankedClient {
             .send()
             .await?;
         if !put.status().is_success() {
+            let status = put.status().as_u16();
+            let body = bounded_text(put).await;
             return Err(UploadError::Storage {
-                status: put.status().as_u16(),
+                status,
+                detail: snippet(&body).to_owned(),
             });
         }
 
@@ -847,6 +850,11 @@ pub fn user_facing_upload_error(e: &UploadError) -> String {
             "Could not reach ganked.tv; check your connection and the API server URL.".to_owned()
         }
         UploadError::Io(_) => "The clip file could not be read.".to_owned(),
+        UploadError::Storage { status: 413, .. } => {
+            "Your clip is too large for ganked.tv's storage; try trimming it shorter or \
+             lowering the bitrate before uploading."
+                .to_owned()
+        }
         other => other.to_string(),
     }
 }
@@ -1091,6 +1099,23 @@ mod tests {
             detail: "bad key".into(),
         };
         assert_eq!(user_facing_upload_error(&api), api.to_string());
+        let too_large = UploadError::Storage {
+            status: 413,
+            detail: "entity too large".into(),
+        };
+        assert_eq!(
+            user_facing_upload_error(&too_large),
+            "Your clip is too large for ganked.tv's storage; try trimming it shorter or \
+             lowering the bitrate before uploading."
+        );
+        let other_storage = UploadError::Storage {
+            status: 500,
+            detail: "boom".into(),
+        };
+        assert_eq!(
+            user_facing_upload_error(&other_storage),
+            other_storage.to_string()
+        );
     }
 
     #[test]
@@ -1666,7 +1691,7 @@ mod tests {
             .await;
         Mock::given(method("PUT"))
             .and(path("/storage/obj"))
-            .respond_with(ResponseTemplate::new(403))
+            .respond_with(ResponseTemplate::new(403).set_body_string("access denied"))
             .mount(&server)
             .await;
 
@@ -1677,9 +1702,56 @@ mod tests {
             .await
             .expect_err("storage 403 fails")
         {
-            UploadError::Storage { status } => assert_eq!(status, 403),
+            UploadError::Storage { status, detail } => {
+                assert_eq!(status, 403);
+                assert!(detail.contains("access denied"));
+            }
             other => panic!("expected Storage error, got {other:?}"),
         }
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn storage_413_gets_actionable_user_facing_copy() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/clips"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "c"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/clips/c/upload-url"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "url": format!("{}/storage/obj", server.uri()),
+                "expiresAt": "2099-01-01T00:00:00Z",
+                "contentType": "video/mp4",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/storage/obj"))
+            .respond_with(ResponseTemplate::new(413).set_body_string("entity too large"))
+            .mount(&server)
+            .await;
+
+        let file = clip_file(b"mp4!");
+        let client = GankedClient::new(&server.uri(), "gtv_k").expect("client");
+        let err = client
+            .upload(&file, &ClipMetadata::new("t", Visibility::Public))
+            .await
+            .expect_err("storage 413 fails");
+        match &err {
+            UploadError::Storage { status, detail } => {
+                assert_eq!(*status, 413);
+                assert!(detail.contains("entity too large"));
+            }
+            other => panic!("expected Storage error, got {other:?}"),
+        }
+        assert_eq!(
+            user_facing_upload_error(&err),
+            "Your clip is too large for ganked.tv's storage; try trimming it shorter or \
+             lowering the bitrate before uploading."
+        );
         let _ = std::fs::remove_file(&file);
     }
 

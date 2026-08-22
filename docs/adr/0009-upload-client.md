@@ -53,11 +53,12 @@ server stays authoritative either way.
 
 - New deps: `reqwest` 0.13 (+rustls stack), `serde_json`, `jiff` (local-time clip titles),
   `wiremock` (dev-only, client tests). All permissive, GPL-compatible; no new CI system deps.
-- The clip is read into memory for the PUT (tens of MB at the 30 s default; ~100 MB worst case at
-  the 60 s cap), only after the presigned URL is in hand. Streaming from disk is a later refinement —
-  presigned S3 PUTs generally want a Content-Length, so it needs care. The PUT deadline scales
-  with file size (~1 Mbit/s floor) instead of a flat timeout, so slow-but-progressing uploads
-  survive.
+- The clip streams from disk for the PUT (an explicit `Content-Length` keeps S3-style endpoints
+  happy) rather than buffering the whole file in memory, only after the presigned URL is in hand.
+  The PUT deadline scales with file size (~1 Mbit/s floor) instead of a flat timeout, so
+  slow-but-progressing uploads survive. A storage-side rejection (e.g. a body-size limit stricter
+  than the client's own pre-check) carries the response body back as `UploadError::Storage`'s
+  `detail`, the same way API errors do, instead of surfacing a bare status code.
 - One `GET /status` after complete fetches the share code; transcoding continues server-side and
   the link is valid while it runs. No polling loop in the recorder.
 - The upload crate is CI-covered (wiremock); the tray/recorder wiring stays in the excluded
