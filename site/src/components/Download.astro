@@ -1,29 +1,26 @@
 ---
 import { APPIMAGE_URL, WIN_SETUP_URL, OSX_SETUP_URL, ALL_RELEASES_URL, INSTALL_CMD } from '../data/release';
 ---
-<section class="sec" id="download"><div class="wrap">
-  <div class="sechead" style="justify-content:center;text-align:center;flex-direction:column;align-items:center;gap:6px">
-    <span class="kick">Download</span><h2 class="sectitle">Grab the beta for your OS</h2>
-    <p class="muted" style="text-align:center">Free and open source. Public beta: work in progress, and builds are currently unsigned.</p>
-  </div>
+<section class="band" id="download"><div class="wrap">
+  <div class="bandhead"><span class="tag">Download</span><h2 class="disp">Grab the beta</h2></div>
   <div class="dl">
     <div class="plat">
       <h3>Linux</h3><div class="os2">Any distro · Wayland &amp; X11</div>
-      <div class="method">Self-updating AppImage:</div>
+      <p>Self-updating AppImage, or the one-liner:</p>
       <div class="cmd"><span class="p">$</span> <span class="cmdtext" id="installCmdDl">{INSTALL_CMD}</span> <button class="cp" data-copy="#installCmdDl" aria-live="polite" aria-label="Copy install command">copy</button></div>
-      <a class="btn mint" href={APPIMAGE_URL}>↓ Download AppImage</a>
+      <a class="btn mint" href={APPIMAGE_URL}>↓ AppImage</a>
     </div>
     <div class="plat">
       <h3>Windows</h3><div class="os2">Windows 10 / 11 · per-user, no admin</div>
-      <div class="method">Run the installer; it updates itself on launch.</div>
-      <a class="btn mint" href={WIN_SETUP_URL}>↓ Download Setup.exe</a>
+      <p>Run the installer; it updates itself on launch.</p>
+      <a class="btn mint" href={WIN_SETUP_URL}>↓ Setup.exe</a>
     </div>
     <div class="plat">
-      <h3>macOS <span class="badge">Beta</span></h3><div class="os2">Apple Silicon · macOS 15+</div>
-      <div class="method">Self-updating installer:</div>
+      <h3>macOS <span class="tag">Early</span></h3><div class="os2">Apple Silicon · macOS 15+</div>
+      <p>Self-updating installer, or the same one-liner as Linux:</p>
       <div class="cmd"><span class="p">$</span> <span class="cmdtext" id="installCmdMac">{INSTALL_CMD}</span> <button class="cp" data-copy="#installCmdMac" aria-live="polite" aria-label="Copy install command">copy</button></div>
-      <a class="btn mint" href={OSX_SETUP_URL}>↓ Download Setup.pkg</a>
+      <a class="btn mint" href={OSX_SETUP_URL}>↓ Setup.pkg</a>
     </div>
   </div>
-  <p class="notewarn">Early software: expect bugs, and please file them. First run on Windows may show a SmartScreen warning until signing lands; choose &ldquo;More info&rdquo; &rarr; &ldquo;Run anyway&rdquo;. On macOS the downloaded <code>.pkg</code> is unsigned, so open it with right-click &rarr; Open; the one-liner installer skips that. <a href={ALL_RELEASES_URL}>All releases on GitHub →</a></p>
+  <p class="notewarn">Beta: expect rough edges, and please file bugs. Builds are unsigned while signing is in the works, so Windows may show a SmartScreen warning; choose &ldquo;More info&rdquo; &rarr; &ldquo;Run anyway&rdquo;. On macOS, open the downloaded <code>.pkg</code> with right-click &rarr; Open; the one-liner installer skips that. <a href={ALL_RELEASES_URL}>All releases on GitHub →</a></p>
 </div></section>
