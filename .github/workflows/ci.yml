@@ -29,12 +29,14 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all --check
 
+      # chunks-exact-to-as-chunks (new in 1.98) is a style preference; the workspace
+      # uses chunks_exact widely and can migrate deliberately rather than under -D warnings.
       - name: clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings -A clippy::chunks-exact-to-as-chunks
 
       # The probe diagnostics + their examples are feature-gated and would otherwise bitrot.
       - name: clippy (capture probes)
-        run: cargo clippy -p rewynd-capture --all-targets --features probes --locked -- -D warnings
+        run: cargo clippy -p rewynd-capture --all-targets --features probes --locked -- -D warnings -A clippy::chunks-exact-to-as-chunks
 
       - name: build
         run: cargo build --workspace --all-targets --locked
@@ -69,7 +71,7 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings -A clippy::chunks-exact-to-as-chunks
 
       - name: build
         run: cargo build --workspace --all-targets --locked
@@ -98,7 +100,7 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings -A clippy::chunks-exact-to-as-chunks
 
       - name: build
         run: cargo build --workspace --all-targets --locked

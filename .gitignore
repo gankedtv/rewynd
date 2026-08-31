@@ -20,3 +20,6 @@ vendor/mp4/target/
 
 # Brainstorming visual-companion mockups (local design scratch)
 .superpowers/
+
+# Local design/browser scratch (concept previews + playwright screenshots)
+.playwright-mcp/
