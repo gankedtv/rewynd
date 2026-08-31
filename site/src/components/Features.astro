@@ -1,18 +1,18 @@
 ---
 const features = [
-  { icon: '▤', title: 'Lives in your tray', body: 'A background recorder that stays out of the way. Launch the app for your clip library and settings whenever you want.' },
-  { icon: '⚡', title: 'Zero-copy pipeline', body: 'The frame stays on the GPU from capture through hardware H.264 encode, light enough to run while gaming on modest hardware.' },
-  { icon: '◇', title: 'Clean, playable clips', body: 'Every clip starts on a keyframe and is independently decodable. No half-frames, no re-encode step.' },
-  { icon: '✎', title: 'Library & trim', body: "Browse, trim, and manage everything you've clipped in a native app, not a folder full of mystery filenames." },
-  { icon: '⚙', title: 'Yours to tune', body: 'Replay length, hotkey, output folder, resolution, framerate, bitrate: all of them parameters. Records at your display\'s own resolution and aspect ratio out of the box, ultrawides included.' },
-  { icon: '↑', title: 'Optional uploads', body: 'One click to ganked.tv or YouTube, only when you ask. Clips never leave your machine on their own.' },
+  { title: 'Zero-copy GPU pipeline', body: 'The frame never round-trips your CPU: captured, encoded, and buffered on the GPU. <b>Light enough to run while gaming on modest hardware.</b>' },
+  { title: 'Lives in your tray', body: 'A background recorder that stays out of the way. Open the app for your library and settings whenever you want.' },
+  { title: 'Clean, playable clips', body: 'Every clip starts on a keyframe and plays everywhere. No half-frames, no re-encode step.' },
+  { title: 'Library & trim built in', body: "Browse and trim everything you've clipped in a native app, not a folder full of mystery filenames." },
+  { title: 'Yours to tune', body: "Replay length, hotkey, resolution, framerate, bitrate: all parameters. Records at your display's own resolution and aspect ratio, ultrawides included." },
+  { title: 'Uploads only on your say-so', body: 'One click to ganked.tv or YouTube. <b>Clips never leave your machine on their own.</b>' },
 ];
 ---
-<section class="sec" id="features"><div class="wrap">
-  <div class="sechead"><span class="kick">Features</span><h2 class="sectitle">Small footprint, no compromises</h2></div>
-  <div class="feat">
+<section class="band dark" id="features"><div class="wrap">
+  <div class="bandhead"><span class="tag">Features</span><h2 class="disp">Small footprint, no compromises</h2></div>
+  <div class="featlist">
     {features.map((f) => (
-      <div class="fcard"><div class="ficon" aria-hidden="true">{f.icon}</div><h3>{f.title}</h3><p>{f.body}</p></div>
+      <div class="featrow"><span class="fi" aria-hidden="true">▶</span><div><h3>{f.title}</h3><p set:html={f.body} /></div></div>
     ))}
   </div>
 </div></section>

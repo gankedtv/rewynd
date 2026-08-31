@@ -4,11 +4,11 @@ import { library } from '../data/clips';
 import { RELEASE_TAG } from '../data/release';
 ---
 <!-- Product shot: rewynd Library (placeholder art, swap for a real screenshot). -->
-<div class="shotwrap">
-  <div class="hotcallout">press <kbd class="kbd">F10</kbd> → clip saved</div>
+<div class="shotframe">
+  <div class="stamp">Press <b>F10</b> → clip saved</div>
   <div class="app" role="img" aria-label="The rewynd clip library, grouped by game">
     <aside class="side">
-      <div class="sbrand"><LogoMark />REWYND</div>
+      <div class="sbrand"><LogoMark />rewynd</div>
       <div class="navitem active">Library</div>
       <div class="navitem">Settings</div>
       <div class="sfoot">
@@ -17,7 +17,7 @@ import { RELEASE_TAG } from '../data/release';
         <div class="ver">{RELEASE_TAG}</div>
       </div>
     </aside>
-    <div class="main">
+    <div class="appmain">
       <div class="libtitle">Library</div>
       <div class="libsub">{library.totalLabel}</div>
       <div class="libbar">

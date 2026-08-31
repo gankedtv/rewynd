@@ -1,0 +1,31 @@
+---
+// Hero visual: three saved clips fanned like prints, with an ink "saved" stamp.
+// Pulls real entries from the placeholder library so names stay in one place.
+import { library } from '../data/clips';
+
+const shortNames: Record<string, string> = {
+  'Valorant': 'VALORANT',
+  'Counter-Strike 2': 'CS2',
+  'Overwatch 2': 'OW2',
+};
+// Each card gets its own hue (echoing the clip's thumbnail art) so the fan
+// reads as three different games, not three prints of the same still.
+const pick = [
+  { game: library.games[0], clip: library.games[0].clips[0], hue: '#ff4655' },
+  { game: library.games[1], clip: library.games[1].clips[0], hue: '#4096ff' },
+  { game: library.games[2], clip: library.games[2].clips[0], hue: '#f99e1a' },
+];
+const mb = (meta: string) => meta.split('·').pop()?.trim() ?? '';
+---
+<div class="fan" role="img" aria-label="Three saved clips fanned out, each stamped with its length">
+  <div class="stamp">Saved <b>◀◀ 0:12</b></div>
+  {pick.map(({ game, clip, hue }, i) => (
+    <div class={`card c${i + 1}`}>
+      <div class="shot" style={`background:radial-gradient(130% 100% at 60% 35%, ${hue}66, #171b1e 68%)`}>
+        <span class="rec"><i></i>REC</span>
+        <span class="dur">{clip.dur}</span>
+      </div>
+      <div class="cap">{clip.title} <span class="mono">{shortNames[game.game] ?? game.game} · {mb(clip.meta)}</span></div>
+    </div>
+  ))}
+</div>
