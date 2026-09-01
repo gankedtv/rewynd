@@ -1,0 +1,17 @@
+---
+const tips = [
+  { title: 'Set your hotkey', body: 'F10 by default, but any key works. Change it whenever you want in Settings.' },
+  { title: 'Choose your replay length', body: '60 seconds by default, up to 120. Longer buffer, slightly more memory. You decide.' },
+  { title: 'Find your clips', body: "The built-in library shows everything you've saved, grouped per game, with trim and delete." },
+  { title: 'Share only if you want', body: 'Optional one-click upload to ganked.tv or YouTube. Off by default; clips stay local otherwise.' },
+];
+---
+<section class="sec" id="practical"><div class="wrap">
+  <div class="eyebrow">Practical</div>
+  <h2>You've installed it. Now what?</h2>
+  <div class="cards2">
+    {tips.map((t) => (
+      <div class="card"><h3 class="acc">{t.title}</h3><p>{t.body}</p></div>
+    ))}
+  </div>
+</div></section>

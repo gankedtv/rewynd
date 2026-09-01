@@ -1,15 +1,16 @@
 ---
 import LogoMark from './LogoMark.astro';
+import { ALL_RELEASES_URL } from '../data/release';
 ---
-<footer><div class="wrap">
+<footer>
   <div class="fcols">
-    <div class="about">
-      <span class="brand"><LogoMark />rewynd <span class="vbadge">Beta</span></span>
-      <p>A lightweight, native instant-replay clip recorder for Linux, Windows, and macOS (Apple Silicon). Built in the open as part of the ganked.tv project. GPL-3.0.</p>
+    <div>
+      <span class="brand"><LogoMark />rewynd</span>
+      Instant replay for your gameplay.<br />Free and open source, GPL-3.0-or-later.
     </div>
-    <div class="fcol"><h4>Product</h4><a href="#how">How it works</a><a href="#features">Features</a><a href="#download">Download</a><a href="https://github.com/gankedtv/rewynd/milestones">Roadmap</a><a href="https://github.com/gankedtv/rewynd/releases">Changelog</a></div>
-    <div class="fcol"><h4>Open source</h4><a href="https://github.com/gankedtv/rewynd">GitHub</a><a href="https://github.com/gankedtv/rewynd#readme">Docs</a><a href="https://github.com/gankedtv/rewynd/issues">Report a bug</a><a href="https://github.com/gankedtv/rewynd/blob/main/LICENSE">License (GPL-3.0)</a></div>
-    <div class="fcol"><h4>ganked.tv</h4><a href="https://ganked.tv">The platform</a><a href="https://ganked.tv">Connect rewynd</a><a href="#">Discord</a></div>
+    <div class="fcol"><h4>Product</h4><a href="#download">Download</a><a href="#how">How it works</a><a href="#platforms">Platforms</a></div>
+    <div class="fcol"><h4>Open source</h4><a href="https://github.com/gankedtv/rewynd">GitHub</a><a href={ALL_RELEASES_URL}>All releases</a><a href="https://github.com/gankedtv/rewynd/issues">Report a bug</a><a href="https://github.com/gankedtv/rewynd/blob/main/LICENSE">License</a></div>
+    <div class="fcol"><h4>ganked.tv</h4><a href="https://ganked.tv">Share your clips</a><a href="https://ganked.tv">About</a></div>
   </div>
-  <div class="fbottom"><span>© 2026 ganked.tv · rewynd · public beta</span><span>RUST · WGPU · GPU-VIDEO</span></div>
-</div></footer>
+  <div class="fbottom">© 2026 rewynd · part of the ganked.tv project · no analytics, no trackers</div>
+</footer>

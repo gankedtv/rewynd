@@ -1,18 +1,16 @@
 ---
-import LibraryShot from './LibraryShot.astro';
-
 const steps = [
-  { title: 'Set it up once', body: "A one-minute wizard picks your capture source, hotkey, and replay length. Sensible defaults if you'd rather not." },
-  { title: 'Just play', body: 'rewynd sits in the tray and keeps the last 60 seconds encoded on your GPU. Quiet enough to forget about.' },
-  { title: 'Hit the hotkey', body: 'The buffer flushes to a clean, keyframe-accurate MP4 you can play or share anywhere.' },
+  { title: 'Set up in a minute', body: 'A short first-run wizard: pick your hotkey, your replay length and where clips should go.' },
+  { title: 'Just play', body: 'rewynd sits in your system tray and stays out of the way. The buffer is always running.' },
+  { title: 'Press F10', body: 'The last 60 seconds become an MP4 in your clips folder, starting cleanly, ready to share.' },
 ];
 ---
-<section class="band" id="how"><div class="wrap">
-  <div class="bandhead"><span class="tag">How it works</span><h2 class="disp">Three keys and you're rolling</h2></div>
-  <div class="steps">
+<section class="sec" id="how"><div class="wrap">
+  <div class="eyebrow">How it works</div>
+  <h2>Set it up once, then forget it exists</h2>
+  <div class="cards3">
     {steps.map((s, i) => (
-      <div class="step"><div class="n">{i + 1}</div><h3>{s.title}</h3><p>{s.body}</p></div>
+      <div class="card"><div class="num">{i + 1}</div><h3>{s.title}</h3><p>{s.body}</p></div>
     ))}
   </div>
-  <LibraryShot />
 </div></section>

@@ -39,18 +39,11 @@ const ogImage = new URL('/assets/logo-512.png', Astro.site).href;
         || (/Mac/i.test(p) && navigator.maxTouchPoints > 1); // iPadOS reports as Mac
       document.documentElement.dataset.os =
         mobile ? 'mobile' : /Win/i.test(p) ? 'win' : /Mac/i.test(p) ? 'mac' : 'linux';
-
-      // Delegated here so the toggle CSS reveals always has a handler.
-      document.addEventListener('click', function (e) {
-        var btn = e.target instanceof Element ? e.target.closest('.cmdtoggle') : null;
-        var fold = btn && btn.closest('.cmdfold');
-        if (fold) btn.setAttribute('aria-expanded', String(fold.classList.toggle('open')));
-      });
     })();
   </script>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Anton&family=Archivo:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
 </head>
 <body>
   <SvgDefs />

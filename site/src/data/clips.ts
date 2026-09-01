@@ -4,6 +4,7 @@
 
 export interface Clip {
   title: string;
+  /** Date/length/size line; kept for a richer shot even where the current one omits it. */
   meta: string;
   dur: string;
   /** CSS background for the placeholder thumbnail. */
