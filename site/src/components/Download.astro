@@ -23,10 +23,10 @@ import { APPIMAGE_URL, WIN_SETUP_URL, OSX_SETUP_URL, INSTALL_CMD } from '../data
     <div class="plat">
       <div>
         <h3>macOS</h3>
-        <p>Apple Silicon, macOS 15+. The same one-liner installs rewynd.app:</p>
+        <p>Apple Silicon, macOS 15+. Prefer the terminal? The same one-liner as Linux works too:</p>
       </div>
       <div class="cmd"><span class="cmdtext" id="installCmdMac">{INSTALL_CMD}</span><button class="cp" data-copy="#installCmdMac" aria-live="polite" aria-label="Copy install command">copy</button></div>
-      <a class="btn ghost" href={OSX_SETUP_URL}>Or download the .pkg</a>
+      <a class="btn acc" href={OSX_SETUP_URL}>Download installer</a>
     </div>
   </div>
   <div class="secnote">The app checks for updates on launch. One click updates everything in place.</div>
