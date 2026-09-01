@@ -1,24 +1,16 @@
 ---
-import ClipFan from './ClipFan.astro';
-import { APPIMAGE_URL, WIN_SETUP_URL, INSTALL_CMD } from '../data/release';
+import { APPIMAGE_URL, WIN_SETUP_URL } from '../data/release';
 ---
-<section class="hero"><div class="wrap herogrid">
-  <div>
-    <span class="kick">Native instant replay · Linux / Windows / macOS</span>
-    <h1 class="disp h1">Clip it <span class="hl">after</span> it happens.</h1>
-    <p class="sub">rewynd keeps the last 60 seconds of gameplay encoded on your GPU, from a quiet tray icon. Something great happens? <b>Press one key. It's already an MP4.</b> No stream, no account, no fans spinning up.</p>
-    <div class="ctas">
-      <a class="btn mint" id="dlPrimary" href="#download" data-linux={APPIMAGE_URL} data-win={WIN_SETUP_URL}>↓ Download</a>
-      <a class="btn" href="https://github.com/gankedtv/rewynd">★ GitHub</a>
-    </div>
-    <div class="cmdfold">
-      <button class="cmdtoggle" type="button" aria-expanded="false" aria-controls="heroCmd">Install from the terminal</button>
-      <div class="cmd" id="heroCmd"><span class="p">$</span> <span class="cmdtext" id="installCmd">{INSTALL_CMD}</span> <button class="cp" data-copy="#installCmd" aria-live="polite" aria-label="Copy install command">copy</button></div>
-    </div>
-    <p class="heronote">Free, GPL-3.0, public beta. Self-updating, fixes land fast. <a href="https://github.com/gankedtv/rewynd/milestones">Roadmap</a></p>
+<header class="hero">
+  <div class="kick">Free · open source · your clips never leave your PC</div>
+  <h1 class="h1">Your best play already happened. rewynd has it.</h1>
+  <p class="sub">rewynd quietly keeps the last 60 seconds of your game in memory. When something worth keeping happens, one key saves it as a clip. You never press record, and nothing is uploaded unless you choose to.</p>
+  <div class="ctas">
+    <a class="btn acc" id="dlPrimary" href="#download" data-linux={APPIMAGE_URL} data-win={WIN_SETUP_URL}>Download</a>
+    <a class="btn ghost" href="#download">All platforms</a>
   </div>
-  <ClipFan />
-</div></section>
+  <div class="heronote">Same app on Windows, Linux and macOS. One hotkey: F10 by default.</div>
+</header>
 
 <script>
   // Progressive enhancement only: the page is fully functional without JS.
@@ -26,10 +18,10 @@ import { APPIMAGE_URL, WIN_SETUP_URL, INSTALL_CMD } from '../data/release';
   const dl = document.getElementById('dlPrimary') as HTMLAnchorElement | null;
   // Mobile keeps the generic label + #download anchor: there is no build to point it at.
   if (dl) {
-    if (os === 'win') { dl.textContent = '↓ Download for Windows'; dl.href = dl.dataset.win || dl.href; }
+    if (os === 'win') { dl.textContent = 'Download for Windows'; dl.href = dl.dataset.win || dl.href; }
     // Intel and Apple Silicon both report "MacIntel", so Macs go to the labelled card.
-    else if (os === 'mac') { dl.textContent = '↓ Download for macOS'; }
-    else if (os === 'linux') { dl.textContent = '↓ Download for Linux'; dl.href = dl.dataset.linux || dl.href; }
+    else if (os === 'mac') { dl.textContent = 'Download for macOS'; }
+    else if (os === 'linux') { dl.textContent = 'Download for Linux'; dl.href = dl.dataset.linux || dl.href; }
   }
 
   // Copy-to-clipboard buttons. Without the Clipboard API (insecure context / old

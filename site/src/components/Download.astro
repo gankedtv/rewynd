@@ -1,26 +1,33 @@
 ---
-import { APPIMAGE_URL, WIN_SETUP_URL, OSX_SETUP_URL, ALL_RELEASES_URL, INSTALL_CMD } from '../data/release';
+import { APPIMAGE_URL, WIN_SETUP_URL, OSX_SETUP_URL, INSTALL_CMD } from '../data/release';
 ---
-<section class="band" id="download"><div class="wrap">
-  <div class="bandhead"><span class="tag">Download</span><h2 class="disp">Grab the beta</h2></div>
+<section class="dlband" id="download"><div class="in">
+  <div class="eyebrow">Download</div>
+  <h2>Get rewynd: free, about a minute to set up</h2>
   <div class="dl">
     <div class="plat">
-      <h3>Linux</h3><div class="os2">Any distro · Wayland &amp; X11</div>
-      <p>Self-updating AppImage, or the one-liner:</p>
-      <div class="cmd"><span class="p">$</span> <span class="cmdtext" id="installCmdDl">{INSTALL_CMD}</span> <button class="cp" data-copy="#installCmdDl" aria-live="polite" aria-label="Copy install command">copy</button></div>
-      <a class="btn mint" href={APPIMAGE_URL}>↓ AppImage</a>
+      <div>
+        <h3>Windows</h3>
+        <p>Download the installer and run it. Per-user, no admin rights.</p>
+      </div>
+      <a class="btn acc" href={WIN_SETUP_URL}>Download installer</a>
     </div>
     <div class="plat">
-      <h3>Windows</h3><div class="os2">Windows 10 / 11 · per-user, no admin</div>
-      <p>Run the installer; it updates itself on launch.</p>
-      <a class="btn mint" href={WIN_SETUP_URL}>↓ Setup.exe</a>
+      <div>
+        <h3>Linux</h3>
+        <p>One command installs the self-updating AppImage on any distro:</p>
+      </div>
+      <div class="cmd"><span class="cmdtext" id="installCmdLinux">{INSTALL_CMD}</span><button class="cp" data-copy="#installCmdLinux" aria-live="polite" aria-label="Copy install command">copy</button></div>
+      <a class="btn ghost" href={APPIMAGE_URL}>Or grab the AppImage</a>
     </div>
     <div class="plat">
-      <h3>macOS <span class="tag">Early</span></h3><div class="os2">Apple Silicon · macOS 15+</div>
-      <p>Self-updating installer, or the same one-liner as Linux:</p>
-      <div class="cmd"><span class="p">$</span> <span class="cmdtext" id="installCmdMac">{INSTALL_CMD}</span> <button class="cp" data-copy="#installCmdMac" aria-live="polite" aria-label="Copy install command">copy</button></div>
-      <a class="btn mint" href={OSX_SETUP_URL}>↓ Setup.pkg</a>
+      <div>
+        <h3>macOS</h3>
+        <p>Apple Silicon, macOS 15+. The same one-liner installs rewynd.app:</p>
+      </div>
+      <div class="cmd"><span class="cmdtext" id="installCmdMac">{INSTALL_CMD}</span><button class="cp" data-copy="#installCmdMac" aria-live="polite" aria-label="Copy install command">copy</button></div>
+      <a class="btn ghost" href={OSX_SETUP_URL}>Or download the .pkg</a>
     </div>
   </div>
-  <p class="notewarn">Beta: expect rough edges, and please file bugs. Builds are unsigned while signing is in the works, so Windows may show a SmartScreen warning; choose &ldquo;More info&rdquo; &rarr; &ldquo;Run anyway&rdquo;. On macOS, open the downloaded <code>.pkg</code> with right-click &rarr; Open; the one-liner installer skips that. <a href={ALL_RELEASES_URL}>All releases on GitHub →</a></p>
+  <div class="secnote">The app checks for updates on launch. One click updates everything in place.</div>
 </div></section>

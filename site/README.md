@@ -27,12 +27,11 @@ site/
   src/
     layouts/Base.astro    # <head>: meta, Open Graph, fonts, global.css, SvgDefs
     pages/index.astro     # composes the section components
-    components/           # BetaBar, Nav, Hero, LibraryShot, TrustStrip, HowItWorks,
-                          # Features, Pipeline, GankedStrip, OpenSource, Download,
-                          # Footer, LogoMark, SvgDefs
-    data/clips.ts         # the placeholder clip library shown in the hero
+    components/           # Nav, Hero, LibraryShot, WhatItDoes, HowItWorks, Platforms,
+                          # Practical, BetaNote, Download, Footer, LogoMark, SvgDefs
+    data/clips.ts         # the placeholder clip library shown below the hero
     data/release.ts       # pinned release tag + download-asset URLs
-    styles/global.css     # the Arena design system (tokens + all component styles)
+    styles/global.css     # design tokens + all component styles
 ```
 
 The hero's OS-aware download label and the "copy" buttons are a small inline
@@ -40,10 +39,10 @@ The hero's OS-aware download label and the "copy" buttons are a small inline
 
 ## Design
 
-Follows the **Arena** design system (see `../docs/design/arena.md`): near-black
-surfaces, one mint accent (`#00e5a0`), borders instead of shadows, Barlow Condensed
-(display) + Inter (body), 8px radii. Dark-only for now (add light mode later with the
-same tokens).
+Ported from the design canvas ("Rewynd Site"): calm dark blue-slate surfaces, one
+seafoam accent (`#6fcfae`), 1px borders instead of shadows, Source Serif 4 (display)
++ Instrument Sans (body) + IBM Plex Mono (data), 8-12px radii. Tokens live at the
+top of `styles/global.css`. Dark-only for now.
 
 Positioning: **standalone, open-source recorder first**; ganked.tv is a first-class
 integration, not the headline. See the full spec:
@@ -75,7 +74,6 @@ default; pull it wherever you deploy. Build/run it locally with
   per-clip naming and game auto-detection/tagging. Keep in sync with the app.
 - **Social card:** `og:image` points at `assets/logo-512.png`; replace with a proper
   1200×630 card.
-- **Discord link** in the footer is a placeholder (`#`).
 
 Numbers on the page are deliberately honest — no invented CPU %, download counts, or
 star totals (Arena "data honesty"). Keep it that way.
