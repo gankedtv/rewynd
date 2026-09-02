@@ -22,11 +22,14 @@ npm run preview   # serve the built dist/
 
 ```text
 site/
-  astro.config.mjs        # set `site` to the real domain (drives canonical + OG URLs)
-  public/assets/          # logo.svg + PNG icons (served at /assets/…)
+  astro.config.mjs        # set `site` to the real domain (drives canonical, OG URLs, sitemap)
+  nginx.conf              # runtime config: 404 page, gzip, immutable caching for /_astro/
+  public/assets/          # logo.svg + PNG icons + og-card.png (served at /assets/…)
   src/
-    layouts/Base.astro    # <head>: meta, Open Graph, fonts, global.css, SvgDefs
+    layouts/Base.astro    # <head>: meta, Open Graph, JSON-LD, fonts, global.css, SvgDefs
     pages/index.astro     # composes the section components
+    pages/404.astro       # served by nginx's error_page for unknown paths
+    pages/robots.txt.ts   # points crawlers at the sitemap; Cloudflare appends its own block
     components/           # Nav, Hero, LibraryShot, WhatItDoes, HowItWorks, Platforms,
                           # Practical, BetaNote, Download, Footer, LogoMark, SvgDefs
     data/clips.ts         # the placeholder clip library shown below the hero
@@ -36,6 +39,29 @@ site/
 
 The hero's OS-aware download label and the "copy" buttons are a small inline
 `<script>` in `Hero.astro` — progressive enhancement; the page works without JS.
+
+`Nav` and `Footer` are shared with the 404 page, so their in-page links are written
+root-relative (`/#how`, not `#how`) — on the homepage that is still a same-document
+hash jump, and from `/404` it actually goes somewhere.
+
+## SEO
+
+`@astrojs/sitemap` emits `/sitemap-index.xml` at build time (the 404 route is excluded).
+`Base.astro` carries the canonical link, the Open Graph / Twitter card meta, and a
+`SoftwareApplication` JSON-LD block. That block deliberately has no `aggregateRating`
+or download count — we have no honest numbers, and inventing them risks a manual action.
+
+`404.astro` passes `noindex` to the layout, which drops the canonical, the `og:url` and
+the JSON-LD: the page is only ever reached through nginx's `error_page`, so the URL a
+canonical would name returns 404 itself, and the site entity belongs on the homepage.
+
+The lockfile is generated on Linux, so it keeps the platform-specific optional deps
+(`@emnapi/*`) that `npm ci` needs inside the `node:22-alpine` build stage. Regenerating
+it on macOS prunes them and breaks the Docker build; do it in the image instead:
+
+```sh
+docker run --rm -v "$PWD":/w -w /w node:22-alpine npm install --package-lock-only
+```
 
 ## Design
 
@@ -72,8 +98,6 @@ default; pull it wherever you deploy. Build/run it locally with
   screenshot. Drop in a real capture when ready — the layout won't move.
 - **Clip titles + game grouping** (`data/clips.ts`) are aspirational — they assume
   per-clip naming and game auto-detection/tagging. Keep in sync with the app.
-- **Social card:** `og:image` points at `assets/logo-512.png`; replace with a proper
-  1200×630 card.
 
 Numbers on the page are deliberately honest — no invented CPU %, download counts, or
 star totals (Arena "data honesty"). Keep it that way.

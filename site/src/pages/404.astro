@@ -1,0 +1,25 @@
+---
+import Base from '../layouts/Base.astro';
+import Nav from '../components/Nav.astro';
+import Footer from '../components/Footer.astro';
+import { ALL_RELEASES_URL } from '../data/release';
+---
+<Base
+  title="Page not found — rewynd"
+  description="That page doesn't exist on rewynd.dev."
+  noindex
+>
+  <Nav />
+  <main>
+    <section class="nf">
+      <p class="eyebrow">404</p>
+      <h1 class="h1">That page rolled off the buffer.</h1>
+      <p class="sub">The link is broken or the page moved. The rest of the site is one hop away.</p>
+      <div class="ctas">
+        <a class="btn acc" href="/">Back to the homepage</a>
+        <a class="btn ghost" href={ALL_RELEASES_URL}>All releases</a>
+      </div>
+    </section>
+  </main>
+  <Footer />
+</Base>

@@ -1,18 +1,47 @@
 ---
 import '../styles/global.css';
 import SvgDefs from '../components/SvgDefs.astro';
+import { RELEASE_TAG, ALL_RELEASES_URL } from '../data/release';
 
 interface Props {
   title?: string;
   description?: string;
+  /** Error routes: skip the canonical and the site-level structured data. */
+  noindex?: boolean;
 }
 const {
   title = 'rewynd: instant replay for your gameplay',
   description = 'rewynd is a lightweight, native instant-replay clip recorder for Linux, Windows, and macOS (Apple Silicon). The last 60 seconds, always one hotkey away. Open source, GPU-light, and one click from ganked.tv.',
+  noindex = false,
 } = Astro.props;
 
-const canonical = new URL(Astro.url.pathname, Astro.site).href;
-const ogImage = new URL('/assets/logo-512.png', Astro.site).href;
+// A noindex route has no canonical of its own: /404 is only ever reached through
+// nginx's error_page, so the URL it would name returns 404 itself.
+const canonical = noindex ? null : new URL(Astro.url.pathname, Astro.site).href;
+const ogImage = new URL('/assets/og-card.png', Astro.site).href;
+
+// Describes the site's one entity, so it belongs on the homepage only — not on an
+// error page whose own description contradicts it.
+// No aggregateRating / downloadCount: we don't have honest numbers, and inventing
+// them is both against the page's rules and a manual-action risk.
+const schema = noindex ? null : {
+  '@context': 'https://schema.org',
+  '@type': 'SoftwareApplication',
+  name: 'rewynd',
+  description,
+  url: new URL('/', Astro.site).href,
+  applicationCategory: 'MultimediaApplication',
+  applicationSubCategory: 'Screen recorder',
+  operatingSystem: 'Linux, Windows, macOS',
+  softwareVersion: RELEASE_TAG,
+  releaseNotes: ALL_RELEASES_URL,
+  codeRepository: 'https://github.com/gankedtv/rewynd',
+  license: 'https://www.gnu.org/licenses/gpl-3.0.html',
+  isAccessibleForFree: true,
+  image: ogImage,
+  offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
+  author: { '@type': 'Organization', name: 'ganked.tv', url: 'https://ganked.tv' },
+};
 ---
 <!DOCTYPE html>
 <html lang="en">
@@ -21,16 +50,28 @@ const ogImage = new URL('/assets/logo-512.png', Astro.site).href;
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{title}</title>
   <meta name="description" content={description} />
-  <link rel="canonical" href={canonical} />
+  {canonical && <link rel="canonical" href={canonical} />}
+  {noindex && <meta name="robots" content="noindex" />}
+  <meta name="theme-color" content="#0f161d" />
   <link rel="icon" href="/assets/logo.svg" type="image/svg+xml" />
   <link rel="apple-touch-icon" href="/assets/logo-256.png" />
-  <!-- Open Graph / social. Replace /assets/logo-512.png with a proper 1200x630 card. -->
+  <!-- Open Graph / social -->
   <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="rewynd" />
+  <meta property="og:locale" content="en_US" />
   <meta property="og:title" content={title} />
   <meta property="og:description" content={description} />
   <meta property="og:image" content={ogImage} />
-  <meta property="og:url" content={canonical} />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="rewynd — the last 60 seconds, one hotkey away." />
+  {canonical && <meta property="og:url" content={canonical} />}
   <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content={title} />
+  <meta name="twitter:description" content={description} />
+  <meta name="twitter:image" content={ogImage} />
+  <meta name="twitter:image:alt" content="rewynd — the last 60 seconds, one hotkey away." />
+  {schema && <script type="application/ld+json" set:html={JSON.stringify(schema)} is:inline />}
   <!-- Above the font links: a classic script can't run while an earlier stylesheet loads. -->
   <script is:inline>
     (function () {
