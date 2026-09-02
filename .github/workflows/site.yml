@@ -40,12 +40,82 @@ jobs:
       - name: build
         run: npm run build
 
+  # Boots the built image and waits for its HEALTHCHECK. `astro build` never
+  # starts a container, so a config change that leaves nginx unreachable used to
+  # ship green and only fail on the deploy host's health gate.
+  container:
+    name: container · healthcheck + endpoints
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
+      - name: build image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: site
+          load: true
+          tags: rewynd-site:ci
+          # `publish` restores these layers, so it ships the image tested here
+          # rather than a fresh resolve of the floating base tags.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: start container
+        run: docker run -d --name site -p 8080:80 rewynd-site:ci
+
+      - name: wait for healthy
+        run: |
+          for _ in $(seq 1 60); do
+            health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' site)
+            case "$health" in
+              healthy)   echo "healthy"; exit 0 ;;
+              unhealthy) echo "::error::healthcheck reported unhealthy"; break ;;
+            esac
+            sleep 2
+          done
+          echo "::error::container never became healthy (last status: ${health:-unknown})"
+          docker inspect -f '{{json .State.Health}}' site
+          docker logs site
+          exit 1
+
+      - name: assert endpoints
+        run: |
+          fail=0
+          check() { # path expected-status
+            got=$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:8080$1") || got=000
+            if [ "$got" != "$2" ]; then
+              echo "::error::$1 returned $got, expected $2"; fail=1
+            fi
+          }
+          check /                  200
+          check /robots.txt        200
+          check /sitemap-index.xml 200
+          check /nope              404
+          # error_page must reach the Astro page, not nginx's stock 404. Assert the
+          # contract (noindex + the header only `location = /404.html` sets on a 404)
+          # rather than the headline copy, which is free to change.
+          body=$(curl -sS http://127.0.0.1:8080/nope) || body=''
+          grep -q 'name="robots" content="noindex"' <<<"$body" \
+            || { echo "::error::/nope is not served the Astro 404 page"; fail=1; }
+          curl -sSI http://127.0.0.1:8080/nope | grep -qi '^cache-control: no-cache' \
+            || { echo "::error::404 response is missing the no-cache header"; fail=1; }
+          exit $fail
+
+      - name: stop container
+        if: always()
+        run: docker rm -f site
+
   # Build the site into a container and push it to GHCR. Runs only on merges to
   # main (never from PRs — no registry writes on untrusted branches). New GHCR
   # packages are private by default; keep it that way in the package settings.
   publish:
     name: publish image (ghcr)
-    needs: build
+    needs: [build, container]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
@@ -66,6 +136,7 @@ jobs:
         with:
           context: site
           push: true
+          cache-from: type=gha
           tags: |
             ghcr.io/${{ github.repository }}-site:latest
             ghcr.io/${{ github.repository }}-site:${{ github.sha }}
