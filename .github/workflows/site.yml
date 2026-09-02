@@ -52,18 +52,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
-
       - name: build image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: site
-          load: true
-          tags: rewynd-site:ci
-          # `publish` restores these layers, so it ships the image tested here
-          # rather than a fresh resolve of the floating base tags.
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        # Labelled here rather than at push time: `publish` ships these exact
+        # bytes, so the image must be complete before it is tested.
+        run: |
+          docker build \
+            --label org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }} \
+            -t rewynd-site:ci site
 
       - name: start container
         run: docker run -d --name site -p 8080:80 rewynd-site:ci
@@ -106,25 +101,42 @@ jobs:
             || { echo "::error::404 response is missing the no-cache header"; fail=1; }
           exit $fail
 
+      # Only main publishes, so only main pays the upload.
+      - name: save tested image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: docker save rewynd-site:ci | gzip > /tmp/site-image.tar.gz
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          name: site-image
+          path: /tmp/site-image.tar.gz
+          retention-days: 1
+
       - name: stop container
         if: always()
         run: docker rm -f site
 
-  # Build the site into a container and push it to GHCR. Runs only on merges to
-  # main (never from PRs — no registry writes on untrusted branches). New GHCR
+  # Pushes the image the `container` job booted and asserted, byte for byte —
+  # it never builds, so it can't re-resolve the floating base tags into something
+  # no job ever ran. Merges to main only; no registry writes from PRs. New GHCR
   # packages are private by default; keep it that way in the package settings.
   publish:
     name: publish image (ghcr)
-    needs: [build, container]
+    needs: container
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          persist-credentials: false
+          name: site-image
+          path: /tmp
+
+      - name: load tested image
+        run: docker load < /tmp/site-image.tar.gz
 
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
@@ -132,13 +144,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: site
-          push: true
-          cache-from: type=gha
-          tags: |
-            ghcr.io/${{ github.repository }}-site:latest
-            ghcr.io/${{ github.repository }}-site:${{ github.sha }}
-          # Links the package to this repo (grants repo-based access + provenance).
-          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+      - name: push
+        run: |
+          image=ghcr.io/${{ github.repository }}-site
+          docker tag rewynd-site:ci "$image:latest"
+          docker tag rewynd-site:ci "$image:${{ github.sha }}"
+          docker push "$image:latest"
+          docker push "$image:${{ github.sha }}"
