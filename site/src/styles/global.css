@@ -164,3 +164,8 @@ footer{border-top:1px solid var(--line);padding:36px var(--gutter) 40px}
   html{scroll-behavior:auto}
   .side .recline .rd{animation:none}
 }
+
+/* 404 */
+.nf{max-width:720px;margin:0 auto;padding:110px var(--gutter) 130px;text-align:center}
+.nf .h1{font-size:clamp(30px,4vw,44px);margin-bottom:18px}
+.nf .sub{font-size:16.5px;line-height:1.65;color:var(--t65);max-width:480px;margin:0 auto 30px;text-wrap:pretty}
