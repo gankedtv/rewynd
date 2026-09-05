@@ -68,7 +68,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends gh
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
@@ -131,7 +131,7 @@ jobs:
     permissions:
       contents: write # gh release upload appends the Windows assets
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
@@ -184,7 +184,7 @@ jobs:
     permissions:
       contents: write # gh release upload appends the macOS assets
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
@@ -263,7 +263,7 @@ jobs:
     permissions:
       contents: write # commits the new tag to site/src/data/release.ts on main
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: main
           # The push below authenticates explicitly, so no credential lingers in .git/config.
