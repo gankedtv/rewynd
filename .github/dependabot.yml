@@ -1,0 +1,34 @@
+# Monthly, grouped, 7-day cooldown. Cargo stays manual (CLAUDE.md → Dependencies).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directories:
+      - /
+      - /.github/actions/*
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /site
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      site:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /site
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      site-image:
+        patterns: ["*"]
