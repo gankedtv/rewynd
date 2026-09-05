@@ -1,7 +1,4 @@
-# Monthly, grouped, after a 7-day cooldown so a freshly compromised release has time to be
-# pulled before it is proposed. Cargo is deliberately not here: Dependabot rewrites manifest
-# ranges, ignores transitive crates, is not MSRV-aware and would fight the ADR 0001 wgpu pin.
-# Cargo.lock is refreshed by hand with `cargo update` (see CLAUDE.md → Dependencies).
+# Monthly, grouped, 7-day cooldown. Cargo stays manual (CLAUDE.md → Dependencies).
 version: 2
 updates:
   - package-ecosystem: github-actions
