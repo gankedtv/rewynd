@@ -25,6 +25,10 @@
 - **Read CodeRabbit's review properly before merging.** Its author login is `coderabbitai[bot]`, so match case-insensitively. The verdict (`Actionable comments posted: N`) lives in the PR *reviews*, and the findings are *inline review comments*, not issue comments: `gh api repos/<owner>/<repo>/pulls/<n>/comments --paginate`. Only treat it as "no findings" after checking that endpoint. If it says rate-limited / "Review limit reached", skip it and merge once CI is green (per the user's standing permission).
 - CI installs the Linux capture system deps (`libpipewire-0.3-dev`, `clang`); keep that in `.github/workflows/ci.yml`.
 
+## Dependencies
+- Dependabot (`.github/dependabot.yml`) keeps GitHub Actions, the site's npm packages and the site's Docker base image current: monthly, one grouped PR per ecosystem, 7-day cooldown. Dependabot security updates are on for everything else, next to the cargo-deny gate.
+- Cargo is refreshed by hand: run `cargo update` in every periodic sweep. The MSRV-aware resolver keeps `rust-version` honest, and `cargo update --verbose --dry-run` lists the majors it left behind. Take majors deliberately, one manifest edit each, never `wgpu`/`gpu-video` (ADR 0001).
+
 ## Habits
 - **Research before implementing** against fast-moving crates (`wgpu`, `ashpd`, `pipewire`, `gpu-video`, …) — **freely web-search** current versions/APIs/features; don't trust training-era memory.
 - **Periodic review:** roughly every ~5 merged PRs, sweep `main` for DRY/refactor/best-practice/library improvements. Do it if worthwhile (its own PR), otherwise continue to the next issue — don't force changes.
