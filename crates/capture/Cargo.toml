@@ -56,7 +56,8 @@ futures-util.workspace = true
 # Windows capture (PLAN §3.5): Windows Graphics Capture → D3D11 shared NT handles.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-capture.workspace = true
-windows.workspace = true
+# Window style/state queries (IsIconic, GWL_STYLE) behind the game heuristic.
+windows = { workspace = true, features = ["Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
 # The probe opens the shared handle on a second D3D11 device (D3D11CreateDevice

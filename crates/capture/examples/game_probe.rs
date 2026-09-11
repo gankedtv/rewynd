@@ -1,7 +1,7 @@
 //! Diagnostic probe for the game detector: every 2 s, print how the current
-//! foreground window scores against the fullscreen-game heuristic (process, rect,
-//! covers-monitor, verdict). Alt-tab into the game while it runs; the output shows
-//! exactly which step accepts or rejects it.
+//! foreground window scores against the fullscreen-game heuristic (process, window
+//! style, rect, state, verdict). Alt-tab into the game while it runs; the output
+//! shows exactly which step accepts or rejects it.
 //!
 //! `cargo run -p rewynd-capture --example game_probe`
 
