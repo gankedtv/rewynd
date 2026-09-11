@@ -4,7 +4,8 @@
 //!
 //! - [`wgc_capture`]: the WGC session setup, the shareable-slot pool, and the
 //!   per-frame copy + NT-handle duplication.
-//! - [`game_window`]: the foreground-game heuristic behind game-only capture.
+//! - [`game_window`]: the foreground-game heuristic behind game-only capture, and
+//!   the latch that releases a captured window once it leaves fullscreen.
 //! - [`wasapi_audio`]: loopback (system mix) and microphone capture as f32 PCM.
 
 mod game_window;

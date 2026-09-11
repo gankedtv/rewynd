@@ -190,7 +190,7 @@ struct HandlerFlags<F> {
     stop: Option<Arc<AtomicBool>>,
     /// Set when the callback breaks: a deliberate, successful end.
     success: Arc<AtomicBool>,
-    /// Set when the stop flag was observed: a clean cooperative stop.
+    /// Set when the stop flag was observed or the keep-alive gave up: a clean stop.
     stopped: Arc<AtomicBool>,
 }
 
@@ -417,7 +417,7 @@ where
         "starting WGC monitor capture"
     );
     let refresh = monitor.refresh_rate().unwrap_or(0);
-    run_session(monitor, refresh, epoch, prefs, stop, on_frame)
+    run_session(monitor, refresh, epoch, prefs, stop, || true, on_frame)
 }
 
 /// The monitor `monitor_index` names (one-based, per the Win32 display enumeration); `None`
@@ -455,10 +455,11 @@ pub type GameCallback = Box<dyn Fn(Option<&crate::game::GameInfo>) + Send + Sync
 
 /// Capture the active *game*, continuously: poll the foreground window until one
 /// looks like a running game (fullscreen/borderless — see
-/// [`super::game_window::fullscreen_game_window`]), capture it until it closes,
-/// then go back to watching for the next one. Desktop content between games is
-/// never captured. `on_game` reports each session's game (and its end) so the
-/// caller can gate audio and label clip folders.
+/// [`super::game_window::fullscreen_game_window`]), capture it until it closes or
+/// stops being fullscreen, then go back to watching for the next one. Losing focus
+/// never ends a session; being minimized ends one only after a long grace. Desktop
+/// content between games is never captured. `on_game` reports each session's game
+/// (and its end) so the caller can gate audio and label clip folders.
 ///
 /// Same callback/stop contract as [`capture_stream`]; a callback `Break` ends the
 /// whole loop, not just the current game's session. Blocks until `on_frame` breaks
@@ -530,12 +531,32 @@ where
                 }
             }
         };
-        // The expected end — the game closed (its item died, surfacing as the
-        // stream-end error) — returns to the detector. Anything else (setup or
-        // device failures) gets a small retry budget for races like a window
-        // closing mid-setup, then propagates so a broken backend can't spin
-        // silently forever.
-        let session = run_session(window, refresh, epoch, prefs, stop.clone(), session_cb);
+        // Releasing on a lost fullscreen is what stops a video player, a chat client
+        // or a minimized game from holding the recorder.
+        let mut latch = super::game_window::Latch::default();
+        let keep_alive = move || {
+            let state = super::game_window::window_state(&window);
+            let keep = latch.observe(state, Instant::now());
+            if !keep {
+                tracing::info!(
+                    ?state,
+                    "captured window is no longer fullscreen; releasing it"
+                );
+            }
+            keep
+        };
+        // The expected ends (the game closed, or it stopped being fullscreen) return to
+        // the detector. Anything else gets a small retry budget, then propagates so a
+        // broken backend can't spin silently forever.
+        let session = run_session(
+            window,
+            refresh,
+            epoch,
+            prefs,
+            stop.clone(),
+            keep_alive,
+            session_cb,
+        );
         if let Some(on_game) = &on_game {
             on_game(None);
         }
@@ -564,12 +585,16 @@ where
 /// [`capture_stream`] and [`capture_game_stream`]. `refresh` is the source
 /// monitor's refresh rate (0 = unknown), used to decide whether `prefs.framerate`
 /// caps delivery via WGC's minimum update interval.
+///
+/// `keep_alive` is polled next to the stop flag every [`STOP_POLL`]; `false` ends the
+/// session as a clean stop. The monitor path has nothing to re-check: `|| true`.
 fn run_session<T, F>(
     item: T,
     refresh: u32,
     epoch: Instant,
     prefs: StreamPrefs,
     stop: Option<Arc<AtomicBool>>,
+    mut keep_alive: impl FnMut() -> bool,
     on_frame: F,
 ) -> Result<(), CaptureError>
 where
@@ -619,10 +644,10 @@ where
         if control.is_finished() {
             break control.wait();
         }
-        if stop
+        let stop_requested = stop
             .as_ref()
-            .is_some_and(|stop| stop.load(Ordering::Relaxed))
-        {
+            .is_some_and(|stop| stop.load(Ordering::Relaxed));
+        if stop_requested || !keep_alive() {
             stopped.store(true, Ordering::Relaxed);
             break control.stop();
         }
@@ -634,5 +659,16 @@ where
         Ok(())
     } else {
         Err(CaptureError::Wgc(STREAM_END_ERROR.to_owned()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A grace shorter than two watchdog samples could expire unobserved.
+    #[test]
+    fn the_release_grace_outlasts_the_watchdog_poll() {
+        assert!(super::super::game_window::RELEASE_GRACE >= 2 * STOP_POLL);
     }
 }
