@@ -457,9 +457,9 @@ pub type GameCallback = Box<dyn Fn(Option<&crate::game::GameInfo>) + Send + Sync
 /// looks like a running game (fullscreen/borderless — see
 /// [`super::game_window::fullscreen_game_window`]), capture it until it closes or
 /// stops being fullscreen, then go back to watching for the next one. Losing focus
-/// never ends a session, and being minimized ends one only after a long grace.
-/// Desktop content between games is never captured. `on_game` reports each session's
-/// game (and its end) so the caller can gate audio and label clip folders.
+/// never ends a session; being minimized ends one only after a long grace. Desktop
+/// content between games is never captured. `on_game` reports each session's game
+/// (and its end) so the caller can gate audio and label clip folders.
 ///
 /// Same callback/stop contract as [`capture_stream`]; a callback `Break` ends the
 /// whole loop, not just the current game's session. Blocks until `on_frame` breaks
@@ -531,8 +531,8 @@ where
                 }
             }
         };
-        // Releasing a window that stopped being fullscreen is what stops a video
-        // player, a chat client or a minimized game from holding the recorder.
+        // Releasing on a lost fullscreen is what stops a video player, a chat client
+        // or a minimized game from holding the recorder.
         let mut latch = super::game_window::Latch::default();
         let keep_alive = move || {
             let state = super::game_window::window_state(&window);
@@ -545,10 +545,8 @@ where
             }
             keep
         };
-        // The expected ends — the game closed (its item died, surfacing as the
-        // stream-end error) or the window stopped being fullscreen — return to the
-        // detector. Anything else (setup or device failures) gets a small retry
-        // budget for races like a window closing mid-setup, then propagates so a
+        // The expected ends (the game closed, or it stopped being fullscreen) return to
+        // the detector. Anything else gets a small retry budget, then propagates so a
         // broken backend can't spin silently forever.
         let session = run_session(
             window,

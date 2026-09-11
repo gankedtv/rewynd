@@ -6,12 +6,9 @@
 //! is how both exclusive-fullscreen and borderless-fullscreen games present.
 //! Windowed-mode games don't match; the desktop-capture opt-in covers those.
 //!
-//! Covering the monitor is not sufficient either — a fullscreen video looks the
-//! same — so known non-game apps and decorated maximized windows are rejected too.
-//!
-//! [`Latch`] applies the same [`WindowState`] to the *captured* window while the
-//! session runs: one that stops being fullscreen is released, so it can't hold the
-//! recorder against the game it is blocking. Losing focus is not a state at all.
+//! Known non-game apps and decorated maximized windows are rejected too.
+//! [`Latch`] applies the same [`WindowState`] to the *captured* window, releasing one
+//! that stops being fullscreen. Losing focus is not a state at all.
 
 use std::time::{Duration, Instant};
 
@@ -22,8 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows_capture::window::Window;
 
-/// Shell/system processes that legitimately own monitor-sized foreground windows —
-/// nor should rewynd capture itself.
+/// Shell processes that legitimately own monitor-sized windows, plus rewynd itself.
 const SHELL_PROCESSES: &[&str] = &[
     "explorer.exe",
     "searchhost.exe",
@@ -129,9 +125,8 @@ fn rect_covers(rect: RECT, bounds: RECT) -> bool {
         && rect.bottom >= bounds.bottom
 }
 
-/// A maximized window still drawing a title bar is a windowed app on a taskbar-less
-/// monitor: every engine's fullscreen and borderless mode drops the caption.
-/// `WS_CAPTION` is two bits, so it is matched whole (`WS_BORDER` alone is not one).
+/// Every engine drops the caption in fullscreen and borderless, so caption+maximize is
+/// a windowed app on a taskbar-less monitor. `WS_CAPTION` is two bits: match it whole.
 fn is_fullscreen_style(style: u32) -> bool {
     !((style & WS_CAPTION.0) == WS_CAPTION.0 && (style & WS_MAXIMIZE.0) != 0)
 }
@@ -150,13 +145,11 @@ pub(crate) enum WindowState {
 /// Long enough to ride out a display-mode switch's flicker.
 pub(crate) const RELEASE_GRACE: Duration = Duration::from_secs(1);
 
-/// Longer: alt-tabbing out of an exclusive-fullscreen game minimizes it, and a release
-/// costs the buffer's continuity. Still bounded, so a game left minimized can't hold
-/// the recorder while another runs.
+/// Longer: alt-tab minimizes an exclusive-fullscreen game. Bounded, so one left
+/// minimized cannot hold the recorder while another runs.
 pub(crate) const MINIMIZED_GRACE: Duration = Duration::from_secs(30);
 
-/// The hold on a captured window, released once it has not been fullscreen for the
-/// grace the stretch away has earned.
+/// Releases the captured window once it has not been fullscreen for its earned grace.
 #[derive(Debug, Default)]
 pub(crate) struct Latch {
     away_since: Option<Instant>,
@@ -171,9 +164,8 @@ impl Latch {
             self.grace = Duration::ZERO;
             return true;
         }
-        // One clock per stretch away, so minimizing does not forgive time already
-        // spent windowed; the longest grace earned holds for the rest of it, so a
-        // window restoring from minimized still gets to re-enter fullscreen.
+        // One clock per stretch, keeping the longest grace earned: minimizing forgives
+        // nothing, and a window restoring from it can still re-enter fullscreen.
         let since = *self.away_since.get_or_insert(now);
         self.grace = self.grace.max(if state == WindowState::Minimized {
             MINIMIZED_GRACE
@@ -224,8 +216,7 @@ pub(crate) fn fullscreen_game_window() -> Option<Window> {
 }
 
 fn classify(window: &Window) -> Verdict {
-    // Anti-cheat games (Vanguard, EAC, ...) refuse OpenProcess, so a failed name query
-    // must NOT disqualify. Everything the lists guard against is queryable.
+    // Anti-cheat games refuse OpenProcess, so a failed name query must NOT disqualify.
     if let Ok(process) = window.process_name() {
         match process_exclusion(&process) {
             Some(Exclusion::Shell) => return Verdict::Shell,
@@ -248,8 +239,7 @@ fn window_style(window: &Window) -> u32 {
     style as u32
 }
 
-/// Shared by the detector and the latch, so a window is never kept under a rule that
-/// would not have latched it.
+/// Shared with the latch, so a window is never kept under a rule that would not latch it.
 pub(crate) fn window_state(window: &Window) -> WindowState {
     let hwnd = HWND(window.as_raw_hwnd());
     // SAFETY: FFI; both tolerate a destroyed HWND (they report false).
@@ -402,7 +392,6 @@ mod tests {
     fn rect_covers_accepts_fullscreen_and_borderless_overhang() {
         assert!(rect_covers(MONITOR, MONITOR));
         assert!(rect_covers(rect(-1, -1, 2561, 1441), MONITOR));
-        // A maximized window hangs its frame over: geometry accepts, the style rejects.
         assert!(rect_covers(rect(-8, -8, 2568, 1448), MONITOR));
     }
 
@@ -420,13 +409,10 @@ mod tests {
         assert!(is_fullscreen_style(
             WS_POPUP.0 | WS_VISIBLE.0 | WS_MAXIMIZE.0
         ));
-        // A border alone is not a caption.
         assert!(is_fullscreen_style(
             WS_POPUP.0 | WS_BORDER.0 | WS_MAXIMIZE.0
         ));
-        // Not maximized: geometry decides.
         assert!(is_fullscreen_style(WS_OVERLAPPEDWINDOW.0 | WS_VISIBLE.0));
-        // Unreadable style must not disqualify.
         assert!(is_fullscreen_style(0));
     }
 
@@ -446,7 +432,6 @@ mod tests {
         assert!(latch.observe(WindowState::Lost, t0 + Duration::from_millis(200)));
         assert!(latch.observe(WindowState::Lost, t0 + Duration::from_millis(800)));
         assert!(latch.observe(WindowState::Fullscreen, t0 + Duration::from_millis(1000)));
-        // The timer restarts from the new loss, not the old one.
         assert!(latch.observe(WindowState::Lost, t0 + Duration::from_millis(1200)));
         assert!(latch.observe(WindowState::Lost, t0 + Duration::from_millis(2100)));
         assert!(!latch.observe(WindowState::Lost, t0 + Duration::from_millis(2200)));
@@ -459,7 +444,6 @@ mod tests {
         assert!(latch.observe(WindowState::Fullscreen, t0));
         assert!(latch.observe(WindowState::Minimized, t0 + Duration::from_secs(2)));
         assert!(latch.observe(WindowState::Fullscreen, t0 + Duration::from_secs(10)));
-        // Coming back to fullscreen restarts the allowance.
         assert!(latch.observe(
             WindowState::Minimized,
             t0 + Duration::from_secs(10) + MINIMIZED_GRACE - Duration::from_secs(1)
@@ -469,7 +453,6 @@ mod tests {
     #[test]
     fn latch_releases_a_window_left_minimized() {
         let t0 = Instant::now();
-        // The allowance runs from the moment the window stopped being fullscreen.
         let away = t0 + Duration::from_secs(1);
         let mut latch = Latch::default();
         assert!(latch.observe(WindowState::Fullscreen, t0));
@@ -499,8 +482,7 @@ mod tests {
         assert!(latch.observe(WindowState::Fullscreen, t0));
         assert!(latch.observe(WindowState::Minimized, t0 + Duration::from_secs(1)));
         assert!(latch.observe(WindowState::Minimized, t0 + Duration::from_secs(10)));
-        // Restoring clears the minimized flag before the window covers its monitor
-        // again, and that window must not cost the session.
+        // Restoring clears the minimized flag before the window covers its monitor.
         assert!(latch.observe(WindowState::Lost, t0 + Duration::from_millis(10_200)));
         assert!(latch.observe(WindowState::Fullscreen, t0 + Duration::from_millis(10_600)));
     }
