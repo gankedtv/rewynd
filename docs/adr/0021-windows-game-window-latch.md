@@ -65,9 +65,14 @@ allowance is bounded rather than unlimited: a game left minimized while a second
 runs would otherwise hold the recorder for the rest of the session. Releasing a
 minimized window is cheap — the rings are cleared when the *next* game starts, not
 when a session ends, so the minimized game's footage stays saveable in the meantime,
-exactly as on Linux. One clock runs for the whole stretch away from fullscreen, so
-minimizing a window that had already left fullscreen buys the longer grace without
-forgiving the time already spent.
+exactly as on Linux.
+
+One clock runs for the whole stretch away from fullscreen, and the longest grace the
+stretch has earned holds for the rest of it. Minimizing therefore does not forgive
+time already spent windowed, and — the case that matters — a window restoring from
+minimized keeps its allowance while it re-enters fullscreen, which it needs: the
+minimized flag clears before the window covers its monitor again, and a stricter rule
+would end the session at the exact moment the user came back.
 
 The watchdog never asks which window is foreground, so merely losing focus cannot
 release a session: a borderless game that yields focus to a chat window on the second

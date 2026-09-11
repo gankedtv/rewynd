@@ -6,18 +6,12 @@
 //! is how both exclusive-fullscreen and borderless-fullscreen games present.
 //! Windowed-mode games don't match; the desktop-capture opt-in covers those.
 //!
-//! Covering the monitor alone is not enough, because a fullscreen video, a stream
-//! viewer or any maximized window on a monitor without a taskbar looks identical:
-//! known non-game apps are rejected by process name, and a maximized window that
-//! still shows its title bar is a windowed app rather than a fullscreen game.
+//! Covering the monitor is not sufficient either — a fullscreen video looks the
+//! same — so known non-game apps and decorated maximized windows are rejected too.
 //!
-//! Detection is not the end of it. [`Latch`] re-checks the captured window while the
-//! session runs, against the same [`WindowState`] the detector uses, and releases it
-//! once it has not been fullscreen for a grace period — so a window that leaves
-//! fullscreen hands the recorder back to the game it was blocking. A minimized window
-//! gets a much longer grace (WGC delivers nothing while minimized, and a release
-//! restarts the replay buffer) but not an unlimited one. Losing focus is not a state
-//! at all: the latch never asks which window is in front.
+//! [`Latch`] applies the same [`WindowState`] to the *captured* window while the
+//! session runs: one that stops being fullscreen is released, so it can't hold the
+//! recorder against the game it is blocking. Losing focus is not a state at all.
 
 use std::time::{Duration, Instant};
 
@@ -28,9 +22,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows_capture::window::Window;
 
-/// Shell/system processes that legitimately own monitor-sized foreground windows
-/// (the desktop itself, the lock screen, task switching) and must never be latched
-/// onto as "the game" — nor should rewynd capture itself.
+/// Shell/system processes that legitimately own monitor-sized foreground windows —
+/// nor should rewynd capture itself.
 const SHELL_PROCESSES: &[&str] = &[
     "explorer.exe",
     "searchhost.exe",
@@ -43,11 +36,8 @@ const SHELL_PROCESSES: &[&str] = &[
     "rewynd-recorder.exe",
 ];
 
-/// Apps that routinely present a window covering the whole monitor but are never the
-/// game: browsers (a fullscreen video), media players, chat clients showing a stream,
-/// storefronts and launchers, remote-desktop viewers and other recorders. Remote
-/// *play* clients (Parsec, Moonlight) are deliberately absent — there the user is
-/// playing a game.
+/// Apps that routinely cover the whole monitor but are never the game. Remote *play*
+/// clients (Parsec, Moonlight) are deliberately absent: there the user is playing.
 const NON_GAME_PROCESSES: &[&str] = &[
     // Browsers
     "chrome.exe",
@@ -110,15 +100,14 @@ const NON_GAME_PROCESSES: &[&str] = &[
     "obs32.exe",
 ];
 
-/// Why a process is disqualified. The two lists are kept apart so the probe can name
-/// which rule rejected a window.
+/// Kept apart so the probe can name which rule rejected a window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Exclusion {
     Shell,
     NonGame,
 }
 
-/// Screensavers run fullscreen over everything and always end in this suffix.
+/// Screensavers run fullscreen over everything and always end in this.
 const SCREENSAVER_SUFFIX: &str = ".scr";
 
 fn process_exclusion(name: &str) -> Option<Exclusion> {
@@ -132,8 +121,7 @@ fn process_exclusion(name: &str) -> Option<Exclusion> {
     None
 }
 
-/// Whether `rect` covers all of `bounds` (a borderless window may hang a pixel over,
-/// so "covers" is `<=`/`>=`, not equality).
+/// A borderless window may hang a pixel over, so "covers" is `<=`/`>=`, not equality.
 fn rect_covers(rect: RECT, bounds: RECT) -> bool {
     rect.left <= bounds.left
         && rect.top <= bounds.top
@@ -141,44 +129,38 @@ fn rect_covers(rect: RECT, bounds: RECT) -> bool {
         && rect.bottom >= bounds.bottom
 }
 
-/// A maximized window that still draws its title bar is a windowed app spread over a
-/// monitor without a taskbar, not a fullscreen game: every engine's fullscreen and
-/// borderless mode drops the caption. `WS_CAPTION` is two bits, so it is matched
-/// whole — a `WS_POPUP | WS_BORDER` borderless window has no caption.
+/// A maximized window still drawing a title bar is a windowed app on a taskbar-less
+/// monitor: every engine's fullscreen and borderless mode drops the caption.
+/// `WS_CAPTION` is two bits, so it is matched whole (`WS_BORDER` alone is not one).
 fn is_fullscreen_style(style: u32) -> bool {
     !((style & WS_CAPTION.0) == WS_CAPTION.0 && (style & WS_MAXIMIZE.0) != 0)
 }
 
-/// What a window is doing now. Only [`WindowState::Fullscreen`] qualifies as a game;
-/// the rest say why not, which is what both the detector and the latch act on.
+/// Only [`WindowState::Fullscreen`] qualifies as a game; the rest say why not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WindowState {
-    /// Covering its monitor, with no title bar in the way.
     Fullscreen,
-    /// Minimized: WGC delivers no frames, and the window is one restore away.
     Minimized,
-    /// Covering its monitor, but as a maximized window that still draws a title bar.
+    /// Covering its monitor, but still drawing a title bar.
     Decorated,
     /// Windowed, hidden or gone.
     Lost,
 }
 
-/// How long a window must stay out of fullscreen before its session is released.
-/// Long enough to ride out the flicker of a display-mode switch, short enough that a
-/// window left behind hands the recorder back quickly.
+/// Long enough to ride out a display-mode switch's flicker.
 pub(crate) const RELEASE_GRACE: Duration = Duration::from_secs(1);
 
-/// The same, for a window that is merely minimized. Generous, because an alt-tab out
-/// of an exclusive-fullscreen game minimizes it and a release costs the replay
-/// buffer's continuity — but still bounded, so a game left minimized cannot hold the
-/// recorder while another one runs.
+/// Longer: alt-tabbing out of an exclusive-fullscreen game minimizes it, and a release
+/// costs the buffer's continuity. Still bounded, so a game left minimized can't hold
+/// the recorder while another runs.
 pub(crate) const MINIMIZED_GRACE: Duration = Duration::from_secs(30);
 
-/// The hold on a captured window: once it has not been fullscreen for longer than the
-/// grace its current state allows, the session ends and detection starts over.
+/// The hold on a captured window, released once it has not been fullscreen for the
+/// grace the stretch away has earned.
 #[derive(Debug, Default)]
 pub(crate) struct Latch {
     away_since: Option<Instant>,
+    grace: Duration,
 }
 
 impl Latch {
@@ -186,22 +168,23 @@ impl Latch {
     pub(crate) fn observe(&mut self, state: WindowState, now: Instant) -> bool {
         if state == WindowState::Fullscreen {
             self.away_since = None;
+            self.grace = Duration::ZERO;
             return true;
         }
-        // One clock for the whole stretch away from fullscreen: minimizing a window
-        // that had already left fullscreen buys the longer grace, not a fresh start.
+        // One clock per stretch away, so minimizing does not forgive time already
+        // spent windowed; the longest grace earned holds for the rest of it, so a
+        // window restoring from minimized still gets to re-enter fullscreen.
         let since = *self.away_since.get_or_insert(now);
-        let grace = if state == WindowState::Minimized {
+        self.grace = self.grace.max(if state == WindowState::Minimized {
             MINIMIZED_GRACE
         } else {
             RELEASE_GRACE
-        };
-        now.duration_since(since) < grace
+        });
+        now.duration_since(since) < self.grace
     }
 }
 
-/// The ordered verdict on a foreground window, shared by the detector and the probe
-/// so the diagnostic always reports the decision that was actually made.
+/// Shared by the detector and the probe, so the diagnostic reports the real decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Verdict {
     Game,
@@ -241,9 +224,8 @@ pub(crate) fn fullscreen_game_window() -> Option<Window> {
 }
 
 fn classify(window: &Window) -> Verdict {
-    // Anti-cheat-protected games (Vanguard, EAC, ...) refuse OpenProcess, so a
-    // failed name query must NOT disqualify — it is in fact a strong game signal.
-    // The processes the lists guard against are always queryable.
+    // Anti-cheat games (Vanguard, EAC, ...) refuse OpenProcess, so a failed name query
+    // must NOT disqualify. Everything the lists guard against is queryable.
     if let Ok(process) = window.process_name() {
         match process_exclusion(&process) {
             Some(Exclusion::Shell) => return Verdict::Shell,
@@ -259,18 +241,18 @@ fn classify(window: &Window) -> Verdict {
     }
 }
 
-/// The window's style bits, or 0 when they can't be read (which never disqualifies).
+/// 0 when the bits can't be read, which never disqualifies.
 fn window_style(window: &Window) -> u32 {
-    // SAFETY: FFI; a stale HWND yields 0, which reads as "no style bits".
+    // SAFETY: FFI; a stale HWND yields 0.
     let style = unsafe { GetWindowLongPtrW(HWND(window.as_raw_hwnd()), GWL_STYLE) };
     style as u32
 }
 
-/// Where the window stands right now. The detector and the latch share it, so a
-/// window can never be kept under a rule that would not have latched it.
+/// Shared by the detector and the latch, so a window is never kept under a rule that
+/// would not have latched it.
 pub(crate) fn window_state(window: &Window) -> WindowState {
     let hwnd = HWND(window.as_raw_hwnd());
-    // SAFETY: FFI; both calls tolerate a destroyed HWND (they report false).
+    // SAFETY: FFI; both tolerate a destroyed HWND (they report false).
     let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
     // SAFETY: FFI.
     let minimized = unsafe { IsIconic(hwnd) }.as_bool();
@@ -286,8 +268,7 @@ fn window_state_from(visible: bool, minimized: bool, covers: bool, style: u32) -
     if !visible {
         return WindowState::Lost;
     }
-    // A minimized window reports a far-offscreen rect, so it must be recognised
-    // before the geometry is consulted.
+    // A minimized window reports a far-offscreen rect, so check this before geometry.
     if minimized {
         return WindowState::Minimized;
     }
@@ -371,8 +352,7 @@ mod tests {
         }
     }
 
-    /// Keep the compiler honest about the lists staying lowercase — the runtime
-    /// comparison lowercases the process name only.
+    /// The runtime comparison lowercases the process name only.
     #[test]
     fn excluded_processes_are_lowercase() {
         for p in SHELL_PROCESSES.iter().chain(NON_GAME_PROCESSES) {
@@ -422,8 +402,7 @@ mod tests {
     fn rect_covers_accepts_fullscreen_and_borderless_overhang() {
         assert!(rect_covers(MONITOR, MONITOR));
         assert!(rect_covers(rect(-1, -1, 2561, 1441), MONITOR));
-        // A maximized decorated window hangs its frame over the monitor: geometry
-        // accepts it, the style rule is what rejects it.
+        // A maximized window hangs its frame over: geometry accepts, the style rejects.
         assert!(rect_covers(rect(-8, -8, 2568, 1448), MONITOR));
     }
 
@@ -507,10 +486,23 @@ mod tests {
         let t0 = Instant::now();
         let mut latch = Latch::default();
         assert!(latch.observe(WindowState::Lost, t0));
-        // Minimizing buys the longer allowance but does not forgive the time already
-        // spent away from fullscreen.
+        // Minimizing widens the allowance, but does not forgive the time already away.
         assert!(latch.observe(WindowState::Minimized, t0 + Duration::from_millis(600)));
-        assert!(!latch.observe(WindowState::Lost, t0 + Duration::from_millis(1400)));
+        assert!(latch.observe(WindowState::Lost, t0 + Duration::from_millis(1400)));
+        assert!(!latch.observe(WindowState::Lost, t0 + MINIMIZED_GRACE));
+    }
+
+    #[test]
+    fn latch_lets_a_window_restoring_from_minimized_reach_fullscreen() {
+        let t0 = Instant::now();
+        let mut latch = Latch::default();
+        assert!(latch.observe(WindowState::Fullscreen, t0));
+        assert!(latch.observe(WindowState::Minimized, t0 + Duration::from_secs(1)));
+        assert!(latch.observe(WindowState::Minimized, t0 + Duration::from_secs(10)));
+        // Restoring clears the minimized flag before the window covers its monitor
+        // again, and that window must not cost the session.
+        assert!(latch.observe(WindowState::Lost, t0 + Duration::from_millis(10_200)));
+        assert!(latch.observe(WindowState::Fullscreen, t0 + Duration::from_millis(10_600)));
     }
 
     #[test]
@@ -531,8 +523,6 @@ mod tests {
             window_state_from(false, true, true, WS_POPUP.0),
             WindowState::Lost
         );
-        // A minimized window reports a far-offscreen rect, so it must be recognised
-        // before the geometry is consulted.
         assert_eq!(
             window_state_from(true, true, false, WS_POPUP.0),
             WindowState::Minimized

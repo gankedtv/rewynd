@@ -190,8 +190,7 @@ struct HandlerFlags<F> {
     stop: Option<Arc<AtomicBool>>,
     /// Set when the callback breaks: a deliberate, successful end.
     success: Arc<AtomicBool>,
-    /// Set when the stop flag was observed, or the session's keep-alive gave up: a
-    /// clean cooperative stop.
+    /// Set when the stop flag was observed or the keep-alive gave up: a clean stop.
     stopped: Arc<AtomicBool>,
 }
 
@@ -532,9 +531,8 @@ where
                 }
             }
         };
-        // Releasing a window that stopped being fullscreen is what keeps a video
-        // player, a chat client — or a game left minimized — from holding the
-        // recorder hostage while another game runs.
+        // Releasing a window that stopped being fullscreen is what stops a video
+        // player, a chat client or a minimized game from holding the recorder.
         let mut latch = super::game_window::Latch::default();
         let keep_alive = move || {
             let state = super::game_window::window_state(&window);
@@ -590,9 +588,8 @@ where
 /// monitor's refresh rate (0 = unknown), used to decide whether `prefs.framerate`
 /// caps delivery via WGC's minimum update interval.
 ///
-/// `keep_alive` is polled alongside the stop flag (every [`STOP_POLL`], on this
-/// thread); returning `false` ends the session as a clean stop. The monitor path has
-/// nothing to re-check and passes `|| true`.
+/// `keep_alive` is polled next to the stop flag every [`STOP_POLL`]; `false` ends the
+/// session as a clean stop. The monitor path has nothing to re-check: `|| true`.
 fn run_session<T, F>(
     item: T,
     refresh: u32,
@@ -671,8 +668,7 @@ where
 mod tests {
     use super::*;
 
-    /// The watchdog only samples the latched window every [`STOP_POLL`], so a grace
-    /// shorter than two polls could expire before it is ever observed as elapsed.
+    /// A grace shorter than two watchdog samples could expire unobserved.
     #[test]
     fn the_release_grace_outlasts_the_watchdog_poll() {
         assert!(super::super::game_window::RELEASE_GRACE >= 2 * STOP_POLL);
