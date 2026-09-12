@@ -2281,10 +2281,14 @@ mod windows {
         // too when it differs and the user hasn't picked one themselves.
         let output_device = config.output_device().map(str::to_owned);
         let mut comms_device = None;
-        if let Some((console, comms)) = default_render_endpoints() {
-            tracing::info!(console, comms, "default playback endpoints");
-            if output_device.is_none() && comms != console {
-                comms_device = Some(comms);
+        if let Some(defaults) = default_render_endpoints() {
+            tracing::info!(
+                console = defaults.console_name,
+                comms = defaults.comms_name,
+                "default playback endpoints"
+            );
+            if output_device.is_none() {
+                comms_device = defaults.separate_comms;
             }
         }
 

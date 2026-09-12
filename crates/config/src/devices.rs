@@ -179,6 +179,14 @@ mod imp {
         status.success().then_some(buf)
     }
 
+    /// Whether `media_class` is `class` or one of its "/Virtual"-style variants. A plain prefix
+    /// test would also take "Audio/Sinkhole".
+    fn class_matches(media_class: &str, class: &str) -> bool {
+        media_class
+            .strip_prefix(class)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    }
+
     /// Extract the nodes whose `media.class` starts with `class`. Split from the process call
     /// so the parsing is testable without a live PipeWire session.
     fn parse_pw_dump(json: &[u8], class: &str) -> Vec<AudioInput> {
@@ -198,12 +206,11 @@ mod imp {
             let Some(props) = obj.pointer("/info/props") else {
                 continue;
             };
-            // A prefix so the "/Virtual" variants come along.
             let media_class = props
                 .get("media.class")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            if !media_class.starts_with(class) {
+            if !class_matches(media_class, class) {
                 continue;
             }
             let Some(id) = props
@@ -315,6 +322,20 @@ mod imp {
                     },
                 ]
             );
+        }
+
+        #[test]
+        fn a_longer_class_name_is_not_a_variant() {
+            let json = br#"[
+                {"type":"PipeWire:Interface:Node","info":{"props":{
+                    "media.class":"Audio/Sinkhole",
+                    "node.name":"not.a.sink"}}},
+                {"type":"PipeWire:Interface:Node","info":{"props":{
+                    "media.class":"Audio/SourceLike",
+                    "node.name":"not.a.source"}}}
+            ]"#;
+            assert!(parse_pw_dump(json, SINK_CLASS).is_empty());
+            assert!(parse_pw_dump(json, SOURCE_CLASS).is_empty());
         }
 
         #[test]
