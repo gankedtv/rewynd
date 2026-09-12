@@ -37,7 +37,7 @@ const F32_BYTES: usize = std::mem::size_of::<f32>();
 /// idle time. Short enough that shutdown is prompt even when the sink delivers no buffers.
 const WATCHDOG_POLL: Duration = Duration::from_millis(200);
 
-pub use crate::{AudioParams, AudioSource};
+pub use crate::{AudioDevice, AudioParams, AudioSource};
 
 impl AudioSource {
     /// Stream name for logs / the PipeWire graph.
@@ -152,7 +152,7 @@ fn decode_f32le(raw: &[u8], offset: usize, size: usize, out: &mut Vec<f32>) {
 pub fn capture_audio(
     params: AudioParams,
     source: AudioSource,
-    device: Option<&str>,
+    device: &AudioDevice,
     idle_timeout: Option<Duration>,
     stop: Option<Arc<AtomicBool>>,
     epoch: Instant,
@@ -186,8 +186,9 @@ pub fn capture_audio(
         props.insert(*pw::keys::STREAM_CAPTURE_SINK, "true");
     }
     // A specific endpoint instead of the default: the session manager links the stream
-    // to the node matching this name (`pw-cli ls Node` lists them).
-    if let Some(name) = device {
+    // to the node matching this name (`pw-cli ls Node` lists them). It decides for itself
+    // what to do when the node is gone, so Preferred and Exact are the same request here.
+    if let Some(name) = device.selector() {
         props.insert(*pw::keys::TARGET_OBJECT, name);
     }
     let stream = pw::stream::StreamRc::new(core, source.stream_name(), props)
@@ -460,7 +461,7 @@ mod tests {
                 channels: 2,
             },
             AudioSource::SinkMonitor,
-            None,
+            &AudioDevice::Default,
             None,
             None,
             Instant::now(),
@@ -475,7 +476,7 @@ mod tests {
                 channels: 0,
             },
             AudioSource::SinkMonitor,
-            None,
+            &AudioDevice::Default,
             None,
             None,
             Instant::now(),

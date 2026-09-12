@@ -10,8 +10,8 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioInput {
     /// The value stored in the config and matched by the capture backend: the WASAPI endpoint's
-    /// friendly name on Windows, the PipeWire `node.name` on Linux, the CoreAudio device name
-    /// on macOS.
+    /// ID on Windows (two endpoints can share a friendly name), the PipeWire `node.name` on
+    /// Linux, the CoreAudio device name on macOS.
     pub id: String,
     /// A human-friendly label shown in the picker (the friendly name on Windows, the PipeWire
     /// `node.description` on Linux, the device name on macOS).
@@ -35,11 +35,12 @@ mod imp {
     use super::AudioInput;
     use windows::Win32::Foundation::PROPERTYKEY;
     use windows::Win32::Media::Audio::{
-        DEVICE_STATE_ACTIVE, EDataFlow, IMMDeviceEnumerator, MMDeviceEnumerator, eCapture, eRender,
+        DEVICE_STATE_ACTIVE, EDataFlow, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
+        eCapture, eRender,
     };
     use windows::Win32::System::Com::{
-        CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
-        STGM_READ,
+        CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+        CoUninitialize, STGM_READ,
     };
     use windows::core::GUID;
 
@@ -48,6 +49,18 @@ mod imp {
         fmtid: GUID::from_u128(0xa45c254e_df1c_4efd_8020_67d146a850e0),
         pid: 14,
     };
+
+    /// The endpoint's opaque ID: what the capture backend matches on, since friendly names
+    /// repeat across identical hardware.
+    fn endpoint_id(device: &IMMDevice) -> Option<String> {
+        // SAFETY: FFI; on success the string is ours to free.
+        let raw = unsafe { device.GetId() }.ok()?;
+        // SAFETY: `raw` is the NUL-terminated string the call just allocated.
+        let id = unsafe { raw.to_string() }.ok();
+        // SAFETY: FFI; frees that allocation whether or not the decode worked.
+        unsafe { CoTaskMemFree(Some(raw.0.cast())) };
+        id
+    }
 
     /// All active capture (input) endpoints, for the microphone picker. Best-effort: an
     /// unreadable device is skipped, a COM failure yields an empty list.
@@ -93,13 +106,11 @@ mod imp {
                     let device = devices.Item(i).ok()?;
                     let store = device.OpenPropertyStore(STGM_READ).ok()?;
                     let value = store.GetValue(&PKEY_DEVICE_FRIENDLY_NAME).ok()?;
-                    let name = value.to_string();
-                    // The friendly name is both what the picker shows and what the capture
-                    // backend resolves, so the id and label are the same on Windows.
-                    (!name.is_empty()).then(|| AudioInput {
-                        id: name.clone(),
-                        label: name,
-                    })
+                    let label = value.to_string();
+                    // Identical hardware gives two endpoints the same friendly name, so the
+                    // stored value is the endpoint ID; the picker shows the name.
+                    let id = endpoint_id(&device)?;
+                    (!label.is_empty()).then_some(AudioInput { id, label })
                 })
                 .collect()
         }

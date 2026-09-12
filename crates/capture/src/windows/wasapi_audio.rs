@@ -29,7 +29,7 @@ use windows::Win32::System::Com::{
 };
 use windows::core::GUID;
 
-use crate::{AudioParams, AudioSource, CaptureError};
+use crate::{AudioDevice, AudioParams, AudioSource, CaptureError};
 
 /// `PKEY_Device_FriendlyName` (functiondiscoverykeys_devpkey.h): the human-readable
 /// endpoint name ("Microphone (Elgato Wave:3)") shown in the sound settings.
@@ -136,16 +136,18 @@ pub fn default_render_endpoints() -> Option<RenderDefaults> {
     })
 }
 
-/// Resolve the capture endpoint: the flow's default, or the active endpoint `name` picks out —
-/// its endpoint ID, else its friendly name (exact first, then substring; case-insensitive). An
-/// unmatched name errors, except on the render flow, which falls back to the default rather than
-/// record silence — a microphone must not switch to a device the user didn't pick.
+/// Resolve the capture endpoint: the flow's default, or the active endpoint the selector picks
+/// out — its endpoint ID, else its friendly name (exact first, then substring; case-insensitive).
+/// An unmatched selector errors unless it is a [`AudioDevice::Preferred`] render endpoint, which
+/// falls back to the default rather than record silence. A microphone must not switch to a device
+/// the user didn't pick, and an [`AudioDevice::Exact`] render endpoint must not either: it is a
+/// second capture next to one already recording the default, and a fallback would double it.
 fn endpoint(
     enumerator: &IMMDeviceEnumerator,
     flow: windows::Win32::Media::Audio::EDataFlow,
-    name: Option<&str>,
+    device: &AudioDevice,
 ) -> Result<IMMDevice, CaptureError> {
-    let Some(name) = name else {
+    let Some(name) = device.selector() else {
         return default_endpoint(enumerator, flow, eConsole);
     };
 
@@ -183,7 +185,7 @@ fn endpoint(
         tracing::info!(device = friendly, "using the configured audio endpoint");
         return Ok(device);
     }
-    if flow == eRender {
+    if flow == eRender && device.may_fall_back() {
         tracing::warn!(
             wanted = name,
             available = names.join(", "),
@@ -212,7 +214,7 @@ fn endpoint(
 pub fn capture_audio(
     params: AudioParams,
     source: AudioSource,
-    device: Option<&str>,
+    device: &AudioDevice,
     idle_timeout: Option<Duration>,
     stop: Option<Arc<AtomicBool>>,
     epoch: Instant,
