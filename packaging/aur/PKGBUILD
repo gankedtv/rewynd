@@ -13,10 +13,11 @@ arch=('x86_64')
 url="https://github.com/gankedtv/rewynd"
 license=('GPL-3.0-or-later')
 # vulkan-icd-loader, libxkbcommon and wayland are dlopened at runtime (wgpu / winit); the rest
-# link directly. ffmpeg backs in-app clip playback.
-depends=('alsa-lib' 'ffmpeg' 'gcc-libs' 'glibc' 'libpipewire' 'libxkbcommon' 'opus'
+# link directly. ffmpeg backs in-app clip playback. libopus is not here: opusic-sys builds it
+# from source (cmake) and links it statically.
+depends=('alsa-lib' 'ffmpeg' 'gcc-libs' 'glibc' 'libpipewire' 'libxkbcommon'
          'vulkan-icd-loader' 'wayland')
-makedepends=('cargo' 'clang' 'git')
+makedepends=('cargo' 'clang' 'cmake' 'git')
 # makepkg's default LTO CFLAGS break aws-lc-sys (rustls' crypto backend): its C objects get
 # GCC LTO bitcode the Rust linker cannot resolve, ending in undefined-symbol spew.
 options=('!lto')
