@@ -252,9 +252,8 @@ fn resolve_mic_uid(name: &str) -> Result<arc::R<ns::String>, CaptureError> {
 /// the video capture's epoch so the muxer can align the tracks).
 ///
 /// `device` selects the microphone by name (case-insensitive substring of the
-/// localized device name); `None` uses the default. SCK's loopback always
-/// follows the system output, so a named device with
-/// [`AudioSource::SinkMonitor`] is an error.
+/// localized device name); `None` uses the default. SCK's loopback always follows
+/// the system output, so a named device with [`AudioSource::SinkMonitor`] is ignored.
 ///
 /// `stop`, when set, is watched off the sample path so shutdown is prompt even
 /// while nothing plays. `idle_timeout`, when set, fails the call if no buffer
@@ -300,10 +299,11 @@ where
     let expected = match source {
         AudioSource::SinkMonitor => {
             if let Some(name) = device {
-                return Err(CaptureError::Sck(format!(
-                    "system-audio loopback follows the system output on macOS; \
-                     a device selection (\"{name}\") is not supported"
-                )));
+                tracing::warn!(
+                    device = name,
+                    "macOS records whatever the system output is playing; \
+                     ignoring the configured audio output"
+                );
             }
             cfg.set_captures_audio(true);
             cfg.set_excludes_current_process_audio(true);

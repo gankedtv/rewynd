@@ -68,15 +68,70 @@ fn is_custom_url(stored: &str, default: &str) -> bool {
     !stored.is_empty() && stored != default
 }
 
-/// Cap a microphone label so a long PipeWire description doesn't run past the dropdown; the ellipsis
+/// Cap a device label so a long PipeWire description doesn't run past the dropdown; the ellipsis
 /// signals it was shortened. Counts by `char` so a multi-byte name is never split mid-codepoint.
-fn truncate_mic_label(label: &str) -> String {
+fn truncate_device_label(label: &str) -> String {
     const MAX_CHARS: usize = 38;
     if label.chars().count() <= MAX_CHARS {
         return label.to_owned();
     }
     let head: String = label.chars().take(MAX_CHARS - 1).collect();
     format!("{head}…")
+}
+
+/// One audio-device field: a dropdown of `options` with a "system default" row (the empty
+/// value), or a free-text box carrying `empty_hint` when enumeration found nothing.
+fn device_picker<'a>(
+    label: &'a str,
+    default_label: &'a str,
+    empty_hint: &'a str,
+    options: &[config::AudioInput],
+    value: &str,
+    on_pick: fn(String) -> Message,
+) -> Element<'a, Message> {
+    if options.is_empty() {
+        return column![
+            field_label(label),
+            text_input(default_label, value)
+                .on_input(on_pick)
+                .style(arena_input),
+            hint(empty_hint),
+        ]
+        .spacing(8)
+        .into();
+    }
+    let default = config::AudioInput {
+        id: String::new(),
+        label: default_label.to_owned(),
+    };
+    let mut rows = vec![default.clone()];
+    // An offline device keeps its row instead of the selection snapping to the default.
+    if !value.is_empty() && !options.iter().any(|o| o.id == value) {
+        rows.push(config::AudioInput {
+            id: value.to_owned(),
+            label: value.to_owned(),
+        });
+    }
+    rows.extend(options.iter().cloned());
+    // Label only; the stored id keeps its full spelling.
+    for row in &mut rows {
+        row.label = truncate_device_label(&row.label);
+    }
+    let selected = rows
+        .iter()
+        .find(|o| o.id == value)
+        .cloned()
+        .unwrap_or(default);
+    column![
+        field_label(label),
+        pick_list(rows, Some(selected), move |o: config::AudioInput| on_pick(
+            o.id
+        ))
+        .style(arena_pick)
+        .width(Length::Fill),
+    ]
+    .spacing(8)
+    .into()
 }
 
 /// The stored URL when it's a genuine custom endpoint, else empty — so the built-in default is
@@ -302,6 +357,8 @@ const FPS_OPTIONS: [u32; 4] = [30, 60, 120, 144];
 const CONNECTOR_CARD_HEIGHT: f32 = 176.0;
 /// The microphone picker's "use the system default" row (stored as an empty value).
 const MIC_DEFAULT: &str = "System default";
+/// The system-audio picker's equivalent row.
+const OUTPUT_DEFAULT: &str = "System default";
 /// Width (logical px) of the fixed left navigation sidebar. Wide enough for the wordmark and the
 /// nav labels; the content area fills the rest of the window.
 const SIDEBAR_WIDTH: f32 = 232.0;
@@ -588,7 +645,7 @@ fn status_pill_parts(status: Option<&config::RecorderStatus>) -> (String, iced::
             RecorderState::Starting => ("Starting up".to_owned(), palette::MUTED),
             RecorderState::Recording => match &s.game {
                 Some(game) => (
-                    format!("Recording: {}", truncate_mic_label(game)),
+                    format!("Recording: {}", truncate_device_label(game)),
                     palette::ACCENT,
                 ),
                 None => ("Recording: Desktop".to_owned(), palette::ACCENT),
@@ -649,6 +706,8 @@ struct App {
     /// Active input devices for the microphone picker (Windows WASAPI endpoints, Linux PipeWire
     /// sources); empty when enumeration finds nothing, where the control is a free-text name.
     mic_options: Vec<config::AudioInput>,
+    /// The same for the system-audio picker. Always empty on macOS, which takes no pick.
+    output_options: Vec<config::AudioInput>,
     /// Whether the settings page's device discovery (audio inputs, the encoder probe) has been
     /// kicked off; it runs once, the first time that page opens.
     probes_started: bool,
@@ -747,6 +806,7 @@ enum Message {
     SeparateMicTrack(bool),
     AudioAdvancedToggled,
     MicrophonePicked(String),
+    OutputDevicePicked(String),
     BufferSeconds(u32),
     ResolutionPicked(Resolution),
     /// An edit to one of the custom width/height boxes (digits only, kept as text).
@@ -759,6 +819,8 @@ enum Message {
     EncodersProbed(Result<config::EncoderProbe, String>),
     /// The machine's active audio inputs (for the microphone picker).
     MicsListed(Vec<config::AudioInput>),
+    /// The machine's active audio outputs (for the system-audio picker).
+    OutputsListed(Vec<config::AudioInput>),
     /// A poll of the recorder's status file (for the top-right pill).
     RecorderStatus(Option<config::RecorderStatus>),
     OutputDirEdited(String),
@@ -850,6 +912,7 @@ impl App {
             custom_width: initial_custom_dim(&config, |(w, _)| w),
             custom_height: initial_custom_dim(&config, |(_, h)| h),
             mic_options: Vec::new(),
+            output_options: Vec::new(),
             probes_started: false,
             api_key: config.upload_api_key().to_owned(),
             // Show the custom-connector fields empty unless a genuinely custom endpoint is set:
@@ -1014,6 +1077,9 @@ impl App {
                     return self.start_settings_probes();
                 }
             }
+            Message::OutputsListed(outputs) => {
+                self.output_options = outputs;
+            }
             Message::MicsListed(mics) => {
                 self.mic_options = mics;
             }
@@ -1060,6 +1126,10 @@ impl App {
                 // The picker's "System default" row carries the empty id; free text is stored
                 // verbatim. Either way the stored value is what the capture backend resolves.
                 self.config.set_microphone(mic);
+                self.touch();
+            }
+            Message::OutputDevicePicked(output) => {
+                self.config.set_output_device(output);
                 self.touch();
             }
             Message::BufferSeconds(s) => {
@@ -1446,6 +1516,14 @@ impl App {
             },
             Message::MicsListed,
         );
+        let outputs = Task::perform(
+            async {
+                tokio::task::spawn_blocking(config::list_audio_outputs)
+                    .await
+                    .unwrap_or_default()
+            },
+            Message::OutputsListed,
+        );
         let probe = Task::perform(
             async {
                 tokio::task::spawn_blocking(probe_encoders_via_recorder)
@@ -1454,7 +1532,7 @@ impl App {
             },
             Message::EncodersProbed,
         );
-        Task::batch([mics, probe])
+        Task::batch([mics, outputs, probe])
     }
 
     /// The stop-and-relaunch of the recorder as a task (off the UI thread), reported through
@@ -1729,53 +1807,29 @@ impl App {
             / 8;
         let est_mb = est_bytes.saturating_add(500_000) / 1_000_000;
 
-        // The microphone picker: a dropdown of the active input devices (Windows WASAPI
-        // endpoints, Linux PipeWire sources), or a free-text device name when enumeration
-        // found nothing. Stored value empty = the system default.
-        let mic_value = self.config.microphone().unwrap_or_default().to_owned();
-        let microphone: Element<Message> = if self.mic_options.is_empty() {
-            column![
-                field_label("Microphone"),
-                text_input(MIC_DEFAULT, &mic_value)
-                    .on_input(Message::MicrophonePicked)
-                    .style(arena_input),
-                hint("Leave empty for the default; on Linux this is the PipeWire node name."),
-            ]
-            .spacing(8)
-            .into()
+        let microphone = device_picker(
+            "Microphone",
+            MIC_DEFAULT,
+            "Leave empty for the default; on Linux this is the PipeWire node name.",
+            &self.mic_options,
+            self.config.microphone().unwrap_or_default(),
+            Message::MicrophonePicked,
+        );
+        // Which output's loopback gets recorded: Windows routes voice chat to its own
+        // default, so Discord can land on an endpoint the console default never hears.
+        let output_device: Element<Message> = if config::OUTPUT_PICKER_SUPPORTED {
+            device_picker(
+                "System audio device",
+                OUTPUT_DEFAULT,
+                "Leave empty for the default; on Linux this is the PipeWire sink node name.",
+                &self.output_options,
+                self.config.output_device().unwrap_or_default(),
+                Message::OutputDevicePicked,
+            )
         } else {
-            // The default row is stored as the empty value.
-            let default = config::AudioInput {
-                id: String::new(),
-                label: MIC_DEFAULT.to_owned(),
-            };
-            let mut options = vec![default.clone()];
-            // Keep a configured-but-offline device visible instead of silently
-            // snapping the selection to the default.
-            if !mic_value.is_empty() && !self.mic_options.iter().any(|o| o.id == mic_value) {
-                options.push(config::AudioInput {
-                    id: mic_value.clone(),
-                    label: mic_value.clone(),
-                });
-            }
-            options.extend(self.mic_options.iter().cloned());
-            // PipeWire descriptions can be long enough to overrun the dropdown; cap the visible
-            // label. The stored id (used for matching and persistence) is left untouched.
-            for o in &mut options {
-                o.label = truncate_mic_label(&o.label);
-            }
-            let selected = options
-                .iter()
-                .find(|o| o.id == mic_value)
-                .cloned()
-                .unwrap_or(default);
             column![
-                field_label("Microphone"),
-                pick_list(options, Some(selected), |o: config::AudioInput| {
-                    Message::MicrophonePicked(o.id)
-                })
-                .style(arena_pick)
-                .width(Length::Fill),
+                field_label("System audio device"),
+                hint("macOS always records whatever your Mac is playing; pick the output in System Settings."),
             ]
             .spacing(8)
             .into()
@@ -1817,6 +1871,7 @@ impl App {
                 .step(0.05_f32)
                 .style(arena_slider),
             ),
+            output_device,
         ];
         // Advanced sits at the bottom of the card, and only while the mic is on (its one option,
         // the separate track, needs a recording mic to mean anything).

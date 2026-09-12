@@ -1310,7 +1310,7 @@ mod linux {
             recorder.system_audio = Some(spawn_audio_capture(
                 "rewynd-audio-system",
                 AudioSource::SinkMonitor,
-                None,
+                config.output_device().map(str::to_owned),
                 audio_params,
                 config.system_gain(),
                 mixer.clone(),
@@ -2061,7 +2061,9 @@ mod windows {
 
     use anyhow::{Context, Result, anyhow};
     use rewynd_buffer::{AudioRingBuffer, EncodedChunk, RingBuffer};
-    use rewynd_capture::windows::{CapturedD3d11Frame, capture_game_stream, capture_stream};
+    use rewynd_capture::windows::{
+        CapturedD3d11Frame, capture_game_stream, capture_stream, default_render_endpoints,
+    };
     use rewynd_capture::{AudioSource, StreamPrefs};
     use rewynd_clip::{ClipSaver, SaveError, SharedAudioBuffer, SharedBuffer, lock_unpoisoned};
     use rewynd_config::{self as config};
@@ -2275,11 +2277,26 @@ mod windows {
         // final drain + Opus flush.
         let captures_done = Arc::new(AtomicBool::new(false));
 
+        // Voice apps follow Windows' separate communications default, so record that endpoint
+        // too when it differs and the user hasn't picked one themselves.
+        let output_device = config.output_device().map(str::to_owned);
+        let mut comms_device = None;
+        if let Some(defaults) = default_render_endpoints() {
+            tracing::info!(
+                console = defaults.console_name,
+                comms = defaults.comms_name,
+                "default playback endpoints"
+            );
+            if output_device.is_none() {
+                comms_device = defaults.separate_comms;
+            }
+        }
+
         // Audio: system loopback + mic sum into the mixer; the mixer thread drains it.
         let system_audio = spawn_audio_capture(
             "rewynd-audio-system",
             AudioSource::SinkMonitor,
-            None,
+            output_device.clone(),
             audio_params,
             config.system_gain(),
             mixer.clone(),
@@ -2293,6 +2310,27 @@ mod windows {
                 );
             })),
         )?;
+        // Optional extra: erroring here would detach the system capture spawned above.
+        let comms_audio = comms_device.and_then(|device| {
+            match spawn_audio_capture(
+                "rewynd-audio-system-comms",
+                AudioSource::SinkMonitor,
+                Some(device),
+                audio_params,
+                config.system_gain(),
+                mixer.clone(),
+                None,
+                &stop,
+                epoch,
+                None,
+            ) {
+                Ok(handle) => Some(handle),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no communications-endpoint capture; clips carry the default output only");
+                    None
+                }
+            }
+        });
         // The mic is optional AND toggleable: when disabled no stream is opened at all
         // (privacy), so clips are system-only. With the separate-track option on, the capture
         // also feeds the mic-only mixer.
@@ -2501,6 +2539,9 @@ mod windows {
         stop.store(true, Ordering::Relaxed);
         let _ = capture.join();
         let _ = system_audio.join();
+        if let Some(h) = comms_audio {
+            let _ = h.join();
+        }
         if let Some(h) = mic_audio {
             let _ = h.join();
         }
@@ -3147,11 +3188,12 @@ mod macos {
             let system_gain = config.system_gain();
             let mic_gain = config.mic_gain();
             let microphone = config.microphone().map(str::to_owned);
+            let output_device = config.output_device().map(str::to_owned);
             move |session_stop: &Arc<AtomicBool>| -> Result<Vec<std::thread::JoinHandle<()>>> {
                 let mut handles = vec![spawn_audio_capture(
                     "rewynd-audio-system",
                     AudioSource::SinkMonitor,
-                    None,
+                    output_device.clone(),
                     audio_params,
                     system_gain,
                     mixer.clone(),

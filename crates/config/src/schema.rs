@@ -220,6 +220,9 @@ struct AudioConfig {
     /// case-insensitively against the device's name (a substring is enough on Windows;
     /// the PipeWire node name on Linux).
     microphone: String,
+    /// Record this output's loopback instead of the system default. Matched like
+    /// `microphone`; ignored on macOS.
+    output_device: String,
     /// Record the microphone at all. Off = no mic stream is even opened (privacy) and clips carry
     /// only system audio.
     mic_enabled: bool,
@@ -237,6 +240,7 @@ impl Default for AudioConfig {
             mic_gain: 1.0,
             system_gain: 1.0,
             microphone: String::new(),
+            output_device: String::new(),
             mic_enabled: true,
             separate_mic_track: false,
         }
@@ -472,6 +476,9 @@ impl Config {
         if let Some(mic) = get("REWYND_MICROPHONE") {
             self.audio.microphone = mic;
         }
+        if let Some(out) = get("REWYND_OUTPUT_DEVICE") {
+            self.audio.output_device = out;
+        }
         if let Some(dir) = get("REWYND_OUTPUT_DIR").filter(|s| !s.is_empty()) {
             self.output.directory = Some(dir);
         }
@@ -608,6 +615,13 @@ impl Config {
     pub fn microphone(&self) -> Option<&str> {
         let mic = self.audio.microphone.trim();
         (!mic.is_empty()).then_some(mic)
+    }
+
+    /// The audio output to record instead of the system default (trimmed; empty = default).
+    #[must_use]
+    pub fn output_device(&self) -> Option<&str> {
+        let out = self.audio.output_device.trim();
+        (!out.is_empty()).then_some(out)
     }
 
     /// Whether to record the microphone at all (off = no mic stream is opened).
@@ -858,6 +872,11 @@ impl Config {
     /// Set the microphone to capture (empty = the system default).
     pub fn set_microphone(&mut self, microphone: String) {
         self.audio.microphone = microphone;
+    }
+
+    /// Set the audio output to record (empty = the system default).
+    pub fn set_output_device(&mut self, output_device: String) {
+        self.audio.output_device = output_device;
     }
 
     /// Set the retention window in seconds (stored as-is; clamped on read by [`buffer_window`]).
@@ -1159,6 +1178,9 @@ system_gain = 1.0
 # Capture a specific microphone instead of the system default. Case-insensitive; on
 # Windows a part of the device name is enough, on Linux use the PipeWire node name.
 microphone = \"\"
+# Record a specific audio output instead of the system default, for when an app's sound is
+# missing from your clips. Spelled like microphone above; ignored on macOS.
+output_device = \"\"
 # Record the microphone at all. false = no mic stream is opened; clips carry only system audio.
 mic_enabled = true
 # Keep the microphone on its own second audio track (as well as the system+mic mix), so editors
@@ -1362,6 +1384,26 @@ mod tests {
             !parsed.separate_mic_track(),
             "gated off by the disabled mic"
         );
+    }
+
+    #[test]
+    fn device_names_default_to_none_and_ignore_surrounding_space() {
+        let c = Config::default();
+        assert_eq!(c.microphone(), None, "empty = the system default");
+        assert_eq!(c.output_device(), None);
+
+        let mut c = Config::default();
+        c.set_microphone("  Wave:3  ".to_owned());
+        c.set_output_device("  Headset  ".to_owned());
+        assert_eq!(c.microphone(), Some("Wave:3"));
+        assert_eq!(c.output_device(), Some("Headset"));
+
+        let back = Config::from_toml_str(&c.to_toml_string().expect("serialize")).expect("reparse");
+        assert_eq!(back.output_device(), Some("Headset"), "survives TOML");
+
+        // Whitespace-only is as good as unset.
+        c.set_output_device("   ".to_owned());
+        assert_eq!(c.output_device(), None);
     }
 
     #[test]

@@ -13,7 +13,7 @@ pub mod wasapi_audio;
 pub mod wgc_capture;
 
 pub use game_window::describe_foreground;
-pub use wasapi_audio::capture_audio;
+pub use wasapi_audio::{RenderDefaults, capture_audio, default_render_endpoints};
 pub use wgc_capture::{
     CapturedD3d11Frame, GameCallback, capture_game_stream, capture_stream, display_geometry,
 };

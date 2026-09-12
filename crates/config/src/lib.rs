@@ -44,7 +44,7 @@ pub use desktop::{
 };
 #[cfg(windows)]
 pub use desktop::{register_clip_protocol, register_toast_identity};
-pub use devices::{AudioInput, list_audio_inputs};
+pub use devices::{AudioInput, OUTPUT_PICKER_SUPPORTED, list_audio_inputs, list_audio_outputs};
 pub use encoders::{
     ENCODER_PROBE_VERSION, EncoderChoice, EncoderProbe, ProbeAdapter, choose_encoder,
 };
