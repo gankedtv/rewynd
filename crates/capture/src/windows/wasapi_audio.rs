@@ -19,7 +19,8 @@ use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
     AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, IAudioCaptureClient, IAudioClient,
-    IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX, eCapture, eConsole, eRender,
+    IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX, eCapture, eCommunications, eConsole,
+    eRender,
 };
 use windows::Win32::Media::Audio::{DEVICE_STATE_ACTIVE, IMMDevice, IMMDeviceCollection};
 use windows::Win32::System::Com::{
@@ -80,18 +81,43 @@ fn friendly_name(device: &IMMDevice) -> Result<String, CaptureError> {
     Ok(value.to_string())
 }
 
+/// The flow's default endpoint for `role`.
+fn default_endpoint(
+    enumerator: &IMMDeviceEnumerator,
+    flow: windows::Win32::Media::Audio::EDataFlow,
+    role: windows::Win32::Media::Audio::ERole,
+) -> Result<IMMDevice, CaptureError> {
+    // SAFETY: FFI.
+    unsafe { enumerator.GetDefaultAudioEndpoint(flow, role) }
+        .map_err(|e| CaptureError::Wasapi(format!("no default endpoint: {e}")))
+}
+
+/// The friendly names of the two defaults Windows keeps for playback: `(console,
+/// communications)`. Voice apps follow the communications one, so when the two differ a
+/// loopback on the console default alone misses their audio. `None` if either is unreadable.
+#[must_use]
+pub fn default_render_endpoints() -> Option<(String, String)> {
+    let _com = ComGuard::init().ok()?;
+    // SAFETY: FFI; COM is initialized on this thread for the guard's lifetime.
+    let enumerator: IMMDeviceEnumerator =
+        unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.ok()?;
+    let name_of = |role| friendly_name(&default_endpoint(&enumerator, eRender, role).ok()?).ok();
+    Some((name_of(eConsole)?, name_of(eCommunications)?))
+}
+
 /// Resolve the capture endpoint: the flow's default, or — when `name` is set — the
-/// active endpoint whose friendly name contains it (case-insensitive). No match is
-/// an error listing what exists, so a typo'd config names its fix.
+/// active endpoint whose friendly name contains it (case-insensitive). An unmatched
+/// name is an error listing what exists, so a typo'd config names its fix — except on
+/// the render flow, where it falls back to the default rather than leave the clips
+/// with no sound. Playback only: silently switching *microphones* would record a
+/// device the user didn't pick.
 fn endpoint(
     enumerator: &IMMDeviceEnumerator,
     flow: windows::Win32::Media::Audio::EDataFlow,
     name: Option<&str>,
 ) -> Result<IMMDevice, CaptureError> {
     let Some(name) = name else {
-        // SAFETY: FFI.
-        return unsafe { enumerator.GetDefaultAudioEndpoint(flow, eConsole) }
-            .map_err(|e| CaptureError::Wasapi(format!("no default endpoint: {e}")));
+        return default_endpoint(enumerator, flow, eConsole);
     };
 
     let wanted = name.to_lowercase();
@@ -114,6 +140,14 @@ fn endpoint(
             return Ok(device);
         }
         names.push(friendly);
+    }
+    if flow == eRender {
+        tracing::warn!(
+            wanted = name,
+            available = names.join(", "),
+            "no active audio output matches the configured device; using the system default"
+        );
+        return default_endpoint(enumerator, flow, eConsole);
     }
     Err(CaptureError::Wasapi(format!(
         "no active audio endpoint matches \"{name}\" (available: {})",

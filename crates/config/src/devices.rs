@@ -1,12 +1,12 @@
-//! Audio-input discovery for the settings' microphone picker. Windows walks the WASAPI capture
-//! endpoints; Linux asks PipeWire (via `pw-dump`) for its audio sources; macOS walks the
+//! Audio-device discovery for the settings' microphone and system-audio pickers. Windows walks
+//! the WASAPI endpoints; Linux asks PipeWire (via `pw-dump`) for its nodes; macOS walks the
 //! CoreAudio devices with input streams. All are best-effort — a failure yields an empty list
 //! and the picker falls back to a free-text device name. Kept out of the capture stack so the
 //! GPU-free settings app never links it.
 
 use std::fmt;
 
-/// A selectable audio input for the microphone picker.
+/// A selectable audio device for one of the pickers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioInput {
     /// The value stored in the config and matched by the capture backend: the WASAPI endpoint's
@@ -18,20 +18,24 @@ pub struct AudioInput {
     pub label: String,
 }
 
+/// Whether this platform can record a chosen audio output. macOS's ScreenCaptureKit loopback
+/// always follows the system output and takes no device, so the picker gives way to a hint there.
+pub const OUTPUT_PICKER_SUPPORTED: bool = !cfg!(target_os = "macos");
+
 impl fmt::Display for AudioInput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.label)
     }
 }
 
-pub use imp::list_audio_inputs;
+pub use imp::{list_audio_inputs, list_audio_outputs};
 
 #[cfg(windows)]
 mod imp {
     use super::AudioInput;
     use windows::Win32::Foundation::PROPERTYKEY;
     use windows::Win32::Media::Audio::{
-        DEVICE_STATE_ACTIVE, IMMDeviceEnumerator, MMDeviceEnumerator, eCapture,
+        DEVICE_STATE_ACTIVE, EDataFlow, IMMDeviceEnumerator, MMDeviceEnumerator, eCapture, eRender,
     };
     use windows::Win32::System::Com::{
         CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
@@ -49,18 +53,29 @@ mod imp {
     /// unreadable device is skipped, a COM failure yields an empty list.
     #[must_use]
     pub fn list_audio_inputs() -> Vec<AudioInput> {
+        list_endpoints(eCapture)
+    }
+
+    /// All active render (output) endpoints, for the system-audio picker. Their loopback is
+    /// what the capture backend records.
+    #[must_use]
+    pub fn list_audio_outputs() -> Vec<AudioInput> {
+        list_endpoints(eRender)
+    }
+
+    fn list_endpoints(flow: EDataFlow) -> Vec<AudioInput> {
         // SAFETY: FFI; paired with `CoUninitialize` below. S_FALSE (already
         // initialized on this thread) is fine.
         if unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_err() {
             return Vec::new();
         }
-        let names = list_inner();
+        let names = list_inner(flow);
         // SAFETY: FFI; pairs the successful init.
         unsafe { CoUninitialize() };
         names
     }
 
-    fn list_inner() -> Vec<AudioInput> {
+    fn list_inner(flow: EDataFlow) -> Vec<AudioInput> {
         // SAFETY: FFI (all calls below); indices stay within the collection's count.
         unsafe {
             let Ok(enumerator): windows::core::Result<IMMDeviceEnumerator> =
@@ -68,7 +83,7 @@ mod imp {
             else {
                 return Vec::new();
             };
-            let Ok(devices) = enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE) else {
+            let Ok(devices) = enumerator.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE) else {
                 return Vec::new();
             };
             let Ok(count) = devices.GetCount() else {
@@ -104,13 +119,30 @@ mod imp {
     /// second; the cap keeps a wedged PipeWire from hanging the settings window at startup.
     const PW_DUMP_TIMEOUT: Duration = Duration::from_secs(2);
 
+    /// `media.class` prefix of a capture endpoint: "Audio/Source" and its "/Virtual" variants.
+    const SOURCE_CLASS: &str = "Audio/Source";
+    /// `media.class` prefix of an output endpoint. Its monitor ports are what the sink-monitor
+    /// capture records, addressed by the sink's own `node.name`.
+    const SINK_CLASS: &str = "Audio/Sink";
+
     /// The PipeWire audio sources, for the microphone picker. Best-effort: if `pw-dump` is
     /// missing, fails, or does not finish within [`PW_DUMP_TIMEOUT`], the list is empty and the
     /// picker falls back to free text. The stored value is the `node.name` (what the capture
     /// backend matches via `target.object`); the label is the friendlier `node.description`.
     #[must_use]
     pub fn list_audio_inputs() -> Vec<AudioInput> {
-        run_pw_dump(PW_DUMP_TIMEOUT).map_or_else(Vec::new, |json| parse_pw_dump(&json))
+        list_nodes(SOURCE_CLASS)
+    }
+
+    /// The PipeWire audio sinks, for the system-audio picker. Same contract as
+    /// [`list_audio_inputs`]; the sink's monitor is what gets recorded.
+    #[must_use]
+    pub fn list_audio_outputs() -> Vec<AudioInput> {
+        list_nodes(SINK_CLASS)
+    }
+
+    fn list_nodes(class: &str) -> Vec<AudioInput> {
+        run_pw_dump(PW_DUMP_TIMEOUT).map_or_else(Vec::new, |json| parse_pw_dump(&json, class))
     }
 
     /// Run `pw-dump` with a bounded wait, returning its stdout on a clean exit or `None` on
@@ -150,9 +182,10 @@ mod imp {
         status.success().then_some(buf)
     }
 
-    /// Extract the audio sources from a `pw-dump` JSON payload. Split from the process call so the
-    /// parsing (the part with the branches) is testable without a live PipeWire session.
-    fn parse_pw_dump(json: &[u8]) -> Vec<AudioInput> {
+    /// Extract the nodes whose `media.class` starts with `class` from a `pw-dump` JSON payload.
+    /// Split from the process call so the parsing (the part with the branches) is testable
+    /// without a live PipeWire session.
+    fn parse_pw_dump(json: &[u8], class: &str) -> Vec<AudioInput> {
         let Ok(dump) = serde_json::from_slice::<serde_json::Value>(json) else {
             return Vec::new();
         };
@@ -169,13 +202,12 @@ mod imp {
             let Some(props) = obj.pointer("/info/props") else {
                 continue;
             };
-            // "Audio/Source" (and its "/Virtual" variants) are real capture endpoints; sink
-            // monitors are "Audio/Sink" and are excluded, matching the mic-capture path.
-            let class = props
+            // A prefix match so the "/Virtual" variants of both classes come along.
+            let media_class = props
                 .get("media.class")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            if !class.starts_with("Audio/Source") {
+            if !media_class.starts_with(class) {
                 continue;
             }
             let Some(id) = props
@@ -206,7 +238,10 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
-        use super::{AudioInput, list_audio_inputs, parse_pw_dump};
+        use super::{
+            AudioInput, SINK_CLASS, SOURCE_CLASS, list_audio_inputs, list_audio_outputs,
+            parse_pw_dump,
+        };
 
         #[test]
         fn parses_sources_labels_and_skips_non_sources() {
@@ -233,7 +268,7 @@ mod imp {
                 {"type":"PipeWire:Interface:Client","info":{"props":{
                     "media.class":"Audio/Source","node.name":"not.a.node"}}}
             ]"#;
-            let got = parse_pw_dump(json);
+            let got = parse_pw_dump(json, SOURCE_CLASS);
             assert_eq!(
                 got,
                 vec![
@@ -256,18 +291,54 @@ mod imp {
         }
 
         #[test]
+        fn the_sink_class_picks_outputs_and_leaves_sources_behind() {
+            let json = br#"[
+                {"type":"PipeWire:Interface:Node","info":{"props":{
+                    "media.class":"Audio/Source",
+                    "node.name":"alsa_input.usb-mic",
+                    "node.description":"USB Microphone"}}},
+                {"type":"PipeWire:Interface:Node","info":{"props":{
+                    "media.class":"Audio/Sink",
+                    "node.name":"alsa_output.speakers",
+                    "node.description":"Speakers"}}},
+                {"type":"PipeWire:Interface:Node","info":{"props":{
+                    "media.class":"Audio/Sink/Virtual",
+                    "node.name":"virtual.sink",
+                    "node.description":"Loopback"}}}
+            ]"#;
+            assert_eq!(
+                parse_pw_dump(json, SINK_CLASS),
+                vec![
+                    AudioInput {
+                        id: "alsa_output.speakers".to_owned(),
+                        label: "Speakers".to_owned(),
+                    },
+                    AudioInput {
+                        id: "virtual.sink".to_owned(),
+                        label: "Loopback".to_owned(),
+                    },
+                ]
+            );
+        }
+
+        #[test]
         fn malformed_payloads_yield_nothing() {
-            assert!(parse_pw_dump(b"not json").is_empty());
-            assert!(parse_pw_dump(b"{}").is_empty());
-            assert!(parse_pw_dump(b"[]").is_empty());
-            // A node with no props is skipped, not a panic.
-            assert!(parse_pw_dump(br#"[{"type":"PipeWire:Interface:Node"}]"#).is_empty());
+            for class in [SOURCE_CLASS, SINK_CLASS] {
+                assert!(parse_pw_dump(b"not json", class).is_empty());
+                assert!(parse_pw_dump(b"{}", class).is_empty());
+                assert!(parse_pw_dump(b"[]", class).is_empty());
+                // A node with no props is skipped, not a panic.
+                assert!(
+                    parse_pw_dump(br#"[{"type":"PipeWire:Interface:Node"}]"#, class).is_empty()
+                );
+            }
         }
 
         #[test]
         fn listing_never_panics() {
-            // pw-dump may be absent in CI; the call must degrade to an empty list.
+            // pw-dump may be absent in CI; the calls must degrade to an empty list.
             let _ = list_audio_inputs();
+            let _ = list_audio_outputs();
         }
     }
 }
@@ -468,6 +539,13 @@ mod imp {
             .collect()
     }
 
+    /// No output picker on macOS: ScreenCaptureKit's loopback always follows the system output,
+    /// so there is nothing to choose between (see [`super::OUTPUT_PICKER_SUPPORTED`]).
+    #[must_use]
+    pub fn list_audio_outputs() -> Vec<AudioInput> {
+        Vec::new()
+    }
+
     #[cfg(test)]
     mod tests {
         use super::{fourcc, list_audio_inputs};
@@ -493,9 +571,14 @@ mod imp {
 mod imp {
     use super::AudioInput;
 
-    /// No enumeration on other platforms: the picker falls back to a free-text device name.
+    /// No enumeration on other platforms: the pickers fall back to a free-text device name.
     #[must_use]
     pub fn list_audio_inputs() -> Vec<AudioInput> {
+        Vec::new()
+    }
+
+    #[must_use]
+    pub fn list_audio_outputs() -> Vec<AudioInput> {
         Vec::new()
     }
 }

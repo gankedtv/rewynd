@@ -1310,7 +1310,7 @@ mod linux {
             recorder.system_audio = Some(spawn_audio_capture(
                 "rewynd-audio-system",
                 AudioSource::SinkMonitor,
-                None,
+                config.output_device().map(str::to_owned),
                 audio_params,
                 config.system_gain(),
                 mixer.clone(),
@@ -2061,7 +2061,9 @@ mod windows {
 
     use anyhow::{Context, Result, anyhow};
     use rewynd_buffer::{AudioRingBuffer, EncodedChunk, RingBuffer};
-    use rewynd_capture::windows::{CapturedD3d11Frame, capture_game_stream, capture_stream};
+    use rewynd_capture::windows::{
+        CapturedD3d11Frame, capture_game_stream, capture_stream, default_render_endpoints,
+    };
     use rewynd_capture::{AudioSource, StreamPrefs};
     use rewynd_clip::{ClipSaver, SaveError, SharedAudioBuffer, SharedBuffer, lock_unpoisoned};
     use rewynd_config::{self as config};
@@ -2275,11 +2277,26 @@ mod windows {
         // final drain + Opus flush.
         let captures_done = Arc::new(AtomicBool::new(false));
 
+        // Windows keeps two playback defaults: the console one, and the communications one
+        // that voice apps follow. When they differ, a loopback on the console default alone
+        // misses Discord and friends, so a second stream records the communications endpoint
+        // as well. Skipped once the user has named an output themselves — an explicit pick
+        // is exact, and both endpoints are logged either way so a support report shows the
+        // mismatch.
+        let output_device = config.output_device().map(str::to_owned);
+        let mut comms_device = None;
+        if let Some((console, comms)) = default_render_endpoints() {
+            tracing::info!(console, comms, "default playback endpoints");
+            if output_device.is_none() && comms != console {
+                comms_device = Some(comms);
+            }
+        }
+
         // Audio: system loopback + mic sum into the mixer; the mixer thread drains it.
         let system_audio = spawn_audio_capture(
             "rewynd-audio-system",
             AudioSource::SinkMonitor,
-            None,
+            output_device.clone(),
             audio_params,
             config.system_gain(),
             mixer.clone(),
@@ -2293,6 +2310,24 @@ mod windows {
                 );
             })),
         )?;
+        // Toast-free: this stream is a bonus on top of the console default, and its failure
+        // costs nothing the primary one already delivers.
+        let comms_audio = comms_device
+            .map(|device| {
+                spawn_audio_capture(
+                    "rewynd-audio-system-comms",
+                    AudioSource::SinkMonitor,
+                    Some(device),
+                    audio_params,
+                    config.system_gain(),
+                    mixer.clone(),
+                    None,
+                    &stop,
+                    epoch,
+                    None,
+                )
+            })
+            .transpose()?;
         // The mic is optional AND toggleable: when disabled no stream is opened at all
         // (privacy), so clips are system-only. With the separate-track option on, the capture
         // also feeds the mic-only mixer.
@@ -2501,6 +2536,9 @@ mod windows {
         stop.store(true, Ordering::Relaxed);
         let _ = capture.join();
         let _ = system_audio.join();
+        if let Some(h) = comms_audio {
+            let _ = h.join();
+        }
         if let Some(h) = mic_audio {
             let _ = h.join();
         }
@@ -3147,11 +3185,12 @@ mod macos {
             let system_gain = config.system_gain();
             let mic_gain = config.mic_gain();
             let microphone = config.microphone().map(str::to_owned);
+            let output_device = config.output_device().map(str::to_owned);
             move |session_stop: &Arc<AtomicBool>| -> Result<Vec<std::thread::JoinHandle<()>>> {
                 let mut handles = vec![spawn_audio_capture(
                     "rewynd-audio-system",
                     AudioSource::SinkMonitor,
-                    None,
+                    output_device.clone(),
                     audio_params,
                     system_gain,
                     mixer.clone(),
