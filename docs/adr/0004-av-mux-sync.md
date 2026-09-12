@@ -1,6 +1,8 @@
 # ADR 0004 — A/V mux: Opus audio track + sync, via a vendored `mp4` fork
 
-- **Status:** Accepted (boxes verified byte-for-byte vs ffmpeg on the dev box, 2026-06-30)
+- **Status:** Accepted (boxes verified byte-for-byte vs ffmpeg on the dev box, 2026-06-30);
+  **revised 2026-09-12** — the libopus bindings moved to `opus` 0.4 / `opusic-sys`, which
+  statically bundles libopus instead of linking the system copy (decision 2 below)
 - **Supersedes / superseded by:** extends ADR 0002 (MP4 muxer)
 - **Relates to:** issue #14 (A/V mux + sync), PLAN §6.4; depends on #12 (video mux) and #13 (audio capture)
 
@@ -26,8 +28,11 @@ support, and upstream (alfg/mp4-rust) is archived — there is nothing to upstre
    `OpusConfig` + `MediaConfig::OpusConfig` variant, `MediaType::OPUS`, the `stsd`/`track`
    wiring, and a `set_track_edit_list` writer hook for the pre-skip edit list.
 
-2. **Audio codec: Opus via the `opus` crate (libopus).** libopus is BSD-3 (GPL-3-compatible)
-   and the `opus` bindings are MIT/Apache-2.0. Encode interleaved F32 at 48 kHz stereo,
+2. **Audio codec: Opus via the `opus` crate (libopus).** libopus is BSD-3 (GPL-3-compatible),
+   the `opus` bindings are MIT/Apache-2.0 and its `opusic-sys` backend BSD-3. Since `opus` 0.4
+   that backend builds libopus 1.6.1 from source with CMake and links it statically: `cmake`
+   becomes a build dependency everywhere, no platform needs libopus installed at runtime, and
+   the AppImage stops depending on the host copy. Encode interleaved F32 at 48 kHz stereo,
    128 kbps VBR (bitrate is a parameter, not hard-coded — per CLAUDE.md). Audio is encoded
    in `rewynd-encode` (codec work) into bare Opus packets; `rewynd-mux` stays codec-agnostic.
 
@@ -92,4 +97,5 @@ support, and upstream (alfg/mp4-rust) is archived — there is nothing to upstre
   tested. Bumping/replacing the muxer stays localized behind the `Muxer` surface (ADR 0002).
 - `rewynd-buffer` gains an audio lane (Opus packets have no keyframe concept — a simple
   time-windowed ring), flushed for the same window as video.
-- libopus becomes a build/runtime dependency (system `libopus`, added to CI apt deps).
+- libopus becomes a build-time dependency only: `cmake` in the CI/AUR/dev build deps, and
+  nothing new at runtime.

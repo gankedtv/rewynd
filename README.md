@@ -86,15 +86,15 @@ The app checks for updates on launch; one click updates both binaries in place.
 
 ## Building
 
-Requires a recent stable Rust (edition 2024) and a C++ compiler (for `vk-mem`). On
-Linux the capture crate additionally needs PipeWire dev headers and libclang (for
-`pipewire-sys`/`libspa-sys` bindgen): on Debian/Ubuntu, `pkg-config
-libpipewire-0.3-dev clang libclang-dev`. On macOS (Apple Silicon, macOS 15+) the
-Xcode Command Line Tools and `cmake` (bundled libopus) are the only extras — capture
-and encode use the system ScreenCaptureKit/VideoToolbox frameworks. In-app clip playback in
-the library decodes through `ffmpeg`: the Linux and Windows installers bundle a copy
-beside the binaries, while dev builds and macOS use whatever `PATH` provides
-(`brew install ffmpeg` on macOS).
+Requires a recent stable Rust (edition 2024), a C++ compiler (for `vk-mem`) and `cmake`
+(the Opus encoder builds libopus from source and links it statically, so nothing needs
+libopus at runtime). On Linux the capture crate additionally needs PipeWire dev headers
+and libclang (for `pipewire-sys`/`libspa-sys` bindgen): on Debian/Ubuntu, `pkg-config
+libpipewire-0.3-dev clang libclang-dev cmake`. On macOS (Apple Silicon, macOS 15+) the
+Xcode Command Line Tools are the only other extra — capture and encode use the system
+ScreenCaptureKit/VideoToolbox frameworks. In-app clip playback in the library decodes
+through `ffmpeg`: the Linux and Windows installers bundle a copy beside the binaries,
+while dev builds and macOS use whatever `PATH` provides (`brew install ffmpeg` on macOS).
 
 ```sh
 cargo build

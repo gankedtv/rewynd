@@ -55,8 +55,8 @@ mp4 = { path = "vendor/mp4" }
 thiserror = "2"
 anyhow = "1"
 # Opus audio encoding (docs/adr/0004): safe bindings over libopus (BSD-3, GPL-3-compatible).
-# Links the system libopus via pkg-config (CI installs libopus-dev).
-opus = "0.3"
+# opusic-sys builds libopus 1.6.1 statically with CMake: cmake at build time, no runtime dep.
+opus = "0.4"
 # CPU H.264: encode fallback (docs/adr/0014) and library-thumbnail decode (docs/adr/0013).
 # BSD-2-Clause; the default `source` feature compiles Cisco's openh264 from vendored source.
 openh264 = "0.9"

@@ -11,9 +11,9 @@ runs:
   using: composite
   steps:
     # pipewire-sys/libspa-sys need libpipewire-0.3 (pkg-config) and libclang (bindgen).
-    # vk-mem needs a C++ compiler (preinstalled). The Opus audio encoder (audiopus_sys)
-    # links system libopus → libopus-dev. The iced settings GUI's winit/softbuffer backend
-    # needs libxkbcommon (keymap) to build (ADR 0006).
+    # vk-mem needs a C++ compiler (preinstalled). The Opus audio encoder (opusic-sys) builds
+    # libopus from source and links it statically → cmake, no libopus-dev. The iced settings
+    # GUI's winit/softbuffer backend needs libxkbcommon (keymap) to build (ADR 0006).
     - name: Install system dependencies
       shell: bash
       run: |
@@ -21,7 +21,7 @@ runs:
         sudo=""; command -v sudo >/dev/null 2>&1 && sudo=sudo
         $sudo apt-get update
         $sudo apt-get install -y --no-install-recommends \
-          pkg-config libpipewire-0.3-dev clang libclang-dev libopus-dev libxkbcommon-dev libasound2-dev
+          pkg-config libpipewire-0.3-dev clang libclang-dev cmake libxkbcommon-dev libasound2-dev
 
     - name: Install Rust (stable)
       # Third-party actions are pinned to commit SHAs (tags are mutable).
