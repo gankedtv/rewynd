@@ -4667,7 +4667,7 @@ dependencies = [
 
 [[package]]
 name = "rewynd"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "dirs",
  "iced",
@@ -4696,14 +4696,14 @@ dependencies = [
 
 [[package]]
 name = "rewynd-buffer"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "rewynd-capture"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "ash",
  "ashpd",
@@ -4732,7 +4732,7 @@ dependencies = [
 
 [[package]]
 name = "rewynd-clip"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "rewynd-buffer",
  "rewynd-config",
@@ -4745,7 +4745,7 @@ dependencies = [
 
 [[package]]
 name = "rewynd-config"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "dirs",
  "libc",
@@ -4760,7 +4760,7 @@ dependencies = [
 
 [[package]]
 name = "rewynd-encode"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "cfg_aliases",
  "cidre",
@@ -4779,7 +4779,7 @@ dependencies = [
 
 [[package]]
 name = "rewynd-gpu"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "cfg_aliases",
  "gpu-video",
@@ -4790,7 +4790,7 @@ dependencies = [
 
 [[package]]
 name = "rewynd-installer"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "iced",
  "image",
@@ -4804,7 +4804,7 @@ dependencies = [
 
 [[package]]
 name = "rewynd-mux"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "mp4",
  "rewynd-buffer",
@@ -4813,7 +4813,7 @@ dependencies = [
 
 [[package]]
 name = "rewynd-recorder"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -4848,7 +4848,7 @@ dependencies = [
 
 [[package]]
 name = "rewynd-upload"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 dependencies = [
  "base64 0.23.1",
  "futures-util",
