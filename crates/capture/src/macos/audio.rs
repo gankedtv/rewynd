@@ -26,7 +26,7 @@ use super::{
     SessionShared, StreamErrDelegate, StreamErrDelegateInner, ensure_screen_capture_access,
     select_display, session_result, shareable_content, watch_session,
 };
-use crate::{AudioParams, AudioSource, CaptureError};
+use crate::{AudioDevice, AudioParams, AudioSource, CaptureError};
 
 /// How far the continuous stream clock may drift behind the wall clock before a
 /// buffer re-anchors: the same 100 ms bound as the WASAPI backend — above SCK's
@@ -252,8 +252,8 @@ fn resolve_mic_uid(name: &str) -> Result<arc::R<ns::String>, CaptureError> {
 /// the video capture's epoch so the muxer can align the tracks).
 ///
 /// `device` selects the microphone by name (case-insensitive substring of the
-/// localized device name); `None` uses the default. SCK's loopback always follows
-/// the system output, so a named device with [`AudioSource::SinkMonitor`] is ignored.
+/// localized device name); [`AudioDevice::Default`] uses the default. SCK's loopback always
+/// follows the system output, so a named device with [`AudioSource::SinkMonitor`] is ignored.
 ///
 /// `stop`, when set, is watched off the sample path so shutdown is prompt even
 /// while nothing plays. `idle_timeout`, when set, fails the call if no buffer
@@ -266,7 +266,7 @@ fn resolve_mic_uid(name: &str) -> Result<arc::R<ns::String>, CaptureError> {
 pub fn capture_audio<F>(
     params: AudioParams,
     source: AudioSource,
-    device: Option<&str>,
+    device: &AudioDevice,
     idle_timeout: Option<Duration>,
     stop: Option<Arc<AtomicBool>>,
     epoch: Instant,
@@ -298,7 +298,7 @@ where
     cfg.set_channel_count(i64::from(params.channels));
     let expected = match source {
         AudioSource::SinkMonitor => {
-            if let Some(name) = device {
+            if let Some(name) = device.selector() {
                 tracing::warn!(
                     device = name,
                     "macOS records whatever the system output is playing; \
@@ -315,7 +315,7 @@ where
             cfg.set_captures_audio(true);
             cfg.set_excludes_current_process_audio(true);
             cfg.set_capture_mic(true);
-            if let Some(name) = device {
+            if let Some(name) = device.selector() {
                 let uid = resolve_mic_uid(name)?;
                 cfg.set_mic_capture_device_id(Some(&uid));
             }

@@ -26,7 +26,7 @@ mod probe {
     use rewynd_capture::linux::capture_audio;
     #[cfg(target_os = "windows")]
     use rewynd_capture::windows::capture_audio;
-    use rewynd_capture::{AudioParams, AudioSource};
+    use rewynd_capture::{AudioDevice, AudioParams, AudioSource};
 
     /// Default number of buffers to capture when `AUDIO_PROBE_BUFFERS` is unset.
     const DEFAULT_BUFFERS: u32 = 200;
@@ -55,12 +55,12 @@ mod probe {
             Ok("mic") => AudioSource::Microphone,
             _ => AudioSource::SinkMonitor,
         };
-        let device = std::env::var("AUDIO_PROBE_DEVICE").ok();
+        let device = AudioDevice::from(std::env::var("AUDIO_PROBE_DEVICE").ok());
 
         let params = AudioParams::default();
         tracing::info!(
             ?source,
-            device = device.as_deref().unwrap_or("<default>"),
+            device = device.selector().unwrap_or("<default>"),
             sample_rate = params.sample_rate,
             channels = params.channels,
             max_buffers,
@@ -77,7 +77,7 @@ mod probe {
         capture_audio(
             params,
             source,
-            device.as_deref(),
+            &device,
             Some(IDLE_TIMEOUT),
             None,
             std::time::Instant::now(),

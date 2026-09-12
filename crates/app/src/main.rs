@@ -131,7 +131,7 @@ mod audio_pipeline {
     use rewynd_capture::macos::capture_audio;
     #[cfg(target_os = "windows")]
     use rewynd_capture::windows::capture_audio;
-    use rewynd_capture::{AudioParams, AudioSource};
+    use rewynd_capture::{AudioDevice, AudioParams, AudioSource};
     use rewynd_clip::{SharedAudioBuffer, lock_unpoisoned};
     use rewynd_encode::{
         AudioEncodeParams, AudioMixer, OpusAudioEncoder, apply_gain, center_mono_into,
@@ -147,16 +147,16 @@ mod audio_pipeline {
     /// How often the mixer thread drains settled audio into the encoder.
     const AUDIO_DRAIN_INTERVAL: Duration = Duration::from_millis(20);
 
-    /// Spawn a thread that captures `source` (from `device`, or the platform default
-    /// when `None`), applies `gain`, and sums each buffer into the shared `mixer`,
-    /// aligned by its capture-relative PTS. A capture error is logged at a severity
+    /// Spawn a thread that captures `source` from `device`, applies `gain`, and sums each
+    /// buffer into the shared `mixer`, aligned by its capture-relative PTS. A capture error
+    /// is logged at a severity
     /// matching the source; a failed system capture loses the clips' primary audio, so
     /// that one also fires `on_system_failure` (the platform surfaces it: tray or toast).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_audio_capture(
         name: &str,
         source: AudioSource,
-        device: Option<String>,
+        device: AudioDevice,
         audio_params: AudioEncodeParams,
         gain: f32,
         mixer: SharedMixer,
@@ -189,7 +189,7 @@ mod audio_pipeline {
                 let result = capture_audio(
                     capture_params,
                     source,
-                    device.as_deref(),
+                    &device,
                     None,
                     Some(stop.clone()),
                     epoch,
@@ -1310,7 +1310,7 @@ mod linux {
             recorder.system_audio = Some(spawn_audio_capture(
                 "rewynd-audio-system",
                 AudioSource::SinkMonitor,
-                config.output_device().map(str::to_owned),
+                config.output_device().map(str::to_owned).into(),
                 audio_params,
                 config.system_gain(),
                 mixer.clone(),
@@ -1331,7 +1331,7 @@ mod linux {
                 recorder.mic_audio = Some(spawn_audio_capture(
                     "rewynd-audio-mic",
                     AudioSource::Microphone,
-                    config.microphone().map(str::to_owned),
+                    config.microphone().map(str::to_owned).into(),
                     audio_params,
                     config.mic_gain(),
                     mixer.clone(),
@@ -2064,7 +2064,7 @@ mod windows {
     use rewynd_capture::windows::{
         CapturedD3d11Frame, capture_game_stream, capture_stream, default_render_endpoints,
     };
-    use rewynd_capture::{AudioSource, StreamPrefs};
+    use rewynd_capture::{AudioDevice, AudioSource, StreamPrefs};
     use rewynd_clip::{ClipSaver, SaveError, SharedAudioBuffer, SharedBuffer, lock_unpoisoned};
     use rewynd_config::{self as config};
     use rewynd_encode::{
@@ -2296,7 +2296,7 @@ mod windows {
         let system_audio = spawn_audio_capture(
             "rewynd-audio-system",
             AudioSource::SinkMonitor,
-            output_device.clone(),
+            output_device.clone().into(),
             audio_params,
             config.system_gain(),
             mixer.clone(),
@@ -2315,7 +2315,7 @@ mod windows {
             match spawn_audio_capture(
                 "rewynd-audio-system-comms",
                 AudioSource::SinkMonitor,
-                Some(device),
+                AudioDevice::Exact(device),
                 audio_params,
                 config.system_gain(),
                 mixer.clone(),
@@ -2338,7 +2338,7 @@ mod windows {
             Some(spawn_audio_capture(
                 "rewynd-audio-mic",
                 AudioSource::Microphone,
-                config.microphone().map(str::to_owned),
+                config.microphone().map(str::to_owned).into(),
                 audio_params,
                 config.mic_gain(),
                 mixer.clone(),
@@ -3193,7 +3193,7 @@ mod macos {
                 let mut handles = vec![spawn_audio_capture(
                     "rewynd-audio-system",
                     AudioSource::SinkMonitor,
-                    output_device.clone(),
+                    output_device.clone().into(),
                     audio_params,
                     system_gain,
                     mixer.clone(),
@@ -3220,7 +3220,7 @@ mod macos {
                     match spawn_audio_capture(
                         "rewynd-audio-mic",
                         AudioSource::Microphone,
-                        microphone.clone(),
+                        microphone.clone().into(),
                         audio_params,
                         mic_gain,
                         mixer.clone(),

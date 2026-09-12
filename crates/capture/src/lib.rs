@@ -46,6 +46,43 @@ pub enum AudioSource {
     Microphone,
 }
 
+/// Which endpoint an audio capture binds to, and what may happen when it is gone.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum AudioDevice {
+    /// The platform's default endpoint for the source.
+    #[default]
+    Default,
+    /// The endpoint the user configured, by platform-specific selector. Falling back to the
+    /// default output beats recording silence when it disappears.
+    Preferred(String),
+    /// Exactly this endpoint or nothing. Falling back would land a second capture on an
+    /// endpoint another capture already records, doubling it in the mix.
+    Exact(String),
+}
+
+impl AudioDevice {
+    /// The endpoint selector, or `None` for the platform default.
+    #[must_use]
+    pub fn selector(&self) -> Option<&str> {
+        match self {
+            Self::Default => None,
+            Self::Preferred(s) | Self::Exact(s) => Some(s),
+        }
+    }
+
+    /// Whether an unmatched selector may fall back to the default endpoint.
+    #[must_use]
+    pub fn may_fall_back(&self) -> bool {
+        matches!(self, Self::Preferred(_))
+    }
+}
+
+impl From<Option<String>> for AudioDevice {
+    fn from(device: Option<String>) -> Self {
+        device.map_or(Self::Default, Self::Preferred)
+    }
+}
+
 /// System-audio capture parameters.
 ///
 /// Opus operates natively at 48 kHz, and stereo matches a typical desktop sink, so those
@@ -104,6 +141,36 @@ pub enum CaptureError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_device_exposes_its_selector() {
+        assert_eq!(AudioDevice::Default.selector(), None);
+        assert_eq!(
+            AudioDevice::Preferred("Speakers".to_owned()).selector(),
+            Some("Speakers")
+        );
+        assert_eq!(
+            AudioDevice::Exact("{0.0.0.00000000}.{guid}".to_owned()).selector(),
+            Some("{0.0.0.00000000}.{guid}")
+        );
+    }
+
+    #[test]
+    fn only_a_preferred_device_may_be_substituted() {
+        assert!(AudioDevice::Preferred("Speakers".to_owned()).may_fall_back());
+        // Substituting either of these doubles a capture or records the wrong endpoint.
+        assert!(!AudioDevice::Exact("{0.0.0.00000000}.{guid}".to_owned()).may_fall_back());
+        assert!(!AudioDevice::Default.may_fall_back());
+    }
+
+    #[test]
+    fn a_configured_device_becomes_a_preference() {
+        assert_eq!(AudioDevice::from(None), AudioDevice::Default);
+        assert_eq!(
+            AudioDevice::from(Some("Speakers".to_owned())),
+            AudioDevice::Preferred("Speakers".to_owned())
+        );
+    }
 
     #[test]
     fn capture_error_variants_display() {
