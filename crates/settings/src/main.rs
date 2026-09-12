@@ -104,9 +104,16 @@ fn device_picker<'a>(
         id: String::new(),
         label: default_label.to_owned(),
     };
+    // Configs written before Windows endpoints were addressed by ID hold a friendly name, which
+    // is a listed device's label: match that too, so it selects its endpoint instead of getting a
+    // second row. Picking anything then stores the id.
+    let listed = options
+        .iter()
+        .find(|o| o.id == value || o.label == value)
+        .map(|o| o.id.clone());
     let mut rows = vec![default.clone()];
     // An offline device keeps its row instead of the selection snapping to the default.
-    if !value.is_empty() && !options.iter().any(|o| o.id == value) {
+    if !value.is_empty() && listed.is_none() {
         rows.push(config::AudioInput {
             id: value.to_owned(),
             label: value.to_owned(),
@@ -117,9 +124,10 @@ fn device_picker<'a>(
     for row in &mut rows {
         row.label = truncate_device_label(&row.label);
     }
+    let wanted = listed.as_deref().unwrap_or(value);
     let selected = rows
         .iter()
-        .find(|o| o.id == value)
+        .find(|o| o.id == wanted)
         .cloned()
         .unwrap_or(default);
     column![
