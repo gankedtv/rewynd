@@ -130,16 +130,27 @@ fn endpoint(
         .map_err(|e| CaptureError::Wasapi(format!("count endpoints: {e}")))?;
 
     let mut names = Vec::with_capacity(count as usize);
+    // An exact name wins over a merely containing one: "Headset" must not land on
+    // "Headset Earphone" while the endpoint it names is sitting right there.
+    let mut partial: Option<(IMMDevice, String)> = None;
     for i in 0..count {
         // SAFETY: FFI; `i` is within the collection.
         let device = unsafe { devices.Item(i) }
             .map_err(|e| CaptureError::Wasapi(format!("endpoint {i}: {e}")))?;
         let friendly = friendly_name(&device)?;
-        if friendly.to_lowercase().contains(&wanted) {
+        let lower = friendly.to_lowercase();
+        if lower == wanted {
             tracing::info!(device = friendly, "using the configured audio endpoint");
             return Ok(device);
         }
+        if partial.is_none() && lower.contains(&wanted) {
+            partial = Some((device, friendly.clone()));
+        }
         names.push(friendly);
+    }
+    if let Some((device, friendly)) = partial {
+        tracing::info!(device = friendly, "using the configured audio endpoint");
+        return Ok(device);
     }
     if flow == eRender {
         tracing::warn!(
