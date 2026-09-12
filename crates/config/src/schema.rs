@@ -220,9 +220,8 @@ struct AudioConfig {
     /// case-insensitively against the device's name (a substring is enough on Windows;
     /// the PipeWire node name on Linux).
     microphone: String,
-    /// Capture this audio output's loopback instead of the system default. Empty = default.
-    /// Matched like `microphone`; ignored on macOS, where the loopback always follows the
-    /// system output.
+    /// Record this output's loopback instead of the system default. Matched like
+    /// `microphone`; ignored on macOS.
     output_device: String,
     /// Record the microphone at all. Off = no mic stream is even opened (privacy) and clips carry
     /// only system audio.
@@ -618,8 +617,7 @@ impl Config {
         (!mic.is_empty()).then_some(mic)
     }
 
-    /// The audio output whose loopback to record instead of the system default, if one is
-    /// configured (trimmed; empty = default).
+    /// The audio output to record instead of the system default (trimmed; empty = default).
     #[must_use]
     pub fn output_device(&self) -> Option<&str> {
         let out = self.audio.output_device.trim();
@@ -1180,10 +1178,8 @@ system_gain = 1.0
 # Capture a specific microphone instead of the system default. Case-insensitive; on
 # Windows a part of the device name is enough, on Linux use the PipeWire node name.
 microphone = \"\"
-# Record a specific audio output's loopback instead of the system default. Case-insensitive; on
-# Windows a part of the device name is enough, on Linux use the PipeWire sink node name. Leave
-# empty unless some app's sound is missing from your clips. Ignored on macOS, where the system
-# audio always follows whatever the Mac is playing through.
+# Record a specific audio output instead of the system default, for when an app's sound is
+# missing from your clips. Spelled like microphone above; ignored on macOS.
 output_device = \"\"
 # Record the microphone at all. false = no mic stream is opened; clips carry only system audio.
 mic_enabled = true
@@ -1405,7 +1401,7 @@ mod tests {
         let back = Config::from_toml_str(&c.to_toml_string().expect("serialize")).expect("reparse");
         assert_eq!(back.output_device(), Some("Headset"), "survives TOML");
 
-        // Whitespace-only is as good as unset, so a cleared picker doesn't pin a blank device.
+        // Whitespace-only is as good as unset.
         c.set_output_device("   ".to_owned());
         assert_eq!(c.output_device(), None);
     }

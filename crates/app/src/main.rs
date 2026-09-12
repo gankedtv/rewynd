@@ -2277,14 +2277,8 @@ mod windows {
         // final drain + Opus flush.
         let captures_done = Arc::new(AtomicBool::new(false));
 
-        // Windows keeps two playback defaults: the console one, and the communications one
-        // that voice apps follow. When they differ, a loopback on the console default alone
-        // misses Discord and friends, so a second stream records the communications endpoint
-        // as well. Skipped once the user has named an output themselves — an explicit pick
-        // is exact, and both endpoints are logged either way so a support report shows the
-        // mismatch. An app playing the same sound through both endpoints at once would land
-        // in the mix twice; a stream goes to one endpoint, so that costs less than the voice
-        // chat these reports are missing.
+        // Voice apps follow Windows' separate communications default, so record that endpoint
+        // too when it differs and the user hasn't picked one themselves.
         let output_device = config.output_device().map(str::to_owned);
         let mut comms_device = None;
         if let Some((console, comms)) = default_render_endpoints() {
@@ -2312,10 +2306,7 @@ mod windows {
                 );
             })),
         )?;
-        // Toast-free and non-fatal both ways: this stream is a bonus on top of the console
-        // default, so neither a failed spawn nor a failed capture may cost the recording the
-        // audio the primary one already delivers. Erroring out here would also detach the
-        // system capture spawned just above.
+        // Optional extra: erroring here would detach the system capture spawned above.
         let comms_audio = comms_device.and_then(|device| {
             match spawn_audio_capture(
                 "rewynd-audio-system-comms",

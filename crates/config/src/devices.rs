@@ -18,8 +18,8 @@ pub struct AudioInput {
     pub label: String,
 }
 
-/// Whether this platform can record a chosen audio output. macOS's ScreenCaptureKit loopback
-/// always follows the system output and takes no device, so the picker gives way to a hint there.
+/// Whether this platform can record a chosen audio output (macOS cannot: SCK follows the
+/// system output).
 pub const OUTPUT_PICKER_SUPPORTED: bool = !cfg!(target_os = "macos");
 
 impl fmt::Display for AudioInput {
@@ -56,8 +56,7 @@ mod imp {
         list_endpoints(eCapture)
     }
 
-    /// All active render (output) endpoints, for the system-audio picker. Their loopback is
-    /// what the capture backend records.
+    /// All active render (output) endpoints, whose loopback is what gets recorded.
     #[must_use]
     pub fn list_audio_outputs() -> Vec<AudioInput> {
         list_endpoints(eRender)
@@ -119,10 +118,9 @@ mod imp {
     /// second; the cap keeps a wedged PipeWire from hanging the settings window at startup.
     const PW_DUMP_TIMEOUT: Duration = Duration::from_secs(2);
 
-    /// `media.class` prefix of a capture endpoint: "Audio/Source" and its "/Virtual" variants.
     const SOURCE_CLASS: &str = "Audio/Source";
-    /// `media.class` prefix of an output endpoint. Its monitor ports are what the sink-monitor
-    /// capture records, addressed by the sink's own `node.name`.
+    /// A sink's monitor ports are what the sink-monitor capture records, addressed by its
+    /// own `node.name`.
     const SINK_CLASS: &str = "Audio/Sink";
 
     /// The PipeWire audio sources, for the microphone picker. Best-effort: if `pw-dump` is
@@ -134,8 +132,7 @@ mod imp {
         list_nodes(SOURCE_CLASS)
     }
 
-    /// The PipeWire audio sinks, for the system-audio picker. Same contract as
-    /// [`list_audio_inputs`]; the sink's monitor is what gets recorded.
+    /// The PipeWire audio sinks, on [`list_audio_inputs`]'s contract.
     #[must_use]
     pub fn list_audio_outputs() -> Vec<AudioInput> {
         list_nodes(SINK_CLASS)
@@ -182,9 +179,8 @@ mod imp {
         status.success().then_some(buf)
     }
 
-    /// Extract the nodes whose `media.class` starts with `class` from a `pw-dump` JSON payload.
-    /// Split from the process call so the parsing (the part with the branches) is testable
-    /// without a live PipeWire session.
+    /// Extract the nodes whose `media.class` starts with `class`. Split from the process call
+    /// so the parsing is testable without a live PipeWire session.
     fn parse_pw_dump(json: &[u8], class: &str) -> Vec<AudioInput> {
         let Ok(dump) = serde_json::from_slice::<serde_json::Value>(json) else {
             return Vec::new();
@@ -202,7 +198,7 @@ mod imp {
             let Some(props) = obj.pointer("/info/props") else {
                 continue;
             };
-            // A prefix match so the "/Virtual" variants of both classes come along.
+            // A prefix so the "/Virtual" variants come along.
             let media_class = props
                 .get("media.class")
                 .and_then(serde_json::Value::as_str)
@@ -539,8 +535,7 @@ mod imp {
             .collect()
     }
 
-    /// No output picker on macOS: ScreenCaptureKit's loopback always follows the system output,
-    /// so there is nothing to choose between (see [`super::OUTPUT_PICKER_SUPPORTED`]).
+    /// Nothing to choose between: SCK's loopback follows the system output.
     #[must_use]
     pub fn list_audio_outputs() -> Vec<AudioInput> {
         Vec::new()

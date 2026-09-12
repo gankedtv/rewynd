@@ -253,9 +253,7 @@ fn resolve_mic_uid(name: &str) -> Result<arc::R<ns::String>, CaptureError> {
 ///
 /// `device` selects the microphone by name (case-insensitive substring of the
 /// localized device name); `None` uses the default. SCK's loopback always follows
-/// the system output, so a named device with [`AudioSource::SinkMonitor`] is
-/// warned about and ignored — a config copied from a PC must not cost a Mac its
-/// system audio.
+/// the system output, so a named device with [`AudioSource::SinkMonitor`] is ignored.
 ///
 /// `stop`, when set, is watched off the sample path so shutdown is prompt even
 /// while nothing plays. `idle_timeout`, when set, fails the call if no buffer

@@ -79,10 +79,8 @@ fn truncate_device_label(label: &str) -> String {
     format!("{head}…")
 }
 
-/// One audio-device field: a dropdown of the enumerated devices with a "system default" row
-/// (stored as the empty value), or a free-text box carrying `empty_hint` when enumeration found
-/// nothing. A configured-but-offline device keeps its row instead of the selection silently
-/// snapping back to the default.
+/// One audio-device field: a dropdown of `options` with a "system default" row (the empty
+/// value), or a free-text box carrying `empty_hint` when enumeration found nothing.
 fn device_picker<'a>(
     label: &'a str,
     default_label: &'a str,
@@ -107,6 +105,7 @@ fn device_picker<'a>(
         label: default_label.to_owned(),
     };
     let mut rows = vec![default.clone()];
+    // An offline device keeps its row instead of the selection snapping to the default.
     if !value.is_empty() && !options.iter().any(|o| o.id == value) {
         rows.push(config::AudioInput {
             id: value.to_owned(),
@@ -114,8 +113,7 @@ fn device_picker<'a>(
         });
     }
     rows.extend(options.iter().cloned());
-    // PipeWire descriptions can be long enough to overrun the dropdown; cap the visible label.
-    // The stored id (used for matching and persistence) is left untouched.
+    // Label only; the stored id keeps its full spelling.
     for row in &mut rows {
         row.label = truncate_device_label(&row.label);
     }
@@ -708,8 +706,7 @@ struct App {
     /// Active input devices for the microphone picker (Windows WASAPI endpoints, Linux PipeWire
     /// sources); empty when enumeration finds nothing, where the control is a free-text name.
     mic_options: Vec<config::AudioInput>,
-    /// The same for the system-audio picker: the machine's output devices, whose loopback is
-    /// what gets recorded. Always empty on macOS, which takes no output selection.
+    /// The same for the system-audio picker. Always empty on macOS, which takes no pick.
     output_options: Vec<config::AudioInput>,
     /// Whether the settings page's device discovery (audio inputs, the encoder probe) has been
     /// kicked off; it runs once, the first time that page opens.
@@ -1810,8 +1807,6 @@ impl App {
             / 8;
         let est_mb = est_bytes.saturating_add(500_000) / 1_000_000;
 
-        // The microphone picker: the active input devices (Windows WASAPI endpoints, Linux
-        // PipeWire sources), or a free-text device name when enumeration found nothing.
         let microphone = device_picker(
             "Microphone",
             MIC_DEFAULT,
@@ -1820,9 +1815,8 @@ impl App {
             self.config.microphone().unwrap_or_default(),
             Message::MicrophonePicked,
         );
-        // The system-audio picker: which output's loopback gets recorded. Worth reaching for
-        // when an app's sound is missing from the clips — Windows routes voice chat to its
-        // own default, so Discord can end up on an endpoint the console default never hears.
+        // Which output's loopback gets recorded: Windows routes voice chat to its own
+        // default, so Discord can land on an endpoint the console default never hears.
         let output_device: Element<Message> = if config::OUTPUT_PICKER_SUPPORTED {
             device_picker(
                 "System audio device",

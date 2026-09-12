@@ -92,9 +92,8 @@ fn default_endpoint(
         .map_err(|e| CaptureError::Wasapi(format!("no default endpoint: {e}")))
 }
 
-/// The friendly names of the two defaults Windows keeps for playback: `(console,
-/// communications)`. Voice apps follow the communications one, so when the two differ a
-/// loopback on the console default alone misses their audio. `None` if either is unreadable.
+/// The friendly names of Windows' two playback defaults, `(console, communications)`.
+/// Voice apps follow the latter, so a differing pair means the console loopback misses them.
 #[must_use]
 pub fn default_render_endpoints() -> Option<(String, String)> {
     let _com = ComGuard::init().ok()?;
@@ -105,12 +104,10 @@ pub fn default_render_endpoints() -> Option<(String, String)> {
     Some((name_of(eConsole)?, name_of(eCommunications)?))
 }
 
-/// Resolve the capture endpoint: the flow's default, or — when `name` is set — the
-/// active endpoint whose friendly name contains it (case-insensitive). An unmatched
-/// name is an error listing what exists, so a typo'd config names its fix — except on
-/// the render flow, where it falls back to the default rather than leave the clips
-/// with no sound. Playback only: silently switching *microphones* would record a
-/// device the user didn't pick.
+/// Resolve the capture endpoint: the flow's default, or the active endpoint whose friendly
+/// name matches `name` (exact first, then substring; case-insensitive). An unmatched name
+/// errors, except on the render flow, which falls back to the default rather than record
+/// silence — a microphone must not switch to a device the user didn't pick.
 fn endpoint(
     enumerator: &IMMDeviceEnumerator,
     flow: windows::Win32::Media::Audio::EDataFlow,
@@ -130,8 +127,7 @@ fn endpoint(
         .map_err(|e| CaptureError::Wasapi(format!("count endpoints: {e}")))?;
 
     let mut names = Vec::with_capacity(count as usize);
-    // An exact name wins over a merely containing one: "Headset" must not land on
-    // "Headset Earphone" while the endpoint it names is sitting right there.
+    // Exact wins: "Headset" must not land on "Headset Earphone".
     let mut partial: Option<(IMMDevice, String)> = None;
     for i in 0..count {
         // SAFETY: FFI; `i` is within the collection.
