@@ -740,6 +740,8 @@ struct App {
     /// Whether the capture card shows its advanced options (the per-start monitor prompt). UI-only.
     #[cfg(target_os = "linux")]
     capture_advanced_open: bool,
+    /// The windowed-games field as typed; the config holds the parsed list. UI-only.
+    windowed_games_text: String,
     login: LoginState,
     /// Mirror of the YouTube OAuth client id override (empty = the compiled-in default).
     yt_client_id: String,
@@ -843,6 +845,7 @@ enum Message {
     #[cfg(target_os = "linux")]
     CaptureAdvancedToggled,
     CaptureDesktop(bool),
+    WindowedGames(String),
     GameFolders(bool),
     StartOnBoot(bool),
     AutoInstallUpdates(bool),
@@ -941,6 +944,7 @@ impl App {
             audio_advanced_open: false,
             #[cfg(target_os = "linux")]
             capture_advanced_open: false,
+            windowed_games_text: config.windowed_games().join(", "),
             yt_client_id: config.youtube_client_id().to_owned(),
             yt_client_secret: config.youtube_client_secret().to_owned(),
             // A stored OAuth-client override stays visible instead of hiding behind the
@@ -1241,6 +1245,19 @@ impl App {
             }
             Message::CaptureDesktop(on) => {
                 self.config.set_capture_desktop(on);
+                self.touch();
+            }
+            Message::WindowedGames(text) => {
+                // The raw text stays as typed (a trailing comma mid-edit must survive a
+                // redraw); the config gets the parsed list.
+                self.config.set_windowed_games(
+                    text.split(',')
+                        .map(str::trim)
+                        .filter(|e| !e.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                );
+                self.windowed_games_text = text;
                 self.touch();
             }
             Message::GameFolders(on) => {
@@ -2055,20 +2072,39 @@ impl App {
         // ScreenCast-portal detail (Windows records the active game by default) that only applies
         // while desktop capture is on.
         let capture_desktop = self.config.capture_desktop();
-        let output_capture = output_capture
-            .push(
+        let output_capture = output_capture.push(
+            column![
+                checkbox(capture_desktop)
+                    .label("Record the whole desktop, not just the active game")
+                    .on_toggle(Message::CaptureDesktop)
+                    .style(arena_check),
+                hint(
+                    "Off records only the game you're playing (fullscreen or \
+                     borderless), keeping other windows out of your clips.",
+                ),
+            ]
+            .spacing(6),
+        );
+        // Only where game-only capture targets the window itself, and moot while the whole
+        // desktop is recorded anyway.
+        let output_capture = if config::WINDOWED_GAMES_SUPPORTED && !capture_desktop {
+            output_capture.push(
                 column![
-                    checkbox(capture_desktop)
-                        .label("Record the whole desktop, not just the active game")
-                        .on_toggle(Message::CaptureDesktop)
-                        .style(arena_check),
+                    field_label("Also record these games when windowed"),
+                    text_input("roblox.exe, Balatro", &self.windowed_games_text)
+                        .on_input(Message::WindowedGames)
+                        .style(arena_input),
                     hint(
-                        "Off records only the game you're playing (fullscreen or \
-                         borderless), keeping other windows out of your clips.",
+                        "Minecraft is built in. Add a program name (roblox.exe) or part of a \
+                         window title, comma-separated: those are recorded at any window size.",
                     ),
                 ]
-                .spacing(6),
+                .spacing(8),
             )
+        } else {
+            output_capture
+        };
+        let output_capture = output_capture
             .push(
                 column![
                     checkbox(self.config.game_folders())

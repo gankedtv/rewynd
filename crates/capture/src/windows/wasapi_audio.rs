@@ -1,33 +1,55 @@
-//! System-audio capture over WASAPI: the default render endpoint's loopback (the
-//! system mix — what you hear) or the default microphone, as interleaved f32 PCM.
+//! System-audio capture over WASAPI as interleaved f32 PCM: every application's playback
+//! through the process-loopback virtual device, an output endpoint's loopback, or a
+//! microphone.
 //!
-//! Shared-mode streams are opened with `AUTOCONVERTPCM | SRC_DEFAULT_QUALITY`, so the
-//! audio engine converts whatever the device's mix format is into the [`AudioParams`]
-//! format we ask for — rate and channel count stay parameters, exactly like the
-//! PipeWire negotiation on Linux. The capture client is polled on the calling thread
-//! (WASAPI buffers ~200 ms internally; a 10 ms poll never starves it), which keeps the
-//! blocking per-buffer-callback shape of [`crate::linux::capture_audio`]: same
-//! arguments, same `ControlFlow` contract, same epoch-relative PTS.
+//! Process loopback (`VAD\Process_Loopback`, Windows 10 2004+) is the default for system
+//! audio. It taps each process's render streams *before* they reach an endpoint, so it
+//! hears a game or voice app whichever output it plays to: the communications default,
+//! a per-app routing in the volume mixer, a virtual mixer's device, an output that became
+//! the default after the recorder started. An endpoint loopback hears only its own
+//! endpoint's mix, and Windows never moves it when the default changes, which is how
+//! clips ended up without system sound. The endpoint path stays for an explicit output
+//! pick and as the fallback when the activation is unavailable.
+//!
+//! Endpoint streams are opened with `AUTOCONVERTPCM | SRC_DEFAULT_QUALITY`, so the audio
+//! engine converts whatever the device's mix format is into the [`AudioParams`] format we
+//! ask for — rate and channel count stay parameters, exactly like the PipeWire negotiation
+//! on Linux; the process-loopback device has no mix format and delivers what was asked
+//! for. The capture client is polled on the calling thread (WASAPI buffers ~200 ms
+//! internally; a 10 ms poll never starves it), which keeps the blocking per-buffer-callback
+//! shape of [`crate::linux::capture_audio`]: same arguments, same `ControlFlow` contract,
+//! same epoch-relative PTS.
 
+use std::mem::ManuallyDrop;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
-    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, IAudioCaptureClient, IAudioClient,
-    IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX, eCapture, eCommunications, eConsole,
+    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, AUDIOCLIENT_ACTIVATION_PARAMS,
+    AUDIOCLIENT_ACTIVATION_PARAMS_0, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+    AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, ActivateAudioInterfaceAsync,
+    IActivateAudioInterfaceAsyncOperation, IActivateAudioInterfaceCompletionHandler,
+    IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient, IAudioClient,
+    IMMDeviceEnumerator, MMDeviceEnumerator, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+    VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX, eCapture, eCommunications, eConsole,
     eRender,
 };
 use windows::Win32::Media::Audio::{DEVICE_STATE_ACTIVE, IMMDevice, IMMDeviceCollection};
+use windows::Win32::System::Com::StructuredStorage::{
+    PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0,
+};
 use windows::Win32::System::Com::{
-    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+    BLOB, CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
     CoUninitialize, STGM_READ,
 };
-use windows::core::GUID;
+use windows::Win32::System::Variant::VT_BLOB;
+use windows::core::{GUID, HRESULT, IUnknown, Interface, Ref, implement};
 
 use crate::{AudioDevice, AudioParams, AudioSource, CaptureError};
 
@@ -50,6 +72,10 @@ const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 /// stay on the stream clock; small enough that a real gap (idle loopback)
 /// re-syncs promptly instead of back-dating the resumed audio.
 const REANCHOR_DRIFT: Duration = Duration::from_millis(100);
+
+/// Bound on waiting for `ActivateAudioInterfaceAsync` to complete. It finishes in
+/// milliseconds; a longer wait means the audio service is wedged, not slow.
+const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Balances `CoInitializeEx` on drop, so every exit path uninitializes COM exactly once.
 struct ComGuard;
@@ -135,6 +161,108 @@ pub fn default_render_endpoints() -> Option<RenderDefaults> {
         comms_name,
     })
 }
+
+/// `ActivateAudioInterfaceAsync` reports completion on an audio-service worker thread; the
+/// activating thread blocks on the channel instead of pumping messages (it is MTA).
+#[implement(IActivateAudioInterfaceCompletionHandler)]
+struct ActivationDone(mpsc::Sender<()>);
+
+impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationDone_Impl {
+    fn ActivateCompleted(
+        &self,
+        _operation: Ref<'_, IActivateAudioInterfaceAsyncOperation>,
+    ) -> windows::core::Result<()> {
+        // A closed receiver means the activator gave up waiting; nothing left to tell.
+        let _ = self.0.send(());
+        Ok(())
+    }
+}
+
+/// A capture client on the process-loopback virtual device: the render streams of every
+/// process outside `exclude_pid`'s tree, whichever endpoint each plays to. Fails on builds
+/// before Windows 10 2004, where the device does not exist.
+fn process_loopback_client(exclude_pid: u32) -> Result<IAudioClient, CaptureError> {
+    let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
+        ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+        Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
+            ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+                TargetProcessId: exclude_pid,
+                ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+            },
+        },
+    };
+    // A VT_BLOB PROPVARIANT pointing at `params`. Never dropped as a PROPVARIANT: the windows
+    // crate clears one on drop, and clearing a blob frees its data pointer, which is this
+    // stack frame.
+    let activation = ManuallyDrop::new(PROPVARIANT {
+        Anonymous: PROPVARIANT_0 {
+            Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
+                vt: VT_BLOB,
+                wReserved1: 0,
+                wReserved2: 0,
+                wReserved3: 0,
+                Anonymous: PROPVARIANT_0_0_0 {
+                    blob: BLOB {
+                        cbSize: size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
+                        pBlobData: std::ptr::from_mut(&mut params).cast(),
+                    },
+                },
+            }),
+        },
+    });
+    let (done, completed) = mpsc::channel();
+    let handler: IActivateAudioInterfaceCompletionHandler = ActivationDone(done).into();
+    // SAFETY: FFI; `params` and `activation` outlive the call, which copies them, and the
+    // operation holds its own reference to the handler.
+    let operation = unsafe {
+        ActivateAudioInterfaceAsync(
+            VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+            &IAudioClient::IID,
+            Some(&*activation),
+            &handler,
+        )
+    }
+    .map_err(|e| CaptureError::Wasapi(format!("activate process loopback: {e}")))?;
+    completed.recv_timeout(ACTIVATION_TIMEOUT).map_err(|_| {
+        CaptureError::Wasapi("process loopback activation did not complete".to_owned())
+    })?;
+    let mut result = HRESULT(0);
+    let mut client: Option<IUnknown> = None;
+    // SAFETY: FFI; both out-params are valid for the call.
+    unsafe { operation.GetActivateResult(&mut result, &mut client) }
+        .map_err(|e| CaptureError::Wasapi(format!("process loopback result: {e}")))?;
+    result
+        .ok()
+        .map_err(|e| CaptureError::Wasapi(format!("process loopback: {e}")))?;
+    let client: IAudioClient = client
+        .ok_or_else(|| CaptureError::Wasapi("process loopback activated nothing".to_owned()))?
+        .cast()
+        .map_err(|e| CaptureError::Wasapi(format!("process loopback client: {e}")))?;
+    Ok(client)
+}
+
+/// Whether this Windows can capture system audio through process loopback, the path the
+/// default output selection takes. `false` means the endpoint-loopback fallback is what
+/// will run, so the caller may want the communications-endpoint extra next to it.
+///
+/// Decided once per process by a trial activation and then fixed, so the capture takes
+/// the same path the caller planned around: a supported box whose activation fails later
+/// gets a retry of the same path, never a silent switch to an endpoint without the extra.
+#[must_use]
+pub fn process_loopback_supported() -> bool {
+    *PROCESS_LOOPBACK_SUPPORTED.get_or_init(|| {
+        let Ok(_com) = ComGuard::init() else {
+            return false;
+        };
+        process_loopback_client(std::process::id())
+            .inspect_err(|e| {
+                tracing::warn!(error = %e, "process loopback unavailable; system audio will use the default output's loopback");
+            })
+            .is_ok()
+    })
+}
+
+static PROCESS_LOOPBACK_SUPPORTED: OnceLock<bool> = OnceLock::new();
 
 /// Resolve the capture endpoint: the flow's default, or the active endpoint the selector picks
 /// out — its endpoint ID, else its friendly name (exact first, then substring; case-insensitive).
@@ -239,10 +367,19 @@ pub fn capture_audio(
         AudioSource::SinkMonitor => eRender,
         AudioSource::Microphone => eCapture,
     };
-    let device = endpoint(&enumerator, flow, device)?;
-    // SAFETY: FFI.
-    let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }
-        .map_err(|e| CaptureError::Wasapi(format!("activate audio client: {e}")))?;
+    let process_loopback = source == AudioSource::SinkMonitor
+        && *device == AudioDevice::Default
+        && process_loopback_supported();
+    let client: IAudioClient = if process_loopback {
+        let client = process_loopback_client(std::process::id())?;
+        tracing::info!("system audio: process loopback (every app, whichever output it plays to)");
+        client
+    } else {
+        let device = endpoint(&enumerator, flow, device)?;
+        // SAFETY: FFI.
+        unsafe { device.Activate(CLSCTX_ALL, None) }
+            .map_err(|e| CaptureError::Wasapi(format!("activate audio client: {e}")))?
+    };
 
     let block_align = params.channels as u16 * (size_of::<f32>() as u16);
     let format = WAVEFORMATEX {
@@ -254,8 +391,13 @@ pub fn capture_audio(
         wBitsPerSample: (size_of::<f32>() as u16) * 8,
         cbSize: 0,
     };
-    let mut stream_flags =
-        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+    let mut stream_flags = if process_loopback {
+        // The process-loopback device has no mix format: it delivers the format asked for.
+        0
+    } else {
+        // The engine converts the endpoint's mix format into ours.
+        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
+    };
     if source == AudioSource::SinkMonitor {
         stream_flags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
     }

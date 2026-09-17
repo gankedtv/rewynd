@@ -48,6 +48,7 @@ use windows_capture::settings::{
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
 
+use super::game_window::WindowedGames;
 use crate::{CaptureError, StreamPrefs};
 
 /// How many shareable slot textures the copies rotate through. Deep enough that a
@@ -454,9 +455,9 @@ pub fn display_geometry(monitor_index: Option<usize>) -> Option<(u32, u32)> {
 pub type GameCallback = Box<dyn Fn(Option<&crate::game::GameInfo>) + Send + Sync>;
 
 /// Capture the active *game*, continuously: poll the foreground window until one
-/// looks like a running game (fullscreen/borderless — see
-/// [`super::game_window::fullscreen_game_window`]), capture it until it closes or
-/// stops being fullscreen, then go back to watching for the next one. Losing focus
+/// looks like a running game (fullscreen/borderless, or one of `windowed_games` at any
+/// size — see [`super::game_window::game_window`]), capture it until it closes or
+/// stops qualifying, then go back to watching for the next one. Losing focus
 /// never ends a session; being minimized ends one only after a long grace. Desktop
 /// content between games is never captured. `on_game` reports each session's game
 /// (and its end) so the caller can gate audio and label clip folders.
@@ -468,6 +469,7 @@ pub fn capture_game_stream<F>(
     epoch: Instant,
     prefs: StreamPrefs,
     stop: Option<Arc<AtomicBool>>,
+    windowed_games: WindowedGames,
     on_frame: F,
     on_game: Option<GameCallback>,
 ) -> Result<(), CaptureError>
@@ -492,21 +494,24 @@ where
             return Ok(());
         }
 
-        let Some(window) = super::game_window::fullscreen_game_window() else {
+        let Some(game) = super::game_window::game_window(&windowed_games) else {
             std::thread::sleep(GAME_POLL);
             continue;
         };
         // Process name only — window titles carry documents/URLs/chat context, and
         // leaking those into logs would undercut the point of game-only capture.
         tracing::info!(
-            process = window.process_name().unwrap_or_default(),
-            "fullscreen game detected; capturing it"
+            process = game.process,
+            windowed = game.windowed,
+            "game detected; capturing it"
         );
+        let window = game.window;
+        let windowed = game.windowed;
         if let Some(on_game) = &on_game {
             // An anti-cheat-shielded process refuses the name query; the empty app id
             // falls back to the window title for naming.
             let info = crate::game::GameInfo {
-                app_id: window.process_name().unwrap_or_default(),
+                app_id: game.name.map_or(game.process, str::to_owned),
                 title: window.title().unwrap_or_default(),
                 pid: window.process_id().ok().filter(|&pid| pid > 0),
             };
@@ -535,13 +540,10 @@ where
         // or a minimized game from holding the recorder.
         let mut latch = super::game_window::Latch::default();
         let keep_alive = move || {
-            let state = super::game_window::window_state(&window);
+            let state = super::game_window::window_state(&window, windowed);
             let keep = latch.observe(state, Instant::now());
             if !keep {
-                tracing::info!(
-                    ?state,
-                    "captured window is no longer fullscreen; releasing it"
-                );
+                tracing::info!(?state, "captured window no longer qualifies; releasing it");
             }
             keep
         };

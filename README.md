@@ -71,6 +71,19 @@ The app checks for updates on launch; one click updates both binaries in place.
 - Optional uploads to [ganked.tv](https://ganked.tv) or YouTube, only when you ask.
   Clips never leave your machine on their own.
 
+## Logs
+
+The recorder writes what it is doing to a small set of log files next to its data, capped at
+2 MB each and three files in total, so they never grow beyond 6 MB:
+
+- Windows: `%LOCALAPPDATA%\rewynd\logs\rewynd-recorder.log`
+- Linux: `$XDG_DATA_HOME/rewynd/logs/rewynd-recorder.log` (usually `~/.local/share/rewynd/logs/`)
+- macOS: `~/Library/Application Support/rewynd/logs/rewynd-recorder.log`
+
+Attach that file to a bug report about clips with no sound, a game that is not picked up,
+or a recorder that stops: it says which audio path ran, whether audio was flowing (a
+`peak` line a minute), and what the capture saw.
+
 ## Workspace layout
 
 | Crate | Role |

@@ -298,8 +298,12 @@ impl Default for HotkeyConfig {
     }
 }
 
+/// Whether this platform honours `[capture] windowed_games` (Windows captures the game window
+/// itself; the others gate a monitor stream on a fullscreen focus).
+pub const WINDOWED_GAMES_SUPPORTED: bool = cfg!(target_os = "windows");
+
 /// Capture options.
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct CaptureConfig {
     /// Re-show the ScreenCast monitor picker each launch (ignore the saved restore token),
@@ -311,6 +315,10 @@ struct CaptureConfig {
     /// Linux keeps the portal's monitor stream but only fills the buffer while a
     /// fullscreen game is focused.
     desktop: bool,
+    /// Games recorded at any window size (Windows), where game-only capture otherwise wants
+    /// a fullscreen window: process names (`roblox.exe`) or window-title fragments. Minecraft
+    /// needs no entry.
+    windowed_games: Vec<String>,
 }
 
 /// Desktop-session startup behaviour.
@@ -672,6 +680,19 @@ impl Config {
         self.capture.desktop
     }
 
+    /// Games to record at any window size: process names or title fragments (trimmed; empty
+    /// entries dropped). Only honoured where [`WINDOWED_GAMES_SUPPORTED`].
+    #[must_use]
+    pub fn windowed_games(&self) -> Vec<String> {
+        self.capture
+            .windowed_games
+            .iter()
+            .map(|e| e.trim())
+            .filter(|e| !e.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// The parsed encoder selection (`auto` / `cpu` / a pinned GPU).
     #[must_use]
     pub fn encoder_preference(&self) -> EncoderPreference {
@@ -907,6 +928,11 @@ impl Config {
     /// Set whether to capture the whole desktop instead of only the active game.
     pub fn set_capture_desktop(&mut self, desktop: bool) {
         self.capture.desktop = desktop;
+    }
+
+    /// Set the games recorded at any window size (see [`Self::windowed_games`]).
+    pub fn set_windowed_games(&mut self, games: Vec<String>) {
+        self.capture.windowed_games = games;
     }
 
     /// Switch uploads on/off (takes effect only once a key is set — see [`upload`]).
@@ -1207,6 +1233,9 @@ always_prompt = false
 # Record the whole desktop instead of only the active fullscreen game.
 # Off keeps private windows out of clips.
 desktop = false
+# Games to record at any window size (Windows): program names or parts of a
+# window title. Minecraft is built in.
+windowed_games = []
 
 [startup]
 # Start rewynd automatically when you log in.
@@ -1265,6 +1294,20 @@ pub fn ensure_default_file() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windowed_games_are_trimmed_and_empty_entries_dropped() {
+        let c = Config::from_toml_str(
+            "[capture]\nwindowed_games = [\" RobloxPlayerBeta.exe \", \"\", \"balatro\"]\n",
+        )
+        .expect("parses");
+        assert_eq!(c.windowed_games(), ["RobloxPlayerBeta.exe", "balatro"]);
+        assert!(Config::default().windowed_games().is_empty());
+
+        let mut c2 = Config::default();
+        c2.set_windowed_games(vec!["osu!.exe".to_owned()]);
+        assert_eq!(c2.windowed_games(), ["osu!.exe"]);
+    }
 
     #[test]
     fn encoder_preference_parses_all_forms() {
