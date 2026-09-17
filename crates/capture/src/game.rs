@@ -98,8 +98,14 @@ pub fn steam_app_name(appid: u32) -> Option<String> {
 fn clean_app_id(app_id: &str) -> String {
     let base = app_id.trim();
     // A Windows process name keeps its whole stem: the dots in `Minecraft.Windows.exe`
-    // are part of the name, not a reverse-DNS id.
-    if let Some(stem) = base.strip_suffix(".exe") {
+    // are part of the name, not a reverse-DNS id. The suffix is matched in any case,
+    // since executables are named `GAME.EXE` often enough.
+    if let Some((stem, suffix)) = base
+        .len()
+        .checked_sub(4)
+        .and_then(|at| base.is_char_boundary(at).then(|| base.split_at(at)))
+        && suffix.eq_ignore_ascii_case(".exe")
+    {
         return stem.trim().to_owned();
     }
     // Reverse-DNS desktop ids: keep the final segment, which names the app.
@@ -173,6 +179,11 @@ mod tests {
             info("Battle.net.exe", "").display_name_via(no_steam),
             "Battle.net"
         );
+        assert_eq!(
+            info("ELDENRING.EXE", "").display_name_via(no_steam),
+            "ELDENRING"
+        );
+        assert_eq!(info(".exe", "Title").display_name_via(no_steam), "Title");
     }
 
     #[test]

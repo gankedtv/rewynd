@@ -1056,6 +1056,9 @@ mod linux {
 
     /// Pipeline failures surfaced to the user via the tray (tooltip + toast); the process
     /// keeps running so already-buffered footage stays saveable.
+    /// The tray tooltip while system audio is being retried; a recovery clears exactly this.
+    const AUDIO_LOST_STATUS: &str = "System audio lost";
+
     enum RecorderEvent {
         CaptureFailed(String),
         SystemAudioFailed(String),
@@ -1577,7 +1580,7 @@ mod linux {
                             format!("The screen capture failed: {e}. Already-buffered footage can still be saved."),
                         ),
                         RecorderEvent::SystemAudioFailed(e) => (
-                            "System audio lost".to_owned(),
+                            AUDIO_LOST_STATUS.to_owned(),
                             format!("Clips will have no system sound until it is back: {e}"),
                         ),
                         RecorderEvent::SystemAudioRestored => (
@@ -1591,15 +1594,17 @@ mod linux {
                             format!("{e} Recording continues on the CPU, which uses more processor power."),
                         ),
                     };
-                    // A recovery toasts, but the tooltip goes back to normal rather than
-                    // keeping "lost" or announcing "back" forever.
-                    let status = if restored {
-                        tray::DEFAULT_STATUS.to_owned()
-                    } else {
-                        title.clone()
-                    };
+                    // A recovery toasts, and clears only its own tooltip: a "Recording
+                    // stopped" or CPU-encoder notice that arrived in between outranks it.
+                    let status = title.clone();
                     handle
-                        .update(|tray: &mut tray::RewyndTray| tray.status = status)
+                        .update(move |tray: &mut tray::RewyndTray| {
+                            if !restored {
+                                tray.status = status;
+                            } else if tray.status == AUDIO_LOST_STATUS {
+                                tray.status = tray::DEFAULT_STATUS.to_owned();
+                            }
+                        })
                         .await;
                     tray::toast(&title, &body).await;
                 }
@@ -2407,19 +2412,18 @@ mod windows {
             &stop,
             epoch,
             Some(Box::new({
-                // Once per process each: a flapping device must not spam toasts.
-                let mut lost_toasted = false;
-                let mut restored_toasted = false;
+                // One pair of toasts per outage: "lost" arms "back", which disarms "lost".
+                let mut lost_shown = false;
                 move |event: SystemAudioEvent| match event {
-                    SystemAudioEvent::Lost(e) if !lost_toasted => {
-                        lost_toasted = true;
+                    SystemAudioEvent::Lost(e) if !lost_shown => {
+                        lost_shown = true;
                         toast(
                             "System audio lost",
                             &format!("Clips will have no system sound until it is back: {e}"),
                         );
                     }
-                    SystemAudioEvent::Restored if !restored_toasted => {
-                        restored_toasted = true;
+                    SystemAudioEvent::Restored if lost_shown => {
+                        lost_shown = false;
                         toast("System audio is back", "Clips have system sound again.");
                     }
                     _ => {}
@@ -3308,8 +3312,7 @@ mod macos {
         // them per game session (an idle recorder must hold no SCK streams). The lost-
         // audio toast fires once per process: session-scoped captures would otherwise
         // re-toast a persistent failure on every game.
-        let audio_lost_toasted = Arc::new(AtomicBool::new(false));
-        let audio_restored_toasted = Arc::new(AtomicBool::new(false));
+        let audio_lost_shown = Arc::new(AtomicBool::new(false));
         let spawn_audio = {
             let mixer = mixer.clone();
             let mic_mixer = mic_mixer.clone();
@@ -3329,11 +3332,10 @@ mod macos {
                     session_stop,
                     epoch,
                     Some(Box::new({
-                        let lost_toasted = audio_lost_toasted.clone();
-                        let restored_toasted = audio_restored_toasted.clone();
+                        let lost_shown = audio_lost_shown.clone();
                         move |event: SystemAudioEvent| match event {
                             SystemAudioEvent::Lost(e) => {
-                                if lost_toasted.swap(true, Ordering::Relaxed) {
+                                if lost_shown.swap(true, Ordering::Relaxed) {
                                     tracing::warn!(error = %e, "system-audio capture failed again");
                                 } else {
                                     toast(
@@ -3345,7 +3347,7 @@ mod macos {
                                 }
                             }
                             SystemAudioEvent::Restored => {
-                                if !restored_toasted.swap(true, Ordering::Relaxed) {
+                                if lost_shown.swap(false, Ordering::Relaxed) {
                                     toast("System audio is back", "Clips have system sound again.");
                                 }
                             }
