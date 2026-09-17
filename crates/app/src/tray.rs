@@ -38,6 +38,9 @@ static ICON: LazyLock<Vec<Icon>> = LazyLock::new(|| {
         .collect()
 });
 
+/// The tooltip title while nothing is wrong.
+pub const DEFAULT_STATUS: &str = "rewynd is recording";
+
 pub struct RewyndTray {
     tx: UnboundedSender<TrayCmd>,
     /// One-line pipeline status shown as the tooltip title; the recorder updates it on failures.
@@ -135,7 +138,7 @@ pub async fn spawn(
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let tray = RewyndTray {
         tx,
-        status: "rewynd is recording".to_owned(),
+        status: DEFAULT_STATUS.to_owned(),
         mic_enabled,
     };
     let handle = tray.spawn().await?;

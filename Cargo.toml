@@ -116,6 +116,8 @@ cidre = { version = "=0.16.1", default-features = false, features = [
 # windows-capture drives the WGC session/frame pool; the `windows` crate (same 0.62.x
 # its API surfaces, so the D3D11 types unify) creates the shareable textures + NT handles.
 windows-capture = "2.0"
+# `#[implement]` (the process-loopback completion handler) expands to `::windows_core` paths.
+windows-core = "0.62"
 windows = { version = "0.62", features = [
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",

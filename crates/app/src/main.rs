@@ -147,11 +147,46 @@ mod audio_pipeline {
     /// How often the mixer thread drains settled audio into the encoder.
     const AUDIO_DRAIN_INTERVAL: Duration = Duration::from_millis(20);
 
+    /// First wait before reopening a failed capture; doubles per failure up to the max. A
+    /// device that was unplugged, went to sleep or changed identity comes back in seconds.
+    const AUDIO_RETRY_MIN: Duration = Duration::from_secs(1);
+    const AUDIO_RETRY_MAX: Duration = Duration::from_secs(30);
+    /// How often a waiting capture thread checks the stop flag.
+    const AUDIO_RETRY_POLL: Duration = Duration::from_millis(100);
+
+    /// Sleep `wait` in stop-aware steps; `true` when the stop flag rose meanwhile.
+    fn wait_unless_stopped(stop: &AtomicBool, wait: Duration) -> bool {
+        let deadline = Instant::now() + wait;
+        while Instant::now() < deadline {
+            if stop.load(Ordering::Relaxed) {
+                return true;
+            }
+            std::thread::sleep(AUDIO_RETRY_POLL);
+        }
+        stop.load(Ordering::Relaxed)
+    }
+
+    /// What the system capture reports to the platform, which surfaces it (tray or toast).
+    pub(crate) enum SystemAudioEvent {
+        /// The capture failed and is being retried; carries the error.
+        Lost(String),
+        /// A reopened capture delivers audio again.
+        Restored,
+    }
+
+    /// The platform's handler for [`SystemAudioEvent`]s.
+    pub(crate) type SystemAudioHook = Box<dyn FnMut(SystemAudioEvent) + Send>;
+
     /// Spawn a thread that captures `source` from `device`, applies `gain`, and sums each
-    /// buffer into the shared `mixer`, aligned by its capture-relative PTS. A capture error is
+    /// buffer into the shared `mixer`, aligned by its capture-relative PTS.
+    ///
+    /// A capture that fails (device unplugged or invalidated, activation refused) is reopened
+    /// after a backoff rather than ending the thread: the recorder runs for a whole session,
+    /// and a device that comes back must be heard again. The first failure of an outage is
     /// logged at a severity matching the source; a failed system capture loses the clips'
-    /// primary audio, so that one also fires `on_system_failure` (the platform surfaces it:
-    /// tray or toast).
+    /// primary audio, so that one also reports [`SystemAudioEvent::Lost`] to `on_system_audio`,
+    /// and [`SystemAudioEvent::Restored`] once audio flows again. Later failures of the same
+    /// outage log at debug; each reopened stream announces itself.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_audio_capture(
         name: &str,
@@ -163,7 +198,7 @@ mod audio_pipeline {
         also_mixer: Option<SharedMixer>,
         stop: &Arc<AtomicBool>,
         epoch: Instant,
-        on_system_failure: Option<Box<dyn FnOnce(String) + Send>>,
+        on_system_audio: Option<SystemAudioHook>,
     ) -> Result<std::thread::JoinHandle<()>> {
         let stop = stop.clone();
         let capture_params = AudioParams {
@@ -174,102 +209,144 @@ mod audio_pipeline {
         std::thread::Builder::new()
             .name(name.to_owned())
             .spawn(move || {
-                // Per-source prep, reused across buffers so the hot path doesn't realloc: the
-                // mic is centred to mono (see `center_mono_into`) so a single-sided mic isn't
-                // stuck in one ear, system audio keeps its stereo image, and the configured
-                // gain is applied to each.
-                let mut prep = Vec::new();
-                // Arc, not Rc: the macOS backend delivers samples on a dispatch queue, so
-                // the callback must be Send there (the other platforms don't mind).
-                let panicked = Arc::new(AtomicBool::new(false));
-                // No idle timeout (capture runs until shutdown); the stop flag drives the
-                // watchdog so the loop quits promptly even if the endpoint suspends.
-                let panicked_flag = panicked.clone();
-                let mut buffers: u64 = 0;
-                let result = capture_audio(
-                    capture_params,
-                    source,
-                    &device,
-                    None,
-                    Some(stop.clone()),
-                    epoch,
-                    move |pcm, pts| {
-                        // Level telemetry for chasing "why is this clip silent" reports —
-                        // ~once a second at the usual 10 ms buffer cadence, debug only.
-                        buffers += 1;
-                        if buffers % 100 == 1 && tracing::enabled!(tracing::Level::DEBUG) {
-                            let peak = pcm.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
-                            tracing::debug!(
-                                ?source,
-                                buffers,
-                                pts_ms = pts.as_millis() as u64,
-                                peak,
-                                "audio level"
-                            );
-                        }
-                        // A panic must not unwind across the PipeWire C callback boundary (UB);
-                        // treat it as a stream failure instead (harmless-but-uniform on WASAPI,
-                        // where the loop is plain Rust).
-                        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            let prepared = match source {
-                                AudioSource::Microphone => {
-                                    center_mono_into(pcm, channels, &mut prep);
-                                    apply_gain(&mut prep, gain);
-                                    prep.as_slice()
-                                }
-                                // Only copy to scale when the gain isn't (near) unity; the
-                                // common gain == 1.0 case passes the buffer through untouched.
-                                // The predicate matches `apply_gain`'s own no-op threshold.
-                                AudioSource::SinkMonitor
-                                    if (gain - 1.0).abs() >= f32::EPSILON =>
+                // Shared with the per-attempt callback, which reports the recovery from
+                // wherever the backend delivers samples.
+                let on_system_audio = Arc::new(Mutex::new(on_system_audio));
+                let mut backoff = AUDIO_RETRY_MIN;
+                // Failures since audio last flowed; the first one of an outage is the loud one.
+                let mut failures: u32 = 0;
+                loop {
+                    // Per-source prep, reused across buffers so the hot path doesn't realloc:
+                    // the mic is centred to mono (see `center_mono_into`) so a single-sided
+                    // mic isn't stuck in one ear, system audio keeps its stereo image, and
+                    // the configured gain is applied to each.
+                    let mut prep = Vec::new();
+                    // Arc, not Rc: the macOS backend delivers samples on a dispatch queue,
+                    // so the callback must be Send there (the other platforms don't mind).
+                    let panicked = Arc::new(AtomicBool::new(false));
+                    let panicked_flag = panicked.clone();
+                    let delivered = Arc::new(AtomicBool::new(false));
+                    let delivered_flag = delivered.clone();
+                    let recovering = failures > 0;
+                    let hook = on_system_audio.clone();
+                    let mixer = mixer.clone();
+                    let also_mixer = also_mixer.clone();
+                    let mut buffers: u64 = 0;
+                    // No idle timeout (capture runs until shutdown); the stop flag drives the
+                    // watchdog so the loop quits promptly even if the endpoint suspends.
+                    let result = capture_audio(
+                        capture_params,
+                        source,
+                        &device,
+                        None,
+                        Some(stop.clone()),
+                        epoch,
+                        move |pcm, pts| {
+                            if !delivered_flag.swap(true, Ordering::Relaxed) && recovering {
+                                tracing::info!(?source, "audio capture recovered");
+                                if source == AudioSource::SinkMonitor
+                                    && let Some(hook) = lock_unpoisoned(&hook).as_mut()
                                 {
-                                    prep.clear();
-                                    prep.extend_from_slice(pcm);
-                                    apply_gain(&mut prep, gain);
-                                    prep.as_slice()
+                                    hook(SystemAudioEvent::Restored);
                                 }
-                                AudioSource::SinkMonitor => pcm,
-                            };
-                            lock_unpoisoned(&mixer).add(prepared, pts);
-                            // The mic's separate-track path: feed the same centred+gained mic PCM
-                            // into its own mixer, so it becomes a second, mic-only Opus track.
-                            if let Some(also) = &also_mixer {
-                                lock_unpoisoned(also).add(prepared, pts);
                             }
-                        }));
-                        match outcome {
-                            Ok(()) => ControlFlow::Continue(()),
-                            Err(_) => {
-                                tracing::error!("audio callback panicked; stopping this capture");
-                                panicked_flag.store(true, Ordering::Relaxed);
-                                ControlFlow::Break(())
+                            // Level telemetry for chasing "why is this clip silent" reports —
+                            // ~once a second at the usual 10 ms buffer cadence, debug only.
+                            buffers += 1;
+                            if buffers % 100 == 1 && tracing::enabled!(tracing::Level::DEBUG) {
+                                let peak = pcm.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+                                tracing::debug!(
+                                    ?source,
+                                    buffers,
+                                    pts_ms = pts.as_millis() as u64,
+                                    peak,
+                                    "audio level"
+                                );
                             }
-                        }
-                    },
-                );
-                // A panic Break reads as a clean stream end; surface it like a capture error.
-                let result = match result {
-                    Ok(()) if panicked.load(Ordering::Relaxed) => {
-                        Err(rewynd_capture::CaptureError::Callback(
-                            "the audio callback panicked".to_owned(),
-                        ))
+                            // A panic must not unwind across the PipeWire C callback boundary
+                            // (UB); treat it as a stream failure instead (harmless-but-uniform
+                            // on WASAPI, where the loop is plain Rust).
+                            let outcome =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    let prepared = match source {
+                                        AudioSource::Microphone => {
+                                            center_mono_into(pcm, channels, &mut prep);
+                                            apply_gain(&mut prep, gain);
+                                            prep.as_slice()
+                                        }
+                                        // Only copy to scale when the gain isn't (near) unity;
+                                        // the common gain == 1.0 case passes the buffer through
+                                        // untouched. The predicate matches `apply_gain`'s own
+                                        // no-op threshold.
+                                        AudioSource::SinkMonitor
+                                            if (gain - 1.0).abs() >= f32::EPSILON =>
+                                        {
+                                            prep.clear();
+                                            prep.extend_from_slice(pcm);
+                                            apply_gain(&mut prep, gain);
+                                            prep.as_slice()
+                                        }
+                                        AudioSource::SinkMonitor => pcm,
+                                    };
+                                    lock_unpoisoned(&mixer).add(prepared, pts);
+                                    // The mic's separate-track path: feed the same
+                                    // centred+gained mic PCM into its own mixer, so it becomes
+                                    // a second, mic-only Opus track.
+                                    if let Some(also) = &also_mixer {
+                                        lock_unpoisoned(also).add(prepared, pts);
+                                    }
+                                }));
+                            match outcome {
+                                Ok(()) => ControlFlow::Continue(()),
+                                Err(_) => {
+                                    tracing::error!(
+                                        "audio callback panicked; stopping this capture"
+                                    );
+                                    panicked_flag.store(true, Ordering::Relaxed);
+                                    ControlFlow::Break(())
+                                }
+                            }
+                        },
+                    );
+                    // A panic Break reads as a clean stream end; it is a bug, not a device
+                    // hiccup, so it ends the thread rather than retrying into it.
+                    if panicked.load(Ordering::Relaxed) {
+                        tracing::error!(?source, "audio capture stopped after a callback panic");
+                        return;
                     }
-                    other => other,
-                };
-                if let Err(e) = result {
+                    let error = match result {
+                        Ok(()) => return,
+                        Err(e) => e,
+                    };
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    // A stream that delivered and then died starts a fresh outage.
+                    if delivered.load(Ordering::Relaxed) {
+                        failures = 0;
+                        backoff = AUDIO_RETRY_MIN;
+                    }
+                    failures += 1;
                     // A missing mic is expected; a failed system capture means the clip loses
-                    // its primary audio, so surface that louder.
-                    match source {
-                        AudioSource::Microphone => {
-                            tracing::info!(error = %e, "no microphone capture; clips use system audio only");
+                    // its primary audio, so surface that louder. Both only once per outage.
+                    match (source, failures) {
+                        (AudioSource::Microphone, 1) => {
+                            tracing::info!(error = %error, retry_in = ?backoff, "no microphone capture yet; clips use system audio only");
                         }
-                        AudioSource::SinkMonitor => {
-                            tracing::error!(error = %e, "system-audio capture failed; clips will have no system sound");
-                            if let Some(surface) = on_system_failure {
-                                surface(e.to_string());
+                        (AudioSource::SinkMonitor, 1) => {
+                            tracing::error!(error = %error, retry_in = ?backoff, "system-audio capture failed; clips will have no system sound");
+                            if let Some(hook) = lock_unpoisoned(&on_system_audio).as_mut() {
+                                hook(SystemAudioEvent::Lost(error.to_string()));
                             }
                         }
+                        _ => {
+                            tracing::debug!(?source, error = %error, failures, retry_in = ?backoff, "audio capture failed again");
+                        }
                     }
+                    if wait_unless_stopped(&stop, backoff) {
+                        return;
+                    }
+                    backoff = (backoff * 2).min(AUDIO_RETRY_MAX);
                 }
             })
             .with_context(|| format!("spawning the {name} thread"))
@@ -959,7 +1036,9 @@ mod linux {
 
     use rewynd_config::{self as config};
 
-    use crate::audio_pipeline::{AUDIO_SETTLE, SharedMixer, run_audio_mixer, spawn_audio_capture};
+    use crate::audio_pipeline::{
+        AUDIO_SETTLE, SharedMixer, SystemAudioEvent, run_audio_mixer, spawn_audio_capture,
+    };
     use crate::badge;
     use crate::params::{audio_encode_params, encode_params, session_params};
     use crate::tray;
@@ -980,6 +1059,8 @@ mod linux {
     enum RecorderEvent {
         CaptureFailed(String),
         SystemAudioFailed(String),
+        /// A reopened system capture delivers again: the tray's "lost" status is stale.
+        SystemAudioRestored,
         /// The GPU encoder was unavailable mid-run; recording continues on the CPU.
         EncoderFallback(String),
     }
@@ -1319,8 +1400,11 @@ mod linux {
                 epoch,
                 Some(Box::new({
                     let events = events_tx.clone();
-                    move |e| {
-                        let _ = events.send(RecorderEvent::SystemAudioFailed(e));
+                    move |event| {
+                        let _ = events.send(match event {
+                            SystemAudioEvent::Lost(e) => RecorderEvent::SystemAudioFailed(e),
+                            SystemAudioEvent::Restored => RecorderEvent::SystemAudioRestored,
+                        });
                     }
                 })),
             )?);
@@ -1486,6 +1570,7 @@ mod linux {
             tokio::select! {
                 event = events.recv() => {
                     let Some(event) = event else { continue };
+                    let restored = matches!(event, RecorderEvent::SystemAudioRestored);
                     let (title, body) = match event {
                         RecorderEvent::CaptureFailed(e) => (
                             "Recording stopped".to_owned(),
@@ -1493,7 +1578,11 @@ mod linux {
                         ),
                         RecorderEvent::SystemAudioFailed(e) => (
                             "System audio lost".to_owned(),
-                            format!("Clips will have no system sound: {e}"),
+                            format!("Clips will have no system sound until it is back: {e}"),
+                        ),
+                        RecorderEvent::SystemAudioRestored => (
+                            "System audio is back".to_owned(),
+                            "Clips have system sound again.".to_owned(),
                         ),
                         // A fall-back to the CPU encoder isn't a failure — recording continues,
                         // just at a higher CPU cost, so keep an unalarming tooltip.
@@ -1502,8 +1591,15 @@ mod linux {
                             format!("{e} Recording continues on the CPU, which uses more processor power."),
                         ),
                     };
+                    // A recovery toasts, but the tooltip goes back to normal rather than
+                    // keeping "lost" or announcing "back" forever.
+                    let status = if restored {
+                        tray::DEFAULT_STATUS.to_owned()
+                    } else {
+                        title.clone()
+                    };
                     handle
-                        .update(|tray: &mut tray::RewyndTray| tray.status = title.clone())
+                        .update(|tray: &mut tray::RewyndTray| tray.status = status)
                         .await;
                     tray::toast(&title, &body).await;
                 }
@@ -2062,7 +2158,8 @@ mod windows {
     use anyhow::{Context, Result, anyhow};
     use rewynd_buffer::{AudioRingBuffer, EncodedChunk, RingBuffer};
     use rewynd_capture::windows::{
-        CapturedD3d11Frame, capture_game_stream, capture_stream, default_render_endpoints,
+        CapturedD3d11Frame, WindowedGames, capture_game_stream, capture_stream,
+        default_render_endpoints, process_loopback_supported,
     };
     use rewynd_capture::{AudioDevice, AudioSource, StreamPrefs};
     use rewynd_clip::{ClipSaver, SaveError, SharedAudioBuffer, SharedBuffer, lock_unpoisoned};
@@ -2082,7 +2179,9 @@ mod windows {
         DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage, WM_HOTKEY,
     };
 
-    use crate::audio_pipeline::{AUDIO_SETTLE, SharedMixer, run_audio_mixer, spawn_audio_capture};
+    use crate::audio_pipeline::{
+        AUDIO_SETTLE, SharedMixer, SystemAudioEvent, run_audio_mixer, spawn_audio_capture,
+    };
     use crate::overlay;
     use crate::params::{audio_encode_params, session_params};
 
@@ -2242,6 +2341,7 @@ mod windows {
         // per-game clip folders stay current, and each new session starts with cleared
         // rings so a clip never spans an between-games gap.
         let capture_desktop = config.capture_desktop();
+        let windowed_games = WindowedGames::new(config.windowed_games());
         let recording = Arc::new(AtomicBool::new(capture_desktop));
 
         // Publish the recorder's live status (chosen backend + game/desktop/idle state) for the
@@ -2277,17 +2377,20 @@ mod windows {
         // final drain + Opus flush.
         let captures_done = Arc::new(AtomicBool::new(false));
 
-        // Voice apps follow Windows' separate communications default, so record that endpoint
-        // too when it differs and the user hasn't picked one themselves.
+        // Voice apps follow Windows' separate communications default. Process loopback hears
+        // them wherever they play; only the endpoint-loopback fallback needs that endpoint
+        // recorded too, and only when the user hasn't picked an output themselves.
         let output_device = config.output_device().map(str::to_owned);
+        let process_loopback = output_device.is_none() && process_loopback_supported();
         let mut comms_device = None;
         if let Some(defaults) = default_render_endpoints() {
             tracing::info!(
                 console = defaults.console_name,
                 comms = defaults.comms_name,
+                process_loopback,
                 "default playback endpoints"
             );
-            if output_device.is_none() {
+            if output_device.is_none() && !process_loopback {
                 comms_device = defaults.separate_comms;
             }
         }
@@ -2303,11 +2406,24 @@ mod windows {
             None,
             &stop,
             epoch,
-            Some(Box::new(|e: String| {
-                toast(
-                    "System audio lost",
-                    &format!("Clips will have no system sound: {e}"),
-                );
+            Some(Box::new({
+                // Once per process each: a flapping device must not spam toasts.
+                let mut lost_toasted = false;
+                let mut restored_toasted = false;
+                move |event: SystemAudioEvent| match event {
+                    SystemAudioEvent::Lost(e) if !lost_toasted => {
+                        lost_toasted = true;
+                        toast(
+                            "System audio lost",
+                            &format!("Clips will have no system sound until it is back: {e}"),
+                        );
+                    }
+                    SystemAudioEvent::Restored if !restored_toasted => {
+                        restored_toasted = true;
+                        toast("System audio is back", "Clips have system sound again.");
+                    }
+                    _ => {}
+                }
             })),
         )?;
         // Optional extra: erroring here would detach the system capture spawned above.
@@ -2417,6 +2533,7 @@ mod windows {
                     &capture_buffer,
                     &capture_stop,
                     capture_desktop,
+                    windowed_games,
                     on_game,
                     capture_choice,
                     &capture_status,
@@ -2616,6 +2733,7 @@ mod windows {
         buffer: &SharedBuffer,
         stop: &Arc<AtomicBool>,
         desktop: bool,
+        windowed_games: WindowedGames,
         on_game: Option<rewynd_capture::windows::GameCallback>,
         choice: config::EncoderChoice,
         status: &crate::status::StatusPublisher,
@@ -2688,7 +2806,14 @@ mod windows {
         if desktop {
             capture_stream(None, epoch, prefs, Some(stop.clone()), on_frame)?;
         } else {
-            capture_game_stream(epoch, prefs, Some(stop.clone()), on_frame, on_game)?;
+            capture_game_stream(
+                epoch,
+                prefs,
+                Some(stop.clone()),
+                windowed_games,
+                on_frame,
+                on_game,
+            )?;
         }
 
         drop(enc);
@@ -2987,7 +3112,9 @@ mod macos {
     use rewynd_config::{self as config};
     use rewynd_encode::{AudioMixer, EncodeParams, VideoToolboxEncoder};
 
-    use crate::audio_pipeline::{AUDIO_SETTLE, SharedMixer, run_audio_mixer, spawn_audio_capture};
+    use crate::audio_pipeline::{
+        AUDIO_SETTLE, SharedMixer, SystemAudioEvent, run_audio_mixer, spawn_audio_capture,
+    };
     use crate::badge_macos;
     use crate::chime;
     use crate::params::{audio_encode_params, session_params};
@@ -3182,6 +3309,7 @@ mod macos {
         // audio toast fires once per process: session-scoped captures would otherwise
         // re-toast a persistent failure on every game.
         let audio_lost_toasted = Arc::new(AtomicBool::new(false));
+        let audio_restored_toasted = Arc::new(AtomicBool::new(false));
         let spawn_audio = {
             let mixer = mixer.clone();
             let mic_mixer = mic_mixer.clone();
@@ -3201,15 +3329,25 @@ mod macos {
                     session_stop,
                     epoch,
                     Some(Box::new({
-                        let toasted = audio_lost_toasted.clone();
-                        move |e: String| {
-                            if toasted.swap(true, Ordering::Relaxed) {
-                                tracing::warn!(error = %e, "system-audio capture failed again");
-                            } else {
-                                toast(
-                                    "System audio lost",
-                                    &format!("Clips will have no system sound: {e}"),
-                                );
+                        let lost_toasted = audio_lost_toasted.clone();
+                        let restored_toasted = audio_restored_toasted.clone();
+                        move |event: SystemAudioEvent| match event {
+                            SystemAudioEvent::Lost(e) => {
+                                if lost_toasted.swap(true, Ordering::Relaxed) {
+                                    tracing::warn!(error = %e, "system-audio capture failed again");
+                                } else {
+                                    toast(
+                                        "System audio lost",
+                                        &format!(
+                                            "Clips will have no system sound until it is back: {e}"
+                                        ),
+                                    );
+                                }
+                            }
+                            SystemAudioEvent::Restored => {
+                                if !restored_toasted.swap(true, Ordering::Relaxed) {
+                                    toast("System audio is back", "Clips have system sound again.");
+                                }
                             }
                         }
                     })),
