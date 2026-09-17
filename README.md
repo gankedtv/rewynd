@@ -76,7 +76,7 @@ The app checks for updates on launch; one click updates both binaries in place.
 The recorder writes what it is doing to a small set of log files next to its data, capped at
 2 MB each and three files in total, so they never grow beyond 6 MB:
 
-- Windows: `%LOCALAPPDATA%ewyndogsewynd-recorder.log`
+- Windows: `%LOCALAPPDATA%\rewynd\logs\rewynd-recorder.log`
 - Linux: `$XDG_DATA_HOME/rewynd/logs/rewynd-recorder.log` (usually `~/.local/share/rewynd/logs/`)
 - macOS: `~/Library/Application Support/rewynd/logs/rewynd-recorder.log`
 
