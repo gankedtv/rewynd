@@ -26,6 +26,7 @@ mod desktop;
 mod devices;
 mod encoders;
 mod lock;
+mod logs;
 mod paths;
 mod process;
 pub mod resolution;
@@ -57,6 +58,7 @@ pub use desktop::{autostart_path, desktop_entry, desktop_exec_value};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use desktop::{install_icons, install_launcher_entry};
 pub use lock::{InstanceLock, acquire_recorder_lock, acquire_settings_lock, settings_running};
+pub use logs::{RotatingLog, log_dir};
 pub use paths::{
     APP_ID, config_path, default_output_dir, recorder_pid_path, settings_activation_path,
     settings_lock_path, sibling_binary,

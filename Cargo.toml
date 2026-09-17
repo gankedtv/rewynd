@@ -61,7 +61,7 @@ opus = "0.4"
 # BSD-2-Clause; the default `source` feature compiles Cisco's openh264 from vendored source.
 openh264 = "0.9"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 pollster = "1"
 # Config file (docs/adr/0005): TOML deserialized via serde. Both MIT/Apache.
 serde = { version = "1", features = ["derive"] }

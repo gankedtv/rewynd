@@ -80,5 +80,6 @@ The blob is held in `ManuallyDrop`.
   volume on most devices.
 - The retry loop applies to the microphone too: a mic plugged in after startup is picked
   up at the next attempt instead of never.
-- Still owed: a log file for installed users, so the next "no system sound" report
-  carries evidence instead of a guess. Tracked separately.
+- The installed recorder now writes a log file as well (`RotatingLog`: three files of at
+  most 2 MB under the platform's data dir), with a per-minute peak-level line per capture,
+  so the next "no system sound" report carries evidence instead of a guess.

@@ -113,6 +113,56 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
+/// Recorder logging: the console as before, plus a size-capped set of log files under the
+/// platform's data dir, so an installed recorder (no console) leaves evidence behind for
+/// "my clips have no sound" reports.
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+mod logging {
+    use std::sync::Mutex;
+
+    use rewynd_config::{RotatingLog, log_dir};
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::{EnvFilter, Layer};
+
+    /// Per file, with [`KEEP_FILES`] files in total: the set never exceeds 6 MB, which is
+    /// days of the recorder's info-level chatter.
+    const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+    const KEEP_FILES: usize = 3;
+    const FILE_NAME: &str = "rewynd-recorder";
+
+    /// The console follows `RUST_LOG` (default info); the file stays at info, without
+    /// colour codes. A file that cannot be opened costs only the file.
+    pub(crate) fn init() {
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let file = log_dir().and_then(|dir| {
+            match RotatingLog::open(&dir, FILE_NAME, MAX_FILE_BYTES, KEEP_FILES) {
+                Ok(log) => Some(log),
+                Err(e) => {
+                    eprintln!("rewynd: not logging to {}: {e}", dir.display());
+                    None
+                }
+            }
+        });
+        let path = file.as_ref().map(|log| log.path().to_path_buf());
+        let file_layer = file.map(|log| {
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(Mutex::new(log))
+                .with_filter(LevelFilter::INFO)
+        });
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer())
+            .with(file_layer)
+            .init();
+        if let Some(path) = path {
+            tracing::info!(path = %path.display(), "logging to a file as well");
+        }
+    }
+}
+
 /// The audio half of the pipeline, shared by the platform recorders: capture threads
 /// summing into the mixer, and the mixer thread draining into the Opus encoder + ring.
 /// Only `capture_audio` itself is platform-specific (PipeWire vs WASAPI vs SCK); the
@@ -153,6 +203,9 @@ mod audio_pipeline {
     const AUDIO_RETRY_MAX: Duration = Duration::from_secs(30);
     /// How often a waiting capture thread checks the stop flag.
     const AUDIO_RETRY_POLL: Duration = Duration::from_millis(100);
+    /// How often a running capture logs its buffer count and peak level: the line a
+    /// "clips have no sound" report needs, cheap enough to keep at info.
+    const AUDIO_STATUS_INTERVAL: Duration = Duration::from_secs(60);
 
     /// Sleep `wait` in stop-aware steps; `true` when the stop flag rose meanwhile.
     fn wait_unless_stopped(stop: &AtomicBool, wait: Duration) -> bool {
@@ -232,6 +285,8 @@ mod audio_pipeline {
                     let mixer = mixer.clone();
                     let also_mixer = also_mixer.clone();
                     let mut buffers: u64 = 0;
+                    let mut peak_since_report = 0.0_f32;
+                    let mut last_report = Instant::now();
                     // No idle timeout (capture runs until shutdown); the stop flag drives the
                     // watchdog so the loop quits promptly even if the endpoint suspends.
                     let result = capture_audio(
@@ -250,18 +305,23 @@ mod audio_pipeline {
                                     hook(SystemAudioEvent::Restored);
                                 }
                             }
-                            // Level telemetry for chasing "why is this clip silent" reports —
-                            // ~once a second at the usual 10 ms buffer cadence, debug only.
+                            // Level telemetry for chasing "why is this clip silent" reports:
+                            // one line a minute with the peak seen since the last one, so a
+                            // silent stream reads as `peak=0` in the log file.
                             buffers += 1;
-                            if buffers % 100 == 1 && tracing::enabled!(tracing::Level::DEBUG) {
-                                let peak = pcm.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
-                                tracing::debug!(
+                            peak_since_report = pcm
+                                .iter()
+                                .fold(peak_since_report, |m, s| m.max(s.abs()));
+                            if last_report.elapsed() >= AUDIO_STATUS_INTERVAL {
+                                tracing::info!(
                                     ?source,
                                     buffers,
                                     pts_ms = pts.as_millis() as u64,
-                                    peak,
-                                    "audio level"
+                                    peak = peak_since_report,
+                                    "audio capture status"
                                 );
+                                peak_since_report = 0.0;
+                                last_report = Instant::now();
                             }
                             // A panic must not unwind across the PipeWire C callback boundary
                             // (UB); treat it as a stream failure instead (harmless-but-uniform
@@ -339,8 +399,10 @@ mod audio_pipeline {
                                 hook(SystemAudioEvent::Lost(error.to_string()));
                             }
                         }
+                        // Info, not debug: the backoff bounds it to a couple of lines a
+                        // minute, and a persistent failure must stay visible in the log file.
                         _ => {
-                            tracing::debug!(?source, error = %error, failures, retry_in = ?backoff, "audio capture failed again");
+                            tracing::info!(?source, error = %error, failures, retry_in = ?backoff, "audio capture failed again");
                         }
                     }
                     if wait_unless_stopped(&stop, backoff) {
@@ -1116,7 +1178,7 @@ mod linux {
     type PortalHandle = rewynd_capture::linux::PortalSession;
 
     pub fn run() -> Result<()> {
-        tracing_subscriber::fmt::init();
+        crate::logging::init();
 
         // Settings come from the config file (written on first run) layered under the built-in
         // defaults and over by `REWYND_*` env overrides (see `rewynd_config`).
@@ -2197,7 +2259,7 @@ mod windows {
     const HOTKEY_POLL: Duration = Duration::from_millis(30);
 
     pub fn run() -> Result<()> {
-        tracing_subscriber::fmt::init();
+        crate::logging::init();
 
         // Per-monitor DPI awareness, set before any threads or windows exist: without
         // it, window/monitor rects arrive DPI-virtualized on scaled displays and the
@@ -3135,7 +3197,7 @@ mod macos {
     }
 
     pub fn run() -> Result<()> {
-        tracing_subscriber::fmt::init();
+        crate::logging::init();
 
         config::ensure_default_file();
         let config = config::load();
