@@ -21,6 +21,7 @@
 //! are called).
 
 mod activation;
+pub mod clip_meta;
 mod clips;
 mod desktop;
 mod devices;
@@ -35,6 +36,7 @@ mod status;
 pub mod upload_history;
 
 pub use activation::{send_settings_activation, take_settings_activation};
+pub use clip_meta::{ClipMeta, ClipMetaStore};
 pub use clips::{
     CLIP_URL_PREFIX, CLIP_URL_SCHEME, ClipEntry, clip_deeplink, clip_from_deeplink,
     clip_output_path, clips_dir, ensure_private_dir, folder_name, list_clips, newest_clip_in,

@@ -182,6 +182,32 @@ pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> std::io::Result
     result
 }
 
+/// Write `bytes` to `path` atomically and owner-only (0600 on unix), creating parent
+/// directories. Used for the small JSON stores beside `config.toml` that hold private data:
+/// upload history (remote ids and share links) and clip names.
+pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let staged = staged_path(path);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = options
+        .open(&staged)
+        .and_then(|mut file| file.write_all(bytes))
+        .and_then(|()| std::fs::rename(&staged, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    result
+}
+
 /// `name` beside `exe`, with the platform's executable suffix. The testable core of
 /// [`sibling_binary`].
 fn sibling_of(exe: &Path, name: &str) -> Option<PathBuf> {

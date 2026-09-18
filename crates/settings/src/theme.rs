@@ -119,6 +119,30 @@ pub fn play_badge<'a, M: 'a>(size: f32) -> Element<'a, M> {
     iced::widget::image(handle).width(size).height(size).into()
 }
 
+// The favourite star, in the two states a clip can be in. Its own small PNGs for the same
+// reason as the play badge: the GUI deliberately builds without iced's svg backend.
+static STAR_FILLED: LazyLock<iced::widget::image::Handle> = LazyLock::new(|| {
+    iced::widget::image::Handle::from_bytes(
+        include_bytes!("../assets/star/star-filled-48.png").as_slice(),
+    )
+});
+static STAR_OUTLINE: LazyLock<iced::widget::image::Handle> = LazyLock::new(|| {
+    iced::widget::image::Handle::from_bytes(
+        include_bytes!("../assets/star/star-outline-48.png").as_slice(),
+    )
+});
+
+/// The favourite star at `size` logical pixels: mint when the clip is starred, a light outline
+/// when it is not.
+pub fn star<'a, M: 'a>(size: f32, filled: bool) -> Element<'a, M> {
+    let handle = if filled {
+        STAR_FILLED.clone()
+    } else {
+        STAR_OUTLINE.clone()
+    };
+    iced::widget::image(handle).width(size).height(size).into()
+}
+
 /// The window icon, decoded from the shipped PNG render of the mark (X11/Windows; see the
 /// `window::Settings` note for Wayland).
 pub fn window_icon() -> Option<iced::window::Icon> {
