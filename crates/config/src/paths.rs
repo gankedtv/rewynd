@@ -185,6 +185,10 @@ pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> std::io::Result
 /// Write `bytes` to `path` atomically and owner-only (0600 on unix), creating parent
 /// directories. Used for the small JSON stores beside `config.toml` that hold private data:
 /// upload history (remote ids and share links) and clip names.
+///
+/// The staged file reaches the disk before the rename, and on unix the directory entry follows
+/// it, so a crash straight after a save can't leave the store empty or holding the previous
+/// version. These files are written when someone renames or stars a clip, not in any hot path.
 pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(parent) = path.parent() {
@@ -200,12 +204,33 @@ pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result
     }
     let result = options
         .open(&staged)
-        .and_then(|mut file| file.write_all(bytes))
-        .and_then(|()| std::fs::rename(&staged, path));
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&staged, path))
+        .and_then(|()| sync_dir_of(path));
     if result.is_err() {
         let _ = std::fs::remove_file(&staged);
     }
     result
+}
+
+/// Flush the directory entry a rename just created, so the file is findable after a crash.
+/// Only unix can open a directory for this; Windows has no equivalent call.
+#[cfg(unix)]
+fn sync_dir_of(path: &Path) -> std::io::Result<()> {
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    match dir {
+        Some(dir) => std::fs::File::open(dir)?.sync_all(),
+        None => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+#[expect(clippy::unnecessary_wraps, reason = "matches the unix signature")]
+fn sync_dir_of(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// `name` beside `exe`, with the platform's executable suffix. The testable core of

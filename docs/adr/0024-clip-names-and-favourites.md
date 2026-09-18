@@ -27,7 +27,10 @@ rewritten.
   `{ name, favourite }`, `BTreeMap`-ordered so the file is stable, entries at their default
   dropped rather than written. Same handling as the upload history: 0600, atomic temp plus
   rename, read-modify-write under an exclusive lock, unreadable or corrupt means empty. The
-  private writer both stores use now lives in `paths.rs`.
+  private writer both stores use now lives in `paths.rs`, and it flushes the staged file and
+  the directory entry before reporting success, so a crash right after a save cannot leave the
+  store holding the previous version. These writes happen when someone renames or stars a clip,
+  never in a hot path.
 
 - **Keyed by file name alone, unlike the upload history.** A name has to survive a clip moving
   between game folders and a trim that rewrites the file in place; mtime in the key would throw
@@ -41,12 +44,18 @@ rewritten.
   second file next to every recording is litter, and a copy of a clip elsewhere would leave its
   sidecar behind.
 
+- **An edit travels as data, not as a new copy of the entry.** "Name it this", "star it",
+  "forget it": each is applied to whatever the store holds once its lock is taken, so a writer
+  that only renamed and one that only starred cannot overwrite each other's field. The settings
+  window is normally the single writer, but its instance lock can fail open, and the store is
+  shared state either way.
+
 - **Edits apply in memory first, then write.** The grid updates on the keystroke; the write runs
-  on a blocking task. A rescan landing mid-write keeps the in-memory value for clips whose write
-  is still owed, so a directory watch cannot show someone their own rename undone. One write per
-  clip is in flight at a time: a further edit marks the clip, and its write goes out when the
-  running one reports back, carrying whatever the value is by then. Deleting a clip clears its
-  entry through that same queue, so an edit still in flight cannot bring it back.
+  on a blocking task. One write per clip is in flight at a time: a further edit waits for the
+  running one to report back and goes out behind it, so a clip's writes stay in order. A rescan
+  landing mid-write replays the edits still owed over what it read, so a directory watch cannot
+  show someone their own rename undone while keeping anything another writer changed. Deleting a
+  clip clears its entry through that same queue, so an edit in flight cannot bring it back.
 
 - **No manual ordering.** The grid is newest-first and grouped by game, both derived. A
   hand-placed order has nowhere to live in that model, and iced has no drag-and-drop to build it

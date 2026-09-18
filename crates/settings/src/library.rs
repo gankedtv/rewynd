@@ -12,7 +12,7 @@ use iced::widget::{
 };
 use iced::{Background, Border, Element, Length, Task, Theme};
 
-use rewynd_config::clip_meta::{self, ClipMeta, ClipMetaStore};
+use rewynd_config::clip_meta::{self, ClipEdit, ClipMetaStore};
 use rewynd_config::upload_history::{self, ClipKey, UploadRecord};
 use rewynd_config::{ClipEntry, Config};
 use rewynd_upload::youtube::{
@@ -306,6 +306,23 @@ pub enum Message {
     TrimReset,
 }
 
+/// The edits to one clip that are not on disk yet: the ones handed to the running write, and
+/// the ones made since, waiting for it to report back.
+#[derive(Debug, Default)]
+struct PendingMeta {
+    writing: Vec<ClipEdit>,
+    waiting: Vec<ClipEdit>,
+}
+
+impl PendingMeta {
+    /// Everything still owed, oldest first.
+    fn all(&self) -> Vec<ClipEdit> {
+        let mut edits = self.writing.clone();
+        edits.extend(self.waiting.iter().cloned());
+        edits
+    }
+}
+
 /// What a trim save does with the result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaveMode {
@@ -416,10 +433,10 @@ pub struct Library {
     rename: Option<String>,
     /// Whether the grid is narrowed to starred clips.
     favourites_only: bool,
-    /// Clips whose edit has not reached disk yet, and whether the value moved on again while
-    /// that write was running. Only one write per clip is in flight, so two quick stars cannot
-    /// land in the wrong order, and a rescan in between keeps the in-memory value.
-    meta_pending: HashMap<String, bool>,
+    /// Clips whose edits have not reached disk yet, keyed by file name. Only one write per clip
+    /// runs at a time, so two quick stars cannot land in the wrong order, and a rescan in
+    /// between replays what is still owed over what it read.
+    meta_pending: HashMap<String, PendingMeta>,
 }
 
 impl Library {
@@ -519,32 +536,35 @@ impl Library {
         }
     }
 
-    /// Apply an edit to the in-memory store, so the grid and the detail page show it before the
-    /// write lands, and put it on its way to disk. A clip that is already being written is
-    /// only marked instead; the follow-up write goes out when that one reports back.
-    fn edit_meta(&mut self, path: &Path, edit: impl FnOnce(&mut ClipMeta)) -> Task<Message> {
+    /// Show an edit at once and put it on its way to disk. A clip that is already being written
+    /// keeps the edit back until that write reports, so its writes stay in order.
+    fn edit_meta(&mut self, path: &Path, edit: ClipEdit) -> Task<Message> {
         let Some(file_name) = clip_meta::file_name_of(path).map(str::to_owned) else {
             return Task::none();
         };
-        self.meta.set(&file_name, edit);
-        if let Some(again) = self.meta_pending.get_mut(&file_name) {
-            *again = true;
+        self.meta.apply(&file_name, std::slice::from_ref(&edit));
+        if let Some(pending) = self.meta_pending.get_mut(&file_name) {
+            pending.waiting.push(edit);
             return Task::none();
         }
-        self.meta_pending.insert(file_name.clone(), false);
-        self.write_meta(file_name)
+        self.write_meta(file_name, vec![edit])
     }
 
-    /// Hand this clip's entry, as it stands now, to a blocking write. The whole entry goes out
-    /// rather than the one field that changed: the in-memory value is what the user is looking
-    /// at, and only this window edits the store while it runs.
-    fn write_meta(&self, file_name: String) -> Task<Message> {
-        let meta = self.meta.entry_of(&file_name);
+    /// Hand a clip's owed edits to a blocking write. They are applied to whatever the store
+    /// holds once its lock is taken, so another writer's other field survives ours.
+    fn write_meta(&mut self, file_name: String, edits: Vec<ClipEdit>) -> Task<Message> {
+        self.meta_pending.insert(
+            file_name.clone(),
+            PendingMeta {
+                writing: edits.clone(),
+                waiting: Vec::new(),
+            },
+        );
         let saved_for = file_name.clone();
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    clip_meta::update(&file_name, |entry| *entry = meta).map_err(|e| e.to_string())
+                    clip_meta::update(&file_name, &edits).map_err(|e| e.to_string())
                 })
                 .await
                 .unwrap_or_else(|e| Err(e.to_string()))
@@ -710,7 +730,7 @@ impl Library {
                 }
                 // Nor should its name and star. Clearing the entry goes through the same queue
                 // as every other edit, so a star still being written can't bring it back.
-                let forgotten = self.edit_meta(&path, |m| *m = ClipMeta::default());
+                let forgotten = self.edit_meta(&path, ClipEdit::Reset);
                 self.entries.retain(|e| e.path != path);
                 self.thumbs.remove(&path);
                 self.pending_thumbs.retain(|(p, _)| p != &path);
@@ -758,20 +778,20 @@ impl Library {
                 // directory, or it would show up as a date. The whole entry is written, not just
                 // the name: a copy deleted outside the app leaves its entry behind, and the next
                 // copy of the same clip takes that file name back.
-                let copy_meta = matches!(mode, SaveMode::Copy).then(|| ClipMeta {
-                    name: self
+                let copy_edits = matches!(mode, SaveMode::Copy).then(|| {
+                    let name = self
                         .meta
                         .name_of(&src)
-                        .and_then(clip_meta::trimmed_copy_name),
-                    favourite: false,
+                        .and_then(clip_meta::trimmed_copy_name);
+                    vec![ClipEdit::Reset, ClipEdit::Name(name)]
                 });
                 return Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
                             let saved = save_trim(&work_src, mode, start, end);
-                            if let (Ok(dst), Some(meta)) = (&saved, copy_meta)
+                            if let (Ok(dst), Some(edits)) = (&saved, copy_edits)
                                 && let Some(file_name) = clip_meta::file_name_of(dst)
-                                && let Err(e) = clip_meta::update(file_name, |m| *m = meta)
+                                && let Err(e) = clip_meta::update(file_name, &edits)
                             {
                                 tracing::warn!(error = %e, "could not name the trimmed copy");
                             }
@@ -835,7 +855,7 @@ impl Library {
                 // An untouched upload title follows the clip's name; one the user typed over
                 // stays theirs.
                 let untouched = self.title == self.title_hint;
-                let saved = self.edit_meta(&path, move |m| m.name = name);
+                let saved = self.edit_meta(&path, ClipEdit::Name(name));
                 self.title_hint = self.suggested_title(&path);
                 if untouched {
                     self.title = self.title_hint.clone();
@@ -844,22 +864,25 @@ impl Library {
             }
             Message::FavouriteToggled(path) => {
                 let starred = self.meta.is_favourite(&path);
-                return self.edit_meta(&path, move |m| m.favourite = !starred);
+                return self.edit_meta(&path, ClipEdit::Favourite(!starred));
             }
             Message::FavouritesFilterToggled => {
                 self.favourites_only = !self.favourites_only;
             }
             Message::MetaSaved(file_name, result) => {
-                let moved_on = self.meta_pending.remove(&file_name).unwrap_or(false);
+                let waiting = self
+                    .meta_pending
+                    .remove(&file_name)
+                    .map(|pending| pending.waiting)
+                    .unwrap_or_default();
                 if let Err(e) = result {
                     // The detail page shows this; a star toggled from the grid has nowhere to
                     // put it, so the log is the backstop.
                     tracing::warn!(error = %e, clip = %file_name, "could not save a clip's name or star");
                     self.action_error = Some(format!("Could not save that: {e}"));
                 }
-                if moved_on {
-                    self.meta_pending.insert(file_name.clone(), false);
-                    return self.write_meta(file_name);
+                if !waiting.is_empty() {
+                    return self.write_meta(file_name, waiting);
                 }
             }
             Message::TitleEdited(s) => self.title = s,
@@ -1115,9 +1138,8 @@ impl Library {
         // still on their way to disk win over it, or a rescan landing mid-write would show the
         // user their own rename undone.
         let mut meta = meta;
-        for file_name in self.meta_pending.keys() {
-            let ours = self.meta.entry_of(file_name);
-            meta.set(file_name, |m| *m = ours);
+        for (file_name, pending) in &self.meta_pending {
+            meta.apply(file_name, &pending.all());
         }
         self.meta = meta;
         // Drop a game filter whose section vanished (its last clip was deleted or moved).
@@ -3919,25 +3941,45 @@ mod tests {
         let key = "rewynd-1-0.mp4";
 
         drop(lib.update(Message::FavouriteToggled(named.path.clone()), &config));
-        assert_eq!(lib.meta_pending.get(key), Some(&false), "one write is out");
+        let pending = lib.meta_pending.get(key).expect("one write is out");
+        assert_eq!(pending.writing, [ClipEdit::Favourite(false)]);
+        assert!(pending.waiting.is_empty());
 
-        // A second press while that write runs only marks the clip; two writes racing could
+        // A second press while that write runs waits its turn; two writes racing could
         // otherwise land on disk in the wrong order.
         drop(lib.update(Message::FavouriteToggled(named.path.clone()), &config));
-        assert_eq!(lib.meta_pending.get(key), Some(&true));
+        let pending = lib.meta_pending.get(key).expect("still owed");
+        assert_eq!(pending.waiting, [ClipEdit::Favourite(true)]);
         assert!(
             lib.meta.is_favourite(&named.path),
             "the UI followed both presses"
         );
 
         drop(lib.update(Message::MetaSaved(key.to_owned(), Ok(())), &config));
-        assert_eq!(
-            lib.meta_pending.get(key),
-            Some(&false),
-            "the follow-up write went out with the value as it now stands"
-        );
+        let pending = lib.meta_pending.get(key).expect("the follow-up went out");
+        assert_eq!(pending.writing, [ClipEdit::Favourite(true)]);
+        assert!(pending.waiting.is_empty());
+
         drop(lib.update(Message::MetaSaved(key.to_owned(), Ok(())), &config));
         assert!(lib.meta_pending.is_empty(), "nothing left owed");
+    }
+
+    #[test]
+    fn a_rescan_replays_only_what_is_still_owed() {
+        let (mut lib, named, _) = named_library();
+        let config = Config::default();
+        drop(lib.update(Message::FavouriteToggled(named.path.clone()), &config));
+
+        // Another window renamed the same clip while our star was being written. The scan
+        // brings their name back, and our star is replayed on top of it: neither is lost.
+        let mut theirs = ClipMetaStore::default();
+        theirs.apply(
+            "rewynd-1-0.mp4",
+            &[ClipEdit::Name(Some("Their name".to_owned()))],
+        );
+        drop(lib.scanned(vec![named.clone()], Vec::new(), theirs));
+        assert_eq!(lib.meta.name_of(&named.path), Some("Their name"));
+        assert!(!lib.meta.is_favourite(&named.path), "our unstar survived");
     }
 
     #[test]

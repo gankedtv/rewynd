@@ -36,6 +36,27 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// One change to a clip's entry. Carried as data rather than a closure so the same change can
+/// be shown on screen now and applied to the stored entry later, under the store's lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipEdit {
+    /// Name it, or (with `None`) take its name away.
+    Name(Option<String>),
+    Favourite(bool),
+    /// Forget the clip: what a delete leaves behind, and what a trimmed copy starts from.
+    Reset,
+}
+
+impl ClipEdit {
+    fn apply_to(&self, meta: &mut ClipMeta) {
+        match self {
+            Self::Name(name) => meta.name.clone_from(name),
+            Self::Favourite(on) => meta.favourite = *on,
+            Self::Reset => *meta = ClipMeta::default(),
+        }
+    }
+}
+
 /// Every clip we know something about, keyed by file name. A `BTreeMap` so the file stays in a
 /// stable order instead of reshuffling on every write.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,10 +94,13 @@ impl ClipMetaStore {
         }
     }
 
-    /// This clip's entry by store key, or a default one when it has none.
-    #[must_use]
-    pub fn entry_of(&self, file_name: &str) -> ClipMeta {
-        self.0.get(file_name).cloned().unwrap_or_default()
+    /// Apply `edits` in order to this clip's entry.
+    pub fn apply(&mut self, file_name: &str, edits: &[ClipEdit]) {
+        self.set(file_name, |meta| {
+            for edit in edits {
+                edit.apply_to(meta);
+            }
+        });
     }
 
     /// Whether the store holds nothing at all.
@@ -98,6 +122,7 @@ fn is_invisible(c: char) -> bool {
     c.is_control()
         || matches!(c,
             '\u{00ad}'                  // soft hyphen
+            | '\u{061c}'                // Arabic letter mark
             | '\u{200b}'..='\u{200f}'   // zero width spaces, joiners, LTR/RTL marks
             | '\u{202a}'..='\u{202e}'   // bidi embedding and overrides
             | '\u{2060}'..='\u{2064}'   // word joiner and invisible operators
@@ -150,15 +175,15 @@ pub fn load() -> ClipMetaStore {
     store_path().map(|p| load_at(&p)).unwrap_or_default()
 }
 
-/// Apply `edit` to one clip's entry and write the store back. The read-modify-write runs under
-/// an exclusive file lock, so the settings window and a second instance can't clobber each
-/// other's edits. An edit that leaves the entry at its default removes it, which is how a
-/// deleted clip is forgotten.
-pub fn update(file_name: &str, edit: impl FnOnce(&mut ClipMeta)) -> std::io::Result<()> {
+/// Apply `edits` to one clip's entry and write the store back. The read-modify-write runs under
+/// an exclusive file lock, and each edit touches only its own field of whatever the store holds
+/// by then, so a second writer's rename and this one's star don't overwrite each other. An edit
+/// that leaves the entry at its default removes it, which is how a deleted clip is forgotten.
+pub fn update(file_name: &str, edits: &[ClipEdit]) -> std::io::Result<()> {
     let path = store_path().ok_or_else(no_path)?;
     with_store_lock(&path, || {
         let mut store = load_at(&path);
-        store.set(file_name, edit);
+        store.apply(file_name, edits);
         save_at(&path, &store)
     })
 }
@@ -281,9 +306,9 @@ mod tests {
         named(&mut store, "rewynd-2-0.mp4", "Stays");
         save_at(&path, &store).expect("save");
 
-        // What the delete handler does: leave the entry at its default.
+        // What the delete handler does: clear the entry.
         let mut store = load_at(&path);
-        store.set("rewynd-1-0.mp4", |m| *m = ClipMeta::default());
+        store.apply("rewynd-1-0.mp4", &[ClipEdit::Reset]);
         save_at(&path, &store).expect("save");
 
         let after = load_at(&path);
@@ -294,11 +319,50 @@ mod tests {
     #[test]
     fn clean_name_drops_invisible_and_direction_flipping_characters() {
         // A name is drawn as a heading, so nothing in it may hide text or reverse it.
-        let sneaky = "Ace\u{202e}gpj.exe\u{200b} \u{feff}clip";
+        let sneaky = "Ace\u{202e}gpj.exe\u{200b} \u{061c}\u{feff}clip";
         let cleaned = clean_name(sneaky).expect("name");
         assert_eq!(cleaned, "Ace gpj.exe clip");
         assert!(!cleaned.chars().any(is_invisible), "{cleaned:?}");
         assert_eq!(clean_name("\u{200b}\u{202e}\u{feff}"), None);
+    }
+
+    #[test]
+    fn an_edit_leaves_every_other_field_alone() {
+        let mut store = ClipMetaStore::default();
+        store.apply(
+            "rewynd-1-0.mp4",
+            &[ClipEdit::Name(Some("Clutch ace".to_owned()))],
+        );
+        store.apply("rewynd-1-0.mp4", &[ClipEdit::Favourite(true)]);
+        let clip = Path::new("rewynd-1-0.mp4");
+        assert_eq!(store.name_of(clip), Some("Clutch ace"));
+        assert!(store.is_favourite(clip));
+
+        // Starring a clip someone else renamed in the meantime keeps their name: the edit is
+        // applied to the entry as it stands, not to a snapshot taken before the lock.
+        store.apply(
+            "rewynd-1-0.mp4",
+            &[ClipEdit::Name(Some("Their name".to_owned()))],
+        );
+        store.apply("rewynd-1-0.mp4", &[ClipEdit::Favourite(false)]);
+        assert_eq!(store.name_of(clip), Some("Their name"));
+        assert!(!store.is_favourite(clip));
+
+        // Reset drops the whole entry, whatever is in it.
+        store.apply("rewynd-1-0.mp4", &[ClipEdit::Reset]);
+        assert!(store.is_empty());
+
+        // Several edits in one go run in order.
+        store.apply(
+            "rewynd-2-0.mp4",
+            &[
+                ClipEdit::Favourite(true),
+                ClipEdit::Name(Some("Kept".to_owned())),
+                ClipEdit::Favourite(false),
+            ],
+        );
+        assert_eq!(store.name_of(Path::new("rewynd-2-0.mp4")), Some("Kept"));
+        assert!(!store.is_favourite(Path::new("rewynd-2-0.mp4")));
     }
 
     #[test]
