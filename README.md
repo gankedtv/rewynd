@@ -65,7 +65,7 @@ The app checks for updates on launch; one click updates both binaries in place.
 ## What you get
 
 - A background recorder that sits in the tray and stays out of the way while you play.
-- A clip library and settings app: browse, trim, and manage your clips.
+- A clip library and settings app: browse, name, star, trim, and manage your clips.
 - A first-run wizard that sets up capture, the hotkey, and the replay length in a
   minute.
 - Optional uploads to [ganked.tv](https://ganked.tv) or YouTube, only when you ask.

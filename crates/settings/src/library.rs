@@ -12,6 +12,7 @@ use iced::widget::{
 };
 use iced::{Background, Border, Element, Length, Task, Theme};
 
+use rewynd_config::clip_meta::{self, ClipEdit, ClipMetaStore};
 use rewynd_config::upload_history::{self, ClipKey, UploadRecord};
 use rewynd_config::{ClipEntry, Config};
 use rewynd_upload::youtube::{
@@ -32,6 +33,9 @@ use crate::theme::{
 use crate::thumbs;
 use crate::trimbar;
 use crate::video;
+
+/// The name field on the detail page, so committing a rename can hand it the keyboard.
+const RENAME_INPUT: &str = "clip-rename";
 
 /// Cards per grid row (the body column is width-capped, so a fixed count stays balanced). Four
 /// across suits the wider default window while staying readable if it is narrowed.
@@ -213,9 +217,22 @@ const POLL_MAX_READS: u32 = 60;
 pub enum Message {
     SearchEdited(String),
     GameFilterPicked(Option<String>),
-    /// A directory rescan finished: the clips found plus the upload history read alongside
-    /// (both come off one blocking task, so neither read stalls the UI thread).
-    Scanned(Vec<ClipEntry>, Vec<UploadRecord>),
+    /// A directory rescan finished: the clips found plus the upload history and the clip
+    /// names read alongside (all off one blocking task, so no read stalls the UI thread).
+    Scanned(Vec<ClipEntry>, Vec<UploadRecord>, ClipMetaStore),
+    /// Start naming the open clip (the title, or the Rename button).
+    RenameStarted,
+    RenameEdited(String),
+    /// Keep what was typed (Enter, or the Save button); an empty name clears it.
+    RenameCommitted,
+    /// Throw the edit away (Escape, or the Cancel button).
+    RenameCancelled,
+    /// Star or unstar a clip, from its card or from its detail page.
+    FavouriteToggled(PathBuf),
+    /// Narrow the grid to starred clips, or stop doing that.
+    FavouritesFilterToggled,
+    /// A name or star finished being written to disk, for the clip with this file name.
+    MetaSaved(String, Result<(), String>),
     /// The open clip's header was read: its duration in seconds (the trim range's ceiling).
     SummaryLoaded(PathBuf, f32),
     ThumbDone(PathBuf, SystemTime, Result<thumbs::Loaded, String>),
@@ -287,6 +304,23 @@ pub enum Message {
     TrimDragEnd,
     /// Escape on the focused timeline: throw the trim edits away, back to the whole clip.
     TrimReset,
+}
+
+/// The edits to one clip that are not on disk yet: the ones handed to the running write, and
+/// the ones made since, waiting for it to report back.
+#[derive(Debug, Default)]
+struct PendingMeta {
+    writing: Vec<ClipEdit>,
+    waiting: Vec<ClipEdit>,
+}
+
+impl PendingMeta {
+    /// Everything still owed, oldest first.
+    fn all(&self) -> Vec<ClipEdit> {
+        let mut edits = self.writing.clone();
+        edits.extend(self.waiting.iter().cloned());
+        edits
+    }
 }
 
 /// What a trim save does with the result.
@@ -392,6 +426,17 @@ pub struct Library {
     /// Remembered successful uploads (per clip, per destination), for badges + the duplicate
     /// guard. Reloaded on each scan and after a record/forget.
     history: Vec<UploadRecord>,
+    /// The names and stars the user gave their clips. Held in memory and edited optimistically;
+    /// the write to disk follows, and a reload arrives with the next scan.
+    meta: ClipMetaStore,
+    /// The name being typed for the open clip, or `None` when the title is not being edited.
+    rename: Option<String>,
+    /// Whether the grid is narrowed to starred clips.
+    favourites_only: bool,
+    /// Clips whose edits have not reached disk yet, keyed by file name. Only one write per clip
+    /// runs at a time, so two quick stars cannot land in the wrong order, and a rescan in
+    /// between replays what is still owed over what it read.
+    meta_pending: HashMap<String, PendingMeta>,
 }
 
 impl Library {
@@ -449,6 +494,10 @@ impl Library {
             // Filled by the first scan (the boot task); reading it here would block the UI
             // thread during startup.
             history: Vec::new(),
+            meta: ClipMetaStore::default(),
+            rename: None,
+            favourites_only: false,
+            meta_pending: HashMap::new(),
         }
     }
 
@@ -457,6 +506,7 @@ impl Library {
         self.open = None;
         self.confirm_delete = false;
         self.action_error = None;
+        self.rename = None;
         self.clear_strip();
         self.reset_preview();
     }
@@ -472,6 +522,55 @@ impl Library {
         self.play_error = None;
         self.seek_resume = false;
         self.fullscreen = false;
+    }
+
+    /// The upload title to suggest for `path`: the name the user gave the clip, else the
+    /// detected game plus the date, else just the date.
+    fn suggested_title(&self, path: &Path) -> String {
+        if let Some(name) = self.meta.name_of(path) {
+            return name.to_owned();
+        }
+        match self.entry(path).and_then(|e| e.game.as_deref()) {
+            Some(game) => titled(game),
+            None => default_title(),
+        }
+    }
+
+    /// Show an edit at once and put it on its way to disk. A clip that is already being written
+    /// keeps the edit back until that write reports, so its writes stay in order.
+    fn edit_meta(&mut self, path: &Path, edit: ClipEdit) -> Task<Message> {
+        let Some(file_name) = clip_meta::file_name_of(path).map(str::to_owned) else {
+            return Task::none();
+        };
+        self.meta.apply(&file_name, std::slice::from_ref(&edit));
+        if let Some(pending) = self.meta_pending.get_mut(&file_name) {
+            pending.waiting.push(edit);
+            return Task::none();
+        }
+        self.write_meta(file_name, vec![edit])
+    }
+
+    /// Hand a clip's owed edits to a blocking write. They are applied to whatever the store
+    /// holds once its lock is taken, so another writer's other field survives ours.
+    fn write_meta(&mut self, file_name: String, edits: Vec<ClipEdit>) -> Task<Message> {
+        self.meta_pending.insert(
+            file_name.clone(),
+            PendingMeta {
+                writing: edits.clone(),
+                waiting: Vec::new(),
+            },
+        );
+        let saved_for = file_name.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    clip_meta::update(&file_name, &edits).map_err(|e| e.to_string())
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()))
+            },
+            move |result| Message::MetaSaved(saved_for.clone(), result),
+        )
     }
 
     /// The upload record for `entry` at `dest`, if the clip was uploaded there.
@@ -503,12 +602,16 @@ impl Library {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    (rewynd_config::list_clips(&dir), upload_history::load())
+                    (
+                        rewynd_config::list_clips(&dir),
+                        upload_history::load(),
+                        clip_meta::load(),
+                    )
                 })
                 .await
                 .unwrap_or_default()
             },
-            |(entries, history)| Message::Scanned(entries, history),
+            |(entries, history, meta)| Message::Scanned(entries, history, meta),
         )
     }
 
@@ -516,7 +619,9 @@ impl Library {
         match message {
             Message::SearchEdited(q) => self.search = q,
             Message::GameFilterPicked(game) => self.game_filter = game,
-            Message::Scanned(entries, history) => return self.scanned(entries, history),
+            Message::Scanned(entries, history, meta) => {
+                return self.scanned(entries, history, meta);
+            }
             Message::ThumbDone(path, modified, result) => {
                 // Free the decode slot, unless a newer decode for the same path superseded it.
                 if self.decoding.get(&path) == Some(&modified) {
@@ -547,11 +652,10 @@ impl Library {
                 self.trim_end = 0.0;
                 self.trim = TrimState::Idle;
                 self.reset_preview();
-                // The suggested title leads with the game when one was detected.
-                self.title_hint = match self.entry(&path).and_then(|e| e.game.as_deref()) {
-                    Some(game) => titled(game),
-                    None => default_title(),
-                };
+                // The name the user gave the clip is the best upload title there is; failing
+                // that the suggestion leads with the game when one was detected.
+                self.title_hint = self.suggested_title(&path);
+                self.rename = None;
                 let detected = self.entry(&path).and_then(|e| e.game.clone());
                 self.open = Some(path.clone());
                 self.confirm_delete = false;
@@ -624,6 +728,9 @@ impl Library {
                 if let Some(entry) = self.entries.iter().find(|e| e.path == path) {
                     thumbs::remove_cached(&path, entry.modified);
                 }
+                // Nor should its name and star. Clearing the entry goes through the same queue
+                // as every other edit, so a star still being written can't bring it back.
+                let forgotten = self.edit_meta(&path, ClipEdit::Reset);
                 self.entries.retain(|e| e.path != path);
                 self.thumbs.remove(&path);
                 self.pending_thumbs.retain(|(p, _)| p != &path);
@@ -633,6 +740,7 @@ impl Library {
                     self.reset_preview();
                 }
                 self.action_error = None;
+                return forgotten;
             }
             Message::Deleted(Err(e)) => {
                 self.action_error = Some(format!("Could not delete the clip: {e}"));
@@ -666,11 +774,31 @@ impl Library {
                 let end = Duration::from_secs_f32(self.trim_end);
                 self.trim = TrimState::Saving;
                 let work_src = src.clone();
+                // A copy is a new file: give it the original's name before the rescan reads the
+                // directory, or it would show up as a date. The whole entry is written, not just
+                // the name: a copy deleted outside the app leaves its entry behind, and the next
+                // copy of the same clip takes that file name back.
+                let copy_edits = matches!(mode, SaveMode::Copy).then(|| {
+                    let name = self
+                        .meta
+                        .name_of(&src)
+                        .and_then(clip_meta::trimmed_copy_name);
+                    vec![ClipEdit::Reset, ClipEdit::Name(name)]
+                });
                 return Task::perform(
                     async move {
-                        tokio::task::spawn_blocking(move || save_trim(&work_src, mode, start, end))
-                            .await
-                            .unwrap_or_else(|e| Err(e.to_string()))
+                        tokio::task::spawn_blocking(move || {
+                            let saved = save_trim(&work_src, mode, start, end);
+                            if let (Ok(dst), Some(edits)) = (&saved, copy_edits)
+                                && let Some(file_name) = clip_meta::file_name_of(dst)
+                                && let Err(e) = clip_meta::update(file_name, &edits)
+                            {
+                                tracing::warn!(error = %e, "could not name the trimmed copy");
+                            }
+                            saved
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()))
                     },
                     move |result| Message::TrimSaved {
                         src: src.clone(),
@@ -702,6 +830,59 @@ impl Library {
                             TrimState::Failed(format!("Could not save the trimmed clip: {e}"));
                     }
                     Err(_) => {}
+                }
+            }
+            Message::RenameStarted => {
+                let Some(path) = self.open.clone() else {
+                    return Task::none();
+                };
+                self.rename = Some(self.meta.name_of(&path).unwrap_or_default().to_owned());
+                return iced::advanced::widget::operate(
+                    iced::advanced::widget::operation::focusable::focus(RENAME_INPUT.into()),
+                );
+            }
+            Message::RenameEdited(s) => {
+                if self.rename.is_some() {
+                    self.rename = Some(s);
+                }
+            }
+            Message::RenameCancelled => self.rename = None,
+            Message::RenameCommitted => {
+                let (Some(path), Some(draft)) = (self.open.clone(), self.rename.take()) else {
+                    return Task::none();
+                };
+                let name = clip_meta::clean_name(&draft);
+                // An untouched upload title follows the clip's name; one the user typed over
+                // stays theirs.
+                let untouched = self.title == self.title_hint;
+                let saved = self.edit_meta(&path, ClipEdit::Name(name));
+                self.title_hint = self.suggested_title(&path);
+                if untouched {
+                    self.title = self.title_hint.clone();
+                }
+                return saved;
+            }
+            Message::FavouriteToggled(path) => {
+                let starred = self.meta.is_favourite(&path);
+                return self.edit_meta(&path, ClipEdit::Favourite(!starred));
+            }
+            Message::FavouritesFilterToggled => {
+                self.favourites_only = !self.favourites_only;
+            }
+            Message::MetaSaved(file_name, result) => {
+                let waiting = self
+                    .meta_pending
+                    .remove(&file_name)
+                    .map(|pending| pending.waiting)
+                    .unwrap_or_default();
+                if let Err(e) = result {
+                    // The detail page shows this; a star toggled from the grid has nowhere to
+                    // put it, so the log is the backstop.
+                    tracing::warn!(error = %e, clip = %file_name, "could not save a clip's name or star");
+                    self.action_error = Some(format!("Could not save that: {e}"));
+                }
+                if !waiting.is_empty() {
+                    return self.write_meta(file_name, waiting);
                 }
             }
             Message::TitleEdited(s) => self.title = s,
@@ -927,7 +1108,12 @@ impl Library {
     /// Store a fresh scan and queue thumbnail decodes for entries whose (path, mtime) slot is
     /// missing or stale. The queue is rebuilt from this scan; decodes already in flight keep
     /// their slot and are not restarted.
-    fn scanned(&mut self, entries: Vec<ClipEntry>, history: Vec<UploadRecord>) -> Task<Message> {
+    fn scanned(
+        &mut self,
+        entries: Vec<ClipEntry>,
+        history: Vec<UploadRecord>,
+        meta: ClipMetaStore,
+    ) -> Task<Message> {
         self.scanning = false;
         self.thumbs
             .retain(|path, _| entries.iter().any(|e| &e.path == path));
@@ -948,6 +1134,14 @@ impl Library {
         }
         self.entries = entries;
         self.history = history;
+        // The reload brings in what another window (or a previous run) wrote. Edits of ours
+        // still on their way to disk win over it, or a rescan landing mid-write would show the
+        // user their own rename undone.
+        let mut meta = meta;
+        for (file_name, pending) in &self.meta_pending {
+            meta.apply(file_name, &pending.all());
+        }
+        self.meta = meta;
         // Drop a game filter whose section vanished (its last clip was deleted or moved).
         let stale = self
             .game_filter
@@ -1087,6 +1281,20 @@ impl Library {
         let mut subs = Vec::new();
         if self.animating() {
             subs.push(iced::window::frames().map(Message::Tick));
+        }
+        if self.rename.is_some() {
+            // The field itself swallows Escape (it drops focus), so this listener takes the key
+            // whether or not the event was captured, and only exists while a rename is open.
+            subs.push(iced::event::listen_with(|event, _status, _id| {
+                matches!(
+                    event,
+                    iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                        ..
+                    })
+                )
+                .then_some(Message::RenameCancelled)
+            }));
         }
         if let (Some(path), Some((start, end))) = (&self.open, self.play_range) {
             let key = (
@@ -1656,10 +1864,10 @@ impl Library {
         if groups.is_empty() {
             // The empty result can come from the search box, the game chips, or both; word it
             // for whichever the user actually touched.
-            let reason = if self.search.trim().is_empty() {
-                "No clips in this section."
-            } else {
-                "No clips match your search."
+            let reason = match (self.favourites_only, self.search.trim().is_empty()) {
+                (_, false) => "No clips match your search.",
+                (true, true) => "No favourites here yet. Star a clip to keep it close.",
+                (false, true) => "No clips in this section.",
             };
             sections = sections.push(
                 container(hint(reason))
@@ -1693,11 +1901,18 @@ impl Library {
             .width(Length::Fixed(260.0));
 
         let labels = self.game_labels();
-        let mut chips = row![chip(
-            "All",
-            self.game_filter.is_none(),
-            Message::GameFilterPicked(None)
-        )]
+        let mut chips = row![
+            chip(
+                "Favourites",
+                self.favourites_only,
+                Message::FavouritesFilterToggled
+            ),
+            chip(
+                "All",
+                self.game_filter.is_none(),
+                Message::GameFilterPicked(None)
+            )
+        ]
         .spacing(8)
         .align_y(iced::Alignment::Center);
         if labels.len() > 1 {
@@ -1772,8 +1987,12 @@ impl Library {
         labels
     }
 
-    /// Whether `entry` passes the active game filter and the search query.
+    /// Whether `entry` passes the favourites filter, the active game filter and the search
+    /// query.
     fn matches(&self, entry: &ClipEntry) -> bool {
+        if self.favourites_only && !self.meta.is_favourite(&entry.path) {
+            return false;
+        }
         if let Some(filter) = &self.game_filter
             && group_label(entry) != filter
         {
@@ -1783,25 +2002,33 @@ impl Library {
         if query.is_empty() {
             return true;
         }
-        let name = entry
+        let file_name = entry
             .path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default();
-        fuzzy_match(query, group_label(entry))
+        self.meta
+            .name_of(&entry.path)
+            .is_some_and(|name| fuzzy_match(query, name))
+            || fuzzy_match(query, group_label(entry))
             || fuzzy_match(query, &saved_at_label(entry.saved_at))
-            || fuzzy_match(query, name)
+            || fuzzy_match(query, file_name)
     }
 
     fn clip_card<'a>(&'a self, entry: &'a ClipEntry) -> Element<'a, Message> {
         // Stack the chips over the "duration · size" line rather than inlining them: a narrow card
         // (four across) can't fit a game chip, an upload badge, and the readout on one row, and the
         // squeezed row wrapped unevenly. Stacking keeps every card the same height at any width.
+        let named = self.meta.name_of(&entry.path);
         let mut info = column![
-            text(saved_at_label(entry.saved_at))
-                .size(12)
-                .font(UI_SEMIBOLD)
-                .style(tinted(palette::TEXT)),
+            text(named.map_or_else(
+                || saved_at_label(entry.saved_at),
+                std::string::ToString::to_string
+            ))
+            .size(12)
+            .font(UI_SEMIBOLD)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .style(tinted(palette::TEXT)),
         ]
         .spacing(7);
         let chips = self.meta_chips(entry);
@@ -1813,9 +2040,17 @@ impl Library {
             info = info.push(chip_row);
         }
         let info = info.push(
-            text(size_label(entry.size_bytes))
-                .size(10)
-                .style(tinted(palette::MUTED)),
+            text(match named {
+                Some(_) => format!(
+                    "{} · {}",
+                    saved_at_label(entry.saved_at),
+                    size_label(entry.size_bytes)
+                ),
+                None => size_label(entry.size_bytes),
+            })
+            .size(10)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .style(tinted(palette::MUTED)),
         );
 
         let mut layers = vec![self.thumbnail(entry, 148.0)];
@@ -1828,18 +2063,23 @@ impl Library {
                 .height(Length::Fixed(148.0)),
         )
         .clip(true);
-        button(
-            column![
-                iced::widget::hover(thumb, play_hint()),
-                container(info).padding([11, 12]),
-            ]
-            .spacing(0),
-        )
-        .on_press(Message::Open(entry.path.clone()))
-        .style(clip_card_style)
-        .padding(0)
+        // The star rides above the hover layer so it stays clickable while the play hint shows;
+        // pressing it never opens the clip, because the card button ignores a captured press.
+        let framed: Element<'_, Message> = layered(vec![
+            iced::widget::hover(thumb, play_hint()),
+            self.star_overlay(entry),
+        ])
         .width(Length::Fill)
-        .into()
+        .height(Length::Fixed(148.0))
+        .into();
+        // Clipped, so a long name runs out of the card's edge instead of widening it.
+        let info = container(info).padding([11, 12]).clip(true);
+        button(column![framed, info].spacing(0))
+            .on_press(Message::Open(entry.path.clone()))
+            .style(clip_card_style)
+            .padding(0)
+            .width(Length::Fill)
+            .into()
     }
 
     /// The clip's chips in order (per-game first, then one per uploaded destination). Empty when
@@ -1888,6 +2128,23 @@ impl Library {
             Some(Thumb::Failed { .. }) => placeholder("No preview", height),
             _ => placeholder("Loading...", height),
         }
+    }
+
+    /// The favourite star in the thumbnail's top-right corner: filled when the clip is starred,
+    /// an outline otherwise, so an unstarred card still shows where to click.
+    fn star_overlay<'a>(&self, entry: &'a ClipEntry) -> Element<'a, Message> {
+        let starred = self.meta.is_favourite(&entry.path);
+        let star = button(theme::star(15.0, starred))
+            .on_press(Message::FavouriteToggled(entry.path.clone()))
+            .style(theme::overlay_button)
+            .padding([5, 5]);
+        container(star)
+            .align_x(iced::Alignment::End)
+            .align_y(iced::Alignment::Start)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(6)
+            .into()
     }
 
     /// The clip's duration as a badge for the thumbnail's corner (arena.md duration badge:
@@ -2055,17 +2312,18 @@ impl Library {
             .style(link_button)
             .padding(0);
 
-        // The heading leads with the game when one was detected.
-        let heading = match &entry.game {
-            Some(game) => format!("{game} · {}", saved_at_label(entry.saved_at)),
-            None => saved_at_label(entry.saved_at),
-        };
-        let mut facts = column![
-            text(heading.to_uppercase()).size(26).font(DISPLAY_BLACK),
-            self.meta_row(entry, 11.0, palette::TEXT_SECONDARY),
-            hint(entry.path.display().to_string()),
-        ]
-        .spacing(10);
+        let mut facts = column![self.heading(entry)].spacing(10);
+        // A named clip keeps its date in the meta row, where the heading no longer carries it.
+        if self.meta.name_of(&entry.path).is_some() {
+            facts = facts.push(
+                text(saved_at_label(entry.saved_at))
+                    .size(11)
+                    .font(UI_SEMIBOLD)
+                    .style(tinted(palette::TEXT_SECONDARY)),
+            );
+        }
+        facts = facts.push(self.meta_row(entry, 11.0, palette::TEXT_SECONDARY));
+        facts = facts.push(hint(entry.path.display().to_string()));
         facts = facts.push(self.actions());
         if let Some(e) = &self.action_error {
             facts = facts.push(text(e.clone()).size(12).style(tinted(palette::DANGER)));
@@ -2084,6 +2342,49 @@ impl Library {
             self.upload_panel(entry, ganked, youtube),
         ]
         .spacing(20)
+        .into()
+    }
+
+    /// The detail page's heading: the clip's name when it has one, else the game and the date.
+    /// Click it to rename, or edit it in place while a rename is running.
+    fn heading<'a>(&'a self, entry: &'a ClipEntry) -> Element<'a, Message> {
+        let fallback = match &entry.game {
+            Some(game) => format!("{game} · {}", saved_at_label(entry.saved_at)),
+            None => saved_at_label(entry.saved_at),
+        };
+        let Some(draft) = &self.rename else {
+            let label = self
+                .meta
+                .name_of(&entry.path)
+                .map_or(fallback, std::string::ToString::to_string);
+            return button(text(label.to_uppercase()).size(26).font(DISPLAY_BLACK))
+                .on_press(Message::RenameStarted)
+                .style(link_button)
+                .padding(0)
+                .into();
+        };
+        column![
+            row![
+                text_input(&fallback, draft)
+                    .id(RENAME_INPUT)
+                    .on_input(Message::RenameEdited)
+                    .on_submit(Message::RenameCommitted)
+                    .style(theme::arena_input)
+                    .width(Length::Fill),
+                button(text("Save").size(11).font(UI_SEMIBOLD))
+                    .on_press(Message::RenameCommitted)
+                    .style(primary_button)
+                    .padding([9, 14]),
+                button(text("Cancel").size(11).font(UI_SEMIBOLD))
+                    .on_press(Message::RenameCancelled)
+                    .style(link_button)
+                    .padding([9, 4]),
+            ]
+            .spacing(10)
+            .align_y(iced::Alignment::Center),
+            hint("Leave it empty to go back to the date."),
+        ]
+        .spacing(6)
         .into()
     }
 
@@ -2257,9 +2558,31 @@ impl Library {
             .align_y(iced::Alignment::Center)
             .into();
         }
+        let starred = self
+            .open
+            .as_ref()
+            .is_some_and(|path| self.meta.is_favourite(path));
+        let favourite = button(
+            row![
+                theme::star(13.0, starred),
+                text(if starred { "Favourited" } else { "Favourite" })
+                    .size(11)
+                    .font(UI_SEMIBOLD),
+            ]
+            .spacing(7)
+            .align_y(iced::Alignment::Center),
+        )
+        .on_press_maybe(self.open.clone().map(Message::FavouriteToggled))
+        .style(move |theme, status| favourite_button(theme, status, starred))
+        .padding([9, 14]);
         row![
             button(text("Open in player").size(11).font(UI_SEMIBOLD))
                 .on_press(Message::Play)
+                .style(secondary_button)
+                .padding([9, 14]),
+            favourite,
+            button(text("Rename").size(11).font(UI_SEMIBOLD))
+                .on_press(Message::RenameStarted)
                 .style(secondary_button)
                 .padding([9, 14]),
             button(text("Show in folder").size(11).font(UI_SEMIBOLD))
@@ -2273,6 +2596,7 @@ impl Library {
         ]
         .spacing(10)
         .align_y(iced::Alignment::Center)
+        .wrap()
         .into()
     }
 
@@ -2984,6 +3308,27 @@ fn name_is_shared(results: &[Game], game: &Game) -> bool {
         .is_some()
 }
 
+/// The favourite button: the secondary outline, already wearing the accent once the clip is
+/// starred so the state reads without hovering.
+fn favourite_button(
+    theme: &Theme,
+    status: iced::widget::button::Status,
+    starred: bool,
+) -> iced::widget::button::Style {
+    let style = secondary_button(theme, status);
+    if !starred || matches!(status, iced::widget::button::Status::Hovered) {
+        return style;
+    }
+    iced::widget::button::Style {
+        text_color: palette::ACCENT,
+        border: Border {
+            color: palette::ACCENT_BORDER,
+            ..style.border
+        },
+        ..style
+    }
+}
+
 /// One row of a search dropdown: quiet until hovered, then the accent tint.
 fn suggestion_style(
     _theme: &Theme,
@@ -3429,6 +3774,239 @@ mod tests {
         assert_eq!(disk_label(0), "0 MB");
         assert_eq!(disk_label(1_500_000_000), "1.5 GB");
         assert_eq!(disk_label(12_300_000_000), "12.3 GB");
+    }
+
+    fn clip_at(path: &str, game: Option<&str>) -> ClipEntry {
+        ClipEntry {
+            path: PathBuf::from(path),
+            game: game.map(str::to_owned),
+            saved_at: SystemTime::UNIX_EPOCH,
+            modified: SystemTime::UNIX_EPOCH,
+            size_bytes: 1,
+        }
+    }
+
+    /// A library holding one named, starred clip and one plain one. Nothing here touches disk:
+    /// the store is filled in memory, and the write tasks the handlers return are dropped.
+    fn named_library() -> (Library, ClipEntry, ClipEntry) {
+        let named = clip_at("/c/Elden Ring/rewynd-1-0.mp4", Some("Elden Ring"));
+        let plain = clip_at("/c/rewynd-2-0.mp4", None);
+        let mut lib = Library::new();
+        lib.meta.set("rewynd-1-0.mp4", |m| {
+            m.name = Some("Clutch ace".to_owned());
+            m.favourite = true;
+        });
+        lib.entries = vec![named.clone(), plain.clone()];
+        (lib, named, plain)
+    }
+
+    #[test]
+    fn the_favourites_filter_and_the_search_both_see_clip_names() {
+        let (mut lib, named, plain) = named_library();
+        assert!(lib.matches(&named) && lib.matches(&plain), "unfiltered");
+
+        lib.favourites_only = true;
+        assert!(lib.matches(&named));
+        assert!(!lib.matches(&plain), "an unstarred clip is filtered out");
+
+        lib.favourites_only = false;
+        lib.search = "clutch".to_owned();
+        assert!(
+            lib.matches(&named),
+            "the name is searchable, case-insensitively"
+        );
+        assert!(!lib.matches(&plain));
+
+        // The old handles still work: the game, the date and the file name.
+        lib.search = "elden".to_owned();
+        assert!(lib.matches(&named));
+        lib.search = "rewynd-2".to_owned();
+        assert!(lib.matches(&plain));
+    }
+
+    #[test]
+    fn a_clips_name_becomes_its_suggested_upload_title() {
+        let (lib, named, plain) = named_library();
+        assert_eq!(lib.suggested_title(&named.path), "Clutch ace");
+        // Without a name the old suggestion stands: the game (or just the date) plus the stamp.
+        assert!(
+            lib.suggested_title(&plain.path).starts_with("rewynd "),
+            "{}",
+            lib.suggested_title(&plain.path)
+        );
+    }
+
+    #[test]
+    fn renaming_carries_an_untouched_upload_title_along() {
+        let (mut lib, named, _) = named_library();
+        let config = Config::default();
+        lib.open = Some(named.path.clone());
+        lib.title_hint = lib.suggested_title(&named.path);
+        lib.title = lib.title_hint.clone();
+
+        lib.rename = Some("  Triple   kill  ".to_owned());
+        drop(lib.update(Message::RenameCommitted, &config));
+        assert_eq!(
+            lib.meta.name_of(&named.path),
+            Some("Triple kill"),
+            "cleaned up"
+        );
+        assert_eq!(lib.title, "Triple kill", "the title followed the name");
+        assert!(lib.rename.is_none(), "the field closed");
+        assert!(
+            lib.meta_pending.contains_key("rewynd-1-0.mp4"),
+            "the write is owed"
+        );
+
+        // A title the user typed over is theirs, and a rename must not overwrite it.
+        lib.title = "My own title".to_owned();
+        lib.rename = Some("Quad kill".to_owned());
+        drop(lib.update(Message::RenameCommitted, &config));
+        assert_eq!(lib.meta.name_of(&named.path), Some("Quad kill"));
+        assert_eq!(lib.title, "My own title");
+    }
+
+    #[test]
+    fn an_empty_name_clears_it_and_escape_throws_the_edit_away() {
+        let (mut lib, named, _) = named_library();
+        let config = Config::default();
+        lib.open = Some(named.path.clone());
+
+        lib.rename = Some("   ".to_owned());
+        drop(lib.update(Message::RenameCommitted, &config));
+        assert_eq!(lib.meta.name_of(&named.path), None, "blank means no name");
+        assert!(lib.meta.is_favourite(&named.path), "the star is untouched");
+
+        lib.rename = Some("Never saved".to_owned());
+        drop(lib.update(Message::RenameCancelled, &config));
+        assert!(lib.rename.is_none());
+        assert_eq!(
+            lib.meta.name_of(&named.path),
+            None,
+            "cancelling stores nothing"
+        );
+    }
+
+    #[test]
+    fn the_star_toggles_from_either_side_of_the_library() {
+        let (mut lib, named, plain) = named_library();
+        let config = Config::default();
+
+        drop(lib.update(Message::FavouriteToggled(named.path.clone()), &config));
+        assert!(
+            !lib.meta.is_favourite(&named.path),
+            "starred clip unstarred"
+        );
+        assert_eq!(
+            lib.meta.name_of(&named.path),
+            Some("Clutch ace"),
+            "name kept"
+        );
+
+        drop(lib.update(Message::FavouriteToggled(plain.path.clone()), &config));
+        assert!(lib.meta.is_favourite(&plain.path));
+    }
+
+    #[test]
+    fn a_rescan_never_undoes_an_edit_still_on_its_way_to_disk() {
+        let (mut lib, named, _) = named_library();
+        let config = Config::default();
+        lib.open = Some(named.path.clone());
+        lib.rename = Some("Just typed".to_owned());
+        drop(lib.update(Message::RenameCommitted, &config));
+
+        // The scan reads the store from before the write landed.
+        let stale = ClipMetaStore::default();
+        drop(lib.scanned(vec![named.clone()], Vec::new(), stale));
+        assert_eq!(
+            lib.meta.name_of(&named.path),
+            Some("Just typed"),
+            "our own unwritten edit survives the reload"
+        );
+
+        // Once the write is confirmed, a later scan is free to bring back whatever is on disk.
+        drop(lib.update(
+            Message::MetaSaved("rewynd-1-0.mp4".to_owned(), Ok(())),
+            &config,
+        ));
+        assert!(lib.meta_pending.is_empty());
+        drop(lib.scanned(vec![named.clone()], Vec::new(), ClipMetaStore::default()));
+        assert_eq!(lib.meta.name_of(&named.path), None);
+    }
+
+    #[test]
+    fn a_second_star_waits_for_the_first_write_to_report_back() {
+        let (mut lib, named, _) = named_library();
+        let config = Config::default();
+        let key = "rewynd-1-0.mp4";
+
+        drop(lib.update(Message::FavouriteToggled(named.path.clone()), &config));
+        let pending = lib.meta_pending.get(key).expect("one write is out");
+        assert_eq!(pending.writing, [ClipEdit::Favourite(false)]);
+        assert!(pending.waiting.is_empty());
+
+        // A second press while that write runs waits its turn; two writes racing could
+        // otherwise land on disk in the wrong order.
+        drop(lib.update(Message::FavouriteToggled(named.path.clone()), &config));
+        let pending = lib.meta_pending.get(key).expect("still owed");
+        assert_eq!(pending.waiting, [ClipEdit::Favourite(true)]);
+        assert!(
+            lib.meta.is_favourite(&named.path),
+            "the UI followed both presses"
+        );
+
+        drop(lib.update(Message::MetaSaved(key.to_owned(), Ok(())), &config));
+        let pending = lib.meta_pending.get(key).expect("the follow-up went out");
+        assert_eq!(pending.writing, [ClipEdit::Favourite(true)]);
+        assert!(pending.waiting.is_empty());
+
+        drop(lib.update(Message::MetaSaved(key.to_owned(), Ok(())), &config));
+        assert!(lib.meta_pending.is_empty(), "nothing left owed");
+    }
+
+    #[test]
+    fn a_rescan_replays_only_what_is_still_owed() {
+        let (mut lib, named, _) = named_library();
+        let config = Config::default();
+        drop(lib.update(Message::FavouriteToggled(named.path.clone()), &config));
+
+        // Another window renamed the same clip while our star was being written. The scan
+        // brings their name back, and our star is replayed on top of it: neither is lost.
+        let mut theirs = ClipMetaStore::default();
+        theirs.apply(
+            "rewynd-1-0.mp4",
+            &[ClipEdit::Name(Some("Their name".to_owned()))],
+        );
+        drop(lib.scanned(vec![named.clone()], Vec::new(), theirs));
+        assert_eq!(lib.meta.name_of(&named.path), Some("Their name"));
+        assert!(!lib.meta.is_favourite(&named.path), "our unstar survived");
+    }
+
+    #[test]
+    fn deleting_a_clip_forgets_its_name_and_star() {
+        let (mut lib, named, _) = named_library();
+        let config = Config::default();
+        drop(lib.update(Message::Deleted(Ok(named.path.clone())), &config));
+        assert_eq!(lib.meta.name_of(&named.path), None);
+        assert!(!lib.meta.is_favourite(&named.path));
+        assert!(
+            lib.meta_pending.contains_key("rewynd-1-0.mp4"),
+            "the clearing write is on its way out, ordered behind any other edit"
+        );
+    }
+
+    #[test]
+    fn a_failed_write_says_so() {
+        let (mut lib, _, _) = named_library();
+        let config = Config::default();
+        drop(lib.update(
+            Message::MetaSaved("rewynd-1-0.mp4".to_owned(), Err("disk full".to_owned())),
+            &config,
+        ));
+        assert_eq!(
+            lib.action_error.as_deref(),
+            Some("Could not save that: disk full")
+        );
     }
 
     #[test]

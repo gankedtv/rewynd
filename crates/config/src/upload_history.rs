@@ -155,32 +155,7 @@ fn load_at(path: &Path) -> Vec<UploadRecord> {
 fn save_at(path: &Path, records: &[UploadRecord]) -> std::io::Result<()> {
     let bytes = serde_json::to_vec_pretty(records)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    write_private_atomic(path, &bytes)
-}
-
-/// Write `bytes` to `path` atomically (temp + rename), owner-only: a crash can't leave a truncated
-/// history, and the remote ids/links never become group/world readable.
-fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let result = options
-        .open(&tmp)
-        .and_then(|mut file| file.write_all(bytes))
-        .and_then(|()| std::fs::rename(&tmp, path));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
+    crate::paths::write_private_atomic(path, &bytes)
 }
 
 #[cfg(test)]
