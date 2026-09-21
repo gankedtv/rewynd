@@ -9,9 +9,6 @@
 //! (the dead channel stops the worker, which kills ffmpeg) exactly like the preview's decode
 //! loop.
 
-// The crop UI is what calls into this module; until it is wired up, nothing in the binary does.
-#![expect(dead_code, reason = "wired up by the crop UI")]
-
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{BufRead, BufReader, Read};
@@ -122,9 +119,11 @@ impl std::error::Error for Error {
 }
 
 /// Whether a crop export can run on this machine. Playback degrades to the system player when
-/// ffmpeg is missing, but a crop has no fallback, so the UI asks before offering one.
+/// ffmpeg is missing, but a crop has no fallback, so the UI asks before offering one. Probed
+/// once per run: the answer cannot change while the app is open, and the probe spawns a process.
 pub fn available() -> bool {
-    player::available()
+    static PROBED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROBED.get_or_init(player::available)
 }
 
 /// The ffmpeg argv for `spec` (no program name).
