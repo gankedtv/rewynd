@@ -33,7 +33,7 @@ It is **general-purpose first**: it produces standalone video files and is not t
 ### Non-goals (do **not** build these unless explicitly told)
 - ~~macOS / Apple Silicon support~~ — was a v1 non-goal; the "maybe someday, separate backend" shipped later as exactly that: ScreenCaptureKit + VideoToolbox, Apple Silicon only, no wgpu/gpu-video. See ADR 0015 and the §3.6 note.
 - A full OBS-style compositor (multiple sources, scenes, overlays mixing). We capture **one** source and encode it.
-- Streaming/RTMP, editing UI, cloud features beyond a single upload call.
+- Streaming/RTMP, a general editing UI beyond trimming and cropping a saved clip (ADR 0025), cloud features beyond a single upload call.
 - CPU/software encoding paths as a primary mode.
 
 ---
