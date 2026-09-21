@@ -230,7 +230,7 @@ pub fn to_model(rect: CropRect) -> Option<CropRect> {
 /// Absolute resize: the dragged edge follows the pointer and the opposite edge anchors.
 ///
 /// A locked `rect_ratio` keeps the same anchor: the handle names the driving axis (E/W take the
-/// width from the pointer, N/S the height, a corner whichever of the two implies the bigger
+/// width from the pointer, N/S the height, a corner whichever of the two implies the smaller
 /// rect), the other axis follows the ratio, and the edges the handle does not drag stay put —
 /// an edge handle keeping the perpendicular axis centred where it was. A rect that would leave
 /// the frame shrinks toward that anchor instead of sliding it.
@@ -275,12 +275,17 @@ pub fn resize_rect(
 /// The ratio-locked half of [`resize_rect`], solved for one number: the width, with the height
 /// following as `width / ratio`.
 fn resize_locked(rect: CropRect, handle: Handle, (px, py): (f32, f32), ratio: f32) -> CropRect {
-    let left = rect.x;
-    let right = rect.x + rect.width;
-    let top = rect.y;
-    let bottom = rect.y + rect.height;
-    let cx = rect.x + rect.width / 2.0;
-    let cy = rect.y + rect.height / 2.0;
+    // Every event builds on the rect the last one produced, whose own edge can land an ulp or
+    // two outside the frame; pulling it back in beats treating it as out of bounds, which would
+    // recentre the rect mid-drag.
+    let start_width = rect.width.min(1.0);
+    let start_height = rect.height.min(1.0);
+    let left = rect.x.clamp(0.0, 1.0 - start_width);
+    let top = rect.y.clamp(0.0, 1.0 - start_height);
+    let right = left + start_width;
+    let bottom = top + start_height;
+    let cx = left + start_width / 2.0;
+    let cy = top + start_height / 2.0;
 
     let from_x = if handle.moves_east() {
         Some(px - left)
@@ -297,10 +302,11 @@ fn resize_locked(rect: CropRect, handle: Handle, (px, py): (f32, f32), ratio: f3
         None
     };
     let wanted = match (from_x, from_y) {
-        // A corner drags both axes: the bigger rect wins, so the pointer's dominant motion does.
-        (Some(x), Some(y)) => x.max(y),
+        // A corner drags both axes: the smaller rect wins, so the rect stays inside the box the
+        // pointer draws and shrinks as soon as the pointer comes in on either axis.
+        (Some(x), Some(y)) => x.min(y),
         (Some(v), None) | (None, Some(v)) => v,
-        (None, None) => rect.width,
+        (None, None) => start_width,
     };
 
     // How much room the anchor leaves: a fixed edge to the frame's, or twice the shorter side
@@ -321,11 +327,20 @@ fn resize_locked(rect: CropRect, handle: Handle, (px, py): (f32, f32), ratio: f3
     };
     let max_width = room_x.min(room_y * ratio);
     let min_width = MIN_CROP_EXTENT.max(MIN_CROP_EXTENT * ratio);
-    let inside = |v: f32| (0.0..=1.0).contains(&v);
-    if !(inside(left) && inside(right) && inside(top) && inside(bottom)) || max_width < min_width {
-        // No rect of this shape fits against the anchor, which takes a rect that was already
-        // outside the frame (or thinner than the minimum) to reach.
-        return clamp_rect(apply_rect_ratio(rect, Some(ratio)));
+    if max_width < min_width {
+        // No rect of this shape fits against the anchor, so the centred one is the best on
+        // offer. Its width has to reach the joint floor before the height is derived from it,
+        // or the minimum is enforced per axis and the ratio does not survive.
+        let floor = start_width.max(min_width);
+        return clamp_rect(apply_rect_ratio(
+            CropRect {
+                x: cx - floor / 2.0,
+                y: cy - start_height / 2.0,
+                width: floor,
+                height: start_height,
+            },
+            Some(ratio),
+        ));
     }
 
     let width = wanted.max(min_width).min(max_width);
@@ -345,8 +360,8 @@ fn resize_locked(rect: CropRect, handle: Handle, (px, py): (f32, f32), ratio: f3
         cy - height / 2.0
     };
     CropRect {
-        x,
-        y,
+        x: x.clamp(0.0, (1.0 - width).max(0.0)),
+        y: y.clamp(0.0, (1.0 - height).max(0.0)),
         width,
         height,
     }
@@ -820,6 +835,119 @@ mod tests {
         assert_near(rect.y, start.y, 1e-4);
         assert!(rect.x + rect.width <= 1.0001, "{rect:?}");
         assert!(rect.y + rect.height <= 1.0001, "{rect:?}");
+        assert_near(rect.width / rect.height, ratio, 1e-4);
+    }
+
+    #[test]
+    fn a_locked_corner_drag_inward_shrinks_on_either_axis() {
+        // Taking the bigger of the two implied rects would leave a corner dragged straight in
+        // on one axis doing nothing at all, because the other axis still spans the old rect.
+        let ratio = wide_ratio();
+        let start = max_rect_for_ratio(Some(ratio));
+
+        let left = resize_rect(
+            start,
+            Handle::Se,
+            (0.3, start.y + start.height),
+            Some(ratio),
+        );
+        assert!(left.width < start.width, "straight left: {left:?}");
+        assert_near(left.width / left.height, ratio, 1e-4);
+        assert_near(left.x, start.x, 1e-4);
+        assert_near(left.y, start.y, 1e-4);
+
+        let up = resize_rect(start, Handle::Se, (start.x + start.width, 0.5), Some(ratio));
+        assert!(up.width < start.width, "straight up: {up:?}");
+        assert_near(up.width / up.height, ratio, 1e-4);
+        assert_near(up.x, start.x, 1e-4);
+        assert_near(up.y, start.y, 1e-4);
+    }
+
+    #[test]
+    fn a_locked_drag_held_against_the_frame_holds_instead_of_recentring() {
+        // Each event builds on the rect the last one produced, and that rect's own edge can
+        // land an ulp outside 0..1 (a north drag's `bottom - height` reaches -6e-8). Reading
+        // that as "outside the frame" would recentre the rect and drop a frame of the drag.
+        let ratio = wide_ratio();
+        let corners = [
+            (Handle::Nw, (0.0, 0.0)),
+            (Handle::N, (0.5, 0.0)),
+            (Handle::Ne, (1.0, 0.0)),
+            (Handle::E, (1.0, 0.5)),
+            (Handle::Se, (1.0, 1.0)),
+            (Handle::S, (0.5, 1.0)),
+            (Handle::Sw, (0.0, 1.0)),
+            (Handle::W, (0.0, 0.5)),
+        ];
+        for (handle, pointer) in corners {
+            for start in [(0.3, 0.375), (0.1, 0.1), (0.5, 0.2)] {
+                let mut rect = CropRect {
+                    x: start.0,
+                    y: start.1,
+                    width: 0.37,
+                    height: 0.37 / ratio,
+                };
+                rect = resize_rect(rect, handle, pointer, Some(ratio));
+                for step in 0..200 {
+                    let next = resize_rect(rect, handle, pointer, Some(ratio));
+                    let where_ = format!("{handle:?} at {pointer:?} from {start:?}, step {step}");
+                    assert!(next.x >= 0.0 && next.y >= 0.0, "{where_}: {next:?}");
+                    assert!(next.x + next.width <= 1.0 + EPS, "{where_}: {next:?}");
+                    assert!(next.y + next.height <= 1.0 + EPS, "{where_}: {next:?}");
+                    assert_near(next.width / next.height, ratio, 1e-4);
+                    // The pointer never moved, so neither may the rect.
+                    assert_near(next.x, rect.x, 1e-4);
+                    assert_near(next.y, rect.y, 1e-4);
+                    assert_near(next.width, rect.width, 1e-4);
+                    rect = next;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_locked_drag_at_the_frame_edge_still_follows_the_pointer_back() {
+        // The rect a north-west drag into the corner produces has its own top at -6e-8. Reading
+        // that as outside the frame sends the next event to the centring fallback, which
+        // ignores the pointer — the drag stops following the mouse until it is released.
+        let ratio = wide_ratio();
+        let start = CropRect {
+            x: 0.3,
+            y: 0.375,
+            width: 0.37,
+            height: 0.37 / ratio,
+        };
+        let corner = resize_rect(start, Handle::Nw, (0.0, 0.0), Some(ratio));
+        let back = resize_rect(corner, Handle::Nw, (0.2, 0.1), Some(ratio));
+
+        assert!(
+            back.width < corner.width - 1e-3,
+            "the pointer came back in: {back:?} from {corner:?}"
+        );
+        assert_near(back.x + back.width, corner.x + corner.width, 1e-4);
+        assert_near(back.y + back.height, corner.y + corner.height, 1e-4);
+        assert_near(back.width / back.height, ratio, 1e-4);
+    }
+
+    #[test]
+    fn the_locked_fallback_keeps_the_ratio_under_the_minimum_extent() {
+        // Raising each axis to the minimum on its own hands back a square whatever the preset
+        // says; the width has to reach the joint floor before the height comes off it.
+        let ratio = wide_ratio();
+        let rect = resize_locked(
+            CropRect {
+                x: 0.0,
+                y: 0.0,
+                width: 0.005,
+                height: 0.0067,
+            },
+            Handle::N,
+            (0.0, 0.0),
+            ratio,
+        );
+
+        assert!(rect.width >= MIN_CROP_EXTENT, "{rect:?}");
+        assert!(rect.height >= MIN_CROP_EXTENT, "{rect:?}");
         assert_near(rect.width / rect.height, ratio, 1e-4);
     }
 

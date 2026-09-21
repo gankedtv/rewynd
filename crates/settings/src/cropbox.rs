@@ -303,7 +303,12 @@ where
                 }
             }
             // The run of nudges is over; the next one starts from what the caller has by then.
-            Event::Keyboard(keyboard::Event::KeyReleased { .. }) if state.focused => {
+            // Only an arrow ends it: letting go of Shift (or of anything else) mid-run would
+            // rebase the next nudge on a rect the caller has not caught up with, losing a step.
+            Event::Keyboard(keyboard::Event::KeyReleased { key, .. })
+                if state.focused
+                    && matches!(key.as_ref(), Key::Named(named) if nudge(named).is_some()) =>
+            {
                 state.live = None;
             }
             _ => {}
@@ -563,6 +568,16 @@ mod tests {
         })
     }
 
+    fn char_release(c: &str) -> Event {
+        Event::Keyboard(keyboard::Event::KeyReleased {
+            key: Key::Character(c.into()),
+            modified_key: Key::Character(c.into()),
+            physical_key: Physical::Code(Code::KeyA),
+            location: Location::Standard,
+            modifiers: Modifiers::default(),
+        })
+    }
+
     fn rect(x: f32, y: f32, width: f32, height: f32) -> CropRect {
         CropRect {
             x,
@@ -742,6 +757,41 @@ mod tests {
 
         let next = last.expect("three nudges, three rects");
         assert_near(next.x, 0.1 + 3.0 * crop::STEP, 1e-5);
+    }
+
+    #[test]
+    fn letting_go_of_another_key_does_not_end_the_nudge_batch() {
+        // Shift comes up between two arrows all the time (a resize run turning into a move
+        // one). Treating that as the end of the batch rebases the next nudge on the rect the
+        // widget was built with, which within a frame is still the pre-nudge one.
+        let (mut widget, mut tree) = harness(rect(0.1, 0.1, 0.5, 0.5), (1920, 1080), None);
+        drive(&mut widget, &mut tree, press(), at(140.0, 78.0));
+        drive(&mut widget, &mut tree, release(), at(140.0, 78.0));
+        let away = mouse::Cursor::Unavailable;
+
+        let (msgs, _) = drive(
+            &mut widget,
+            &mut tree,
+            key_press(Named::ArrowRight, Code::ArrowRight, Modifiers::default()),
+            away,
+        );
+        assert_near(only_change(&msgs).x, 0.1 + crop::STEP, 1e-5);
+
+        for event in [
+            key_release(Named::Shift, Code::ShiftLeft),
+            char_release("a"),
+        ] {
+            let (msgs, _) = drive(&mut widget, &mut tree, event, away);
+            assert!(msgs.is_empty(), "a release edits nothing: {msgs:?}");
+        }
+
+        let (msgs, _) = drive(
+            &mut widget,
+            &mut tree,
+            key_press(Named::ArrowRight, Code::ArrowRight, Modifiers::default()),
+            away,
+        );
+        assert_near(only_change(&msgs).x, 0.1 + 2.0 * crop::STEP, 1e-5);
     }
 
     #[test]

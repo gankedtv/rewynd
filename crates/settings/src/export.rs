@@ -303,7 +303,16 @@ fn export_loop(spec: &Spec, total: Duration, tx: &tokio::sync::mpsc::Sender<Even
         Ok(status) => finish(status, &stderr, &spec.dst),
         Err(e) => Err(Error::Io(e)),
     };
-    let _ = tx.blocking_send(Event::Done(result));
+    report(tx, result, &spec.dst);
+}
+
+/// Hand the outcome to the UI, or clear `dst` when nobody is left to take it: the export was
+/// cancelled between ffmpeg's last byte and this report, and a cancelled export leaves nothing
+/// behind — temp or finished copy.
+fn report(tx: &tokio::sync::mpsc::Sender<Event>, result: Result<(), Error>, dst: &Path) {
+    if tx.blocking_send(Event::Done(result)).is_err() {
+        let _ = std::fs::remove_file(dst);
+    }
 }
 
 /// Forward rising progress until ffmpeg's stdout ends. `false` means the receiver is gone (the
@@ -601,6 +610,27 @@ mod tests {
         );
         assert!(long.starts_with('…'));
         assert!(long.ends_with('x'));
+    }
+
+    #[test]
+    fn a_cancel_between_the_last_frame_and_the_report_clears_the_output() {
+        // Cancelling closes the receiver. By then ffmpeg may already have written the whole
+        // file, and nobody is left to rename it over the clip or name it as a copy.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dst = dir.path().join("out.tmp");
+        std::fs::write(&dst, b"encoded").expect("write");
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(4);
+        drop(rx);
+        report(&tx, Ok(()), &dst);
+        assert!(!dst.exists(), "a cancelled export leaves nothing behind");
+
+        // With the UI still listening the file is left for the caller to place.
+        std::fs::write(&dst, b"encoded").expect("write");
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(4);
+        report(&tx, Ok(()), &dst);
+        assert!(dst.exists(), "a delivered export is the caller's to place");
+        assert!(matches!(rx.try_recv(), Ok(Event::Done(Ok(())))));
     }
 
     #[test]
