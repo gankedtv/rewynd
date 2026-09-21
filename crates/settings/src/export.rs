@@ -119,11 +119,11 @@ impl std::error::Error for Error {
 }
 
 /// Whether a crop export can run on this machine. Playback degrades to the system player when
-/// ffmpeg is missing, but a crop has no fallback, so the UI asks before offering one. Probed
-/// once per run: the answer cannot change while the app is open, and the probe spawns a process.
+/// ffmpeg is missing, but a crop has no fallback, so the UI asks before offering one. Not
+/// remembered: an ffmpeg installed while the app is open has to count, and the caller only
+/// asks again while the answer is still no.
 pub fn available() -> bool {
-    static PROBED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PROBED.get_or_init(player::available)
+    player::available()
 }
 
 /// The ffmpeg argv for `spec` (no program name).
@@ -218,6 +218,10 @@ fn argv(spec: &Spec, progress: bool) -> Result<Vec<OsString>, Error> {
         "yuv420p",
         "-c:a",
         "copy",
+        // Clips carry Opus, which older ffmpeg builds still refuse to mux into MP4 without
+        // being told the combination is fine.
+        "-strict",
+        "-2",
         "-movflags",
         "+faststart",
         // Temps are written as `.tmp`, so the muxer cannot be guessed from the name.
@@ -438,6 +442,8 @@ mod tests {
                 "yuv420p",
                 "-c:a",
                 "copy",
+                "-strict",
+                "-2",
                 "-movflags",
                 "+faststart",
                 "-f",
@@ -497,6 +503,11 @@ mod tests {
         let argv = strings(&args(&spec()).expect("valid crop"));
         assert_eq!(value_after(&argv, "-c:a"), "copy");
         assert_eq!(value_after(&argv, "-movflags"), "+faststart");
+        assert_eq!(
+            value_after(&argv, "-strict"),
+            "-2",
+            "an Opus stream copy into MP4 is experimental on older builds"
+        );
     }
 
     #[test]

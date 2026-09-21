@@ -28,8 +28,9 @@ output size. Save, Save as copy and Upload all apply it.
   re-encode makes the seek frame-accurate, `-t` after it for the kept length,
   `-vf crop=W:H:X:Y`, `-map 0:v:0 -map 0:a?` (a clip recorded with everything muted has no
   audio track and must still export), `libx264` at CRF 18 / preset `veryfast` with libx264's
-  own profile pick, `-pix_fmt yuv420p`, `-c:a copy`, `-movflags +faststart`, `-f mp4`. Cutting
-  and cropping in one pass means the frames are decoded and encoded once, not twice.
+  own profile pick, `-pix_fmt yuv420p`, `-c:a copy -strict -2` (clips carry Opus, which older
+  ffmpeg builds still call experimental in MP4), `-movflags +faststart`, `-f mp4`. Cutting and
+  cropping in one pass means the frames are decoded and encoded once, not twice.
 
 - **The crop rect reaches ffmpeg in even integer pixels — origin as well as size.** yuv420p
   subsamples chroma 2×2, so an odd `X`/`Y` has no chroma sample to start from, not just an odd
@@ -65,8 +66,9 @@ output size. Save, Save as copy and Upload all apply it.
 
 - **macOS says so instead of failing.** No ffmpeg is bundled there, so the crop controls show
   a "needs ffmpeg" state exactly as in-app playback already does — up front, not at the moment
-  someone hits Save. The bundled-or-`PATH` ffmpeg is probed once per app run and the answer
-  reused.
+  someone hits Save. The bundled-or-`PATH` ffmpeg is re-probed every time a clip is opened
+  until one is found, so installing it while the app is open is enough; once found, the answer
+  is kept.
 
 - **The overlay is drawn, not shaded.** Scrims and handles are painted over the full
   letterboxed frame using `crop::contain_rect`, the same contain fit the video shader uses, so
@@ -96,8 +98,8 @@ output size. Save, Save as copy and Upload all apply it.
   system player without it. The AUR package already depends on `ffmpeg`; the installers
   already bundle it.
 - A crop export costs real time on a long clip — it is an encode, not a copy. ffmpeg's
-  `-progress pipe:1` drives a progress bar, and dropping the task kills ffmpeg and removes the
-  partial file.
+  `-progress pipe:1` drives a progress bar, and the Cancel beside it drops the task, which
+  kills ffmpeg and removes the partial file.
 - Exported clips get their library thumbnail from openh264 decoding libx264's output. High
   profile decodes today; `VideoQuality.profile` is the escape hatch if a future build of
   either disagrees.

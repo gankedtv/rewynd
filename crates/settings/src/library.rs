@@ -254,20 +254,26 @@ pub enum Message {
     TrimSaved {
         src: PathBuf,
         mode: SaveMode,
+        /// Whether this save went through the encoder, said by the task that ran it rather
+        /// than read back off a state the user may have moved on from.
+        cropped: bool,
         result: Result<PathBuf, String>,
     },
-    /// Whether this machine has an ffmpeg a crop export can run (probed once per run).
+    /// Whether this machine has an ffmpeg a crop export can run.
     FfmpegProbed(bool),
     /// The overlay moved or resized the crop rectangle.
     CropChanged(crop::CropRect),
-    /// A crop drag, or a run of keyboard nudges, ended.
-    CropReleased,
     /// An aspect-ratio preset was picked for the crop.
     CropPresetPicked(crop::Ratio),
     /// Back to the whole frame (the overlay's Escape, or the Reset button).
     CropReset,
-    /// How far the running crop export has got, `0.0..=1.0`.
-    ExportProgress(f32),
+    /// How far the export of `src` has got, `0.0..=1.0`.
+    ExportProgress {
+        src: PathBuf,
+        fraction: f32,
+    },
+    /// Give up on the running crop export (the Cancel button beside its progress).
+    ExportCancelled,
     TitleEdited(String),
     DescriptionEdited(text_editor::Action),
     GameSearchEdited(String),
@@ -428,6 +434,9 @@ pub struct Library {
     ffmpeg: Option<bool>,
     /// How far a running crop export has got, while one runs.
     export_progress: Option<f32>,
+    /// Cancels the running crop export: dropping its task kills ffmpeg and clears the partial
+    /// file. Held only while one runs.
+    export_abort: Option<iced::task::Handle>,
     trim: TrimState,
     /// Play / show-in-folder / delete failure for the open clip.
     action_error: Option<String>,
@@ -512,6 +521,7 @@ impl Library {
             crop_ratio: crop::Ratio::Free,
             ffmpeg: None,
             export_progress: None,
+            export_abort: None,
             trim: TrimState::Idle,
             action_error: None,
             title: String::new(),
@@ -564,6 +574,15 @@ impl Library {
         self.seek_resume = false;
         self.fullscreen = false;
         self.reset_crop();
+    }
+
+    /// Drop a finished save's banner, because the edit it described has moved on. A running
+    /// save keeps its state: it owns the temp it is writing, and re-enabling Save under it
+    /// would let a second export write the same file.
+    fn clear_save_banner(&mut self) {
+        if matches!(self.trim, TrimState::Saved { .. } | TrimState::Failed(_)) {
+            self.trim = TrimState::Idle;
+        }
     }
 
     /// Forget the crop rectangle and the frame it was measured against: another clip (or the
@@ -728,8 +747,9 @@ impl Library {
                 if !self.game_input.is_empty() {
                     tasks.push(self.find_games(config));
                 }
-                // Whether a crop can be offered at all. Once per run: the probe spawns ffmpeg.
-                if self.ffmpeg.is_none() {
+                // Whether a crop can be offered at all. Re-probed until one is found, so an
+                // ffmpeg installed while the app is open is picked up on the next clip.
+                if self.ffmpeg != Some(true) {
                     tasks.push(Task::perform(
                         async {
                             tokio::task::spawn_blocking(export::available)
@@ -812,7 +832,7 @@ impl Library {
             Message::TrimStartChanged(v) => {
                 // Keep at least a small gap below the end.
                 self.trim_start = v.clamp(0.0, (self.trim_end - MIN_TRIM_SECS).max(0.0));
-                self.trim = TrimState::Idle;
+                self.clear_save_banner();
                 // Editing the range pauses playback; the preview scrubs to the handle instead.
                 self.play_range = None;
                 self.play_frame = None;
@@ -823,7 +843,7 @@ impl Library {
             Message::TrimEndChanged(v) => {
                 let hi = self.open_duration();
                 self.trim_end = v.clamp(self.trim_start + MIN_TRIM_SECS, hi.max(MIN_TRIM_SECS));
-                self.trim = TrimState::Idle;
+                self.clear_save_banner();
                 self.play_range = None;
                 self.play_frame = None;
                 self.play_pos = None;
@@ -845,12 +865,19 @@ impl Library {
                     }
                 };
             }
-            Message::TrimSaved { src, mode, result } => {
+            Message::TrimSaved {
+                src,
+                mode,
+                cropped,
+                result,
+            } => {
                 // The trim may finish after the user opened another clip; only stamp the result on
                 // its own detail page. The rescan still runs so the new clip shows up regardless.
                 let current = self.open.as_deref() == Some(src.as_path());
-                let cropped = matches!(self.trim, TrimState::Saving { cropped: true });
-                self.export_progress = None;
+                if current {
+                    self.export_progress = None;
+                    self.export_abort = None;
+                }
                 match result {
                     Ok(path) => {
                         let overwrite = matches!(mode, SaveMode::Overwrite);
@@ -1140,18 +1167,15 @@ impl Library {
                 if self.open_dur > 0.0 {
                     self.trim_start = 0.0;
                     self.trim_end = self.open_dur;
-                    self.trim = TrimState::Idle;
+                    self.clear_save_banner();
                 }
             }
             Message::FfmpegProbed(found) => self.ffmpeg = Some(found),
             Message::CropChanged(rect) => {
                 self.crop = rect;
                 // A saved banner must not linger over a rect that has moved since.
-                self.trim = TrimState::Idle;
+                self.clear_save_banner();
             }
-            // The rect is committed on every change already; the release is kept for symmetry
-            // with the timeline's own drag end.
-            Message::CropReleased => {}
             Message::CropPresetPicked(ratio) => {
                 self.crop_ratio = ratio;
                 // Free keeps whatever rect is on screen; a locked preset re-centres the largest
@@ -1161,16 +1185,28 @@ impl Library {
                 {
                     self.crop = crop::max_rect_for_ratio(ratio.rect_ratio(frame_ratio));
                 }
-                self.trim = TrimState::Idle;
+                self.clear_save_banner();
             }
             Message::CropReset => {
                 self.crop = crop::FULL_FRAME;
-                self.trim = TrimState::Idle;
+                self.clear_save_banner();
             }
-            Message::ExportProgress(fraction) => {
-                if matches!(self.trim, TrimState::Saving { .. }) {
+            Message::ExportProgress { src, fraction } => {
+                // Only the export this page is waiting for: one left running on another clip
+                // must not drive the bar here.
+                if self.open.as_deref() == Some(src.as_path())
+                    && matches!(self.trim, TrimState::Saving { .. })
+                {
                     self.export_progress = Some(fraction.clamp(0.0, 1.0));
                 }
+            }
+            Message::ExportCancelled => {
+                // Dropping the export task kills ffmpeg, which clears the partial file.
+                if let Some(abort) = self.export_abort.take() {
+                    abort.abort();
+                }
+                self.trim = TrimState::Idle;
+                self.export_progress = None;
             }
             Message::OpenLink(url) => {
                 if let Err(e) = open::that_detached(&url) {
@@ -1675,6 +1711,7 @@ impl Library {
             move |result| Message::TrimSaved {
                 src: src.clone(),
                 mode,
+                cropped: false,
                 result,
             },
         )
@@ -1709,7 +1746,13 @@ impl Library {
         let copy_edits = self.copy_edits(&src, mode);
         self.trim = TrimState::Saving { cropped: true };
         self.export_progress = Some(0.0);
-        Task::stream(crop_export(src, mode, spec, total, copy_edits))
+        let (task, abort) =
+            Task::stream(crop_export(src, mode, spec, total, copy_edits)).abortable();
+        // A plain handle, like the upload's: a save someone asked for finishes even if they
+        // open another clip meanwhile. Only Cancel aborts it (which kills ffmpeg and clears
+        // the partial file).
+        self.export_abort = Some(abort);
+        task
     }
 
     /// Kick off the upload for the open clip: the client is built from the config at click
@@ -2417,7 +2460,6 @@ impl Library {
                     self.crop_ratio.rect_ratio(frame_ratio),
                     Message::CropChanged,
                 )
-                .on_released(Message::CropReleased)
                 .on_reset(Message::CropReset)
                 .on_tap(Message::PlayToggle)
                 .into(),
@@ -2822,12 +2864,25 @@ impl Library {
 
         let panel = match &self.trim {
             TrimState::Idle => panel,
-            TrimState::Saving { .. } => panel.push(hint(match self.export_progress {
-                Some(fraction) => {
-                    format!("Encoding the cropped clip\u{2026} {:.0}%", fraction * 100.0)
-                }
-                None => "Saving the trimmed clip...".to_owned(),
-            })),
+            // Only the encode is worth offering a way out of: the lossless cut is a copy that
+            // is over before a button could be pressed.
+            TrimState::Saving { cropped: true } => panel.push(
+                row![
+                    hint(match self.export_progress {
+                        Some(fraction) => {
+                            format!("Encoding the cropped clip\u{2026} {:.0}%", fraction * 100.0)
+                        }
+                        None => "Encoding the cropped clip\u{2026}".to_owned(),
+                    }),
+                    button(text("Cancel").size(11).font(UI_SEMIBOLD))
+                        .on_press(Message::ExportCancelled)
+                        .style(secondary_button)
+                        .padding([5, 11]),
+                ]
+                .spacing(10)
+                .align_y(iced::Alignment::Center),
+            ),
+            TrimState::Saving { cropped: false } => panel.push(hint("Saving the trimmed clip...")),
             TrimState::Saved {
                 overwrite: true,
                 cropped,
@@ -3811,7 +3866,12 @@ fn crop_export(
             while let Some(event) = events.next().await {
                 match event {
                     export::Event::Progress(fraction) => {
-                        let _ = output.send(Message::ExportProgress(fraction)).await;
+                        let _ = output
+                            .send(Message::ExportProgress {
+                                src: src.clone(),
+                                fraction,
+                            })
+                            .await;
                     }
                     export::Event::Done(done) => encoded = done.map_err(|e| e.to_string()),
                 }
@@ -3825,7 +3885,14 @@ fn crop_export(
                 .unwrap_or_else(|e| Err(e.to_string())),
                 Err(e) => Err(e),
             };
-            let _ = output.send(Message::TrimSaved { src, mode, result }).await;
+            let _ = output
+                .send(Message::TrimSaved {
+                    src,
+                    mode,
+                    cropped: true,
+                    result,
+                })
+                .await;
         },
     )
 }
@@ -4885,6 +4952,109 @@ mod tests {
         ));
         assert!(matches!(lib.trim, TrimState::Idle), "the banner is gone");
         assert!(lib.crop_pixels().is_none(), "no frame, no pixels yet");
+    }
+
+    #[test]
+    fn an_edit_under_a_running_save_leaves_it_running() {
+        // A crop export is a long encode that owns the temp it is writing; putting the panel
+        // back to Idle would re-enable Save and let a second one write the same file.
+        let (mut lib, named, _) = named_library();
+        let config = Config::default();
+        lib.open = Some(named.path.clone());
+        lib.open_dims = Some(ULTRAWIDE);
+        lib.open_dur = 30.0;
+        lib.trim_end = 30.0;
+        lib.trim = TrimState::Saving { cropped: true };
+
+        for message in [
+            Message::CropChanged(crop::CropRect {
+                x: 0.1,
+                y: 0.1,
+                width: 0.5,
+                height: 0.5,
+            }),
+            Message::CropPresetPicked(crop::Ratio::Wide16x9),
+            Message::CropReset,
+            Message::TrimStartChanged(1.0),
+            Message::TrimEndChanged(20.0),
+            Message::TrimReset,
+        ] {
+            let what = format!("{message:?}");
+            drop(lib.update(message, &config));
+            assert!(
+                matches!(lib.trim, TrimState::Saving { cropped: true }),
+                "{what} must not call off the encode"
+            );
+        }
+
+        // A finished save's banner still gets out of the way of the next edit.
+        lib.trim = TrimState::Failed("nope".to_owned());
+        drop(lib.update(Message::CropReset, &config));
+        assert!(matches!(lib.trim, TrimState::Idle));
+    }
+
+    #[test]
+    fn only_the_open_clips_export_drives_the_progress_bar() {
+        let (mut lib, named, plain) = named_library();
+        let config = Config::default();
+        lib.open = Some(named.path.clone());
+        lib.trim = TrimState::Saving { cropped: true };
+        lib.export_progress = Some(0.25);
+
+        drop(lib.update(
+            Message::ExportProgress {
+                src: plain.path.clone(),
+                fraction: 0.9,
+            },
+            &config,
+        ));
+        assert_eq!(
+            lib.export_progress,
+            Some(0.25),
+            "another clip's export is not this page's"
+        );
+
+        drop(lib.update(
+            Message::ExportProgress {
+                src: named.path.clone(),
+                fraction: 0.5,
+            },
+            &config,
+        ));
+        assert_eq!(lib.export_progress, Some(0.5));
+
+        // Nor does a save that lands for some other clip clear what this one is showing.
+        drop(lib.update(
+            Message::TrimSaved {
+                src: plain.path.clone(),
+                mode: SaveMode::Copy,
+                cropped: true,
+                result: Ok(plain.path.clone()),
+            },
+            &config,
+        ));
+        assert_eq!(lib.export_progress, Some(0.5));
+        assert!(matches!(lib.trim, TrimState::Saving { cropped: true }));
+    }
+
+    #[test]
+    fn cancelling_an_export_aborts_the_task_that_runs_ffmpeg() {
+        let (mut lib, named, _) = named_library();
+        let config = Config::default();
+        lib.open = Some(named.path.clone());
+        lib.open_dims = Some(ULTRAWIDE);
+        lib.open_dur = 30.0;
+        lib.trim_end = 30.0;
+
+        drop(lib.start_crop_save(named.path.clone(), SaveMode::Overwrite, None, WIDE_CROP));
+        let watch = lib.export_abort.clone().expect("an abortable export");
+        assert!(matches!(lib.trim, TrimState::Saving { cropped: true }));
+
+        drop(lib.update(Message::ExportCancelled, &config));
+        assert!(watch.is_aborted(), "dropping the task is what kills ffmpeg");
+        assert!(matches!(lib.trim, TrimState::Idle));
+        assert_eq!(lib.export_progress, None);
+        assert!(lib.export_abort.is_none());
     }
 
     #[test]

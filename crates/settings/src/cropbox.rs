@@ -39,7 +39,6 @@ pub struct CropBox<'a, Message> {
     /// The preset lock, already resolved against the frame ratio (`None` is free-form).
     rect_ratio: Option<f32>,
     on_change: Box<dyn Fn(CropRect) -> Message + 'a>,
-    on_released: Option<Message>,
     on_reset: Option<Message>,
     on_tap: Option<Message>,
 }
@@ -48,6 +47,10 @@ pub struct CropBox<'a, Message> {
 struct Drag {
     /// `None` is a body move rather than an edge/corner resize.
     handle: Option<Handle>,
+    /// Where the press landed, and the rect it found: a body move is measured from these, so
+    /// it cannot drift or lose a step whatever order a frame's moves arrive in.
+    press: (f32, f32),
+    origin: CropRect,
     /// The previous pointer position, in fractions of the picture area.
     last: (f32, f32),
     /// Whether the pointer moved at all; a press that did not is a tap, not a drag.
@@ -60,9 +63,10 @@ struct State {
     /// Whether keyboard input edits this rect (gained by pressing the picture, lost by
     /// pressing elsewhere or Escape).
     focused: bool,
-    /// A keyboard nudge is in progress; its release goes out once, on key release, like a
-    /// drag end. Publishing it per press would re-run the caller's commit at key-repeat rate.
-    keys_engaged: bool,
+    /// The last rect this widget published. iced runs every event of a frame through `update`
+    /// before rebuilding the view, so `self.rect` is stale within a batch and each edit has to
+    /// build on this instead; cleared once the caller is certain to have caught up.
+    live: Option<CropRect>,
 }
 
 impl<'a, Message> CropBox<'a, Message> {
@@ -77,16 +81,9 @@ impl<'a, Message> CropBox<'a, Message> {
             frame,
             rect_ratio,
             on_change: Box::new(on_change),
-            on_released: None,
             on_reset: None,
             on_tap: None,
         }
-    }
-
-    /// Publish `message` when a drag, or a run of keyboard nudges, ends.
-    pub fn on_released(mut self, message: Message) -> Self {
-        self.on_released = Some(message);
-        self
     }
 
     /// Publish `message` when Escape is pressed while the overlay has keyboard focus.
@@ -108,32 +105,18 @@ impl<'a, Message> CropBox<'a, Message> {
         crop::contain_rect(self.frame, bounds)
     }
 
-    /// Publish a new rect, unless the edit changed nothing.
-    fn publish(&self, next: CropRect, shell: &mut Shell<'_, Message>) {
-        if next != self.rect {
+    /// Publish `next`, unless the edit changed nothing. Measured against the rect the edit was
+    /// built on, which within a batch is [`State::live`] rather than `self.rect`.
+    fn publish(&self, current: CropRect, next: CropRect, shell: &mut Shell<'_, Message>) {
+        if next != current {
             shell.publish((self.on_change)(next));
         }
     }
 
-    fn release(&self, shell: &mut Shell<'_, Message>)
-    where
-        Message: Clone,
-    {
-        if let Some(message) = &self.on_released {
-            shell.publish(message.clone());
-        }
-    }
-
-    /// Drop keyboard focus. An engaged nudge still publishes its release, so the caller's
-    /// commit-on-release logic never dangles.
-    fn unfocus(&self, state: &mut State, shell: &mut Shell<'_, Message>)
-    where
-        Message: Clone,
-    {
-        if state.keys_engaged {
-            state.keys_engaged = false;
-            self.release(shell);
-        }
+    /// Drop keyboard focus, and the working rect with it: the next edit starts from whatever
+    /// the caller has by then.
+    fn unfocus(&self, state: &mut State, shell: &mut Shell<'_, Message>) {
+        state.live = None;
         state.focused = false;
         shell.request_redraw();
     }
@@ -212,14 +195,17 @@ where
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 if let Some(pos) = cursor.position().filter(|p| contains(area, *p)) {
                     let frac = crop::point_fraction(area, pos);
+                    let current = state.live.unwrap_or(self.rect);
                     state.focused = true;
                     state.drag = Some(Drag {
                         handle: crop::hit_test_handle(
-                            self.rect,
+                            current,
                             frac,
                             (area.width, area.height),
                             GRAB,
                         ),
+                        press: frac,
+                        origin: current,
                         last: frac,
                         moved: false,
                     });
@@ -234,28 +220,37 @@ where
             // The event's own position, not the cursor's: a drag that wanders under a control
             // stacked above this layer arrives with a levitating (positionless) cursor.
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
-                let Some(drag) = state.drag.as_mut() else {
+                let Some(mut drag) = state.drag.take() else {
                     return;
                 };
                 let frac = crop::point_fraction(area, *position);
                 if frac != drag.last {
+                    let current = state.live.unwrap_or(self.rect);
                     let next = match drag.handle {
-                        Some(handle) => crop::resize_rect(self.rect, handle, frac, self.rect_ratio),
-                        None => {
-                            crop::move_rect(self.rect, frac.0 - drag.last.0, frac.1 - drag.last.1)
-                        }
+                        Some(handle) => crop::resize_rect(current, handle, frac, self.rect_ratio),
+                        // Measured from the press rather than the previous move: the whole
+                        // frame's moves reach `update` before the view rebuilds, so a delta
+                        // against a rect that has not caught up would keep only the last one.
+                        None => crop::move_rect(
+                            drag.origin,
+                            frac.0 - drag.press.0,
+                            frac.1 - drag.press.1,
+                        ),
                     };
                     drag.last = frac;
                     drag.moved = true;
-                    self.publish(next, shell);
+                    state.live = Some(next);
+                    self.publish(current, next, shell);
                 }
+                state.drag = Some(drag);
                 shell.capture_event();
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 if let Some(drag) = state.drag.take() {
-                    if drag.moved {
-                        self.release(shell);
-                    } else if let Some(message) = &self.on_tap {
+                    state.live = None;
+                    if !drag.moved
+                        && let Some(message) = &self.on_tap
+                    {
                         shell.publish(message.clone());
                     }
                     shell.capture_event();
@@ -282,34 +277,34 @@ where
                         let Some((dx, dy)) = nudge(named) else {
                             return;
                         };
+                        // Every nudge builds on the last one, so a held key's repeats add up
+                        // instead of collapsing into a single step.
+                        let current = state.live.unwrap_or(self.rect);
                         let next = if modifiers.shift() {
-                            // Shift resizes instead of moving, always from the south-east
-                            // corner, so the rect's origin stays where the user put it.
+                            // Shift resizes instead of moving: the south-east corner follows
+                            // the key and the north-west one stays put, ratio lock and all.
                             crop::resize_rect(
-                                self.rect,
+                                current,
                                 Handle::Se,
                                 (
-                                    self.rect.x + self.rect.width + dx,
-                                    self.rect.y + self.rect.height + dy,
+                                    current.x + current.width + dx,
+                                    current.y + current.height + dy,
                                 ),
                                 self.rect_ratio,
                             )
                         } else {
-                            crop::move_rect(self.rect, dx, dy)
+                            crop::move_rect(current, dx, dy)
                         };
-                        self.publish(next, shell);
-                        state.keys_engaged = true;
+                        state.live = Some(next);
+                        self.publish(current, next, shell);
                         shell.capture_event();
                     }
                     _ => {}
                 }
             }
-            Event::Keyboard(keyboard::Event::KeyReleased { .. })
-                if state.focused && state.keys_engaged =>
-            {
-                state.keys_engaged = false;
-                self.release(shell);
-                shell.capture_event();
+            // The run of nudges is over; the next one starts from what the caller has by then.
+            Event::Keyboard(keyboard::Event::KeyReleased { .. }) if state.focused => {
+                state.live = None;
             }
             _ => {}
         }
@@ -512,7 +507,6 @@ mod tests {
     #[derive(Clone, Debug, PartialEq)]
     enum Msg {
         Change(CropRect),
-        Released,
         Reset,
         Tap,
     }
@@ -586,7 +580,6 @@ mod tests {
         rect_ratio: Option<f32>,
     ) -> (CropBox<'static, Msg>, Tree) {
         let widget = CropBox::new(start, frame, rect_ratio, Msg::Change)
-            .on_released(Msg::Released)
             .on_reset(Msg::Reset)
             .on_tap(Msg::Tap);
         let tree = Tree {
@@ -672,7 +665,7 @@ mod tests {
         assert!(captured);
 
         let (msgs, captured) = drive(&mut widget, &mut tree, release(), at(200.0, 112.5));
-        assert_eq!(msgs, vec![Msg::Released]);
+        assert!(msgs.is_empty(), "a drag that moved is no tap: {msgs:?}");
         assert!(captured);
     }
 
@@ -710,6 +703,48 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_of_moves_keeps_the_whole_displacement() {
+        // iced runs every event of a frame through `update` before the view is rebuilt, so
+        // `self.rect` stays at the pressed rect for all three moves here. A delta measured
+        // against it would throw away everything but the last one.
+        let (mut widget, mut tree) = harness(rect(0.1, 0.1, 0.5, 0.5), (1920, 1080), None);
+        drive(&mut widget, &mut tree, press(), at(100.0, 100.0));
+
+        let mut last = None;
+        for x in [110.0, 120.0, 130.0] {
+            let (msgs, _) = drive(&mut widget, &mut tree, moved(x, 110.0), at(x, 110.0));
+            last = Some(only_change(&msgs));
+        }
+
+        let next = last.expect("three moves, three rects");
+        assert_near(next.x, 0.1 + 30.0 / W, 1e-4);
+        assert_near(next.y, 0.1 + 10.0 / H, 1e-4);
+        assert_near(next.width, 0.5, 1e-5);
+    }
+
+    #[test]
+    fn a_batch_of_nudges_keeps_every_step() {
+        let (mut widget, mut tree) = harness(rect(0.1, 0.1, 0.5, 0.5), (1920, 1080), None);
+        drive(&mut widget, &mut tree, press(), at(140.0, 78.0));
+        drive(&mut widget, &mut tree, release(), at(140.0, 78.0));
+
+        let away = mouse::Cursor::Unavailable;
+        let mut last = None;
+        for _ in 0..3 {
+            let (msgs, _) = drive(
+                &mut widget,
+                &mut tree,
+                key_press(Named::ArrowRight, Code::ArrowRight, Modifiers::default()),
+                away,
+            );
+            last = Some(only_change(&msgs));
+        }
+
+        let next = last.expect("three nudges, three rects");
+        assert_near(next.x, 0.1 + 3.0 * crop::STEP, 1e-5);
+    }
+
+    #[test]
     fn keyboard_edits_after_click_focus() {
         let (mut widget, mut tree) = harness(rect(0.1, 0.1, 0.5, 0.5), (1920, 1080), None);
 
@@ -729,7 +764,8 @@ mod tests {
         assert_near(next.width, 0.5, 1e-5);
         assert!(captured);
 
-        // Shift resizes from the south-east corner instead of moving.
+        // Shift resizes from the south-east corner instead of moving — of the rect the nudge
+        // above published, which is not the one the widget was built with.
         let (msgs, _) = drive(
             &mut widget,
             &mut tree,
@@ -738,16 +774,15 @@ mod tests {
         );
         let next = only_change(&msgs);
         assert_near(next.width, 0.5 - crop::STEP, 1e-5);
-        assert_near(next.x, 0.1, 1e-5);
+        assert_near(next.x, 0.1 + crop::STEP, 1e-5);
 
-        // The release goes out once, on key release, not per nudge.
         let (msgs, _) = drive(
             &mut widget,
             &mut tree,
             key_release(Named::ArrowLeft, Code::ArrowLeft),
             away,
         );
-        assert_eq!(msgs, vec![Msg::Released]);
+        assert!(msgs.is_empty(), "a key release edits nothing: {msgs:?}");
 
         let (msgs, captured) = drive(
             &mut widget,

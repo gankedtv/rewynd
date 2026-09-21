@@ -228,19 +228,28 @@ pub fn to_model(rect: CropRect) -> Option<CropRect> {
 }
 
 /// Absolute resize: the dragged edge follows the pointer and the opposite edge anchors.
+///
+/// A locked `rect_ratio` keeps the same anchor: the handle names the driving axis (E/W take the
+/// width from the pointer, N/S the height, a corner whichever of the two implies the bigger
+/// rect), the other axis follows the ratio, and the edges the handle does not drag stay put —
+/// an edge handle keeping the perpendicular axis centred where it was. A rect that would leave
+/// the frame shrinks toward that anchor instead of sliding it.
 pub fn resize_rect(
     rect: CropRect,
     handle: Handle,
     pointer: (f32, f32),
     rect_ratio: Option<f32>,
 ) -> CropRect {
+    let px = pointer.0.clamp(0.0, 1.0);
+    let py = pointer.1.clamp(0.0, 1.0);
+    if let Some(ratio) = usable_ratio(rect_ratio) {
+        return resize_locked(rect, handle, (px, py), ratio);
+    }
+
     let mut left = rect.x;
     let mut right = rect.x + rect.width;
     let mut top = rect.y;
     let mut bottom = rect.y + rect.height;
-
-    let px = pointer.0.clamp(0.0, 1.0);
-    let py = pointer.1.clamp(0.0, 1.0);
 
     if handle.moves_west() {
         left = px.min(right - MIN_CROP_EXTENT);
@@ -255,15 +264,91 @@ pub fn resize_rect(
         bottom = py.max(top + MIN_CROP_EXTENT);
     }
 
-    let next = clamp_rect(CropRect {
+    clamp_rect(CropRect {
         x: left,
         y: top,
         width: right - left,
         height: bottom - top,
-    });
-    match rect_ratio {
-        None => next,
-        Some(_) => clamp_rect(apply_rect_ratio(next, rect_ratio)),
+    })
+}
+
+/// The ratio-locked half of [`resize_rect`], solved for one number: the width, with the height
+/// following as `width / ratio`.
+fn resize_locked(rect: CropRect, handle: Handle, (px, py): (f32, f32), ratio: f32) -> CropRect {
+    let left = rect.x;
+    let right = rect.x + rect.width;
+    let top = rect.y;
+    let bottom = rect.y + rect.height;
+    let cx = rect.x + rect.width / 2.0;
+    let cy = rect.y + rect.height / 2.0;
+
+    let from_x = if handle.moves_east() {
+        Some(px - left)
+    } else if handle.moves_west() {
+        Some(right - px)
+    } else {
+        None
+    };
+    let from_y = if handle.moves_south() {
+        Some((py - top) * ratio)
+    } else if handle.moves_north() {
+        Some((bottom - py) * ratio)
+    } else {
+        None
+    };
+    let wanted = match (from_x, from_y) {
+        // A corner drags both axes: the bigger rect wins, so the pointer's dominant motion does.
+        (Some(x), Some(y)) => x.max(y),
+        (Some(v), None) | (None, Some(v)) => v,
+        (None, None) => rect.width,
+    };
+
+    // How much room the anchor leaves: a fixed edge to the frame's, or twice the shorter side
+    // of the old centre on an axis this handle does not drag.
+    let room_x = if handle.moves_east() {
+        1.0 - left
+    } else if handle.moves_west() {
+        right
+    } else {
+        2.0 * cx.min(1.0 - cx)
+    };
+    let room_y = if handle.moves_south() {
+        1.0 - top
+    } else if handle.moves_north() {
+        bottom
+    } else {
+        2.0 * cy.min(1.0 - cy)
+    };
+    let max_width = room_x.min(room_y * ratio);
+    let min_width = MIN_CROP_EXTENT.max(MIN_CROP_EXTENT * ratio);
+    let inside = |v: f32| (0.0..=1.0).contains(&v);
+    if !(inside(left) && inside(right) && inside(top) && inside(bottom)) || max_width < min_width {
+        // No rect of this shape fits against the anchor, which takes a rect that was already
+        // outside the frame (or thinner than the minimum) to reach.
+        return clamp_rect(apply_rect_ratio(rect, Some(ratio)));
+    }
+
+    let width = wanted.max(min_width).min(max_width);
+    let height = width / ratio;
+    let x = if handle.moves_east() {
+        left
+    } else if handle.moves_west() {
+        right - width
+    } else {
+        cx - width / 2.0
+    };
+    let y = if handle.moves_south() {
+        top
+    } else if handle.moves_north() {
+        bottom - height
+    } else {
+        cy - height / 2.0
+    };
+    CropRect {
+        x,
+        y,
+        width,
+        height,
     }
 }
 
@@ -307,13 +392,11 @@ fn even_px(v: f32) -> u32 {
     (v.round() as u32) / 2 * 2
 }
 
-/// Output pixel dimensions for a rect against a known source frame, even (yuv420p chroma
-/// alignment) and never zero.
+/// Output pixel dimensions for a rect against a known source frame: the size of the crop
+/// [`pixel_rect`] hands ffmpeg, so the readout cannot promise what the export will not write.
 pub fn output_size(rect: CropRect, frame_w: u32, frame_h: u32) -> (u32, u32) {
-    (
-        even_px(rect.width * frame_w as f32).max(2),
-        even_px(rect.height * frame_h as f32).max(2),
-    )
+    let pixels = pixel_rect(rect, frame_w, frame_h);
+    (pixels.width, pixels.height)
 }
 
 /// An integer crop rect in source pixels.
@@ -666,6 +749,89 @@ mod tests {
         let rect = resize_rect(FULL_FRAME, Handle::Se, (0.5, 0.9), rect_ratio);
 
         assert_near(rect.width / rect.height, rect_ratio.unwrap(), 1e-4);
+    }
+
+    /// 16:9 out of 3440x1440, the preset the anchoring tests below all drag.
+    fn wide_ratio() -> f32 {
+        Ratio::Wide16x9
+            .rect_ratio(ULTRAWIDE)
+            .expect("a locked ratio")
+    }
+
+    #[test]
+    fn a_locked_south_drag_shrinks_both_axes_and_keeps_the_top_edge() {
+        // Deriving the height from the width instead would leave an N/S drag doing nothing at
+        // all: the width never moved.
+        let ratio = wide_ratio();
+        let start = max_rect_for_ratio(Some(ratio));
+        let rect = resize_rect(start, Handle::S, (0.5, 0.8), Some(ratio));
+
+        assert_near(rect.height, 0.8, 1e-4);
+        assert!(rect.width < start.width, "{rect:?}");
+        assert_near(rect.y, start.y, 1e-4);
+        assert_near(rect.x + rect.width / 2.0, start.x + start.width / 2.0, 1e-4);
+        assert_near(rect.width / rect.height, ratio, 1e-4);
+    }
+
+    #[test]
+    fn a_locked_corner_drag_keeps_the_opposite_corner() {
+        let ratio = wide_ratio();
+        let start = max_rect_for_ratio(Some(ratio));
+        let rect = resize_rect(start, Handle::Nw, (0.3, 0.2), Some(ratio));
+
+        assert_near(rect.x + rect.width, start.x + start.width, 1e-4);
+        assert_near(rect.y + rect.height, start.y + start.height, 1e-4);
+        assert_near(rect.width / rect.height, ratio, 1e-4);
+    }
+
+    #[test]
+    fn a_locked_edge_drag_keeps_the_anchored_edge_and_the_centre() {
+        let ratio = wide_ratio();
+        let start = CropRect {
+            x: 0.1,
+            y: 0.1,
+            width: 0.5 * ratio,
+            height: 0.5,
+        };
+        let rect = resize_rect(start, Handle::E, (0.6, 0.35), Some(ratio));
+
+        assert_near(rect.x, start.x, 1e-4);
+        assert_near(rect.width, 0.5, 1e-4);
+        assert_near(
+            rect.y + rect.height / 2.0,
+            start.y + start.height / 2.0,
+            1e-4,
+        );
+        assert_near(rect.width / rect.height, ratio, 1e-4);
+    }
+
+    #[test]
+    fn a_locked_drag_past_the_frame_shrinks_instead_of_sliding_the_anchor() {
+        let ratio = wide_ratio();
+        let start = CropRect {
+            x: 0.1,
+            y: 0.1,
+            width: 0.5 * ratio,
+            height: 0.5,
+        };
+        let rect = resize_rect(start, Handle::Se, (5.0, 5.0), Some(ratio));
+
+        assert_near(rect.x, start.x, 1e-4);
+        assert_near(rect.y, start.y, 1e-4);
+        assert!(rect.x + rect.width <= 1.0001, "{rect:?}");
+        assert!(rect.y + rect.height <= 1.0001, "{rect:?}");
+        assert_near(rect.width / rect.height, ratio, 1e-4);
+    }
+
+    #[test]
+    fn a_locked_resize_stops_at_the_minimum_extent() {
+        let ratio = wide_ratio();
+        let start = max_rect_for_ratio(Some(ratio));
+        let rect = resize_rect(start, Handle::Se, (0.0, 0.0), Some(ratio));
+
+        assert!(rect.width >= MIN_CROP_EXTENT, "{rect:?}");
+        assert!(rect.height >= MIN_CROP_EXTENT, "{rect:?}");
+        assert_near(rect.width / rect.height, ratio, 1e-4);
     }
 
     #[test]
