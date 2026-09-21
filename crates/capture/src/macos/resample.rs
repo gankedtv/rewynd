@@ -129,7 +129,7 @@ mod tests {
         let mut out = Vec::new();
         r.process(&[0.0, 1.0, 0.0, 1.0], &mut out);
         // Left stays 0, right stays 1 through the interpolation.
-        for frame in out.chunks_exact(2) {
+        for frame in out.as_chunks::<2>().0 {
             assert!((frame[0] - 0.0).abs() < 1e-6);
             assert!((frame[1] - 1.0).abs() < 1e-6);
         }

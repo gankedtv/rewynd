@@ -165,7 +165,7 @@ pub(crate) fn deinterleave_uv(uv: &[u8], u: &mut Vec<u8>, v: &mut Vec<u8>) {
     v.clear();
     u.reserve(uv.len() / 2);
     v.reserve(uv.len() / 2);
-    for pair in uv.chunks_exact(2) {
+    for pair in uv.as_chunks::<2>().0 {
         u.push(pair[0]);
         v.push(pair[1]);
     }

@@ -367,7 +367,9 @@ mod tests {
         assert_eq!(pts, ms(10));
         assert_eq!(out.len(), 240 * 2);
         assert!(
-            out.chunks_exact(2)
+            out.as_chunks::<2>()
+                .0
+                .iter()
                 .all(|f| (f[0] - 0.5).abs() < 1e-6 && (f[1] + 0.5).abs() < 1e-6),
             "left stays left, right stays right"
         );

@@ -320,7 +320,9 @@ fn audio_loop(path: &Path, start: Duration, end: Duration, stop: &AtomicBool) {
             continue;
         }
         let samples: Vec<f32> = pending[..usable]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
         pending.drain(..usable);
@@ -374,7 +376,9 @@ pub fn waveform(path: &Path, buckets: usize) -> Option<Vec<f32>> {
     read?;
 
     let samples: Vec<f32> = bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]).abs())
         .collect();
     if samples.is_empty() || buckets == 0 {

@@ -76,7 +76,9 @@ fn decode_wav(bytes: &[u8]) -> Option<(Vec<f32>, u16, u32)> {
         } else if id == b"data" {
             samples = Some(
                 bytes[body..body + size]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|s| i16::from_le_bytes([s[0], s[1]]) as f32 / 32_768.0)
                     .collect::<Vec<f32>>(),
             );
