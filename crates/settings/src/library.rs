@@ -1735,7 +1735,8 @@ impl Library {
     /// The frame size the export would write: the crop's, or the whole source frame.
     fn output_size(&self) -> Option<(u32, u32)> {
         let (width, height) = self.frame_dims()?;
-        Some(crop::output_size(self.crop, width, height))
+        let rect = self.crop_model().unwrap_or(crop::FULL_FRAME);
+        Some(crop::output_size(rect, width, height))
     }
 
     /// The clip-store edits a saved copy needs, if this save makes one. A copy is a new file:
@@ -5038,6 +5039,11 @@ mod tests {
             ..crop::FULL_FRAME
         };
         assert_eq!(lib.crop_pixels(), None);
+        assert_eq!(
+            lib.output_size(),
+            Some(ULTRAWIDE),
+            "the readout follows the export"
+        );
 
         drop(lib.update(Message::CropPresetPicked(crop::Ratio::Wide16x9), &config));
         assert_eq!(lib.crop_pixels(), Some(WIDE_CROP));
