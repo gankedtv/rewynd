@@ -40,6 +40,21 @@ ignore = [
     "RUSTSEC-2024-0418", # gdk-sys
     "RUSTSEC-2024-0419", # gtk-sys
     "RUSTSEC-2024-0420", # gtk3-macros
+    # zip extraction keeping SUID/SGID bits (0367), following symlinks out of the destination
+    # (0368) and applying permissions through them (0369); fixed only in zip >= 9, which no
+    # stable velopack takes yet (1.2.x pins ^8.6). Its only input here is the update package
+    # from our own release feed, hash-checked against that feed: whoever can publish a crafted
+    # one can already ship any binary. Drop when a stable velopack moves to zip 9 (bump
+    # VPK_VERSION in release.yml with it).
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+    # zvariant, zvariant_derive and zbus_names unmaintained as standalone crates: zbus 6 folded
+    # them in. Linux-only, via zbus 5 under ashpd, ksni, notify-rust and our own portal code.
+    # Drop once those move to zbus 6 and we follow.
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
 ]
 
 [licenses]
