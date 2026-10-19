@@ -15,18 +15,24 @@ env:
   # Lockstep with the `velopack` crate pin in Cargo.toml — a crate/CLI mismatch breaks the
   # update protocol (see the release plan).
   VPK_VERSION: "1.2.0"
-  # The ffmpeg bundled beside our binaries (in-app playback decodes through a spawned ffmpeg;
-  # not every machine has one). Pinned to a BtbN monthly autobuild (kept for two years) with
-  # per-asset sha256, fetched by .github/scripts/fetch-ffmpeg.sh. GPL builds — the app is
-  # GPL-3.0-or-later. The Linux build's glibc floor (2.28) sits below the AppImage's 2.35.
-  # Bumping the pin (needed before the tag ages out): pick a newer end-of-month tag from
-  # BtbN/FFmpeg-Builds releases, take its release-branch (-gpl-N.N) linux64/win64 assets, and
-  # refresh the two sha256s from a local download.
+  # The ffmpeg bundled beside our binaries (in-app playback and crop export spawn it; not every
+  # machine has one), fetched with per-asset sha256 by .github/scripts/fetch-ffmpeg.sh. GPL
+  # builds with libx264 — the app is GPL-3.0-or-later.
+  # Linux/Windows: a BtbN monthly autobuild (kept for two years). The Linux build's glibc floor
+  # (2.28) sits below the AppImage's 2.35. Bumping (needed before the tag ages out): pick a newer
+  # end-of-month tag from BtbN/FFmpeg-Builds releases, take its release-branch (-gpl-N.N)
+  # linux64/win64 assets, and refresh the two sha256s from a local download.
+  # macOS: BtbN has no macOS builds, so a Martin Riedl static arm64 release build (only system
+  # frameworks linked, signed with his Developer ID). Bumping: pick the matching ffmpeg release
+  # from ffmpeg.martin-riedl.de/info/history/macos/arm64/release and take the build id and
+  # ffmpeg.zip sha256 from its download links.
   FFMPEG_TAG: autobuild-2026-06-30-13-34
   FFMPEG_LINUX_ASSET: ffmpeg-n8.1.2-21-gce3c09c101-linux64-gpl-8.1.tar.xz
   FFMPEG_LINUX_SHA256: 0ba73bbd93472c7622f6dec26d334c5e62e64d858d072490b2844320970456cd
   FFMPEG_WIN_ASSET: ffmpeg-n8.1.2-21-gce3c09c101-win64-gpl-8.1.zip
   FFMPEG_WIN_SHA256: 682361e32c9631caec09e5d9f09077101c9ed90c14e275f62014fefa6d397990
+  FFMPEG_MAC_BUILD: 1783011502_8.1.2
+  FFMPEG_MAC_SHA256: ef1aa60006c7b77ce170c1608c08d8e4ba1c30c5746f2ac986ded932d0ac2c3c
 
 jobs:
   # Same fmt/clippy/build/test + cargo-deny that gate every push, reused verbatim so packaging
@@ -222,6 +228,9 @@ jobs:
         run: |
           mkdir -p pack
           cp target/release/rewynd target/release/rewynd-recorder pack/
+          # Lands in Contents/MacOS beside the binaries, where the GUI looks first. vpk leaves
+          # it alone while the app is unsigned, so it keeps its own Developer ID signature.
+          bash .github/scripts/fetch-ffmpeg.sh macarm64 pack
           # Our own Info.plist (--plist, which excludes --bundleId: the plist carries the id):
           # Velopack's generated one has no NSMicrophoneUsageDescription, and macOS kills a
           # bundled process the moment it touches the microphone without it. vpk does not stamp

@@ -106,9 +106,8 @@ and libclang (for `pipewire-sys`/`libspa-sys` bindgen): on Debian/Ubuntu, `pkg-c
 libpipewire-0.3-dev clang libclang-dev cmake`. On macOS (Apple Silicon, macOS 15+) the
 Xcode Command Line Tools are the only other extra — capture and encode use the system
 ScreenCaptureKit/VideoToolbox frameworks. In-app clip playback and crop export in the
-library run through `ffmpeg`: the Linux and Windows installers bundle a copy beside the
-binaries, while dev builds and macOS use whatever `PATH` provides (`brew install ffmpeg`
-on macOS).
+library run through `ffmpeg`: releases bundle a copy beside the binaries on every
+platform, while dev builds use whatever `PATH` provides (`brew install ffmpeg` on macOS).
 
 ```sh
 cargo build

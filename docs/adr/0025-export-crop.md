@@ -23,8 +23,9 @@ output size. Save, Save as copy and Upload all apply it.
 ## Decision
 
 - **The crop is applied by the bundled ffmpeg, in one re-encode with the trim.** ffmpeg is
-  already shipped beside our binaries on Linux and Windows for in-app playback — a BtbN GPL
-  autobuild, so it carries libx264. The invocation (`export.rs`) is `-ss` *before* `-i` so the
+  shipped beside our binaries for in-app playback — a BtbN GPL autobuild on Linux and
+  Windows, a Martin Riedl static GPL build on macOS (BtbN has none) — so it carries libx264
+  on every platform. The invocation (`export.rs`) is `-ss` *before* `-i` so the
   re-encode makes the seek frame-accurate, `-t` after it for the kept length,
   `-vf crop=W:H:X:Y`, `-map 0:v:0 -map 0:a?` (a clip recorded with everything muted has no
   audio track and must still export), `libx264` at CRF 18 / preset `veryfast` with libx264's
@@ -64,11 +65,18 @@ output size. Save, Save as copy and Upload all apply it.
   same `player::ffmpeg_command`; no new crate, no wgpu, no encoder in the window's dependency
   tree (ADR 0006).
 
-- **macOS says so instead of failing.** No ffmpeg is bundled there, so the crop controls show
-  a "needs ffmpeg" state exactly as in-app playback already does — up front, not at the moment
-  someone hits Save. The bundled-or-`PATH` ffmpeg is re-probed every time a clip is opened
-  until one is found, so installing it while the app is open is enough; once found, the answer
-  is kept.
+- **macOS gets a bundled ffmpeg too.** The macOS release used to rely on a `PATH` ffmpeg,
+  which an app launched from Finder or the Dock never sees: launchd's `PATH` has no
+  `/opt/homebrew/bin`. So the release now ships the same ffmpeg release in `Contents/MacOS`,
+  where `player::ffmpeg_command` already looks first. The build links only system
+  frameworks and carries its builder's Developer ID signature, which vpk leaves alone while
+  our bundle is unsigned.
+
+- **A machine without ffmpeg says so instead of failing.** Dev builds and distro packages
+  still use the `PATH` ffmpeg, so the crop controls show a "needs ffmpeg" state exactly as
+  in-app playback already does — up front, not at the moment someone hits Save. The
+  bundled-or-`PATH` ffmpeg is re-probed every time a clip is opened until one is found, so
+  installing it while the app is open is enough; once found, the answer is kept.
 
 - **The overlay is drawn, not shaded.** Scrims and handles are painted over the full
   letterboxed frame using `crop::contain_rect`, the same contain fit the video shader uses, so
@@ -96,7 +104,9 @@ output size. Save, Save as copy and Upload all apply it.
 
 - Crop makes ffmpeg a hard dependency for that one action, where playback only degrades to the
   system player without it. The AUR package already depends on `ffmpeg`; the installers
-  already bundle it.
+  bundle it on all three platforms.
+- The macOS download grows by the ffmpeg binary (about 65 MB unpacked), as the Linux and
+  Windows ones already did.
 - A crop export costs real time on a long clip — it is an encode, not a copy. ffmpeg's
   `-progress pipe:1` drives a progress bar, and the Cancel beside it drops the task, which
   kills ffmpeg and removes the partial file.
