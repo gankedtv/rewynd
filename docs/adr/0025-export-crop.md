@@ -108,8 +108,12 @@ output size. Save, Save as copy and Upload all apply it.
 - The macOS download grows by the ffmpeg binary (about 65 MB unpacked), as the Linux and
   Windows ones already did.
 - A crop export costs real time on a long clip — it is an encode, not a copy. ffmpeg's
-  `-progress pipe:1` drives a progress bar, and the Cancel beside it drops the task, which
-  kills ffmpeg and removes the partial file.
+  `-progress pipe:1` drives a progress bar, and the Cancel beside it raises a flag the worker
+  polls, so ffmpeg is killed and the partial file removed even while ffmpeg prints nothing
+  (its faststart pass). Every export writes a hidden temp and renames it into place, over the
+  clip or to the copy's name, so a half-written file never shows in the library. One crop
+  save runs at a time; a crop save on another clip waits for it (an upload's crop is its own
+  throwaway encode and does not).
 - Exported clips get their library thumbnail from openh264 decoding libx264's output. High
   profile decodes today; `VideoQuality.profile` is the escape hatch if a future build of
   either disagrees.

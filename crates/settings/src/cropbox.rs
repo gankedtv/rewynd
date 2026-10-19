@@ -283,15 +283,7 @@ where
                         let next = if modifiers.shift() {
                             // Shift resizes instead of moving: the south-east corner follows
                             // the key and the north-west one stays put, ratio lock and all.
-                            crop::resize_rect(
-                                current,
-                                Handle::Se,
-                                (
-                                    current.x + current.width + dx,
-                                    current.y + current.height + dy,
-                                ),
-                                self.rect_ratio,
-                            )
+                            crop::nudge_size(current, dx, dy, self.rect_ratio)
                         } else {
                             crop::move_rect(current, dx, dy)
                         };

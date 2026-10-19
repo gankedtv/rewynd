@@ -367,6 +367,23 @@ fn resize_locked(rect: CropRect, handle: Handle, (px, py): (f32, f32), ratio: f3
     }
 }
 
+/// Keyboard resize: the south-east corner moves by `(dx, dy)` and the north-west one stays put.
+/// Under a ratio lock the pressed axis drives and the other follows; handing the corner one
+/// unmoved axis would let that axis veto every step that grows the rect.
+pub fn nudge_size(rect: CropRect, dx: f32, dy: f32, rect_ratio: Option<f32>) -> CropRect {
+    let (dx, dy) = match usable_ratio(rect_ratio) {
+        Some(ratio) if dx != 0.0 => (dx, dx / ratio),
+        Some(ratio) => (dy * ratio, dy),
+        None => (dx, dy),
+    };
+    resize_rect(
+        rect,
+        Handle::Se,
+        (rect.x + rect.width + dx, rect.y + rect.height + dy),
+        rect_ratio,
+    )
+}
+
 /// Delta-based move, deliberately: an absolute move would teleport the rect's centre to the
 /// pointer the instant someone presses on the picture.
 pub fn move_rect(rect: CropRect, dx: f32, dy: f32) -> CropRect {
@@ -1388,5 +1405,54 @@ mod tests {
             point_fraction(degenerate, iced::Point::new(9.0, 9.0)),
             (0.0, 0.0)
         );
+    }
+
+    #[test]
+    fn a_locked_keyboard_resize_grows_and_shrinks_on_either_axis() {
+        let ratio = Ratio::Wide16x9.rect_ratio(ULTRAWIDE);
+        let start = apply_rect_ratio(
+            CropRect {
+                x: 0.1,
+                y: 0.1,
+                width: 0.4,
+                height: 0.4,
+            },
+            ratio,
+        );
+        let r = ratio.expect("a locked ratio");
+        for (dx, dy, grows) in [
+            (STEP, 0.0, true),
+            (0.0, STEP, true),
+            (-STEP, 0.0, false),
+            (0.0, -STEP, false),
+        ] {
+            let next = nudge_size(start, dx, dy, ratio);
+            assert_eq!(
+                next.width > start.width,
+                grows,
+                "({dx}, {dy}) moved the width from {} to {}",
+                start.width,
+                next.width
+            );
+            assert_near(next.width / next.height, r, 1e-4);
+            assert_near(next.x, start.x, EPS);
+            assert_near(next.y, start.y, EPS);
+        }
+    }
+
+    #[test]
+    fn a_free_keyboard_resize_moves_only_the_pressed_axis() {
+        let start = CropRect {
+            x: 0.1,
+            y: 0.1,
+            width: 0.4,
+            height: 0.3,
+        };
+        let wider = nudge_size(start, STEP, 0.0, None);
+        assert_near(wider.width, 0.4 + STEP, EPS);
+        assert_near(wider.height, 0.3, EPS);
+        let taller = nudge_size(start, 0.0, STEP, None);
+        assert_near(taller.width, 0.4, EPS);
+        assert_near(taller.height, 0.3 + STEP, EPS);
     }
 }

@@ -5,15 +5,17 @@
 //! it has one). Audio is copied through untouched — and mapped optionally, because a clip
 //! recorded with everything muted has no audio track at all and must still export.
 //!
-//! [`run`] blocks; [`stream`] is the same work as UI events, cancelled by dropping the stream
-//! (the dead channel stops the worker, which kills ffmpeg) exactly like the preview's decode
-//! loop.
+//! [`run`] blocks; [`stream`] is the same work as UI events. Both stop when their `cancel` flag
+//! is raised, and the stream also when it is dropped, exactly like the preview's decode loop:
+//! ffmpeg is killed and the partial file removed.
 
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use iced::futures::Stream;
@@ -24,6 +26,11 @@ use crate::player;
 /// Smallest crop ffmpeg will take: yuv420p subsamples chroma 2x2, so a side below this has no
 /// chroma sample to encode.
 const MIN_CROP: u32 = 2;
+
+/// How often a running export looks for a cancel. ffmpeg can go quiet for a long while (its
+/// faststart pass rewrites the whole file after the last progress line), so this is polled
+/// rather than checked between progress lines.
+const CANCEL_POLL: Duration = Duration::from_millis(50);
 
 /// How much of ffmpeg's stderr a failure carries back to the UI.
 const TAIL_LINES: usize = 3;
@@ -89,6 +96,8 @@ pub enum Error {
         stderr_tail: String,
     },
     Io(std::io::Error),
+    /// The export was stopped before it finished.
+    Cancelled,
 }
 
 impl fmt::Display for Error {
@@ -105,6 +114,7 @@ impl fmt::Display for Error {
                 stderr_tail,
             } => write!(f, "ffmpeg failed: {stderr_tail}"),
             Self::Io(e) => e.fmt(f),
+            Self::Cancelled => f.write_str("The export was cancelled."),
         }
     }
 }
@@ -131,21 +141,26 @@ pub fn args(spec: &Spec) -> Result<Vec<OsString>, Error> {
     argv(spec, false)
 }
 
-/// Run `spec` to completion. Blocking; a failed export leaves no half-written `dst` behind.
-pub fn run(spec: &Spec) -> Result<(), Error> {
-    let argv = args(spec)?;
-    let mut child = spawn(&argv, Stdio::null())?;
-    let mut stderr = Vec::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_end(&mut stderr);
-    }
-    let status = child.wait().map_err(Error::Io)?;
-    finish(status, &stderr, &spec.dst)
+/// Run `spec` to completion. Blocking; a failed or cancelled export leaves no half-written
+/// `dst` behind.
+pub fn run(spec: &Spec, cancel: &AtomicBool) -> Result<(), Error> {
+    encode(
+        spec,
+        &args(spec)?,
+        Duration::ZERO,
+        &|| cancel.load(Ordering::Relaxed),
+        |_| {},
+    )
 }
 
 /// Run `spec` as UI events: [`Event::Progress`] against `total` (the exported length), then one
-/// [`Event::Done`]. Dropping the stream cancels the export and removes the partial file.
-pub fn stream(spec: Spec, total: Duration) -> impl Stream<Item = Event> + Send {
+/// [`Event::Done`]. Raising `cancel` or dropping the stream stops the export and removes the
+/// partial file.
+pub fn stream(
+    spec: Spec,
+    total: Duration,
+    cancel: Arc<AtomicBool>,
+) -> impl Stream<Item = Event> + Send {
     iced::stream::channel(
         4,
         move |mut output: iced::futures::channel::mpsc::Sender<Event>| async move {
@@ -156,7 +171,19 @@ pub fn stream(spec: Spec, total: Duration) -> impl Stream<Item = Event> + Send {
                 // A panic mid-export must still produce the terminal event: without one the UI
                 // would sit on its progress bar forever.
                 let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    export_loop(&spec, total, &tx);
+                    let result = argv(&spec, true).and_then(|argv| {
+                        let progress = tx.clone();
+                        encode(
+                            &spec,
+                            &argv,
+                            total,
+                            &|| cancel.load(Ordering::Relaxed) || tx.is_closed(),
+                            move |fraction| {
+                                let _ = progress.blocking_send(Event::Progress(fraction));
+                            },
+                        )
+                    });
+                    report(&tx, result, &spec.dst);
                 }));
                 if run.is_err() {
                     tracing::error!("crop export panicked");
@@ -243,13 +270,13 @@ fn seconds(d: Duration) -> String {
     format!("{:.3}", d.as_secs_f64())
 }
 
-/// Spawn ffmpeg with `argv`: no stdin, stderr piped for the failure tail, stdout as asked.
-fn spawn(argv: &[OsString], stdout: Stdio) -> Result<Child, Error> {
+/// Spawn ffmpeg with `argv`: no stdin, stderr piped for the failure tail, stdout for progress.
+fn spawn(argv: &[OsString]) -> Result<Child, Error> {
     let mut command = player::ffmpeg_command();
     command
         .args(argv)
         .stdin(Stdio::null())
-        .stdout(stdout)
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     player::hide_console(&mut command);
     command.spawn().map_err(|e| match e.kind() {
@@ -258,52 +285,56 @@ fn spawn(argv: &[OsString], stdout: Stdio) -> Result<Child, Error> {
     })
 }
 
-/// Spawn, pump progress, and report. Emits exactly one [`Event::Done`] unless the receiver went
-/// away, which means the export was cancelled and nobody is left to tell.
-fn export_loop(spec: &Spec, total: Duration, tx: &tokio::sync::mpsc::Sender<Event>) {
-    let argv = match argv(spec, true) {
-        Ok(argv) => argv,
-        Err(e) => {
-            let _ = tx.blocking_send(Event::Done(Err(e)));
-            return;
-        }
-    };
-    let mut child = match spawn(&argv, Stdio::piped()) {
-        Ok(child) => child,
-        Err(e) => {
-            let _ = tx.blocking_send(Event::Done(Err(e)));
-            return;
-        }
-    };
-    // stderr drains on its own thread: a failing ffmpeg can fill that pipe and deadlock while
-    // this thread is still waiting on progress lines.
-    let pipe = child.stderr.take();
-    let drain = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_end(&mut bytes);
-        }
-        bytes
-    });
-
-    let live = match child.stdout.take() {
-        Some(stdout) => pump_progress(stdout, total, tx),
-        None => true,
-    };
-    if !live {
-        let _ = child.kill();
-    }
-    let status = child.wait();
-    let stderr = drain.join().unwrap_or_default();
-    if !live {
-        let _ = std::fs::remove_file(&spec.dst);
-        return;
-    }
-    let result = match status {
-        Ok(status) => finish(status, &stderr, &spec.dst),
-        Err(e) => Err(Error::Io(e)),
-    };
-    report(tx, result, &spec.dst);
+/// Spawn ffmpeg with `argv` and wait for it, killing it (and removing the partial `dst`) as
+/// soon as `cancelled` says so. `progress` hears every rising fraction of `total`.
+fn encode(
+    spec: &Spec,
+    argv: &[OsString],
+    total: Duration,
+    cancelled: &(dyn Fn() -> bool + Sync),
+    progress: impl FnMut(f32) + Send,
+) -> Result<(), Error> {
+    let mut child = spawn(argv)?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    std::thread::scope(|scope| {
+        // Both pipes drain on their own threads, so this one is free to watch for a cancel, and
+        // a failing ffmpeg cannot fill its stderr pipe and deadlock against the progress reads.
+        let drain = scope.spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = stderr {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        });
+        let pump = scope.spawn(move || {
+            if let Some(stdout) = stdout {
+                pump_progress(stdout, total, progress);
+            }
+        });
+        let status = loop {
+            let stopped = if cancelled() {
+                Error::Cancelled
+            } else {
+                match child.try_wait() {
+                    Ok(Some(status)) => break status,
+                    Ok(None) => {
+                        std::thread::sleep(CANCEL_POLL);
+                        continue;
+                    }
+                    Err(e) => Error::Io(e),
+                }
+            };
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&spec.dst);
+            return Err(stopped);
+        };
+        // Every progress line is out before the outcome is.
+        let _ = pump.join();
+        let stderr = drain.join().unwrap_or_default();
+        finish(status, &stderr, &spec.dst)
+    })
 }
 
 /// Hand the outcome to the UI, or clear `dst` when nobody is left to take it: the export was
@@ -315,13 +346,8 @@ fn report(tx: &tokio::sync::mpsc::Sender<Event>, result: Result<(), Error>, dst:
     }
 }
 
-/// Forward rising progress until ffmpeg's stdout ends. `false` means the receiver is gone (the
-/// export was cancelled).
-fn pump_progress(
-    stdout: impl Read,
-    total: Duration,
-    tx: &tokio::sync::mpsc::Sender<Event>,
-) -> bool {
+/// Forward rising progress until ffmpeg's stdout ends.
+fn pump_progress(stdout: impl Read, total: Duration, mut progress: impl FnMut(f32)) {
     let mut last = 0.0;
     for line in BufReader::new(stdout).lines().map_while(Result::ok) {
         let Some(fraction) = progress_of(&line, total) else {
@@ -331,11 +357,8 @@ fn pump_progress(
             continue;
         }
         last = fraction;
-        if tx.blocking_send(Event::Progress(fraction)).is_err() {
-            return false;
-        }
+        progress(fraction);
     }
-    true
 }
 
 /// The fraction of `total` one `-progress` line reports, or `None` when it carries no position.
@@ -685,7 +708,7 @@ mod tests {
             },
             video: VideoQuality::DEFAULT,
         };
-        run(&spec).expect("the export runs");
+        run(&spec, &AtomicBool::new(false)).expect("the export runs");
 
         let summary = rewynd_mux::read::clip_summary(&dst).expect("a readable MP4");
         assert_eq!((summary.width, summary.height), (320, 180));
@@ -711,6 +734,59 @@ mod tests {
             ]),
             "the Opus track was copied through"
         );
+    }
+
+    #[test]
+    #[ignore = "needs ffmpeg on PATH"]
+    fn a_raised_cancel_stops_a_running_export_and_clears_its_output() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("in.mp4");
+        // Long and large enough that the encode is still going when the flag goes up.
+        assert!(ffmpeg(&[
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=1920x1080:rate=60",
+            "-t",
+            "20",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            &src.to_string_lossy(),
+        ]));
+        let dst = dir.path().join("out.tmp");
+        let spec = Spec {
+            src,
+            dst: dst.clone(),
+            range: None,
+            crop: PixelRect {
+                x: 0,
+                y: 0,
+                width: 1440,
+                height: 1080,
+            },
+            video: VideoQuality::DEFAULT,
+        };
+        let cancel = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                cancel.store(true, Ordering::Relaxed);
+            });
+            run(&spec, &cancel)
+        });
+        assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "stopped within a poll, not at the end of the encode: {:?}",
+            started.elapsed()
+        );
+        assert!(!dst.exists(), "a cancelled export leaves nothing behind");
     }
 
     /// A 2 s colour-bars clip with an Opus tone, i.e. a stand-in for a recorded clip.

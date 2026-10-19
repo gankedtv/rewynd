@@ -372,16 +372,17 @@ enum TrimState {
     Failed(String),
 }
 
-/// The crop export in flight. Identified by its clip, because it outlives the page that started
-/// it: a save someone asked for finishes even if they open another clip meanwhile, and only a
-/// message about this same `src` may clear it.
+/// The crop export in flight; there is at most one. Identified by its clip, because it outlives
+/// the page that started it: a save someone asked for finishes even if they open another clip
+/// meanwhile, and only that clip's [`Message::TrimSaved`] clears it — the task always sends
+/// one, cancelled or not, so the slot never outlives the work.
 struct RunningExport {
     src: PathBuf,
-    /// Dropping the task kills ffmpeg and clears the partial file.
-    abort: iced::task::Handle,
-    /// Cancel's other half: the finishing rename runs on a blocking task the abort cannot
-    /// reach, so it reads this before touching the original.
+    /// Cancel: the worker kills ffmpeg and clears the partial file, and the finishing move
+    /// leaves the clip alone.
     cancelled: Arc<AtomicBool>,
+    /// The last progress it reported, so a page reopened mid-encode picks the bar back up.
+    progress: f32,
 }
 
 pub struct Library {
@@ -450,6 +451,8 @@ pub struct Library {
     export_progress: Option<f32>,
     /// The crop export currently running, if any.
     export: Option<RunningExport>,
+    /// The clips a lossless save is still writing: like an export, it outlives its page.
+    trims: Vec<PathBuf>,
     trim: TrimState,
     /// Play / show-in-folder / delete failure for the open clip.
     action_error: Option<String>,
@@ -535,6 +538,7 @@ impl Library {
             ffmpeg: None,
             export_progress: None,
             export: None,
+            trims: Vec::new(),
             trim: TrimState::Idle,
             action_error: None,
             title: String::new(),
@@ -735,9 +739,16 @@ impl Library {
                 // A clip reopened mid-encode is still being written: the panel goes back to
                 // showing that, so Save stays out of reach and no second export can race the
                 // first one into the same temp.
-                let encoding = self.export.as_ref().is_some_and(|e| e.src == path);
-                if encoding {
+                let encoding = self
+                    .export
+                    .as_ref()
+                    .filter(|e| e.src == path && !e.cancelled.load(Ordering::Relaxed));
+                if let Some(export) = encoding {
                     self.trim = TrimState::Saving { cropped: true };
+                    self.export_progress = Some(export.progress);
+                } else if self.trims.contains(&path) {
+                    self.trim = TrimState::Saving { cropped: false };
+                    self.export_progress = None;
                 } else {
                     self.trim = TrimState::Idle;
                     self.export_progress = None;
@@ -812,6 +823,12 @@ impl Library {
             Message::DeleteCancelled => self.confirm_delete = false,
             Message::DeleteConfirmed => {
                 self.confirm_delete = false;
+                // A save still writing this clip would put it back the moment it lands.
+                if self.saving_open_clip() {
+                    self.action_error =
+                        Some("The clip is still being saved; delete it once that is done.".into());
+                    return Task::none();
+                }
                 let Some(path) = self.open.clone() else {
                     return Task::none();
                 };
@@ -895,21 +912,22 @@ impl Library {
                 // The trim may finish after the user opened another clip; only stamp the result on
                 // its own detail page. The rescan still runs so the new clip shows up regardless.
                 let current = self.open.as_deref() == Some(src.as_path());
-                // The handle belongs to the export that just reported, whichever clip is open
-                // now: clearing it by page would drop a live handle for another clip.
-                if self.export.as_ref().is_some_and(|e| e.src == src) {
-                    self.export = None;
+                // The slot belongs to the export that just reported, whichever clip is open now:
+                // clearing it by page would drop a live export for another clip.
+                let export = self.export.take_if(|e| cropped && e.src == src);
+                if !cropped && let Some(i) = self.trims.iter().position(|p| *p == src) {
+                    self.trims.swap_remove(i);
                 }
-                // A cancel already put the panel back; whatever the task says after that is
-                // not news, neither as a banner nor as a failure.
-                let waiting = current && matches!(self.trim, TrimState::Saving { .. });
+                // A cancel already put the panel back, so the refusal that follows it is not
+                // news. A save that beat the cancel to the rename did happen, though, and says so.
+                let cancelled = export.is_some_and(|e| e.cancelled.load(Ordering::Relaxed));
                 if current {
                     self.export_progress = None;
                 }
                 match result {
                     Ok(path) => {
                         let overwrite = matches!(mode, SaveMode::Overwrite);
-                        if waiting {
+                        if current {
                             self.trim = TrimState::Saved {
                                 overwrite,
                                 cropped,
@@ -924,7 +942,7 @@ impl Library {
                         }
                         return Task::batch(tasks);
                     }
-                    Err(e) if waiting => {
+                    Err(e) if current && !cancelled => {
                         let what = if cropped { "cropped" } else { "trimmed" };
                         self.trim =
                             TrimState::Failed(format!("Could not save the {what} clip: {e}"));
@@ -1220,25 +1238,28 @@ impl Library {
                 self.clear_save_banner();
             }
             Message::ExportProgress { src, fraction } => {
+                let fraction = fraction.clamp(0.0, 1.0);
+                if let Some(export) = self.export.as_mut().filter(|e| e.src == src) {
+                    export.progress = fraction;
+                }
                 // Only the export this page is waiting for: one left running on another clip
                 // must not drive the bar here.
                 if self.open.as_deref() == Some(src.as_path())
                     && matches!(self.trim, TrimState::Saving { .. })
                 {
-                    self.export_progress = Some(fraction.clamp(0.0, 1.0));
+                    self.export_progress = Some(fraction);
                 }
             }
             Message::ExportCancelled => {
                 // The Cancel button belongs to the export this page is showing; one left
-                // running on another clip keeps going.
-                let running = self
+                // running on another clip keeps going. The export keeps its slot until its
+                // task reports, which it does within a poll of the flag.
+                if let Some(export) = self
                     .export
-                    .take_if(|e| Some(e.src.as_path()) == self.open.as_deref());
-                if let Some(export) = running {
-                    // Dropping the task kills ffmpeg, which clears the partial file; the flag
-                    // stops the finishing rename, which a drop cannot reach.
+                    .as_ref()
+                    .filter(|e| Some(e.src.as_path()) == self.open.as_deref())
+                {
                     export.cancelled.store(true, Ordering::Relaxed);
-                    export.abort.abort();
                     self.trim = TrimState::Idle;
                     self.export_progress = None;
                 }
@@ -1687,6 +1708,17 @@ impl Library {
         crop::to_model(self.crop)
     }
 
+    /// Whether a save is still writing the open clip: its panel says so, or its task has not
+    /// reported yet (a cancelled export keeps its slot until ffmpeg is gone).
+    fn saving_open_clip(&self) -> bool {
+        let Some(open) = self.open.as_deref() else {
+            return false;
+        };
+        matches!(self.trim, TrimState::Saving { .. })
+            || self.export.as_ref().is_some_and(|e| e.src == open)
+            || self.trims.iter().any(|p| p == open)
+    }
+
     /// The crop ffmpeg would get, once both the rect and the frame it is measured against are
     /// known.
     fn crop_pixels(&self) -> Option<crop::PixelRect> {
@@ -1729,6 +1761,7 @@ impl Library {
         end: Duration,
     ) -> Task<Message> {
         self.trim = TrimState::Saving { cropped: false };
+        self.trims.push(src.clone());
         let copy_edits = self.copy_edits(&src, mode);
         let work_src = src.clone();
         Task::perform(
@@ -1761,14 +1794,17 @@ impl Library {
         range: Option<(Duration, Duration)>,
         crop: crop::PixelRect,
     ) -> Task<Message> {
+        // One encode at a time: the slot is how Cancel, the progress bar and a reopened page
+        // find it, and a second one would leave the first beyond their reach.
+        if self.export.is_some() {
+            return Task::none();
+        }
         let spec = export::Spec {
             src: src.clone(),
-            dst: match mode {
-                SaveMode::Copy => unique_copy_path(&src, "crop"),
-                // Written beside the clip, then renamed over it, so a failed encode leaves the
-                // original untouched.
-                SaveMode::Overwrite => overwrite_temp_path(&src),
-            },
+            // Either way the encode goes to a hidden temp beside the clip and is renamed into
+            // place once whole: over the clip, or to the copy's name. A half-written file
+            // never shows up in the library, and a failed one leaves the original untouched.
+            dst: save_temp_path(&src),
             range,
             crop,
             video: export::VideoQuality::DEFAULT,
@@ -1782,24 +1818,14 @@ impl Library {
         self.trim = TrimState::Saving { cropped: true };
         self.export_progress = Some(0.0);
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (task, abort) = Task::stream(crop_export(
-            src.clone(),
-            mode,
-            spec,
-            total,
-            copy_edits,
-            Arc::clone(&cancelled),
-        ))
-        .abortable();
-        // A plain handle, like the upload's: a save someone asked for finishes even if they
-        // open another clip meanwhile. Only Cancel stops it (which kills ffmpeg and clears
-        // the partial file).
+        // A save someone asked for finishes even if they open another clip meanwhile. Only
+        // Cancel stops it.
         self.export = Some(RunningExport {
-            src,
-            abort,
-            cancelled,
+            src: src.clone(),
+            cancelled: Arc::clone(&cancelled),
+            progress: 0.0,
         });
-        task
+        Task::stream(crop_export(src, mode, spec, total, copy_edits, cancelled))
     }
 
     /// Kick off the upload for the open clip: the client is built from the config at click
@@ -2887,7 +2913,9 @@ impl Library {
         ]
         .spacing(14);
 
-        let busy = matches!(self.trim, TrimState::Saving { .. });
+        // A crop waits for another clip's encode to finish: there is one export slot.
+        let queued = cropping && self.export.is_some();
+        let busy = self.saving_open_clip() || queued;
         let changed = start > TRIM_EPSILON || end < dur - TRIM_EPSILON;
         let ready = save_ready(busy, length, changed, cropping);
         let mut save = button(text("Save").size(13).font(UI_BOLD))
@@ -2910,6 +2938,9 @@ impl Library {
         );
 
         let panel = match &self.trim {
+            TrimState::Idle if queued && !self.saving_open_clip() => panel.push(hint(
+                "Another clip is still encoding; save this crop once it is done.",
+            )),
             TrimState::Idle => panel,
             // Only the encode is worth offering a way out of: the lossless cut is a copy that
             // is over before a button could be pressed.
@@ -3018,8 +3049,9 @@ impl Library {
                 .on_press(Message::ShowInFolder)
                 .style(secondary_button)
                 .padding([9, 14]),
+            // Deleting under a running save would see the save put the clip back.
             button(text("Delete").size(11).font(UI_SEMIBOLD))
-                .on_press(Message::DeleteRequested)
+                .on_press_maybe((!self.saving_open_clip()).then_some(Message::DeleteRequested))
                 .style(theme::danger_outline_button)
                 .padding([9, 14]),
         ]
@@ -3832,14 +3864,21 @@ fn unique_copy_path(src: &Path, suffix: &str) -> PathBuf {
     candidate
 }
 
-/// A sibling temp path in `src`'s directory (so the replace is a same-filesystem, atomic rename).
-fn overwrite_temp_path(src: &Path) -> PathBuf {
-    // Unique per attempt: two saves of one clip writing the same temp would interleave into a
-    // single file, which then gets renamed over the original.
+/// The temp a save writes before renaming it into place, in `src`'s directory (so the rename is
+/// a same-filesystem, atomic one).
+fn save_temp_path(src: &Path) -> PathBuf {
+    sibling_temp_path(src, SAVE_TEMP_MARK)
+}
+
+/// A hidden, `.tmp`-suffixed sibling of `src` (the clip store lists `rewynd-*.mp4`, so it never
+/// shows one), tagged with `mark` for [`sweep_temps_in`].
+fn sibling_temp_path(src: &Path, mark: &str) -> PathBuf {
+    // Unique per attempt: two saves or uploads writing one temp would interleave into a single
+    // file, which then gets renamed over the original or sent.
     static ATTEMPT: AtomicU32 = AtomicU32::new(0);
     let n = ATTEMPT.fetch_add(1, Ordering::Relaxed);
     let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("clip");
-    src.with_file_name(format!(".{name}.trimming.{}-{n}.tmp", std::process::id()))
+    src.with_file_name(format!(".{name}{mark}{}-{n}.tmp", std::process::id()))
 }
 
 /// Trim `src` to `[start, end]`. [`SaveMode::Copy`] writes a fresh sibling file and returns it;
@@ -3851,6 +3890,9 @@ fn save_trim(
     start: Duration,
     end: Duration,
 ) -> Result<PathBuf, String> {
+    if let Some(dir) = src.parent() {
+        sweep_temps_in(dir, SystemTime::now());
+    }
     match mode {
         SaveMode::Copy => {
             let dst = unique_copy_path(src, "trim");
@@ -3859,7 +3901,7 @@ fn save_trim(
                 .map_err(|e| e.to_string())
         }
         SaveMode::Overwrite => {
-            let temp = overwrite_temp_path(src);
+            let temp = save_temp_path(src);
             let result = rewynd_mux::read::trim_clip(src, &temp, start, end)
                 .map_err(|e| e.to_string())
                 .and_then(|_| std::fs::rename(&temp, src).map_err(|e| e.to_string()))
@@ -3902,7 +3944,8 @@ fn edit_plan(trim: Option<(Duration, Duration)>, crop: Option<crop::PixelRect>) 
 const EXPORT_CANCELLED: &str = "the export was cancelled";
 
 /// One crop export as UI messages: ffmpeg's progress while it runs, then the finishing move
-/// (naming a copy, or swapping the temp in over the original) as one [`Message::TrimSaved`].
+/// (renaming the temp to the copy's name, or over the original) as one [`Message::TrimSaved`],
+/// which comes even when the export was cancelled or failed.
 fn crop_export(
     src: PathBuf,
     mode: SaveMode,
@@ -3917,7 +3960,13 @@ fn crop_export(
             use iced::futures::{SinkExt, StreamExt};
 
             let dst = spec.dst.clone();
-            let mut events = std::pin::pin!(export::stream(spec, total));
+            if let Some(dir) = src.parent().map(Path::to_path_buf) {
+                let _ = tokio::task::spawn_blocking(move || {
+                    sweep_temps_in(&dir, SystemTime::now());
+                })
+                .await;
+            }
+            let mut events = std::pin::pin!(export::stream(spec, total, Arc::clone(&cancelled)));
             let mut encoded = Err("the export stopped without saying why".to_owned());
             while let Some(event) = events.next().await {
                 match event {
@@ -3953,37 +4002,35 @@ fn crop_export(
     )
 }
 
-/// Put a finished export where the save asked for it: a copy keeps the original's name, an
-/// overwrite atomically replaces the clip — and its temp goes if the rename fails, leaving the
-/// original untouched.
+/// Put a finished export's `temp` where the save asked for it: a copy gets a fresh sibling
+/// name (and the original's clip name), an overwrite atomically replaces the clip. The temp
+/// goes if the rename fails, leaving the original untouched.
 ///
-/// This runs on a blocking task, which an abort cannot interrupt, so `cancelled` is read here:
-/// a cancel that lands while ffmpeg's last bytes are being flushed must still leave the clip
-/// and its directory exactly as they were.
+/// `cancelled` is read here, last: a cancel that lands while ffmpeg's last bytes are being
+/// flushed must still leave the clip and its directory exactly as they were.
 fn place_export(
     src: &Path,
     mode: SaveMode,
-    dst: PathBuf,
+    temp: PathBuf,
     copy_edits: Option<Vec<ClipEdit>>,
     cancelled: &AtomicBool,
 ) -> Result<PathBuf, String> {
     if cancelled.load(Ordering::Relaxed) {
-        let _ = std::fs::remove_file(&dst);
+        let _ = std::fs::remove_file(&temp);
         return Err(EXPORT_CANCELLED.to_owned());
     }
-    match mode {
-        SaveMode::Copy => {
-            name_copy(&dst, copy_edits);
-            Ok(dst)
-        }
-        SaveMode::Overwrite => match std::fs::rename(&dst, src) {
-            Ok(()) => Ok(src.to_path_buf()),
-            Err(e) => {
-                let _ = std::fs::remove_file(&dst);
-                Err(e.to_string())
-            }
-        },
+    let dst = match mode {
+        SaveMode::Copy => unique_copy_path(src, "crop"),
+        SaveMode::Overwrite => src.to_path_buf(),
+    };
+    if let Err(e) = std::fs::rename(&temp, &dst) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e.to_string());
     }
+    if matches!(mode, SaveMode::Copy) {
+        name_copy(&dst, copy_edits);
+    }
+    Ok(dst)
 }
 
 /// Give a saved copy the name its original carried.
@@ -4007,46 +4054,43 @@ fn debounce(generation: &mut u64, message: fn(u64) -> Message) -> Task<Message> 
     })
 }
 
-/// Marks the throwaway trim one upload sends. Hidden and `.tmp`-suffixed, so the clip store
-/// (which lists `rewynd-*.mp4`) never shows one.
+/// Marks the throwaway trim or crop one upload sends.
 const UPLOAD_TEMP_MARK: &str = ".uploading.";
 
-/// How long a leftover upload trim may sit before the next upload sweeps it: an upload
-/// cancelled mid-trim leaves one behind (the blocking cut outlives the dropped task).
-const UPLOAD_TEMP_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Marks the temp a save writes before renaming it into place.
+const SAVE_TEMP_MARK: &str = ".trimming.";
+
+/// How long a leftover temp may sit before the next save or upload in its folder sweeps it: a
+/// crash or a force-quit mid-encode leaves one behind, and so does an upload cancelled mid-trim
+/// (the blocking cut outlives the dropped task). No live encode goes a day without writing.
+const TEMP_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// A sibling temp path for the trim, in the clip's own directory the way the in-place trim
 /// does it: that filesystem holds the clips already, so it has the room a clip-sized cut needs
 /// and no other user's `/tmp` can be in the way.
 fn upload_temp_path(src: &Path) -> PathBuf {
-    // Unique per attempt: two clips (or two goes at one) must not race over the same file.
-    static ATTEMPT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let n = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("clip");
-    src.with_file_name(format!(
-        ".{name}{UPLOAD_TEMP_MARK}{}-{n}.tmp",
-        std::process::id()
-    ))
+    sibling_temp_path(src, UPLOAD_TEMP_MARK)
 }
 
-/// Drop the upload temps in `dir` older than [`UPLOAD_TEMP_MAX_AGE`]. Blocking, and
-/// deliberately silent: a sweep that fails must not fail the upload behind it.
-fn sweep_upload_temps_in(dir: &Path, now: SystemTime) {
+/// Drop the save and upload temps in `dir` older than [`TEMP_MAX_AGE`]. Blocking, and
+/// deliberately silent: a sweep that fails must not fail the save or upload behind it.
+fn sweep_temps_in(dir: &Path, now: SystemTime) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .contains(UPLOAD_TEMP_MARK)
-        {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let temp = name.starts_with('.')
+            && name.ends_with(".tmp")
+            && (name.contains(UPLOAD_TEMP_MARK) || name.contains(SAVE_TEMP_MARK));
+        if !temp {
             continue;
         }
         let stale = entry
             .metadata()
             .and_then(|m| m.modified())
-            .is_ok_and(|m| now.duration_since(m).is_ok_and(|a| a > UPLOAD_TEMP_MAX_AGE));
+            .is_ok_and(|m| now.duration_since(m).is_ok_and(|a| a > TEMP_MAX_AGE));
         if stale {
             let _ = std::fs::remove_file(entry.path());
         }
@@ -4064,6 +4108,10 @@ impl PreparedClip {
     /// The clip at `src`, with the editor's `plan` applied to a throwaway copy first when there
     /// is one to apply.
     async fn of(src: PathBuf, plan: EditPlan) -> Result<Self, String> {
+        // The blocking cut outlives this future when Cancel drops it; an encode watches this
+        // flag, which the guard raises on the way out, and stops.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = RaiseOnDrop(Arc::clone(&cancel));
         let cut: Box<dyn FnOnce() -> Result<PathBuf, String> + Send> = match plan {
             EditPlan::None => {
                 return Ok(Self {
@@ -4075,7 +4123,7 @@ impl PreparedClip {
                 Box::new(move || trim_for_upload(&src, start, end))
             }
             EditPlan::Encode { range, crop } => {
-                Box::new(move || crop_for_upload(&src, range, crop))
+                Box::new(move || crop_for_upload(&src, range, crop, &cancel))
             }
         };
         let path = tokio::task::spawn_blocking(cut)
@@ -4086,6 +4134,15 @@ impl PreparedClip {
 
     fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+/// Raises its flag when dropped.
+struct RaiseOnDrop(Arc<AtomicBool>);
+
+impl Drop for RaiseOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 
@@ -4100,7 +4157,7 @@ impl Drop for PreparedClip {
 /// Cut `src` to `[start, end]` into a throwaway file for one upload. Blocking.
 fn trim_for_upload(src: &Path, start: Duration, end: Duration) -> Result<PathBuf, String> {
     if let Some(dir) = src.parent() {
-        sweep_upload_temps_in(dir, SystemTime::now());
+        sweep_temps_in(dir, SystemTime::now());
     }
     let dst = upload_temp_path(src);
     rewynd_mux::read::trim_clip(src, &dst, start, end)
@@ -4111,14 +4168,16 @@ fn trim_for_upload(src: &Path, start: Duration, end: Duration) -> Result<PathBuf
         })
 }
 
-/// Crop (and, in the same pass, cut) `src` into a throwaway file for one upload. Blocking.
+/// Crop (and, in the same pass, cut) `src` into a throwaway file for one upload. Blocking until
+/// done or `cancel` is raised.
 fn crop_for_upload(
     src: &Path,
     range: Option<(Duration, Duration)>,
     crop: crop::PixelRect,
+    cancel: &AtomicBool,
 ) -> Result<PathBuf, String> {
     if let Some(dir) = src.parent() {
-        sweep_upload_temps_in(dir, SystemTime::now());
+        sweep_temps_in(dir, SystemTime::now());
     }
     let dst = upload_temp_path(src);
     let spec = export::Spec {
@@ -4128,10 +4187,12 @@ fn crop_for_upload(
         crop,
         video: export::VideoQuality::DEFAULT,
     };
-    export::run(&spec).map(|()| dst.clone()).map_err(|e| {
-        let _ = std::fs::remove_file(&dst);
-        format!("Could not crop the clip for upload: {e}")
-    })
+    export::run(&spec, cancel)
+        .map(|()| dst.clone())
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&dst);
+            format!("Could not crop the clip for upload: {e}")
+        })
 }
 
 /// `n` evenly spaced, centred sample positions in `0.0..1.0` (cell i samples its own midpoint),
@@ -4778,21 +4839,30 @@ mod tests {
     }
 
     #[test]
-    fn the_temp_sweep_drops_only_stale_upload_temps() {
+    fn the_temp_sweep_drops_only_stale_temps() {
         let dir = tempfile::tempdir().expect("temp dir");
         let clip = dir.path().join("rewynd-1-0.mp4");
         std::fs::write(&clip, b"x").expect("write");
-        let temp = upload_temp_path(&clip);
-        std::fs::write(&temp, b"x").expect("write");
-        // Sweeping "from" far enough ahead makes both files look old.
-        let far_future = SystemTime::now() + UPLOAD_TEMP_MAX_AGE + Duration::from_secs(60);
+        let upload = upload_temp_path(&clip);
+        let save = save_temp_path(&clip);
+        std::fs::write(&upload, b"x").expect("write");
+        std::fs::write(&save, b"x").expect("write");
+        // Sweeping "from" far enough ahead makes every file look old.
+        let far_future = SystemTime::now() + TEMP_MAX_AGE + Duration::from_secs(60);
 
-        sweep_upload_temps_in(dir.path(), SystemTime::now());
-        assert!(temp.exists(), "a fresh temp is left alone");
+        sweep_temps_in(dir.path(), SystemTime::now());
+        assert!(
+            upload.exists() && save.exists(),
+            "a fresh temp is left alone"
+        );
 
-        sweep_upload_temps_in(dir.path(), far_future);
-        assert!(!temp.exists(), "a temp past the age is removed");
-        assert!(clip.exists(), "the clip beside it is never touched");
+        sweep_temps_in(dir.path(), far_future);
+        assert!(!upload.exists(), "an upload temp past the age is removed");
+        assert!(
+            !save.exists(),
+            "and so is a save's, a crash mid-encode leaves"
+        );
+        assert!(clip.exists(), "the clip beside them is never touched");
     }
 
     /// Reads the live catalogue, so it only runs where the config points at a real server.
@@ -5113,34 +5183,44 @@ mod tests {
     }
 
     #[test]
-    fn cancelling_an_export_aborts_the_task_that_runs_ffmpeg() {
+    fn cancelling_an_export_raises_its_flag_and_keeps_the_slot_until_it_reports() {
         let (mut lib, named, plain) = editing_library();
         let config = Config::default();
 
         drop(lib.start_crop_save(named.path.clone(), SaveMode::Overwrite, None, WIDE_CROP));
-        let running = lib.export.as_ref().expect("an abortable export");
-        let watch = running.abort.clone();
-        let flag = Arc::clone(&running.cancelled);
+        let flag = Arc::clone(&lib.export.as_ref().expect("a running export").cancelled);
         assert!(matches!(lib.trim, TrimState::Saving { cropped: true }));
 
         // Cancel belongs to the page showing the export; another clip's page must not reach it.
         lib.open = Some(plain.path.clone());
         drop(lib.update(Message::ExportCancelled, &config));
-        assert!(!watch.is_aborted(), "another page's Cancel is not this one");
-        assert!(lib.export.is_some());
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "another page's Cancel is not this one"
+        );
 
         lib.open = Some(named.path.clone());
         drop(lib.update(Message::ExportCancelled, &config));
-        assert!(watch.is_aborted(), "dropping the task is what kills ffmpeg");
         assert!(
             flag.load(Ordering::Relaxed),
-            "and the flag is what stops the rename the abort cannot reach"
+            "the flag is what kills ffmpeg and stops the rename"
         );
         assert!(matches!(lib.trim, TrimState::Idle));
         assert_eq!(lib.export_progress, None);
-        assert!(lib.export.is_none());
+        assert!(
+            lib.export.is_some(),
+            "the slot stays taken until ffmpeg is gone"
+        );
+        assert!(
+            lib.saving_open_clip(),
+            "so the clip cannot be deleted under it"
+        );
 
-        // The cancelled placement still reports; it must not land as a failure banner.
+        // Reopening the page in that window does not bring the cancelled encode back.
+        drop(lib.update(Message::Open(named.path.clone()), &config));
+        assert!(matches!(lib.trim, TrimState::Idle));
+
+        // The cancelled export still reports; it must not land as a failure banner.
         drop(lib.update(
             Message::TrimSaved {
                 src: named.path.clone(),
@@ -5154,6 +5234,36 @@ mod tests {
             matches!(lib.trim, TrimState::Idle),
             "a cancel is not a failure"
         );
+        assert!(lib.export.is_none(), "and the report frees the slot");
+    }
+
+    #[test]
+    fn a_save_that_beats_its_cancel_still_says_so() {
+        // The rename can land between the flag being read and being raised. The clip has then
+        // changed on disk, and the page must not pretend otherwise.
+        let (mut lib, named, _) = editing_library();
+        let config = Config::default();
+        drop(lib.start_crop_save(named.path.clone(), SaveMode::Overwrite, None, WIDE_CROP));
+        drop(lib.update(Message::ExportCancelled, &config));
+
+        drop(lib.update(
+            Message::TrimSaved {
+                src: named.path.clone(),
+                mode: SaveMode::Overwrite,
+                cropped: true,
+                result: Ok(named.path.clone()),
+            },
+            &config,
+        ));
+        assert!(matches!(
+            lib.trim,
+            TrimState::Saved {
+                overwrite: true,
+                cropped: true,
+                ..
+            }
+        ));
+        assert!(lib.export.is_none());
     }
 
     #[test]
@@ -5170,39 +5280,75 @@ mod tests {
             "another clip has nothing of its own running"
         );
         assert_eq!(lib.export_progress, None);
+        assert!(!lib.saving_open_clip());
+
+        // The export keeps going while its page is closed, and its bar with it.
+        drop(lib.update(
+            Message::ExportProgress {
+                src: named.path.clone(),
+                fraction: 0.8,
+            },
+            &config,
+        ));
+        assert_eq!(lib.export_progress, None, "not on this page");
 
         drop(lib.update(Message::Open(named.path.clone()), &config));
         assert!(
             matches!(lib.trim, TrimState::Saving { cropped: true }),
             "the encode is still writing this clip"
         );
-        let busy = matches!(lib.trim, TrimState::Saving { .. });
+        assert_eq!(
+            lib.export_progress,
+            Some(0.8),
+            "the bar picks up where the export is"
+        );
         assert!(
-            !save_ready(busy, 30.0, false, true),
+            !save_ready(lib.saving_open_clip(), 30.0, false, true),
             "so Save stays out of reach"
         );
-
-        // And the bar it left behind picks the export back up.
-        drop(lib.update(
-            Message::ExportProgress {
-                src: named.path.clone(),
-                fraction: 0.4,
-            },
-            &config,
-        ));
-        assert_eq!(lib.export_progress, Some(0.4));
     }
 
     #[test]
-    fn a_result_for_one_clip_leaves_another_clips_export_running() {
+    fn a_second_crop_waits_for_the_running_export() {
+        // One slot: a second export would leave the first beyond Cancel and the progress bar.
         let (mut lib, named, plain) = editing_library();
         let config = Config::default();
         drop(lib.start_crop_save(named.path.clone(), SaveMode::Overwrite, None, WIDE_CROP));
-        lib.open = Some(plain.path.clone());
-        drop(lib.start_crop_save(plain.path.clone(), SaveMode::Overwrite, None, WIDE_CROP));
-        let watch = lib.export.as_ref().expect("an export").abort.clone();
 
-        lib.open = Some(named.path.clone());
+        drop(lib.update(Message::Open(plain.path.clone()), &config));
+        drop(lib.start_crop_save(plain.path.clone(), SaveMode::Overwrite, None, WIDE_CROP));
+        assert!(
+            matches!(lib.trim, TrimState::Idle),
+            "the second never started"
+        );
+        let running = lib.export.as_ref().expect("the first export runs on");
+        assert_eq!(running.src, named.path);
+
+        // Nor does a result for another clip free the slot.
+        drop(lib.update(
+            Message::TrimSaved {
+                src: plain.path.clone(),
+                mode: SaveMode::Overwrite,
+                cropped: true,
+                result: Ok(plain.path.clone()),
+            },
+            &config,
+        ));
+        assert_eq!(lib.export.as_ref().map(|e| &e.src), Some(&named.path));
+    }
+
+    #[test]
+    fn a_clip_being_saved_cannot_be_deleted() {
+        let (mut lib, named, _) = editing_library();
+        let config = Config::default();
+        drop(lib.start_crop_save(named.path.clone(), SaveMode::Overwrite, None, WIDE_CROP));
+
+        lib.confirm_delete = true;
+        let delete = lib.update(Message::DeleteConfirmed, &config);
+        assert_eq!(delete.units(), 0, "the save would only put the clip back");
+        assert!(!lib.confirm_delete);
+
+        // Once the save reports, the clip is the user's to delete again.
         drop(lib.update(
             Message::TrimSaved {
                 src: named.path.clone(),
@@ -5212,18 +5358,55 @@ mod tests {
             },
             &config,
         ));
+        assert!(lib.update(Message::DeleteConfirmed, &config).units() > 0);
+    }
 
-        let still = lib.export.as_ref().expect("the second export runs on");
-        assert_eq!(still.src, plain.path, "the live handle is the plain clip's");
-        assert!(!watch.is_aborted());
+    #[test]
+    fn a_trim_save_outlives_a_detour_like_an_export_does() {
+        let (mut lib, named, plain) = editing_library();
+        let config = Config::default();
+        drop(lib.start_trim_save(
+            named.path.clone(),
+            SaveMode::Overwrite,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        ));
+        drop(lib.update(Message::Open(plain.path.clone()), &config));
+        assert!(!lib.saving_open_clip(), "the other clip is free");
+        drop(lib.update(Message::Open(named.path.clone()), &config));
+        assert!(
+            matches!(lib.trim, TrimState::Saving { cropped: false }),
+            "the save is still writing this clip"
+        );
+
+        // Deleting now would see the rename put the clip back; the page says why it won't.
+        lib.confirm_delete = true;
+        assert_eq!(lib.update(Message::DeleteConfirmed, &config).units(), 0);
+        assert!(lib.action_error.is_some());
+
+        // A lossless save cannot be cancelled, so its outcome is news on its page.
+        drop(lib.update(
+            Message::TrimSaved {
+                src: named.path.clone(),
+                mode: SaveMode::Overwrite,
+                cropped: false,
+                result: Err("disk full".to_owned()),
+            },
+            &config,
+        ));
+        assert!(
+            matches!(&lib.trim, TrimState::Failed(e) if e.contains("disk full")),
+            "the failure shows on the reopened page"
+        );
+        assert!(!lib.saving_open_clip(), "and the clip is free again");
     }
 
     #[test]
     fn an_overwrite_temp_is_unique_per_attempt() {
         // Two exports of one clip sharing a temp would interleave into a single file.
         let src = Path::new("/clips/Elden Ring/rewynd-1-0.mp4");
-        let first = overwrite_temp_path(src);
-        let again = overwrite_temp_path(src);
+        let first = save_temp_path(src);
+        let again = save_temp_path(src);
 
         assert_eq!(first.parent(), Some(Path::new("/clips/Elden Ring")));
         let name = first.file_name().and_then(|n| n.to_str()).expect("name");
@@ -5237,25 +5420,49 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let src = dir.path().join("rewynd-1-0.mp4");
         std::fs::write(&src, b"original").expect("write");
-        let temp = overwrite_temp_path(&src);
-        std::fs::write(&temp, b"encoded").expect("write");
         let cancelled = AtomicBool::new(true);
 
-        let placed = place_export(&src, SaveMode::Overwrite, temp.clone(), None, &cancelled);
-        assert_eq!(placed, Err(EXPORT_CANCELLED.to_owned()));
-        assert!(!temp.exists(), "the temp goes with the cancel");
+        for mode in [SaveMode::Overwrite, SaveMode::Copy] {
+            let temp = save_temp_path(&src);
+            std::fs::write(&temp, b"encoded").expect("write");
+            let placed = place_export(&src, mode, temp.clone(), None, &cancelled);
+            assert_eq!(placed, Err(EXPORT_CANCELLED.to_owned()));
+            assert!(!temp.exists(), "the temp goes with the cancel");
+        }
         assert_eq!(
             std::fs::read(&src).expect("the clip"),
             b"original",
-            "and the original is never replaced"
+            "the original is never replaced"
         );
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("list")
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left, vec![src.file_name().expect("name").to_owned()]);
+    }
 
-        // A copy has nowhere to be either: nothing of a cancelled export survives.
-        let copy = unique_copy_path(&src, "crop");
-        std::fs::write(&copy, b"encoded").expect("write");
-        let placed = place_export(&src, SaveMode::Copy, copy.clone(), None, &cancelled);
-        assert!(placed.is_err());
-        assert!(!copy.exists(), "{copy:?}");
+    #[test]
+    fn a_placed_copy_is_renamed_out_of_its_temp() {
+        // The encode writes a hidden temp, so the library never lists a half-written copy.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let src = dir.path().join("rewynd-1-0.mp4");
+        std::fs::write(&src, b"original").expect("write");
+        let temp = save_temp_path(&src);
+        std::fs::write(&temp, b"encoded").expect("write");
+
+        let placed = place_export(
+            &src,
+            SaveMode::Copy,
+            temp.clone(),
+            None,
+            &AtomicBool::new(false),
+        );
+        let copy = dir.path().join("rewynd-1-0-crop.mp4");
+        assert_eq!(placed, Ok(copy.clone()));
+        assert!(!temp.exists());
+        assert_eq!(std::fs::read(&copy).expect("the copy"), b"encoded");
+        assert_eq!(std::fs::read(&src).expect("the clip"), b"original");
     }
 
     #[test]
@@ -5320,7 +5527,7 @@ mod tests {
             width: 320,
             height: 180,
         };
-        let cropped = crop_for_upload(&src, None, crop).expect("crop");
+        let cropped = crop_for_upload(&src, None, crop, &AtomicBool::new(false)).expect("crop");
         let summary = rewynd_mux::read::clip_summary(&cropped).expect("read the crop");
         assert_eq!((summary.width, summary.height), (320, 180));
 
