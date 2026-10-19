@@ -249,15 +249,7 @@ impl Pipeline {
                 depth_or_array_layers: 1,
             },
         );
-        // Letterbox: scale the fullscreen quad down on the wider axis so the frame's aspect ratio
-        // is preserved inside the widget bounds (Contain, never cropped).
-        let frame_aspect = w as f32 / h as f32;
-        let bounds_aspect = (bounds.width / bounds.height).max(f32::EPSILON);
-        let scale = if frame_aspect > bounds_aspect {
-            [1.0, bounds_aspect / frame_aspect]
-        } else {
-            [frame_aspect / bounds_aspect, 1.0]
-        };
+        let scale = fit_scale((w, h), *bounds);
         queue.write_buffer(&self.fit, 0, bytemuck_cast(&[scale[0], scale[1], 0.0, 0.0]));
     }
 
@@ -270,6 +262,18 @@ impl Pipeline {
         render_pass.draw(0..4, 0..1);
         true
     }
+}
+
+/// Letterbox: how much of `bounds` the fitted picture covers on each axis, which is what the
+/// fullscreen quad scales by so the frame keeps its aspect ratio (Contain, never cropped).
+/// Derived from [`crate::crop::contain_rect`] rather than its own aspect math, so the shader and
+/// the crop overlay drawn on top of it letterbox to exactly the same rectangle.
+fn fit_scale(frame: (u32, u32), bounds: Rectangle) -> [f32; 2] {
+    let area = crate::crop::contain_rect(frame, bounds);
+    if bounds.width <= 0.0 || bounds.height <= 0.0 || area.width <= 0.0 || area.height <= 0.0 {
+        return [1.0, 1.0];
+    }
+    [area.width / bounds.width, area.height / bounds.height]
 }
 
 /// Reinterpret a `[f32; 4]` as bytes without pulling in the `bytemuck` crate.
@@ -306,3 +310,59 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     return textureSample(tex, samp, in.uv);
 }
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The aspect math this used to do inline, kept as the oracle: routing it through
+    /// `contain_rect` must not move a single pixel of the letterbox.
+    fn aspect_scale(frame: (u32, u32), bounds: Rectangle) -> [f32; 2] {
+        let frame_aspect = frame.0 as f32 / frame.1 as f32;
+        let bounds_aspect = (bounds.width / bounds.height).max(f32::EPSILON);
+        if frame_aspect > bounds_aspect {
+            [1.0, bounds_aspect / frame_aspect]
+        } else {
+            [frame_aspect / bounds_aspect, 1.0]
+        }
+    }
+
+    #[test]
+    fn fit_scale_matches_the_aspect_formula_it_replaced() {
+        let cases = [
+            // A wide frame in a wider box: pillarboxed, so the quad narrows.
+            (
+                (1920u32, 1080u32),
+                Rectangle::new(iced::Point::new(10.0, 20.0), iced::Size::new(800.0, 300.0)),
+            ),
+            // A wide frame in a taller box: letterboxed, so the quad shortens.
+            (
+                (3440, 1440),
+                Rectangle::new(iced::Point::ORIGIN, iced::Size::new(800.0, 600.0)),
+            ),
+            // Exactly the frame's aspect: no bars at all.
+            (
+                (1920, 1080),
+                Rectangle::new(iced::Point::new(5.0, 7.0), iced::Size::new(640.0, 360.0)),
+            ),
+        ];
+
+        for (frame, bounds) in cases {
+            let [x, y] = fit_scale(frame, bounds);
+            let [ex, ey] = aspect_scale(frame, bounds);
+            assert!(
+                (x - ex).abs() <= 1e-5 && (y - ey).abs() <= 1e-5,
+                "{frame:?} in {bounds:?}: expected [{ex}, {ey}], got [{x}, {y}]"
+            );
+        }
+
+        assert_eq!(
+            fit_scale(
+                (1920, 1080),
+                Rectangle::new(iced::Point::ORIGIN, iced::Size::ZERO)
+            ),
+            [1.0, 1.0],
+            "a zero-size widget leaves the quad alone instead of dividing by it"
+        );
+    }
+}

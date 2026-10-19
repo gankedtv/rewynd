@@ -5,6 +5,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use iced::widget::{
@@ -24,6 +26,9 @@ use rewynd_upload::{
 };
 
 use crate::anim::lerp_color;
+use crate::crop;
+use crate::cropbox;
+use crate::export;
 use crate::player;
 use crate::theme::{
     self, CONTENT_MAX_WIDTH, DISPLAY_BLACK, UI_BOLD, UI_SEMIBOLD, accent_button_style, accent_chip,
@@ -233,8 +238,9 @@ pub enum Message {
     FavouritesFilterToggled,
     /// A name or star finished being written to disk, for the clip with this file name.
     MetaSaved(String, Result<(), String>),
-    /// The open clip's header was read: its duration in seconds (the trim range's ceiling).
-    SummaryLoaded(PathBuf, f32),
+    /// The open clip's header was read: its duration in seconds (the trim range's ceiling), and
+    /// its source frame size when the header gave one (the crop rect's frame).
+    SummaryLoaded(PathBuf, f32, Option<(u32, u32)>),
     ThumbDone(PathBuf, SystemTime, Result<thumbs::Loaded, String>),
     Open(PathBuf),
     Back,
@@ -250,8 +256,26 @@ pub enum Message {
     TrimSaved {
         src: PathBuf,
         mode: SaveMode,
+        /// Whether this save went through the encoder, said by the task that ran it rather
+        /// than read back off a state the user may have moved on from.
+        cropped: bool,
         result: Result<PathBuf, String>,
     },
+    /// Whether this machine has an ffmpeg a crop export can run.
+    FfmpegProbed(bool),
+    /// The overlay moved or resized the crop rectangle.
+    CropChanged(crop::CropRect),
+    /// An aspect-ratio preset was picked for the crop.
+    CropPresetPicked(crop::Ratio),
+    /// Back to the whole frame (the overlay's Escape, or the Reset button).
+    CropReset,
+    /// How far the export of `src` has got, `0.0..=1.0`.
+    ExportProgress {
+        src: PathBuf,
+        fraction: f32,
+    },
+    /// Give up on the running crop export (the Cancel button beside its progress).
+    ExportCancelled,
     TitleEdited(String),
     DescriptionEdited(text_editor::Action),
     GameSearchEdited(String),
@@ -333,12 +357,32 @@ pub enum SaveMode {
     Copy,
 }
 
-/// Where the open clip's trim stands.
+/// Where the open clip's trim (or crop) stands. `cropped` marks a save that went through
+/// ffmpeg, so the panel can say encode where the lossless cut says trim.
 enum TrimState {
     Idle,
-    Saving,
-    Saved { overwrite: bool, path: PathBuf },
+    Saving {
+        cropped: bool,
+    },
+    Saved {
+        overwrite: bool,
+        cropped: bool,
+        path: PathBuf,
+    },
     Failed(String),
+}
+
+/// The crop export in flight; there is at most one. Identified by its clip, because it outlives
+/// the page that started it: a save someone asked for finishes even if they open another clip
+/// meanwhile, and only that clip's [`Message::TrimSaved`] clears it — the task always sends
+/// one, cancelled or not, so the slot never outlives the work.
+struct RunningExport {
+    src: PathBuf,
+    /// Cancel: the worker kills ffmpeg and clears the partial file, and the finishing move
+    /// leaves the clip alone.
+    cancelled: Arc<AtomicBool>,
+    /// The last progress it reported, so a page reopened mid-encode picks the bar back up.
+    progress: f32,
 }
 
 pub struct Library {
@@ -393,6 +437,22 @@ pub struct Library {
     trim_end: f32,
     /// The open clip's duration in seconds (read from its header on open), the trim range's ceiling.
     open_dur: f32,
+    /// The open clip's source frame size, once its header has been read. The crop rect is
+    /// normalized to it, so no crop reaches pixels before this lands.
+    open_dims: Option<(u32, u32)>,
+    /// The crop rect for the open clip, in fractions of its source frame. Ephemeral editor
+    /// state like the trim range: reset on open, never written to the clip store.
+    crop: crop::CropRect,
+    /// The aspect-ratio preset the rect is locked to.
+    crop_ratio: crop::Ratio,
+    /// Whether this machine has an ffmpeg to crop with; `None` until the probe reports.
+    ffmpeg: Option<bool>,
+    /// How far a running crop export has got, while one runs.
+    export_progress: Option<f32>,
+    /// The crop export currently running, if any.
+    export: Option<RunningExport>,
+    /// The clips a lossless save is still writing: like an export, it outlives its page.
+    trims: Vec<PathBuf>,
     trim: TrimState,
     /// Play / show-in-folder / delete failure for the open clip.
     action_error: Option<String>,
@@ -472,6 +532,13 @@ impl Library {
             trim_start: 0.0,
             trim_end: 0.0,
             open_dur: 0.0,
+            open_dims: None,
+            crop: crop::FULL_FRAME,
+            crop_ratio: crop::Ratio::Free,
+            ffmpeg: None,
+            export_progress: None,
+            export: None,
+            trims: Vec::new(),
             trim: TrimState::Idle,
             action_error: None,
             title: String::new(),
@@ -511,7 +578,8 @@ impl Library {
         self.reset_preview();
     }
 
-    /// Drop the scrub frame and stop any preview playback (leaving a clip, or its file changed).
+    /// Drop the scrub frame and the crop, and stop any preview playback (leaving a clip, or its
+    /// file changed).
     fn reset_preview(&mut self) {
         self.scrub_frame = None;
         self.scrub_busy = false;
@@ -522,6 +590,24 @@ impl Library {
         self.play_error = None;
         self.seek_resume = false;
         self.fullscreen = false;
+        self.reset_crop();
+    }
+
+    /// Drop a finished save's banner, because the edit it described has moved on. A running
+    /// save keeps its state: it owns the temp it is writing, and re-enabling Save under it
+    /// would let a second export write the same file.
+    fn clear_save_banner(&mut self) {
+        if matches!(self.trim, TrimState::Saved { .. } | TrimState::Failed(_)) {
+            self.trim = TrimState::Idle;
+        }
+    }
+
+    /// Forget the crop rectangle and the frame it was measured against: another clip (or the
+    /// same one after an overwrite) is another frame.
+    fn reset_crop(&mut self) {
+        self.open_dims = None;
+        self.crop = crop::FULL_FRAME;
+        self.crop_ratio = crop::Ratio::Free;
     }
 
     /// The upload title to suggest for `path`: the name the user gave the clip, else the
@@ -650,7 +736,23 @@ impl Library {
                 self.open_dur = 0.0;
                 self.trim_start = 0.0;
                 self.trim_end = 0.0;
-                self.trim = TrimState::Idle;
+                // A clip reopened mid-encode is still being written: the panel goes back to
+                // showing that, so Save stays out of reach and no second export can race the
+                // first one into the same temp.
+                let encoding = self
+                    .export
+                    .as_ref()
+                    .filter(|e| e.src == path && !e.cancelled.load(Ordering::Relaxed));
+                if let Some(export) = encoding {
+                    self.trim = TrimState::Saving { cropped: true };
+                    self.export_progress = Some(export.progress);
+                } else if self.trims.contains(&path) {
+                    self.trim = TrimState::Saving { cropped: false };
+                    self.export_progress = None;
+                } else {
+                    self.trim = TrimState::Idle;
+                    self.export_progress = None;
+                }
                 self.reset_preview();
                 // The name the user gave the clip is the best upload title there is; failing
                 // that the suggestion leads with the game when one was detected.
@@ -677,16 +779,30 @@ impl Library {
                 if !self.game_input.is_empty() {
                     tasks.push(self.find_games(config));
                 }
+                // Whether a crop can be offered at all. Re-probed until one is found, so an
+                // ffmpeg installed while the app is open is picked up on the next clip.
+                if self.ffmpeg != Some(true) {
+                    tasks.push(Task::perform(
+                        async {
+                            tokio::task::spawn_blocking(export::available)
+                                .await
+                                .unwrap_or(false)
+                        },
+                        Message::FfmpegProbed,
+                    ));
+                }
                 return Task::batch(tasks);
             }
             Message::Back => self.show_grid(),
-            Message::SummaryLoaded(path, dur) => {
-                // The summary landing completes the open: the trim resets to the full span.
-                // Handles can't be moved meaningfully before this (the span was 0 until now).
+            Message::SummaryLoaded(path, dur, dims) => {
+                // The summary landing completes the open: the trim resets to the full span and
+                // the crop overlay learns the frame it is measured against. Neither can be
+                // moved meaningfully before this (the span was 0 and the frame unknown).
                 if self.open.as_deref() == Some(path.as_path()) {
                     self.open_dur = dur;
                     self.trim_start = 0.0;
                     self.trim_end = dur;
+                    self.open_dims = dims;
                 }
             }
             Message::Play => {
@@ -707,6 +823,12 @@ impl Library {
             Message::DeleteCancelled => self.confirm_delete = false,
             Message::DeleteConfirmed => {
                 self.confirm_delete = false;
+                // A save still writing this clip would put it back the moment it lands.
+                if self.saving_open_clip() {
+                    self.action_error =
+                        Some("The clip is still being saved; delete it once that is done.".into());
+                    return Task::none();
+                }
                 let Some(path) = self.open.clone() else {
                     return Task::none();
                 };
@@ -748,7 +870,7 @@ impl Library {
             Message::TrimStartChanged(v) => {
                 // Keep at least a small gap below the end.
                 self.trim_start = v.clamp(0.0, (self.trim_end - MIN_TRIM_SECS).max(0.0));
-                self.trim = TrimState::Idle;
+                self.clear_save_banner();
                 // Editing the range pauses playback; the preview scrubs to the handle instead.
                 self.play_range = None;
                 self.play_frame = None;
@@ -759,7 +881,7 @@ impl Library {
             Message::TrimEndChanged(v) => {
                 let hi = self.open_duration();
                 self.trim_end = v.clamp(self.trim_start + MIN_TRIM_SECS, hi.max(MIN_TRIM_SECS));
-                self.trim = TrimState::Idle;
+                self.clear_save_banner();
                 self.play_range = None;
                 self.play_frame = None;
                 self.play_pos = None;
@@ -770,52 +892,47 @@ impl Library {
                 let Some(src) = self.open.clone() else {
                     return Task::none();
                 };
-                let start = Duration::from_secs_f32(self.trim_start);
-                let end = Duration::from_secs_f32(self.trim_end);
-                self.trim = TrimState::Saving;
-                let work_src = src.clone();
-                // A copy is a new file: give it the original's name before the rescan reads the
-                // directory, or it would show up as a date. The whole entry is written, not just
-                // the name: a copy deleted outside the app leaves its entry behind, and the next
-                // copy of the same clip takes that file name back.
-                let copy_edits = matches!(mode, SaveMode::Copy).then(|| {
-                    let name = self
-                        .meta
-                        .name_of(&src)
-                        .and_then(clip_meta::trimmed_copy_name);
-                    vec![ClipEdit::Reset, ClipEdit::Name(name)]
-                });
-                return Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || {
-                            let saved = save_trim(&work_src, mode, start, end);
-                            if let (Ok(dst), Some(edits)) = (&saved, copy_edits)
-                                && let Some(file_name) = clip_meta::file_name_of(dst)
-                                && let Err(e) = clip_meta::update(file_name, &edits)
-                            {
-                                tracing::warn!(error = %e, "could not name the trimmed copy");
-                            }
-                            saved
-                        })
-                        .await
-                        .unwrap_or_else(|e| Err(e.to_string()))
-                    },
-                    move |result| Message::TrimSaved {
-                        src: src.clone(),
-                        mode,
-                        result,
-                    },
-                );
+                return match edit_plan(self.upload_trim(), self.crop_pixels()) {
+                    // Saving an untouched clip would only copy it; the panel gates this already.
+                    EditPlan::None => Task::none(),
+                    EditPlan::Lossless { start, end } => {
+                        self.start_trim_save(src, mode, start, end)
+                    }
+                    EditPlan::Encode { range, crop } => {
+                        self.start_crop_save(src, mode, range, crop)
+                    }
+                };
             }
-            Message::TrimSaved { src, mode, result } => {
+            Message::TrimSaved {
+                src,
+                mode,
+                cropped,
+                result,
+            } => {
                 // The trim may finish after the user opened another clip; only stamp the result on
                 // its own detail page. The rescan still runs so the new clip shows up regardless.
                 let current = self.open.as_deref() == Some(src.as_path());
+                // The slot belongs to the export that just reported, whichever clip is open now:
+                // clearing it by page would drop a live export for another clip.
+                let export = self.export.take_if(|e| cropped && e.src == src);
+                if !cropped && let Some(i) = self.trims.iter().position(|p| *p == src) {
+                    self.trims.swap_remove(i);
+                }
+                // A cancel already put the panel back, so the refusal that follows it is not
+                // news. A save that beat the cancel to the rename did happen, though, and says so.
+                let cancelled = export.is_some_and(|e| e.cancelled.load(Ordering::Relaxed));
+                if current {
+                    self.export_progress = None;
+                }
                 match result {
                     Ok(path) => {
                         let overwrite = matches!(mode, SaveMode::Overwrite);
                         if current {
-                            self.trim = TrimState::Saved { overwrite, path };
+                            self.trim = TrimState::Saved {
+                                overwrite,
+                                cropped,
+                                path,
+                            };
                         }
                         let mut tasks = vec![self.refresh(config)];
                         // Overwrite replaced the open clip in place: reload its span + filmstrip so
@@ -825,9 +942,10 @@ impl Library {
                         }
                         return Task::batch(tasks);
                     }
-                    Err(e) if current => {
+                    Err(e) if current && !cancelled => {
+                        let what = if cropped { "cropped" } else { "trimmed" };
                         self.trim =
-                            TrimState::Failed(format!("Could not save the trimmed clip: {e}"));
+                            TrimState::Failed(format!("Could not save the {what} clip: {e}"));
                     }
                     Err(_) => {}
                 }
@@ -1054,6 +1172,9 @@ impl Library {
                 self.play_pos = None;
                 self.play_error =
                     Some("In-app preview needs ffmpeg installed; use Open in player.");
+                // The preview and the export spawn the same ffmpeg, so this answers the crop
+                // probe as well.
+                self.ffmpeg = Some(false);
             }
             Message::PlayerEnded => {
                 self.play_range = None;
@@ -1092,7 +1213,55 @@ impl Library {
                 if self.open_dur > 0.0 {
                     self.trim_start = 0.0;
                     self.trim_end = self.open_dur;
+                    self.clear_save_banner();
+                }
+            }
+            Message::FfmpegProbed(found) => self.ffmpeg = Some(found),
+            Message::CropChanged(rect) => {
+                self.crop = rect;
+                // A saved banner must not linger over a rect that has moved since.
+                self.clear_save_banner();
+            }
+            Message::CropPresetPicked(ratio) => {
+                self.crop_ratio = ratio;
+                // Free keeps whatever rect is on screen; a locked preset re-centres the largest
+                // rect of that shape, which needs the frame the rect is measured against.
+                if ratio != crop::Ratio::Free
+                    && let Some(frame_ratio) = self.frame_ratio()
+                {
+                    self.crop = crop::max_rect_for_ratio(ratio.rect_ratio(frame_ratio));
+                }
+                self.clear_save_banner();
+            }
+            Message::CropReset => {
+                self.crop = crop::FULL_FRAME;
+                self.clear_save_banner();
+            }
+            Message::ExportProgress { src, fraction } => {
+                let fraction = fraction.clamp(0.0, 1.0);
+                if let Some(export) = self.export.as_mut().filter(|e| e.src == src) {
+                    export.progress = fraction;
+                }
+                // Only the export this page is waiting for: one left running on another clip
+                // must not drive the bar here.
+                if self.open.as_deref() == Some(src.as_path())
+                    && matches!(self.trim, TrimState::Saving { .. })
+                {
+                    self.export_progress = Some(fraction);
+                }
+            }
+            Message::ExportCancelled => {
+                // The Cancel button belongs to the export this page is showing; one left
+                // running on another clip keeps going. The export keeps its slot until its
+                // task reports, which it does within a poll of the flag.
+                if let Some(export) = self
+                    .export
+                    .as_ref()
+                    .filter(|e| Some(e.src.as_path()) == self.open.as_deref())
+                {
+                    export.cancelled.store(true, Ordering::Relaxed);
                     self.trim = TrimState::Idle;
+                    self.export_progress = None;
                 }
             }
             Message::OpenLink(url) => {
@@ -1198,18 +1367,23 @@ impl Library {
         let sum_path = path.clone();
         let summary = Task::perform(
             async move {
-                let dur = tokio::task::spawn_blocking({
+                let read = tokio::task::spawn_blocking({
                     let path = sum_path.clone();
                     move || {
                         rewynd_mux::read::clip_summary(&path)
-                            .map_or(0.0, |s| s.duration.as_secs_f32())
+                            .map(|s| (s.duration.as_secs_f32(), (s.width, s.height)))
+                            .ok()
                     }
                 })
                 .await
-                .unwrap_or(0.0);
-                (sum_path, dur)
+                .ok()
+                .flatten();
+                (sum_path, read)
             },
-            |(path, dur)| Message::SummaryLoaded(path, dur),
+            |(path, read)| {
+                let (dur, dims) = read.map_or((0.0, None), |(dur, dims)| (dur, Some(dims)));
+                Message::SummaryLoaded(path, dur, dims)
+            },
         );
         let wave_path = path.clone();
         let wave = Task::perform(
@@ -1518,6 +1692,143 @@ impl Library {
         })
     }
 
+    /// The open clip's source frame, once its header has been read and made sense.
+    fn frame_dims(&self) -> Option<(u32, u32)> {
+        self.open_dims.filter(|(w, h)| *w > 0 && *h > 0)
+    }
+
+    /// The source frame's width/height, which every ratio preset is resolved against.
+    fn frame_ratio(&self) -> Option<f32> {
+        let (width, height) = self.frame_dims()?;
+        Some(width as f32 / height as f32)
+    }
+
+    /// The crop rect worth exporting, or `None` when the whole frame is kept.
+    fn crop_model(&self) -> Option<crop::CropRect> {
+        crop::to_model(self.crop)
+    }
+
+    /// Whether a save is still writing the open clip: its panel says so, or its task has not
+    /// reported yet (a cancelled export keeps its slot until ffmpeg is gone).
+    fn saving_open_clip(&self) -> bool {
+        let Some(open) = self.open.as_deref() else {
+            return false;
+        };
+        matches!(self.trim, TrimState::Saving { .. })
+            || self.export.as_ref().is_some_and(|e| e.src == open)
+            || self.trims.iter().any(|p| p == open)
+    }
+
+    /// The crop ffmpeg would get, once both the rect and the frame it is measured against are
+    /// known.
+    fn crop_pixels(&self) -> Option<crop::PixelRect> {
+        let (width, height) = self.frame_dims()?;
+        Some(crop::pixel_rect(self.crop_model()?, width, height))
+    }
+
+    /// Whether the crop controls can be offered: a known frame, and an ffmpeg to encode with
+    /// (a crop has no fallback, unlike playback).
+    fn crop_enabled(&self) -> bool {
+        self.frame_dims().is_some() && self.ffmpeg == Some(true)
+    }
+
+    /// The frame size the export would write: the crop's, or the whole source frame.
+    fn output_size(&self) -> Option<(u32, u32)> {
+        let (width, height) = self.frame_dims()?;
+        let rect = self.crop_model().unwrap_or(crop::FULL_FRAME);
+        Some(crop::output_size(rect, width, height))
+    }
+
+    /// The clip-store edits a saved copy needs, if this save makes one. A copy is a new file:
+    /// give it the original's name before the rescan reads the directory, or it would show up
+    /// as a date. The whole entry is written, not just the name: a copy deleted outside the app
+    /// leaves its entry behind, and the next copy of the same clip takes that file name back.
+    fn copy_edits(&self, src: &Path, mode: SaveMode) -> Option<Vec<ClipEdit>> {
+        matches!(mode, SaveMode::Copy).then(|| {
+            let name = self
+                .meta
+                .name_of(src)
+                .and_then(clip_meta::trimmed_copy_name);
+            vec![ClipEdit::Reset, ClipEdit::Name(name)]
+        })
+    }
+
+    /// Cut `src` losslessly on a blocking task, naming the copy as it lands.
+    fn start_trim_save(
+        &mut self,
+        src: PathBuf,
+        mode: SaveMode,
+        start: Duration,
+        end: Duration,
+    ) -> Task<Message> {
+        self.trim = TrimState::Saving { cropped: false };
+        self.trims.push(src.clone());
+        let copy_edits = self.copy_edits(&src, mode);
+        let work_src = src.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let saved = save_trim(&work_src, mode, start, end);
+                    if let Ok(dst) = &saved {
+                        name_copy(dst, copy_edits);
+                    }
+                    saved
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()))
+            },
+            move |result| Message::TrimSaved {
+                src: src.clone(),
+                mode,
+                cropped: false,
+                result,
+            },
+        )
+    }
+
+    /// Re-encode `src` through ffmpeg: the crop and the cut in one pass, written where `mode`
+    /// wants it, with ffmpeg's progress driving the panel.
+    fn start_crop_save(
+        &mut self,
+        src: PathBuf,
+        mode: SaveMode,
+        range: Option<(Duration, Duration)>,
+        crop: crop::PixelRect,
+    ) -> Task<Message> {
+        // One encode at a time: the slot is how Cancel, the progress bar and a reopened page
+        // find it, and a second one would leave the first beyond their reach.
+        if self.export.is_some() {
+            return Task::none();
+        }
+        let spec = export::Spec {
+            src: src.clone(),
+            // Either way the encode goes to a hidden temp beside the clip and is renamed into
+            // place once whole: over the clip, or to the copy's name. A half-written file
+            // never shows up in the library, and a failed one leaves the original untouched.
+            dst: save_temp_path(&src),
+            range,
+            crop,
+            video: export::VideoQuality::DEFAULT,
+        };
+        // What the progress fractions are measured against: the kept range, else the clip.
+        let total = range.map_or_else(
+            || Duration::from_secs_f32(self.open_duration().max(0.0)),
+            |(start, end)| end.saturating_sub(start),
+        );
+        let copy_edits = self.copy_edits(&src, mode);
+        self.trim = TrimState::Saving { cropped: true };
+        self.export_progress = Some(0.0);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        // A save someone asked for finishes even if they open another clip meanwhile. Only
+        // Cancel stops it.
+        self.export = Some(RunningExport {
+            src: src.clone(),
+            cancelled: Arc::clone(&cancelled),
+            progress: 0.0,
+        });
+        Task::stream(crop_export(src, mode, spec, total, copy_edits, cancelled))
+    }
+
     /// Kick off the upload for the open clip: the client is built from the config at click
     /// time, exactly as the tray does. Only the destination-specific upload future differs;
     /// the readiness check and task scaffolding are shared.
@@ -1542,14 +1853,14 @@ impl Library {
             return Task::none();
         }
         let meta = self.metadata();
-        // The clip actually sent is the trimmed range when the timeline shows one, so an
-        // unsaved (or saved-as-a-copy) trim can't quietly upload the whole recording.
-        let trim = self.upload_trim();
+        // The clip actually sent is what the editor shows — the trimmed range, the crop, or
+        // both — so an unsaved (or saved-as-a-copy) edit can't quietly upload the whole frame.
+        let plan = edit_plan(self.upload_trim(), self.crop_pixels());
         let upload: std::pin::Pin<Box<dyn Future<Output = Result<Uploaded, String>> + Send>> = {
             let clip = path.clone();
             match dest {
-                Dest::Ganked => Box::pin(upload_ganked(config.upload(), clip, meta, trim)),
-                Dest::YouTube => Box::pin(upload_youtube(config.youtube(), clip, meta, trim)),
+                Dest::Ganked => Box::pin(upload_ganked(config.upload(), clip, meta, plan)),
+                Dest::YouTube => Box::pin(upload_youtube(config.youtube(), clip, meta, plan)),
             }
         };
         let (task, abort) = Task::perform(upload, Message::UploadDone).abortable();
@@ -2053,7 +2364,7 @@ impl Library {
             .style(tinted(palette::MUTED)),
         );
 
-        let mut layers = vec![self.thumbnail(entry, 148.0)];
+        let mut layers = vec![self.thumbnail(entry, 148.0, iced::ContentFit::Cover)];
         if let Some(badge) = self.duration_badge(entry) {
             layers.push(badge);
         }
@@ -2120,11 +2431,16 @@ impl Library {
             .into()
     }
 
-    /// The clip's thumbnail at the given height, or a neutral placeholder while it loads
-    /// (or when the clip can't be decoded).
-    fn thumbnail<'a>(&'a self, entry: &'a ClipEntry, height: f32) -> Element<'a, Message> {
+    /// The clip's thumbnail at the given height and fit, or a neutral placeholder while it
+    /// loads (or when the clip can't be decoded).
+    fn thumbnail<'a>(
+        &'a self,
+        entry: &'a ClipEntry,
+        height: f32,
+        fit: iced::ContentFit,
+    ) -> Element<'a, Message> {
         match self.thumbs.get(&entry.path) {
-            Some(Thumb::Ready { handle, .. }) => frame_image(handle.clone(), height),
+            Some(Thumb::Ready { handle, .. }) => frame_image(handle.clone(), height, fit),
             Some(Thumb::Failed { .. }) => placeholder("No preview", height),
             _ => placeholder("Loading...", height),
         }
@@ -2197,22 +2513,35 @@ impl Library {
         }
     }
 
-    /// The big detail preview: the moving frame (else the thumbnail), the brand mark as the
-    /// centred play control, click-anywhere pause, and the fullscreen toggle.
-    fn preview<'a>(&'a self, entry: &'a ClipEntry) -> Element<'a, Message> {
-        let frame: Element<Message> = match self.moving_frame() {
-            Some(element) => element,
-            None => self.thumbnail(entry, PREVIEW_HEIGHT),
-        };
-        let playing = self.play_range.is_some();
-        let mut layers: Vec<Element<Message>> = vec![
+    /// The preview's stacked layers, shared by the inline preview and the fullscreen one: the
+    /// frame itself (a press anywhere plays or pauses), the crop overlay when a crop can be
+    /// made, the play badge while paused, and the fullscreen toggle when there is one to offer.
+    fn frame_layers<'a>(&'a self, frame: Element<'a, Message>) -> Vec<Element<'a, Message>> {
+        let mut layers: Vec<Element<'a, Message>> = vec![
             iced::widget::mouse_area(frame)
                 .on_press(Message::PlayToggle)
                 .into(),
         ];
-        if !playing {
+        if self.crop_enabled()
+            && let (Some(dims), Some(frame_ratio)) = (self.frame_dims(), self.frame_ratio())
+        {
+            // The overlay owns every press over the picture, so the click-to-play layer below
+            // it is reached through `on_tap`.
             layers.push(
-                container(play_button(56.0))
+                cropbox::CropBox::new(
+                    self.crop,
+                    dims,
+                    self.crop_ratio.rect_ratio(frame_ratio),
+                    Message::CropChanged,
+                )
+                .on_reset(Message::CropReset)
+                .on_tap(Message::PlayToggle)
+                .into(),
+            );
+        }
+        if self.play_range.is_none() {
+            layers.push(
+                container(play_button(if self.fullscreen { 96.0 } else { 56.0 }))
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .align_x(iced::Alignment::Center)
@@ -2220,28 +2549,131 @@ impl Library {
                     .into(),
             );
         }
-        layers.push(
-            container(
-                button(text("Fullscreen").size(12).font(UI_SEMIBOLD))
-                    .on_press(Message::FullscreenToggle)
-                    .style(theme::overlay_button)
-                    .padding([7, 13]),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_x(iced::Alignment::End)
-            .align_y(iced::Alignment::End)
-            .padding(10)
-            .into(),
-        );
+        if !self.fullscreen {
+            layers.push(
+                container(
+                    button(text("Fullscreen").size(12).font(UI_SEMIBOLD))
+                        .on_press(Message::FullscreenToggle)
+                        .style(theme::overlay_button)
+                        .padding([7, 13]),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::Alignment::End)
+                .align_y(iced::Alignment::End)
+                .padding(10)
+                .into(),
+            );
+        }
+        layers
+    }
+
+    /// The crop controls under the preview: the ratio pills, the size the export would write,
+    /// and a way back to the whole frame, over the overlay's keyboard legend.
+    fn crop_controls(&self) -> Element<'_, Message> {
+        let enabled = self.crop_enabled();
+        let mut pills = row![].spacing(6).align_y(iced::Alignment::Center);
+        for ratio in crop::Ratio::ALL {
+            let active = self.crop_ratio == ratio;
+            let mut pill = button(text(ratio.label()).size(11).font(UI_SEMIBOLD))
+                .style(move |theme: &Theme, status| {
+                    segment_style(
+                        theme,
+                        status,
+                        active,
+                        palette::ACCENT,
+                        palette::INK_ON_ACCENT,
+                    )
+                })
+                .padding([5, 11]);
+            if enabled {
+                pill = pill.on_press(Message::CropPresetPicked(ratio));
+            }
+            pills = pills.push(pill);
+        }
+
+        let mut controls = row![pills, Space::new().width(Length::Fill)]
+            .spacing(10)
+            .align_y(iced::Alignment::Center);
+        if let Some((width, height)) = self.output_size() {
+            let color = if self.crop_model().is_some() {
+                palette::ACCENT
+            } else {
+                palette::TEXT_SECONDARY
+            };
+            controls = controls.push(
+                text(format!("Output {width}\u{d7}{height}"))
+                    .size(11)
+                    .font(UI_SEMIBOLD)
+                    .style(tinted(color)),
+            );
+        }
+        if crop::is_changed(self.crop) {
+            controls = controls.push(
+                button(text("Reset").size(11).font(UI_SEMIBOLD))
+                    .on_press(Message::CropReset)
+                    .style(link_button)
+                    .padding([5, 4]),
+            );
+        }
+
+        let mut panel = column![controls].spacing(8);
+        if enabled {
+            panel = panel.push(
+                row![
+                    hint("Drag the box or its corners"),
+                    theme::kbd_chip("\u{2190}"),
+                    theme::kbd_chip("\u{2191}"),
+                    theme::kbd_chip("\u{2193}"),
+                    theme::kbd_chip("\u{2192}"),
+                    hint("move"),
+                    theme::kbd_chip("shift+arrows"),
+                    hint("resize"),
+                    theme::kbd_chip("esc"),
+                    hint("reset"),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            );
+        }
+        panel.into()
+    }
+
+    /// The one line under the preview about what this machine cannot do: playback and cropping
+    /// spawn the same ffmpeg, so a missing one is said once rather than twice.
+    fn preview_hint(&self) -> Option<Element<'_, Message>> {
+        match (self.play_error, self.ffmpeg) {
+            (Some(_), Some(false)) => Some(hint(
+                "In-app preview and cropping need ffmpeg installed; use Open in player.",
+            )),
+            (Some(reason), _) => Some(hint(reason)),
+            (None, Some(false)) => Some(hint("Cropping needs ffmpeg installed.")),
+            (None, _) => None,
+        }
+    }
+
+    /// The big detail preview: the moving frame (else the thumbnail), the crop overlay, the
+    /// brand mark as the centred play control, click-anywhere pause and the fullscreen toggle,
+    /// with the crop controls under the box.
+    fn preview<'a>(&'a self, entry: &'a ClipEntry) -> Element<'a, Message> {
+        let frame: Element<Message> = match self.moving_frame() {
+            Some(element) => element,
+            // Letterboxed, not filled: an overlay on a cropped-to-fill picture would point at
+            // pixels the export will not use.
+            None => self.thumbnail(entry, PREVIEW_HEIGHT, iced::ContentFit::Contain),
+        };
         // Layered above an empty base: iced only hard-clips layered stack children, so this
-        // keeps the Cover-scaled frame inside the box (see `layered`).
-        let stack = layered(layers)
+        // keeps the frame inside the box (see `layered`).
+        let stack = layered(self.frame_layers(frame))
             .width(Length::Fill)
             .height(Length::Fixed(PREVIEW_HEIGHT));
-        let mut col = column![container(stack).clip(true).style(theme::card_style)].spacing(6);
-        if let Some(reason) = self.play_error {
-            col = col.push(hint(reason));
+        let mut col = column![
+            container(stack).clip(true).style(theme::card_style),
+            self.crop_controls(),
+        ]
+        .spacing(6);
+        if let Some(line) = self.preview_hint() {
+            col = col.push(line);
         }
         col.into()
     }
@@ -2251,25 +2683,11 @@ impl Library {
     fn fullscreen_view<'a>(&'a self, entry: &'a ClipEntry) -> Element<'a, Message> {
         let frame: Element<Message> = match self.moving_frame() {
             Some(element) => element,
-            None => self.thumbnail(entry, 400.0),
+            None => self.thumbnail(entry, 400.0, iced::ContentFit::Contain),
         };
-        let playing = self.play_range.is_some();
-        let mut layers: Vec<Element<Message>> = vec![
-            iced::widget::mouse_area(frame)
-                .on_press(Message::PlayToggle)
-                .into(),
-        ];
-        if !playing {
-            layers.push(
-                container(play_button(96.0))
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .align_x(iced::Alignment::Center)
-                    .align_y(iced::Alignment::Center)
-                    .into(),
-            );
-        }
-        let video = layered(layers).width(Length::Fill).height(Length::Fill);
+        let video = layered(self.frame_layers(frame))
+            .width(Length::Fill)
+            .height(Length::Fill);
 
         let stat = |label: &'static str, secs: f32| {
             text(format!("{label} {}", secs_label(secs)))
@@ -2447,12 +2865,14 @@ impl Library {
             .into()
     }
 
-    /// The trim panel: a start/end range over the clip, and a lossless "save a trimmed copy" action.
+    /// The trim panel: a start/end range over the clip, the crop framed on the preview above
+    /// it, and the save actions for both.
     fn trim_panel(&self) -> Element<'_, Message> {
         let dur = self.open_dur.max(MIN_TRIM_SECS);
         let start = self.trim_start.clamp(0.0, dur);
         let end = self.trim_end.clamp(0.0, dur);
         let length = (end - start).max(0.0);
+        let cropping = self.crop_pixels().is_some();
 
         // A quiet legend for the timeline's keyboard controls; the keys only listen after a
         // click on the timeline, so say so.
@@ -2478,18 +2898,27 @@ impl Library {
             value_row("Start", secs_label(start)),
             value_row("End", secs_label(end)),
             value_row("Trimmed length", secs_label(length)),
-            hint(
-                "Drag the handles on the timeline to set the range. The start snaps back to the \
-                 nearest keyframe (about a second), so the cut is lossless. Save replaces this \
-                 clip; Save as copy keeps the original.",
-            ),
+            hint(match self.output_size().filter(|_| cropping) {
+                // The two paths differ in where the clip starts, so the panel says which one
+                // this save takes rather than leaving people to notice.
+                Some((width, height)) => format!(
+                    "Cropping re-encodes the clip to {width}\u{d7}{height} with ffmpeg, so the \
+                     cut is exact (no keyframe snap) and takes a moment. Save replaces this \
+                     clip; Save as copy keeps the original."
+                ),
+                None => "Drag the handles on the timeline to set the range. The start snaps \
+                         back to the nearest keyframe (about a second), so the cut is lossless. \
+                         Save replaces this clip; Save as copy keeps the original."
+                    .to_owned(),
+            }),
         ]
         .spacing(14);
 
-        let busy = matches!(self.trim, TrimState::Saving);
-        // Saving an untouched range would only copy the clip; wait until a handle moved.
+        // A crop waits for another clip's encode to finish: there is one export slot.
+        let queued = cropping && self.export.is_some();
+        let busy = self.saving_open_clip() || queued;
         let changed = start > TRIM_EPSILON || end < dur - TRIM_EPSILON;
-        let ready = !busy && length >= MIN_TRIM_SECS && changed;
+        let ready = save_ready(busy, length, changed, cropping);
         let mut save = button(text("Save").size(13).font(UI_BOLD))
             .style(primary_button)
             .padding([11, 24]);
@@ -2510,23 +2939,55 @@ impl Library {
         );
 
         let panel = match &self.trim {
+            TrimState::Idle if queued && !self.saving_open_clip() => panel.push(hint(
+                "Another clip is still encoding; save this crop once it is done.",
+            )),
             TrimState::Idle => panel,
-            TrimState::Saving => panel.push(hint("Saving the trimmed clip...")),
+            // Only the encode is worth offering a way out of: the lossless cut is a copy that
+            // is over before a button could be pressed.
+            TrimState::Saving { cropped: true } => panel.push(
+                row![
+                    hint(match self.export_progress {
+                        Some(fraction) => {
+                            format!("Encoding the cropped clip\u{2026} {:.0}%", fraction * 100.0)
+                        }
+                        None => "Encoding the cropped clip\u{2026}".to_owned(),
+                    }),
+                    button(text("Cancel").size(11).font(UI_SEMIBOLD))
+                        .on_press(Message::ExportCancelled)
+                        .style(secondary_button)
+                        .padding([5, 11]),
+                ]
+                .spacing(10)
+                .align_y(iced::Alignment::Center),
+            ),
+            TrimState::Saving { cropped: false } => panel.push(hint("Saving the trimmed clip...")),
             TrimState::Saved {
-                overwrite: true, ..
+                overwrite: true,
+                cropped,
+                ..
             } => panel.push(
-                text("Trimmed. Ready to upload below.")
-                    .size(12)
-                    .style(tinted(palette::ACCENT)),
+                text(if *cropped {
+                    "Cropped. Ready to upload below."
+                } else {
+                    "Trimmed. Ready to upload below."
+                })
+                .size(12)
+                .style(tinted(palette::ACCENT)),
             ),
             TrimState::Saved {
                 overwrite: false,
+                cropped,
                 path,
             } => panel.push(
                 column![
-                    text("Saved a trimmed copy. The upload below sends this same range.")
-                        .size(12)
-                        .style(tinted(palette::ACCENT)),
+                    text(if *cropped {
+                        "Saved a cropped copy. The upload below sends this same range."
+                    } else {
+                        "Saved a trimmed copy. The upload below sends this same range."
+                    })
+                    .size(12)
+                    .style(tinted(palette::ACCENT)),
                     hint(path.display().to_string()),
                 ]
                 .spacing(6),
@@ -2535,7 +2996,7 @@ impl Library {
                 panel.push(text(e.clone()).size(12).style(tinted(palette::DANGER)))
             }
         };
-        card("TRIM", panel)
+        card("TRIM & CROP", panel)
     }
 
     /// Play / show in folder / delete, with the delete confirm inline (no OS dialog).
@@ -2589,8 +3050,9 @@ impl Library {
                 .on_press(Message::ShowInFolder)
                 .style(secondary_button)
                 .padding([9, 14]),
+            // Deleting under a running save would see the save put the clip back.
             button(text("Delete").size(11).font(UI_SEMIBOLD))
-                .on_press(Message::DeleteRequested)
+                .on_press_maybe((!self.saving_open_clip()).then_some(Message::DeleteRequested))
                 .style(theme::danger_outline_button)
                 .padding([9, 14]),
         ]
@@ -3094,10 +3556,10 @@ async fn upload_ganked(
     up: rewynd_config::UploadSettings,
     path: PathBuf,
     meta: ClipMetadata,
-    trim: Option<(Duration, Duration)>,
+    plan: EditPlan,
 ) -> Result<Uploaded, String> {
     let client = ganked_client(&up)?;
-    let prepared = PreparedClip::of(path, trim).await?;
+    let prepared = PreparedClip::of(path, plan).await?;
     let clip = client.upload(prepared.path(), &meta).await.map_err(|e| {
         // The user-facing copy is shared with the tray; the full error goes to the log.
         tracing::error!(error = %e, "upload failed");
@@ -3170,7 +3632,7 @@ async fn upload_youtube(
     yt: rewynd_config::YouTubeSettings,
     path: PathBuf,
     meta: ClipMetadata,
-    trim: Option<(Duration, Duration)>,
+    plan: EditPlan,
 ) -> Result<Uploaded, String> {
     let client = YouTubeClient::new(
         rewynd_config::non_empty_or(&yt.client_id, DEFAULT_CLIENT_ID),
@@ -3178,7 +3640,7 @@ async fn upload_youtube(
         &yt.refresh_token,
     )
     .map_err(|e| e.to_string())?;
-    let prepared = PreparedClip::of(path, trim).await?;
+    let prepared = PreparedClip::of(path, plan).await?;
     let video = client.upload(prepared.path(), &meta).await.map_err(|e| {
         tracing::error!(error = %e, "YouTube upload failed");
         user_facing_youtube_error(&e)
@@ -3375,33 +3837,49 @@ fn clip_card_style(
     }
 }
 
-/// One segment of the destination control: mint fill + ink when active, quiet otherwise.
+/// Whether Save / Save as copy can run: never while a save is in flight, only with at least
+/// [`MIN_TRIM_SECS`] kept, and only when there is an edit to save — a real cut or a crop.
+fn save_ready(busy: bool, length: f32, trimmed: bool, cropped: bool) -> bool {
+    !busy && length >= MIN_TRIM_SECS && (trimmed || cropped)
+}
+
 /// A `m:ss` label for a number of seconds.
 fn secs_label(seconds: f32) -> String {
     let s = seconds.max(0.0).round() as u32;
     format!("{}:{:02}", s / 60, s % 60)
 }
 
-/// A fresh sibling path for a trimmed copy of `src` (`<stem>-trim.<ext>`, bumping a counter when
-/// taken), so re-trimming never overwrites an earlier trim and the copy lands beside the original
-/// (same per-game folder).
-fn unique_trim_path(src: &Path) -> PathBuf {
+/// A fresh sibling path for a saved copy of `src` (`<stem>-<suffix>.<ext>`, bumping a counter
+/// when taken), so saving twice never overwrites an earlier copy and the new file lands beside
+/// the original (same per-game folder).
+fn unique_copy_path(src: &Path, suffix: &str) -> PathBuf {
     let parent = src.parent().unwrap_or_else(|| Path::new("."));
     let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("clip");
     let ext = src.extension().and_then(|s| s.to_str()).unwrap_or("mp4");
-    let mut candidate = parent.join(format!("{stem}-trim.{ext}"));
+    let mut candidate = parent.join(format!("{stem}-{suffix}.{ext}"));
     let mut n = 2;
     while candidate.exists() {
-        candidate = parent.join(format!("{stem}-trim-{n}.{ext}"));
+        candidate = parent.join(format!("{stem}-{suffix}-{n}.{ext}"));
         n += 1;
     }
     candidate
 }
 
-/// A sibling temp path in `src`'s directory (so the replace is a same-filesystem, atomic rename).
-fn overwrite_temp_path(src: &Path) -> PathBuf {
+/// The temp a save writes before renaming it into place, in `src`'s directory (so the rename is
+/// a same-filesystem, atomic one).
+fn save_temp_path(src: &Path) -> PathBuf {
+    sibling_temp_path(src, SAVE_TEMP_MARK)
+}
+
+/// A hidden, `.tmp`-suffixed sibling of `src` (the clip store lists `rewynd-*.mp4`, so it never
+/// shows one), tagged with `mark` for [`sweep_temps_in`].
+fn sibling_temp_path(src: &Path, mark: &str) -> PathBuf {
+    // Unique per attempt: two saves or uploads writing one temp would interleave into a single
+    // file, which then gets renamed over the original or sent.
+    static ATTEMPT: AtomicU32 = AtomicU32::new(0);
+    let n = ATTEMPT.fetch_add(1, Ordering::Relaxed);
     let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("clip");
-    src.with_file_name(format!(".{name}.trimming.{}.tmp", std::process::id()))
+    src.with_file_name(format!(".{name}{mark}{}-{n}.tmp", std::process::id()))
 }
 
 /// Trim `src` to `[start, end]`. [`SaveMode::Copy`] writes a fresh sibling file and returns it;
@@ -3413,15 +3891,18 @@ fn save_trim(
     start: Duration,
     end: Duration,
 ) -> Result<PathBuf, String> {
+    if let Some(dir) = src.parent() {
+        sweep_temps_in(dir, SystemTime::now());
+    }
     match mode {
         SaveMode::Copy => {
-            let dst = unique_trim_path(src);
+            let dst = unique_copy_path(src, "trim");
             rewynd_mux::read::trim_clip(src, &dst, start, end)
                 .map(|_| dst)
                 .map_err(|e| e.to_string())
         }
         SaveMode::Overwrite => {
-            let temp = overwrite_temp_path(src);
+            let temp = save_temp_path(src);
             let result = rewynd_mux::read::trim_clip(src, &temp, start, end)
                 .map_err(|e| e.to_string())
                 .and_then(|_| std::fs::rename(&temp, src).map_err(|e| e.to_string()))
@@ -3431,6 +3912,135 @@ fn save_trim(
             }
             result
         }
+    }
+}
+
+/// What a save or an upload of the open clip has to do. A crop cannot be a stream copy, so any
+/// crop takes the whole edit (cut included) through the encoder in one pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditPlan {
+    None,
+    Lossless {
+        start: Duration,
+        end: Duration,
+    },
+    Encode {
+        range: Option<(Duration, Duration)>,
+        crop: crop::PixelRect,
+    },
+}
+
+/// Route one clip's pending edits: nothing, a lossless cut, or a re-encode. `trim` is already
+/// `None` unless the range differs from the whole clip, and `crop` unless the rect does.
+fn edit_plan(trim: Option<(Duration, Duration)>, crop: Option<crop::PixelRect>) -> EditPlan {
+    match (trim, crop) {
+        (range, Some(crop)) => EditPlan::Encode { range, crop },
+        (Some((start, end)), None) => EditPlan::Lossless { start, end },
+        (None, None) => EditPlan::None,
+    }
+}
+
+/// What a placement refused because Cancel got there first. The panel is already back to Idle
+/// by then, so the handler drops it rather than raising a failure banner.
+const EXPORT_CANCELLED: &str = "the export was cancelled";
+
+/// One crop export as UI messages: ffmpeg's progress while it runs, then the finishing move
+/// (renaming the temp to the copy's name, or over the original) as one [`Message::TrimSaved`],
+/// which comes even when the export was cancelled or failed.
+fn crop_export(
+    src: PathBuf,
+    mode: SaveMode,
+    spec: export::Spec,
+    total: Duration,
+    copy_edits: Option<Vec<ClipEdit>>,
+    cancelled: Arc<AtomicBool>,
+) -> impl iced::futures::Stream<Item = Message> {
+    iced::stream::channel(
+        4,
+        move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+            use iced::futures::{SinkExt, StreamExt};
+
+            let dst = spec.dst.clone();
+            if let Some(dir) = src.parent().map(Path::to_path_buf) {
+                let _ = tokio::task::spawn_blocking(move || {
+                    sweep_temps_in(&dir, SystemTime::now());
+                })
+                .await;
+            }
+            let mut events = std::pin::pin!(export::stream(spec, total, Arc::clone(&cancelled)));
+            let mut encoded = Err("the export stopped without saying why".to_owned());
+            while let Some(event) = events.next().await {
+                match event {
+                    export::Event::Progress(fraction) => {
+                        let _ = output
+                            .send(Message::ExportProgress {
+                                src: src.clone(),
+                                fraction,
+                            })
+                            .await;
+                    }
+                    export::Event::Done(done) => encoded = done.map_err(|e| e.to_string()),
+                }
+            }
+            let encoded_src = src.clone();
+            let result = match encoded {
+                Ok(()) => tokio::task::spawn_blocking(move || {
+                    place_export(&encoded_src, mode, dst, copy_edits, &cancelled)
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string())),
+                Err(e) => Err(e),
+            };
+            let _ = output
+                .send(Message::TrimSaved {
+                    src,
+                    mode,
+                    cropped: true,
+                    result,
+                })
+                .await;
+        },
+    )
+}
+
+/// Put a finished export's `temp` where the save asked for it: a copy gets a fresh sibling
+/// name (and the original's clip name), an overwrite atomically replaces the clip. The temp
+/// goes if the rename fails, leaving the original untouched.
+///
+/// `cancelled` is read here, last: a cancel that lands while ffmpeg's last bytes are being
+/// flushed must still leave the clip and its directory exactly as they were.
+fn place_export(
+    src: &Path,
+    mode: SaveMode,
+    temp: PathBuf,
+    copy_edits: Option<Vec<ClipEdit>>,
+    cancelled: &AtomicBool,
+) -> Result<PathBuf, String> {
+    if cancelled.load(Ordering::Relaxed) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(EXPORT_CANCELLED.to_owned());
+    }
+    let dst = match mode {
+        SaveMode::Copy => unique_copy_path(src, "crop"),
+        SaveMode::Overwrite => src.to_path_buf(),
+    };
+    if let Err(e) = std::fs::rename(&temp, &dst) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e.to_string());
+    }
+    if matches!(mode, SaveMode::Copy) {
+        name_copy(&dst, copy_edits);
+    }
+    Ok(dst)
+}
+
+/// Give a saved copy the name its original carried.
+fn name_copy(dst: &Path, edits: Option<Vec<ClipEdit>>) {
+    if let Some(edits) = edits
+        && let Some(file_name) = clip_meta::file_name_of(dst)
+        && let Err(e) = clip_meta::update(file_name, &edits)
+    {
+        tracing::warn!(error = %e, "could not name the saved copy");
     }
 }
 
@@ -3445,46 +4055,43 @@ fn debounce(generation: &mut u64, message: fn(u64) -> Message) -> Task<Message> 
     })
 }
 
-/// Marks the throwaway trim one upload sends. Hidden and `.tmp`-suffixed, so the clip store
-/// (which lists `rewynd-*.mp4`) never shows one.
+/// Marks the throwaway trim or crop one upload sends.
 const UPLOAD_TEMP_MARK: &str = ".uploading.";
 
-/// How long a leftover upload trim may sit before the next upload sweeps it: an upload
-/// cancelled mid-trim leaves one behind (the blocking cut outlives the dropped task).
-const UPLOAD_TEMP_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Marks the temp a save writes before renaming it into place.
+const SAVE_TEMP_MARK: &str = ".trimming.";
+
+/// How long a leftover temp may sit before the next save or upload in its folder sweeps it: a
+/// crash or a force-quit mid-encode leaves one behind, and so does an upload cancelled mid-trim
+/// (the blocking cut outlives the dropped task). No live encode goes a day without writing.
+const TEMP_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// A sibling temp path for the trim, in the clip's own directory the way the in-place trim
 /// does it: that filesystem holds the clips already, so it has the room a clip-sized cut needs
 /// and no other user's `/tmp` can be in the way.
 fn upload_temp_path(src: &Path) -> PathBuf {
-    // Unique per attempt: two clips (or two goes at one) must not race over the same file.
-    static ATTEMPT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let n = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("clip");
-    src.with_file_name(format!(
-        ".{name}{UPLOAD_TEMP_MARK}{}-{n}.tmp",
-        std::process::id()
-    ))
+    sibling_temp_path(src, UPLOAD_TEMP_MARK)
 }
 
-/// Drop the upload temps in `dir` older than [`UPLOAD_TEMP_MAX_AGE`]. Blocking, and
-/// deliberately silent: a sweep that fails must not fail the upload behind it.
-fn sweep_upload_temps_in(dir: &Path, now: SystemTime) {
+/// Drop the save and upload temps in `dir` older than [`TEMP_MAX_AGE`]. Blocking, and
+/// deliberately silent: a sweep that fails must not fail the save or upload behind it.
+fn sweep_temps_in(dir: &Path, now: SystemTime) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .contains(UPLOAD_TEMP_MARK)
-        {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let temp = name.starts_with('.')
+            && name.ends_with(".tmp")
+            && (name.contains(UPLOAD_TEMP_MARK) || name.contains(SAVE_TEMP_MARK));
+        if !temp {
             continue;
         }
         let stale = entry
             .metadata()
             .and_then(|m| m.modified())
-            .is_ok_and(|m| now.duration_since(m).is_ok_and(|a| a > UPLOAD_TEMP_MAX_AGE));
+            .is_ok_and(|m| now.duration_since(m).is_ok_and(|a| a > TEMP_MAX_AGE));
         if stale {
             let _ = std::fs::remove_file(entry.path());
         }
@@ -3499,15 +4106,28 @@ struct PreparedClip {
 }
 
 impl PreparedClip {
-    /// The clip at `src`, cut to `trim` first when the timeline shows a range.
-    async fn of(src: PathBuf, trim: Option<(Duration, Duration)>) -> Result<Self, String> {
-        let Some((start, end)) = trim else {
-            return Ok(Self {
-                path: src,
-                temp: false,
-            });
+    /// The clip at `src`, with the editor's `plan` applied to a throwaway copy first when there
+    /// is one to apply.
+    async fn of(src: PathBuf, plan: EditPlan) -> Result<Self, String> {
+        // The blocking cut outlives this future when Cancel drops it; an encode watches this
+        // flag, which the guard raises on the way out, and stops.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = RaiseOnDrop(Arc::clone(&cancel));
+        let cut: Box<dyn FnOnce() -> Result<PathBuf, String> + Send> = match plan {
+            EditPlan::None => {
+                return Ok(Self {
+                    path: src,
+                    temp: false,
+                });
+            }
+            EditPlan::Lossless { start, end } => {
+                Box::new(move || trim_for_upload(&src, start, end))
+            }
+            EditPlan::Encode { range, crop } => {
+                Box::new(move || crop_for_upload(&src, range, crop, &cancel))
+            }
         };
-        let path = tokio::task::spawn_blocking(move || trim_for_upload(&src, start, end))
+        let path = tokio::task::spawn_blocking(cut)
             .await
             .unwrap_or_else(|e| Err(e.to_string()))?;
         Ok(Self { path, temp: true })
@@ -3515,6 +4135,15 @@ impl PreparedClip {
 
     fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+/// Raises its flag when dropped.
+struct RaiseOnDrop(Arc<AtomicBool>);
+
+impl Drop for RaiseOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 
@@ -3529,7 +4158,7 @@ impl Drop for PreparedClip {
 /// Cut `src` to `[start, end]` into a throwaway file for one upload. Blocking.
 fn trim_for_upload(src: &Path, start: Duration, end: Duration) -> Result<PathBuf, String> {
     if let Some(dir) = src.parent() {
-        sweep_upload_temps_in(dir, SystemTime::now());
+        sweep_temps_in(dir, SystemTime::now());
     }
     let dst = upload_temp_path(src);
     rewynd_mux::read::trim_clip(src, &dst, start, end)
@@ -3537,6 +4166,33 @@ fn trim_for_upload(src: &Path, start: Duration, end: Duration) -> Result<PathBuf
         .map_err(|e| {
             let _ = std::fs::remove_file(&dst);
             format!("Could not trim the clip for upload: {e}")
+        })
+}
+
+/// Crop (and, in the same pass, cut) `src` into a throwaway file for one upload. Blocking until
+/// done or `cancel` is raised.
+fn crop_for_upload(
+    src: &Path,
+    range: Option<(Duration, Duration)>,
+    crop: crop::PixelRect,
+    cancel: &AtomicBool,
+) -> Result<PathBuf, String> {
+    if let Some(dir) = src.parent() {
+        sweep_temps_in(dir, SystemTime::now());
+    }
+    let dst = upload_temp_path(src);
+    let spec = export::Spec {
+        src: src.to_path_buf(),
+        dst: dst.clone(),
+        range,
+        crop,
+        video: export::VideoQuality::DEFAULT,
+    };
+    export::run(&spec, cancel)
+        .map(|()| dst.clone())
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&dst);
+            format!("Could not crop the clip for upload: {e}")
         })
 }
 
@@ -3582,6 +4238,7 @@ fn dest_accent(dest: Dest) -> (iced::Color, iced::Color) {
     }
 }
 
+/// One segment of the destination control: mint fill + ink when active, quiet otherwise.
 fn segment_style(
     _theme: &Theme,
     status: iced::widget::button::Status,
@@ -3641,13 +4298,18 @@ fn play_button<'a>(size: f32) -> Element<'a, Message> {
         .into()
 }
 
-/// A decoded frame styled like every clip image: full width, covering `height`. Callers wrap it
-/// in [`layered`] + a `clip(true)` container (Cover overflows the box on mismatched aspects).
-fn frame_image<'a>(handle: iced::widget::image::Handle, height: f32) -> Element<'a, Message> {
+/// A decoded frame at full width and `height`. `Cover` fills the box (the grid cards) and needs
+/// a [`layered`] + `clip(true)` wrapper, since it overflows on a mismatched aspect; `Contain`
+/// letterboxes it, which is what the crop overlay is drawn against.
+fn frame_image<'a>(
+    handle: iced::widget::image::Handle,
+    height: f32,
+    fit: iced::ContentFit,
+) -> Element<'a, Message> {
     iced::widget::image(handle)
         .width(Length::Fill)
         .height(height)
-        .content_fit(iced::ContentFit::Cover)
+        .content_fit(fit)
         .into()
 }
 
@@ -4178,21 +4840,30 @@ mod tests {
     }
 
     #[test]
-    fn the_temp_sweep_drops_only_stale_upload_temps() {
+    fn the_temp_sweep_drops_only_stale_temps() {
         let dir = tempfile::tempdir().expect("temp dir");
         let clip = dir.path().join("rewynd-1-0.mp4");
         std::fs::write(&clip, b"x").expect("write");
-        let temp = upload_temp_path(&clip);
-        std::fs::write(&temp, b"x").expect("write");
-        // Sweeping "from" far enough ahead makes both files look old.
-        let far_future = SystemTime::now() + UPLOAD_TEMP_MAX_AGE + Duration::from_secs(60);
+        let upload = upload_temp_path(&clip);
+        let save = save_temp_path(&clip);
+        std::fs::write(&upload, b"x").expect("write");
+        std::fs::write(&save, b"x").expect("write");
+        // Sweeping "from" far enough ahead makes every file look old.
+        let far_future = SystemTime::now() + TEMP_MAX_AGE + Duration::from_secs(60);
 
-        sweep_upload_temps_in(dir.path(), SystemTime::now());
-        assert!(temp.exists(), "a fresh temp is left alone");
+        sweep_temps_in(dir.path(), SystemTime::now());
+        assert!(
+            upload.exists() && save.exists(),
+            "a fresh temp is left alone"
+        );
 
-        sweep_upload_temps_in(dir.path(), far_future);
-        assert!(!temp.exists(), "a temp past the age is removed");
-        assert!(clip.exists(), "the clip beside it is never touched");
+        sweep_temps_in(dir.path(), far_future);
+        assert!(!upload.exists(), "an upload temp past the age is removed");
+        assert!(
+            !save.exists(),
+            "and so is a save's, a crash mid-encode leaves"
+        );
+        assert!(clip.exists(), "the clip beside them is never touched");
     }
 
     /// Reads the live catalogue, so it only runs where the config points at a real server.
@@ -4313,5 +4984,563 @@ mod tests {
         let label = saved_at_label(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000));
         assert_eq!(label.len(), 16, "{label}");
         assert!(label.starts_with("2023-11-1"), "{label}");
+    }
+
+    /// The ultrawide crop the whole feature exists for: 16:9 out of a 3440x1440 frame.
+    const ULTRAWIDE: (u32, u32) = (3440, 1440);
+    const WIDE_CROP: crop::PixelRect = crop::PixelRect {
+        x: 440,
+        y: 0,
+        width: 2560,
+        height: 1440,
+    };
+
+    #[test]
+    fn a_crop_takes_the_whole_edit_through_the_encoder() {
+        let range = (Duration::from_secs(5), Duration::from_secs(12));
+        assert_eq!(edit_plan(None, None), EditPlan::None);
+        assert_eq!(
+            edit_plan(Some(range), None),
+            EditPlan::Lossless {
+                start: range.0,
+                end: range.1
+            },
+            "a cut on its own stays a stream copy"
+        );
+        assert_eq!(
+            edit_plan(None, Some(WIDE_CROP)),
+            EditPlan::Encode {
+                range: None,
+                crop: WIDE_CROP
+            },
+        );
+        assert_eq!(
+            edit_plan(Some(range), Some(WIDE_CROP)),
+            EditPlan::Encode {
+                range: Some(range),
+                crop: WIDE_CROP
+            },
+            "cut and crop are one pass"
+        );
+    }
+
+    #[test]
+    fn only_a_real_crop_reaches_the_exporter() {
+        let mut lib = Library::new();
+        let config = Config::default();
+        lib.open_dims = Some(ULTRAWIDE);
+        assert_eq!(lib.crop_pixels(), None, "the whole frame is not a crop");
+        assert_eq!(lib.output_size(), Some(ULTRAWIDE));
+
+        // A nudge under the threshold is a mis-click; re-encoding it would cost time for no
+        // visible change.
+        lib.crop = crop::CropRect {
+            x: 0.002,
+            ..crop::FULL_FRAME
+        };
+        assert_eq!(lib.crop_pixels(), None);
+        assert_eq!(
+            lib.output_size(),
+            Some(ULTRAWIDE),
+            "the readout follows the export"
+        );
+
+        drop(lib.update(Message::CropPresetPicked(crop::Ratio::Wide16x9), &config));
+        assert_eq!(lib.crop_pixels(), Some(WIDE_CROP));
+        assert_eq!(lib.output_size(), Some((2560, 1440)));
+
+        // Without the frame the header delivers, no rect can be turned into pixels.
+        lib.open_dims = None;
+        assert_eq!(lib.crop_pixels(), None);
+        assert_eq!(lib.output_size(), None);
+    }
+
+    #[test]
+    fn opening_a_clip_forgets_the_crop() {
+        let (mut lib, named, _) = named_library();
+        let config = Config::default();
+        lib.open_dims = Some(ULTRAWIDE);
+        lib.crop_ratio = crop::Ratio::Wide16x9;
+        drop(lib.update(Message::CropPresetPicked(crop::Ratio::Wide16x9), &config));
+        assert!(lib.crop_pixels().is_some(), "a crop is framed");
+
+        drop(lib.update(Message::Open(named.path.clone()), &config));
+        assert_eq!(lib.crop, crop::FULL_FRAME, "a freshly opened clip is whole");
+        assert_eq!(lib.crop_ratio, crop::Ratio::Free);
+        assert_eq!(lib.open_dims, None, "the frame arrives with the summary");
+        assert_eq!(lib.export_progress, None);
+    }
+
+    #[test]
+    fn a_crop_edit_clears_the_saved_banner() {
+        let (mut lib, named, _) = named_library();
+        let config = Config::default();
+        lib.open = Some(named.path.clone());
+        lib.trim = TrimState::Saved {
+            overwrite: false,
+            cropped: true,
+            path: named.path.clone(),
+        };
+
+        drop(lib.update(
+            Message::CropChanged(crop::CropRect {
+                x: 0.1,
+                y: 0.1,
+                width: 0.5,
+                height: 0.5,
+            }),
+            &config,
+        ));
+        assert!(matches!(lib.trim, TrimState::Idle), "the banner is gone");
+        assert!(lib.crop_pixels().is_none(), "no frame, no pixels yet");
+    }
+
+    #[test]
+    fn an_edit_under_a_running_save_leaves_it_running() {
+        // A crop export is a long encode that owns the temp it is writing; putting the panel
+        // back to Idle would re-enable Save and let a second one write the same file.
+        let (mut lib, named, _) = named_library();
+        let config = Config::default();
+        lib.open = Some(named.path.clone());
+        lib.open_dims = Some(ULTRAWIDE);
+        lib.open_dur = 30.0;
+        lib.trim_end = 30.0;
+        lib.trim = TrimState::Saving { cropped: true };
+
+        for message in [
+            Message::CropChanged(crop::CropRect {
+                x: 0.1,
+                y: 0.1,
+                width: 0.5,
+                height: 0.5,
+            }),
+            Message::CropPresetPicked(crop::Ratio::Wide16x9),
+            Message::CropReset,
+            Message::TrimStartChanged(1.0),
+            Message::TrimEndChanged(20.0),
+            Message::TrimReset,
+        ] {
+            let what = format!("{message:?}");
+            drop(lib.update(message, &config));
+            assert!(
+                matches!(lib.trim, TrimState::Saving { cropped: true }),
+                "{what} must not call off the encode"
+            );
+        }
+
+        // A finished save's banner still gets out of the way of the next edit.
+        lib.trim = TrimState::Failed("nope".to_owned());
+        drop(lib.update(Message::CropReset, &config));
+        assert!(matches!(lib.trim, TrimState::Idle));
+    }
+
+    #[test]
+    fn only_the_open_clips_export_drives_the_progress_bar() {
+        let (mut lib, named, plain) = named_library();
+        let config = Config::default();
+        lib.open = Some(named.path.clone());
+        lib.trim = TrimState::Saving { cropped: true };
+        lib.export_progress = Some(0.25);
+
+        drop(lib.update(
+            Message::ExportProgress {
+                src: plain.path.clone(),
+                fraction: 0.9,
+            },
+            &config,
+        ));
+        assert_eq!(
+            lib.export_progress,
+            Some(0.25),
+            "another clip's export is not this page's"
+        );
+
+        drop(lib.update(
+            Message::ExportProgress {
+                src: named.path.clone(),
+                fraction: 0.5,
+            },
+            &config,
+        ));
+        assert_eq!(lib.export_progress, Some(0.5));
+
+        // Nor does a save that lands for some other clip clear what this one is showing.
+        drop(lib.update(
+            Message::TrimSaved {
+                src: plain.path.clone(),
+                mode: SaveMode::Copy,
+                cropped: true,
+                result: Ok(plain.path.clone()),
+            },
+            &config,
+        ));
+        assert_eq!(lib.export_progress, Some(0.5));
+        assert!(matches!(lib.trim, TrimState::Saving { cropped: true }));
+    }
+
+    /// A library with `named` open, its frame and span filled in: the state a crop save needs.
+    fn editing_library() -> (Library, ClipEntry, ClipEntry) {
+        let (mut lib, named, plain) = named_library();
+        lib.open = Some(named.path.clone());
+        lib.open_dims = Some(ULTRAWIDE);
+        lib.open_dur = 30.0;
+        lib.trim_end = 30.0;
+        (lib, named, plain)
+    }
+
+    #[test]
+    fn cancelling_an_export_raises_its_flag_and_keeps_the_slot_until_it_reports() {
+        let (mut lib, named, plain) = editing_library();
+        let config = Config::default();
+
+        drop(lib.start_crop_save(named.path.clone(), SaveMode::Overwrite, None, WIDE_CROP));
+        let flag = Arc::clone(&lib.export.as_ref().expect("a running export").cancelled);
+        assert!(matches!(lib.trim, TrimState::Saving { cropped: true }));
+
+        // Cancel belongs to the page showing the export; another clip's page must not reach it.
+        lib.open = Some(plain.path.clone());
+        drop(lib.update(Message::ExportCancelled, &config));
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "another page's Cancel is not this one"
+        );
+
+        lib.open = Some(named.path.clone());
+        drop(lib.update(Message::ExportCancelled, &config));
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "the flag is what kills ffmpeg and stops the rename"
+        );
+        assert!(matches!(lib.trim, TrimState::Idle));
+        assert_eq!(lib.export_progress, None);
+        assert!(
+            lib.export.is_some(),
+            "the slot stays taken until ffmpeg is gone"
+        );
+        assert!(
+            lib.saving_open_clip(),
+            "so the clip cannot be deleted under it"
+        );
+
+        // Reopening the page in that window does not bring the cancelled encode back.
+        drop(lib.update(Message::Open(named.path.clone()), &config));
+        assert!(matches!(lib.trim, TrimState::Idle));
+
+        // The cancelled export still reports; it must not land as a failure banner.
+        drop(lib.update(
+            Message::TrimSaved {
+                src: named.path.clone(),
+                mode: SaveMode::Overwrite,
+                cropped: true,
+                result: Err(EXPORT_CANCELLED.to_owned()),
+            },
+            &config,
+        ));
+        assert!(
+            matches!(lib.trim, TrimState::Idle),
+            "a cancel is not a failure"
+        );
+        assert!(lib.export.is_none(), "and the report frees the slot");
+    }
+
+    #[test]
+    fn a_save_that_beats_its_cancel_still_says_so() {
+        // The rename can land between the flag being read and being raised. The clip has then
+        // changed on disk, and the page must not pretend otherwise.
+        let (mut lib, named, _) = editing_library();
+        let config = Config::default();
+        drop(lib.start_crop_save(named.path.clone(), SaveMode::Overwrite, None, WIDE_CROP));
+        drop(lib.update(Message::ExportCancelled, &config));
+
+        drop(lib.update(
+            Message::TrimSaved {
+                src: named.path.clone(),
+                mode: SaveMode::Overwrite,
+                cropped: true,
+                result: Ok(named.path.clone()),
+            },
+            &config,
+        ));
+        assert!(matches!(
+            lib.trim,
+            TrimState::Saved {
+                overwrite: true,
+                cropped: true,
+                ..
+            }
+        ));
+        assert!(lib.export.is_none());
+    }
+
+    #[test]
+    fn reopening_a_clip_mid_encode_leaves_its_save_out_of_reach() {
+        // Re-enabling Save under a running export lets a second one write the same temp, and
+        // two ffmpegs interleaving into one file get renamed over the original.
+        let (mut lib, named, plain) = editing_library();
+        let config = Config::default();
+        drop(lib.start_crop_save(named.path.clone(), SaveMode::Overwrite, None, WIDE_CROP));
+
+        drop(lib.update(Message::Open(plain.path.clone()), &config));
+        assert!(
+            matches!(lib.trim, TrimState::Idle),
+            "another clip has nothing of its own running"
+        );
+        assert_eq!(lib.export_progress, None);
+        assert!(!lib.saving_open_clip());
+
+        // The export keeps going while its page is closed, and its bar with it.
+        drop(lib.update(
+            Message::ExportProgress {
+                src: named.path.clone(),
+                fraction: 0.8,
+            },
+            &config,
+        ));
+        assert_eq!(lib.export_progress, None, "not on this page");
+
+        drop(lib.update(Message::Open(named.path.clone()), &config));
+        assert!(
+            matches!(lib.trim, TrimState::Saving { cropped: true }),
+            "the encode is still writing this clip"
+        );
+        assert_eq!(
+            lib.export_progress,
+            Some(0.8),
+            "the bar picks up where the export is"
+        );
+        assert!(
+            !save_ready(lib.saving_open_clip(), 30.0, false, true),
+            "so Save stays out of reach"
+        );
+    }
+
+    #[test]
+    fn a_second_crop_waits_for_the_running_export() {
+        // One slot: a second export would leave the first beyond Cancel and the progress bar.
+        let (mut lib, named, plain) = editing_library();
+        let config = Config::default();
+        drop(lib.start_crop_save(named.path.clone(), SaveMode::Overwrite, None, WIDE_CROP));
+
+        drop(lib.update(Message::Open(plain.path.clone()), &config));
+        drop(lib.start_crop_save(plain.path.clone(), SaveMode::Overwrite, None, WIDE_CROP));
+        assert!(
+            matches!(lib.trim, TrimState::Idle),
+            "the second never started"
+        );
+        let running = lib.export.as_ref().expect("the first export runs on");
+        assert_eq!(running.src, named.path);
+
+        // Nor does a result for another clip free the slot.
+        drop(lib.update(
+            Message::TrimSaved {
+                src: plain.path.clone(),
+                mode: SaveMode::Overwrite,
+                cropped: true,
+                result: Ok(plain.path.clone()),
+            },
+            &config,
+        ));
+        assert_eq!(lib.export.as_ref().map(|e| &e.src), Some(&named.path));
+    }
+
+    #[test]
+    fn a_clip_being_saved_cannot_be_deleted() {
+        let (mut lib, named, _) = editing_library();
+        let config = Config::default();
+        drop(lib.start_crop_save(named.path.clone(), SaveMode::Overwrite, None, WIDE_CROP));
+
+        lib.confirm_delete = true;
+        let delete = lib.update(Message::DeleteConfirmed, &config);
+        assert_eq!(delete.units(), 0, "the save would only put the clip back");
+        assert!(!lib.confirm_delete);
+
+        // Once the save reports, the clip is the user's to delete again.
+        drop(lib.update(
+            Message::TrimSaved {
+                src: named.path.clone(),
+                mode: SaveMode::Overwrite,
+                cropped: true,
+                result: Ok(named.path.clone()),
+            },
+            &config,
+        ));
+        assert!(lib.update(Message::DeleteConfirmed, &config).units() > 0);
+    }
+
+    #[test]
+    fn a_trim_save_outlives_a_detour_like_an_export_does() {
+        let (mut lib, named, plain) = editing_library();
+        let config = Config::default();
+        drop(lib.start_trim_save(
+            named.path.clone(),
+            SaveMode::Overwrite,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        ));
+        drop(lib.update(Message::Open(plain.path.clone()), &config));
+        assert!(!lib.saving_open_clip(), "the other clip is free");
+        drop(lib.update(Message::Open(named.path.clone()), &config));
+        assert!(
+            matches!(lib.trim, TrimState::Saving { cropped: false }),
+            "the save is still writing this clip"
+        );
+
+        // Deleting now would see the rename put the clip back; the page says why it won't.
+        lib.confirm_delete = true;
+        assert_eq!(lib.update(Message::DeleteConfirmed, &config).units(), 0);
+        assert!(lib.action_error.is_some());
+
+        // A lossless save cannot be cancelled, so its outcome is news on its page.
+        drop(lib.update(
+            Message::TrimSaved {
+                src: named.path.clone(),
+                mode: SaveMode::Overwrite,
+                cropped: false,
+                result: Err("disk full".to_owned()),
+            },
+            &config,
+        ));
+        assert!(
+            matches!(&lib.trim, TrimState::Failed(e) if e.contains("disk full")),
+            "the failure shows on the reopened page"
+        );
+        assert!(!lib.saving_open_clip(), "and the clip is free again");
+    }
+
+    #[test]
+    fn an_overwrite_temp_is_unique_per_attempt() {
+        // Two exports of one clip sharing a temp would interleave into a single file.
+        let src = Path::new("/clips/Elden Ring/rewynd-1-0.mp4");
+        let first = save_temp_path(src);
+        let again = save_temp_path(src);
+
+        assert_eq!(first.parent(), Some(Path::new("/clips/Elden Ring")));
+        let name = first.file_name().and_then(|n| n.to_str()).expect("name");
+        assert!(name.starts_with('.') && name.ends_with(".tmp"), "{name}");
+        assert_ne!(again, first);
+        assert_eq!(again.parent(), first.parent());
+    }
+
+    #[test]
+    fn a_cancelled_placement_leaves_the_clip_and_its_folder_alone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let src = dir.path().join("rewynd-1-0.mp4");
+        std::fs::write(&src, b"original").expect("write");
+        let cancelled = AtomicBool::new(true);
+
+        for mode in [SaveMode::Overwrite, SaveMode::Copy] {
+            let temp = save_temp_path(&src);
+            std::fs::write(&temp, b"encoded").expect("write");
+            let placed = place_export(&src, mode, temp.clone(), None, &cancelled);
+            assert_eq!(placed, Err(EXPORT_CANCELLED.to_owned()));
+            assert!(!temp.exists(), "the temp goes with the cancel");
+        }
+        assert_eq!(
+            std::fs::read(&src).expect("the clip"),
+            b"original",
+            "the original is never replaced"
+        );
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("list")
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left, vec![src.file_name().expect("name").to_owned()]);
+    }
+
+    #[test]
+    fn a_placed_copy_is_renamed_out_of_its_temp() {
+        // The encode writes a hidden temp, so the library never lists a half-written copy.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let src = dir.path().join("rewynd-1-0.mp4");
+        std::fs::write(&src, b"original").expect("write");
+        let temp = save_temp_path(&src);
+        std::fs::write(&temp, b"encoded").expect("write");
+
+        let placed = place_export(
+            &src,
+            SaveMode::Copy,
+            temp.clone(),
+            None,
+            &AtomicBool::new(false),
+        );
+        let copy = dir.path().join("rewynd-1-0-crop.mp4");
+        assert_eq!(placed, Ok(copy.clone()));
+        assert!(!temp.exists());
+        assert_eq!(std::fs::read(&copy).expect("the copy"), b"encoded");
+        assert_eq!(std::fs::read(&src).expect("the clip"), b"original");
+    }
+
+    #[test]
+    fn a_saved_copy_lands_beside_the_original_under_its_own_suffix() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let src = dir.path().join("rewynd-1-0.mp4");
+        assert_eq!(
+            unique_copy_path(&src, "crop"),
+            dir.path().join("rewynd-1-0-crop.mp4")
+        );
+        assert_eq!(
+            unique_copy_path(&src, "trim"),
+            dir.path().join("rewynd-1-0-trim.mp4")
+        );
+
+        std::fs::write(dir.path().join("rewynd-1-0-crop.mp4"), b"x").expect("write");
+        assert_eq!(
+            unique_copy_path(&src, "crop"),
+            dir.path().join("rewynd-1-0-crop-2.mp4"),
+            "a taken name bumps its own counter"
+        );
+        assert_eq!(
+            unique_copy_path(&src, "trim"),
+            dir.path().join("rewynd-1-0-trim.mp4"),
+            "and leaves the other suffix alone"
+        );
+    }
+
+    #[test]
+    fn a_crop_on_its_own_is_enough_to_save() {
+        assert!(!save_ready(false, 30.0, false, false), "nothing to save");
+        assert!(save_ready(false, 30.0, true, false), "a cut");
+        assert!(
+            save_ready(false, 30.0, false, true),
+            "a crop over the whole range"
+        );
+        assert!(!save_ready(true, 30.0, true, true), "a save is already out");
+        assert!(
+            !save_ready(false, MIN_TRIM_SECS / 2.0, false, true),
+            "too short to keep anything"
+        );
+    }
+
+    /// Runs the real encoder over a synthesised clip, so it needs an ffmpeg to spawn.
+    #[test]
+    #[ignore = "needs ffmpeg on PATH"]
+    fn an_upload_crop_really_crops_the_clip() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let src = dir.path().join("rewynd-1-0.mp4");
+        let made = player::ffmpeg_command()
+            .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
+            .args(["-f", "lavfi", "-i", "testsrc=size=640x360:rate=30"])
+            .args(["-t", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&src)
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(made, "ffmpeg synthesises the source clip");
+
+        let crop = crop::PixelRect {
+            x: 160,
+            y: 90,
+            width: 320,
+            height: 180,
+        };
+        let cropped = crop_for_upload(&src, None, crop, &AtomicBool::new(false)).expect("crop");
+        let summary = rewynd_mux::read::clip_summary(&cropped).expect("read the crop");
+        assert_eq!((summary.width, summary.height), (320, 180));
+
+        drop(PreparedClip {
+            path: cropped.clone(),
+            temp: true,
+        });
+        assert!(!cropped.exists(), "the temp must not outlive the upload");
     }
 }

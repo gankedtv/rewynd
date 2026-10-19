@@ -65,7 +65,7 @@ The app checks for updates on launch; one click updates both binaries in place.
 ## What you get
 
 - A background recorder that sits in the tray and stays out of the way while you play.
-- A clip library and settings app: browse, name, star, trim, and manage your clips.
+- A clip library and settings app: browse, name, star, trim, crop, and manage your clips.
 - A first-run wizard that sets up capture, the hotkey, and the replay length in a
   minute.
 - Optional uploads to [ganked.tv](https://ganked.tv) or YouTube, only when you ask.
@@ -105,9 +105,9 @@ libopus at runtime). On Linux the capture crate additionally needs PipeWire dev 
 and libclang (for `pipewire-sys`/`libspa-sys` bindgen): on Debian/Ubuntu, `pkg-config
 libpipewire-0.3-dev clang libclang-dev cmake`. On macOS (Apple Silicon, macOS 15+) the
 Xcode Command Line Tools are the only other extra — capture and encode use the system
-ScreenCaptureKit/VideoToolbox frameworks. In-app clip playback in the library decodes
-through `ffmpeg`: the Linux and Windows installers bundle a copy beside the binaries,
-while dev builds and macOS use whatever `PATH` provides (`brew install ffmpeg` on macOS).
+ScreenCaptureKit/VideoToolbox frameworks. In-app clip playback and crop export in the
+library run through `ffmpeg`: releases bundle a copy beside the binaries on every
+platform, while dev builds use whatever `PATH` provides (`brew install ffmpeg` on macOS).
 
 ```sh
 cargo build

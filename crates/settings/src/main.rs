@@ -14,8 +14,11 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod anim;
+mod crop;
+mod cropbox;
 #[cfg(target_os = "macos")]
 mod dock;
+mod export;
 mod hotkey;
 mod library;
 mod player;

@@ -178,11 +178,27 @@ fn spawn_audio_ffmpeg(path: &Path, start: Duration, end: Duration) -> std::io::R
 /// The ffmpeg to spawn: the copy the installers bundle beside our own binaries (not every
 /// machine has ffmpeg), else whatever `PATH` provides (dev runs, distro packages that depend on
 /// the system ffmpeg).
-fn ffmpeg_command() -> Command {
+pub(crate) fn ffmpeg_command() -> Command {
     match rewynd_config::sibling_binary("ffmpeg").filter(|p| p.is_file()) {
         Some(bundled) => Command::new(bundled),
         None => Command::new("ffmpeg"),
     }
+}
+
+/// Whether an ffmpeg we can actually run is on this machine: the UI asks before offering a
+/// feature that has no fallback (unlike playback, which degrades to the system player).
+pub(crate) fn available() -> bool {
+    let mut command = ffmpeg_command();
+    command
+        .arg("-version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_console(&mut command);
+    command
+        .spawn()
+        .and_then(|mut child| child.wait())
+        .is_ok_and(|status| status.success())
 }
 
 /// The shared ffmpeg invocation prefix for one `[start, end]` range of a clip.
@@ -208,14 +224,14 @@ fn ffmpeg_range(path: &Path, start: Duration, end: Duration) -> Command {
 /// ffmpeg is a console-subsystem exe; without this, every preview/waveform spawn would flash a
 /// console window now that this GUI is a windows-subsystem app with none of its own.
 #[cfg(windows)]
-fn hide_console(command: &mut Command) {
+pub(crate) fn hide_console(command: &mut Command) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     command.creation_flags(CREATE_NO_WINDOW);
 }
 
 #[cfg(not(windows))]
-fn hide_console(_command: &mut Command) {}
+pub(crate) fn hide_console(_command: &mut Command) {}
 
 /// Read raw frames off the pipe and send them paced to their nominal times. Returns `true`
 /// when the pipe ended naturally (range done or ffmpeg died), `false` when the receiver is
@@ -304,7 +320,9 @@ fn audio_loop(path: &Path, start: Duration, end: Duration, stop: &AtomicBool) {
             continue;
         }
         let samples: Vec<f32> = pending[..usable]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
         pending.drain(..usable);
@@ -358,7 +376,9 @@ pub fn waveform(path: &Path, buckets: usize) -> Option<Vec<f32>> {
     read?;
 
     let samples: Vec<f32> = bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]).abs())
         .collect();
     if samples.is_empty() || buckets == 0 {
