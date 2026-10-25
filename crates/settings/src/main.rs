@@ -827,6 +827,7 @@ enum Message {
     CustomHeightEdited(String),
     FpsPicked(u32),
     BitrateMbps(u32),
+    AutoBitrate(bool),
     EncoderPicked(String),
     /// The recorder's `--probe-encoders` output (for the recording-method picker).
     EncodersProbed(Result<config::EncoderProbe, String>),
@@ -1197,6 +1198,12 @@ impl App {
                 let mut v = self.config.video_stored();
                 v.bitrate_bps = mbps.saturating_mul(BITS_PER_MBIT);
                 self.config.set_video(v);
+                // Explicit, so landing on the old 12 Mbps default doesn't read back as auto.
+                self.config.set_auto_bitrate(false);
+                self.touch();
+            }
+            Message::AutoBitrate(on) => {
+                self.config.set_auto_bitrate(on);
                 self.touch();
             }
             Message::EncoderPicked(value) => {
@@ -1826,10 +1833,16 @@ impl App {
         let v = self.config.video_stored();
         let a = self.config.audio_stored();
         let mbps = v.bitrate_bps / BITS_PER_MBIT;
+        let auto_bitrate = self.config.auto_bitrate();
+        let (record_w, record_h) = self
+            .config
+            .resolution_mode()
+            .resolve(self.display_geometry());
+        let video_bps = self.config.bitrate_for(record_w, record_h, v.framerate);
         let secs = self.config.buffer_seconds().min(u64::from(BUFFER_MAX_S)) as u32;
         // Rough clip size from the target bitrate (video + audio) over the replay window,
         // rounded to the nearest MB.
-        let est_bytes = u64::from(v.bitrate_bps)
+        let est_bytes = u64::from(video_bps)
             .saturating_add(u64::from(a.bitrate_bps))
             .saturating_mul(u64::from(secs))
             / 8;
@@ -2000,6 +2013,32 @@ impl App {
             )
         };
 
+        // Auto shows the bitrate it picked for the size above; the slider is only for a pinned one.
+        let auto_check = checkbox(auto_bitrate)
+            .label("Match bitrate to the resolution")
+            .on_toggle(Message::AutoBitrate)
+            .style(arena_check);
+        let quality: Element<Message> = if auto_bitrate {
+            let auto_mbps = f64::from(video_bps) / f64::from(BITS_PER_MBIT);
+            setting("Quality", format!("Auto · {auto_mbps:.0} Mbps"), auto_check)
+        } else {
+            column![
+                setting(
+                    "Quality",
+                    format!("{mbps} Mbps"),
+                    slider(
+                        BITRATE_MIN_MBPS..=BITRATE_MAX_MBPS,
+                        mbps,
+                        Message::BitrateMbps
+                    )
+                    .style(arena_slider),
+                ),
+                auto_check,
+            ]
+            .spacing(7)
+            .into()
+        };
+
         let recording = card(
             "RECORDING",
             column![
@@ -2017,16 +2056,7 @@ impl App {
                         .style(arena_pick)
                         .width(Length::Fill),
                 ),
-                setting(
-                    "Quality",
-                    format!("{mbps} Mbps"),
-                    slider(
-                        BITRATE_MIN_MBPS..=BITRATE_MAX_MBPS,
-                        mbps,
-                        Message::BitrateMbps
-                    )
-                    .style(arena_slider),
-                ),
+                quality,
                 encoder_method,
                 value_row("Estimated clip size", format!("about {est_mb} MB")),
             ]
@@ -2508,6 +2538,9 @@ fn normalize(c: &mut Config) {
         c.buffer_seconds()
             .clamp(u64::from(BUFFER_MIN_S), u64::from(BUFFER_MAX_S)),
     );
+    // Settle an older config's implied auto setting first: snapping its bitrate below could
+    // otherwise land on the old default and flip a hand-picked bitrate to auto.
+    c.set_auto_bitrate(c.auto_bitrate());
     let mut v = c.video_stored();
     let mbps = (v.bitrate_bps / BITS_PER_MBIT).clamp(BITRATE_MIN_MBPS, BITRATE_MAX_MBPS);
     v.bitrate_bps = mbps * BITS_PER_MBIT;

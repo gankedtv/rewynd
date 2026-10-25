@@ -36,10 +36,26 @@ pub enum Event {
 /// hidpi). The scrub preview reuses it so paused and playing frames match.
 pub const PREVIEW_WIDTH: u32 = 960;
 
-/// Decode width while the preview is fullscreen. 1280 rather than full 1920 keeps the per-frame
-/// GPU texture upload light (the preview re-uploads every frame) while still looking crisp
-/// upscaled; the video widget renders it letterboxed.
+/// Decode width while the preview is fullscreen but the window hasn't been measured yet.
+/// Fullscreen otherwise decodes at the window's own pixel width ([`fullscreen_width`]), so a
+/// 3440-wide clip on a 3440-wide window isn't upscaled from a fraction of its pixels.
 pub const FULLSCREEN_WIDTH: u32 = 1280;
+
+/// Fullscreen decode widths round up to this, so dragging the window's edge restarts playback
+/// a handful of times rather than at every pixel. It divides the common widths (1280, 1920,
+/// 2560, 3840), so those decode exactly.
+const FULLSCREEN_STEP: u32 = 128;
+
+/// The fullscreen decode width for a window `logical_width` wide at `scale`: its pixel width,
+/// rounded up to [`FULLSCREEN_STEP`]. Never wider than the clip itself; [`thumbs::scaled_dims`]
+/// caps that at decode time.
+pub fn fullscreen_width(logical_width: f32, scale: f32) -> u32 {
+    let pixels = logical_width * scale;
+    if !pixels.is_finite() || pixels < 1.0 {
+        return FULLSCREEN_WIDTH;
+    }
+    (pixels.ceil() as u32).div_ceil(FULLSCREEN_STEP) * FULLSCREEN_STEP
+}
 
 /// The preview's fixed frame rate. The recorder's capture is damage-driven (variable rate, with
 /// bursts far above the display rate), so ffmpeg resamples to constant-rate output; that also
@@ -394,4 +410,28 @@ pub fn waveform(path: &Path, buckets: usize) -> Option<Vec<f32>> {
         return None;
     }
     Some(peaks.iter().map(|p| p / max).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fullscreen_decodes_at_the_windows_pixel_width() {
+        assert_eq!(fullscreen_width(1920.0, 1.0), 1920);
+        assert_eq!(fullscreen_width(1280.0, 1.5), 1920);
+        assert_eq!(
+            fullscreen_width(3440.0, 1.0),
+            3456,
+            "3440 rounded up a step"
+        );
+        assert_eq!(fullscreen_width(1512.0, 2.0), 3072);
+    }
+
+    #[test]
+    fn an_unreadable_window_falls_back_to_the_default_width() {
+        assert_eq!(fullscreen_width(0.0, 1.0), FULLSCREEN_WIDTH);
+        assert_eq!(fullscreen_width(f32::NAN, 2.0), FULLSCREEN_WIDTH);
+        assert_eq!(fullscreen_width(1920.0, f32::INFINITY), FULLSCREEN_WIDTH);
+    }
 }

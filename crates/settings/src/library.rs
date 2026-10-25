@@ -322,6 +322,10 @@ pub enum Message {
     FullscreenToggle,
     /// Leave the fullscreen preview (Escape).
     FullscreenExit,
+    /// The window changed size while the preview fills it.
+    WindowResized,
+    /// The fullscreen decode width the window's pixel size calls for.
+    WindowMeasured(u32),
     /// Move the playhead to this time (a press/drag between the trim edges).
     Seek(f32),
     /// A timeline drag was released; playback resumes here if seeking paused it.
@@ -429,6 +433,8 @@ pub struct Library {
     seek_resume: bool,
     /// Whether the preview fills the whole window.
     fullscreen: bool,
+    /// The fullscreen decode width, from the window's last measured pixel size.
+    window_px: Option<u32>,
     /// The open clip's normalized audio peaks for the timeline lane.
     waveform: Option<Vec<f32>>,
     confirm_delete: bool,
@@ -527,6 +533,7 @@ impl Library {
             play_error: None,
             seek_resume: false,
             fullscreen: false,
+            window_px: None,
             waveform: None,
             confirm_delete: false,
             trim_start: 0.0,
@@ -1185,8 +1192,17 @@ impl Library {
                     self.waveform = peaks;
                 }
             }
-            Message::FullscreenToggle => self.set_fullscreen(!self.fullscreen),
-            Message::FullscreenExit => self.set_fullscreen(false),
+            Message::FullscreenToggle => return self.set_fullscreen(!self.fullscreen),
+            Message::FullscreenExit => return self.set_fullscreen(false),
+            Message::WindowResized => return measure_window(),
+            Message::WindowMeasured(px) => {
+                if self.window_px != Some(px) {
+                    self.window_px = Some(px);
+                    if self.fullscreen {
+                        self.reanchor_playback();
+                    }
+                }
+            }
             Message::Seek(secs) => {
                 let secs = secs.clamp(self.trim_start, self.trim_end.max(self.trim_start));
                 self.play_pos = Some(secs);
@@ -1402,12 +1418,20 @@ impl Library {
     }
 
     /// Grow or shrink the preview; a running playback restarts from its current position so the
-    /// decode width follows the pane size.
-    fn set_fullscreen(&mut self, on: bool) {
+    /// decode width follows the pane size. Going fullscreen re-reads the window's size, which
+    /// may have changed since the last time.
+    fn set_fullscreen(&mut self, on: bool) -> Task<Message> {
         if self.fullscreen == on {
-            return;
+            return Task::none();
         }
         self.fullscreen = on;
+        self.reanchor_playback();
+        if on { measure_window() } else { Task::none() }
+    }
+
+    /// Restart a running playback from where it is, for a decode-width change: the playback
+    /// subscription is keyed by its range and width, so a new width alone would rewind it.
+    fn reanchor_playback(&mut self) {
         if let (Some((_, end)), Some(pos)) = (self.play_range, self.play_pos) {
             self.play_range = Some((pos.min(end), end));
         }
@@ -1416,7 +1440,7 @@ impl Library {
     /// The decode width for scrub frames and playback, matching the pane the preview fills.
     fn preview_width(&self) -> u32 {
         if self.fullscreen {
-            player::FULLSCREEN_WIDTH
+            self.window_px.unwrap_or(player::FULLSCREEN_WIDTH)
         } else {
             player::PREVIEW_WIDTH
         }
@@ -1455,6 +1479,9 @@ impl Library {
         let mut subs = Vec::new();
         if self.animating() {
             subs.push(iced::window::frames().map(Message::Tick));
+        }
+        if self.fullscreen {
+            subs.push(iced::window::resize_events().map(|_| Message::WindowResized));
         }
         if self.rename.is_some() {
             // The field itself swallows Escape (it drops focus), so this listener takes the key
@@ -3526,6 +3553,17 @@ impl DestStatus {
             Dest::YouTube => "Log in with YouTube under Settings first.".to_owned(),
         })
     }
+}
+
+/// Read the window's pixel size into the fullscreen decode width.
+fn measure_window() -> Task<Message> {
+    iced::window::latest().and_then(|id| {
+        iced::window::size(id).then(move |size| {
+            iced::window::scale_factor(id).map(move |scale| {
+                Message::WindowMeasured(player::fullscreen_width(size.width, scale))
+            })
+        })
+    })
 }
 
 /// Both destinations' status, from the same validated config the uploads read.

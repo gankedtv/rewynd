@@ -21,6 +21,7 @@
 //! are called).
 
 mod activation;
+pub mod bitrate;
 pub mod clip_meta;
 mod clips;
 mod desktop;
