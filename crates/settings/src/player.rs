@@ -56,17 +56,20 @@ pub fn window_pixels(logical: (f32, f32), scale: f32) -> Option<(u32, u32)> {
 /// as the picture is drawn there (narrower than the window when the clip's shape leaves bars at
 /// the sides), rounded up to [`FULLSCREEN_STEP`], at most [`MAX_FULLSCREEN_WIDTH`]. A 3440-wide
 /// clip on a 3440-wide window is no longer upscaled from a fraction of its pixels. Never wider
-/// than the clip itself: [`thumbs::scaled_dims`] caps that at decode time.
+/// than the clip itself: the decode couldn't use more, and since playback is keyed on this
+/// width, resizing the window over a smaller clip would restart it for nothing.
 pub fn fullscreen_width(window: (u32, u32), clip: Option<(u32, u32)>) -> u32 {
     let (window_w, window_h) = window;
-    let drawn = match clip {
+    let (drawn, widest) = match clip {
         Some((w, h)) if w > 0 && h > 0 => {
             let at_full_height = u64::from(window_h) * u64::from(w) / u64::from(h);
-            u64::from(window_w).min(at_full_height) as u32
+            (u64::from(window_w).min(at_full_height) as u32, w)
         }
-        _ => window_w,
+        _ => (window_w, MAX_FULLSCREEN_WIDTH),
     };
-    (drawn.max(1).div_ceil(FULLSCREEN_STEP) * FULLSCREEN_STEP).min(MAX_FULLSCREEN_WIDTH)
+    (drawn.max(1).div_ceil(FULLSCREEN_STEP) * FULLSCREEN_STEP)
+        .min(widest)
+        .min(MAX_FULLSCREEN_WIDTH)
 }
 
 /// The preview's fixed frame rate. The recorder's capture is damage-driven (variable rate, with
@@ -432,18 +435,33 @@ mod tests {
 
     #[test]
     fn fullscreen_decodes_as_wide_as_the_picture_is_drawn() {
-        assert_eq!(
-            fullscreen_width(ULTRAWIDE, Some(ULTRAWIDE)),
-            3456,
-            "3440 rounded up a step"
-        );
         assert_eq!(fullscreen_width((1920, 1080), Some((3840, 2160))), 1920);
         assert_eq!(
-            fullscreen_width(ULTRAWIDE, Some((1920, 1080))),
+            fullscreen_width((1900, 1080), Some((3840, 2160))),
+            1920,
+            "rounded up a step"
+        );
+        assert_eq!(
+            fullscreen_width((2560, 1440), Some((3440, 1440))),
             2560,
-            "a 16:9 clip is pillarboxed on an ultrawide, so only 2560 px of it show"
+            "an ultrawide clip is letterboxed on a 16:9 window, so only 2560 px of it show"
         );
         assert_eq!(fullscreen_width((1920, 1080), None), 1920);
+    }
+
+    #[test]
+    fn fullscreen_decodes_no_wider_than_the_clip() {
+        assert_eq!(
+            fullscreen_width(ULTRAWIDE, Some(ULTRAWIDE)),
+            3440,
+            "the round-up stops at the clip's width"
+        );
+        assert_eq!(
+            fullscreen_width(ULTRAWIDE, Some((1920, 1080))),
+            1920,
+            "drawn 2560 wide, but the clip has only 1920 px to give"
+        );
+        assert_eq!(fullscreen_width((1920, 1080), Some((1000, 562))), 1000);
     }
 
     #[test]
