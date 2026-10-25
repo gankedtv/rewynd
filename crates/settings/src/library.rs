@@ -322,10 +322,10 @@ pub enum Message {
     FullscreenToggle,
     /// Leave the fullscreen preview (Escape).
     FullscreenExit,
-    /// The window changed size while the preview fills it.
+    /// The window changed size.
     WindowResized,
-    /// The fullscreen decode width the window's pixel size calls for.
-    WindowMeasured(u32),
+    /// The window's size in pixels (`None` when it couldn't be read).
+    WindowMeasured(Option<(u32, u32)>),
     /// Move the playhead to this time (a press/drag between the trim edges).
     Seek(f32),
     /// A timeline drag was released; playback resumes here if seeking paused it.
@@ -433,8 +433,8 @@ pub struct Library {
     seek_resume: bool,
     /// Whether the preview fills the whole window.
     fullscreen: bool,
-    /// The fullscreen decode width, from the window's last measured pixel size.
-    window_px: Option<u32>,
+    /// The window's last measured size in pixels, which the fullscreen decode width follows.
+    window_px: Option<(u32, u32)>,
     /// The open clip's normalized audio peaks for the timeline lane.
     waveform: Option<Vec<f32>>,
     confirm_delete: bool,
@@ -1196,12 +1196,9 @@ impl Library {
             Message::FullscreenExit => return self.set_fullscreen(false),
             Message::WindowResized => return measure_window(),
             Message::WindowMeasured(px) => {
-                if self.window_px != Some(px) {
-                    self.window_px = Some(px);
-                    if self.fullscreen {
-                        self.reanchor_playback();
-                    }
-                }
+                let before = self.preview_width();
+                self.window_px = px.or(self.window_px);
+                self.width_changed(before);
             }
             Message::Seek(secs) => {
                 let secs = secs.clamp(self.trim_start, self.trim_end.max(self.trim_start));
@@ -1418,20 +1415,29 @@ impl Library {
     }
 
     /// Grow or shrink the preview; a running playback restarts from its current position so the
-    /// decode width follows the pane size. Going fullscreen re-reads the window's size, which
-    /// may have changed since the last time.
+    /// decode width follows the pane size. Resizes keep the window's size current, so only the
+    /// first fullscreen has to wait for a reading (playing on at the inline width meanwhile).
     fn set_fullscreen(&mut self, on: bool) -> Task<Message> {
         if self.fullscreen == on {
             return Task::none();
         }
+        let before = self.preview_width();
         self.fullscreen = on;
-        self.reanchor_playback();
-        if on { measure_window() } else { Task::none() }
+        self.width_changed(before);
+        if on && self.window_px.is_none() {
+            measure_window()
+        } else {
+            Task::none()
+        }
     }
 
-    /// Restart a running playback from where it is, for a decode-width change: the playback
-    /// subscription is keyed by its range and width, so a new width alone would rewind it.
-    fn reanchor_playback(&mut self) {
+    /// Restart a running playback from where it is when the decode width moved off `before`:
+    /// the playback subscription is keyed by its range and width, so a new width alone would
+    /// rewind it, and re-anchoring when nothing moved would restart it for nothing.
+    fn width_changed(&mut self, before: u32) {
+        if self.preview_width() == before {
+            return;
+        }
         if let (Some((_, end)), Some(pos)) = (self.play_range, self.play_pos) {
             self.play_range = Some((pos.min(end), end));
         }
@@ -1439,10 +1445,9 @@ impl Library {
 
     /// The decode width for scrub frames and playback, matching the pane the preview fills.
     fn preview_width(&self) -> u32 {
-        if self.fullscreen {
-            self.window_px.unwrap_or(player::FULLSCREEN_WIDTH)
-        } else {
-            player::PREVIEW_WIDTH
+        match (self.fullscreen, self.window_px) {
+            (true, Some(window)) => player::fullscreen_width(window, self.open_dims),
+            _ => player::PREVIEW_WIDTH,
         }
     }
 
@@ -1480,9 +1485,7 @@ impl Library {
         if self.animating() {
             subs.push(iced::window::frames().map(Message::Tick));
         }
-        if self.fullscreen {
-            subs.push(iced::window::resize_events().map(|_| Message::WindowResized));
-        }
+        subs.push(iced::window::resize_events().map(|_| Message::WindowResized));
         if self.rename.is_some() {
             // The field itself swallows Escape (it drops focus), so this listener takes the key
             // whether or not the event was captured, and only exists while a rename is open.
@@ -3555,12 +3558,12 @@ impl DestStatus {
     }
 }
 
-/// Read the window's pixel size into the fullscreen decode width.
+/// Read the window's size in pixels, for the fullscreen decode width.
 fn measure_window() -> Task<Message> {
     iced::window::latest().and_then(|id| {
         iced::window::size(id).then(move |size| {
             iced::window::scale_factor(id).map(move |scale| {
-                Message::WindowMeasured(player::fullscreen_width(size.width, scale))
+                Message::WindowMeasured(player::window_pixels((size.width, size.height), scale))
             })
         })
     })

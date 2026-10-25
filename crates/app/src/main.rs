@@ -2846,37 +2846,44 @@ mod windows {
     }
 
     impl Sizing {
-        /// Re-size for the `measured` display when the encoder wasn't built for it. A failed
-        /// rebuild keeps the old encoder, whose frames come out letterboxed rather than lost.
+        /// Re-size for the `measured` display when the encoder wasn't built for it. If the new
+        /// size can't be built, the old one is rebuilt and its frames come out letterboxed; the
+        /// display stays unadopted, so the next session tries again. `Err` only when even that
+        /// fails, which leaves `enc` empty.
         fn follow(
             &mut self,
             measured: Option<(u32, u32)>,
             gpu: &GpuContext,
             backend: Backend,
-            enc: &mut Box<dyn Encoder + Send>,
-        ) {
+            enc: &mut Option<Box<dyn Encoder + Send>>,
+        ) -> Result<()> {
             if measured.is_none() || measured == self.display {
-                return;
+                return Ok(());
+            }
+            let next = session_params(&self.config, measured, &self.choice, &self.adapters);
+            let shape = |p: &EncodeParams| (p.width, p.height, p.bitrate_bps);
+            if shape(&next) != shape(&self.params) {
+                // Old one first: a GPU can cap how many hardware encode sessions run at once,
+                // and the ring is empty, so it holds nothing worth keeping.
+                *enc = None;
+                match encoder_on(gpu, backend, next) {
+                    Ok(fresh) => *enc = Some(fresh),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            ?measured,
+                            "could not rebuild the encoder for this display; keeping the current size"
+                        );
+                        *enc = Some(encoder_on(gpu, backend, self.params)?);
+                        return Ok(());
+                    }
+                }
+                self.params = next;
+                self.saver.set_dimensions(next.width, next.height);
             }
             self.display = measured;
             self.status.set_display(measured);
-            let next = session_params(&self.config, measured, &self.choice, &self.adapters);
-            let shape = |p: &EncodeParams| (p.width, p.height, p.bitrate_bps);
-            if shape(&next) == shape(&self.params) {
-                return;
-            }
-            match encoder_on(gpu, backend, next) {
-                Ok(fresh) => {
-                    *enc = fresh;
-                    self.params = next;
-                    self.saver.set_dimensions(next.width, next.height);
-                }
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    ?measured,
-                    "could not rebuild the encoder for this display; keeping the current size"
-                ),
-            }
+            Ok(())
         }
     }
 
@@ -2897,10 +2904,15 @@ mod windows {
         on_game: Option<rewynd_capture::windows::GameCallback>,
     ) -> Result<()> {
         let (gpu, enc, backend) = build_encoder(&sizing.choice, sizing.params, &sizing.status)?;
+        if let Backend::Cpu = backend {
+            // After a GPU fallback, re-sizing must not keep honouring that GPU's size limits.
+            sizing.choice = config::EncoderChoice::Cpu;
+        }
         // Mutexes, not RefCell/Rc as on Linux: the per-frame callback runs on the WGC
-        // capture thread, so everything it captures must be Send (+Sync via Arc).
+        // capture thread, so everything it captures must be Send (+Sync via Arc). The encoder
+        // slot is only ever empty while a re-size swaps it.
         let conv = Arc::new(Mutex::new(Nv12Converter::new(&gpu)?));
-        let enc = Arc::new(Mutex::new(enc));
+        let enc = Arc::new(Mutex::new(Some(enc)));
         sizing.status.set_capture_live();
         tracing::info!(desktop, "capture pipeline ready; filling the ring buffer");
 
@@ -2935,12 +2947,13 @@ mod windows {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let mut enc = lock_unpoisoned(&enc);
                     if fresh_ring {
-                        sizing.follow(captured.display, &gpu, backend, &mut enc);
+                        sizing.follow(captured.display, &gpu, backend, &mut enc)?;
                     }
+                    let enc = enc.as_deref_mut().context("no encoder after a re-size")?;
                     encode_captured(
                         &gpu,
                         &lock_unpoisoned(&conv),
-                        &mut **enc,
+                        enc,
                         sizing.params,
                         &captured,
                         frame_index == 0 || fresh_ring,

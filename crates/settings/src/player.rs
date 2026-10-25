@@ -36,25 +36,37 @@ pub enum Event {
 /// hidpi). The scrub preview reuses it so paused and playing frames match.
 pub const PREVIEW_WIDTH: u32 = 960;
 
-/// Decode width while the preview is fullscreen but the window hasn't been measured yet.
-/// Fullscreen otherwise decodes at the window's own pixel width ([`fullscreen_width`]), so a
-/// 3440-wide clip on a 3440-wide window isn't upscaled from a fraction of its pixels.
-pub const FULLSCREEN_WIDTH: u32 = 1280;
-
 /// Fullscreen decode widths round up to this, so dragging the window's edge restarts playback
 /// a handful of times rather than at every pixel. It divides the common widths (1280, 1920,
 /// 2560, 3840), so those decode exactly.
 const FULLSCREEN_STEP: u32 = 128;
 
-/// The fullscreen decode width for a window `logical_width` wide at `scale`: its pixel width,
-/// rounded up to [`FULLSCREEN_STEP`]. Never wider than the clip itself; [`thumbs::scaled_dims`]
-/// caps that at decode time.
-pub fn fullscreen_width(logical_width: f32, scale: f32) -> u32 {
-    let pixels = logical_width * scale;
-    if !pixels.is_finite() || pixels < 1.0 {
-        return FULLSCREEN_WIDTH;
-    }
-    (pixels.ceil() as u32).div_ceil(FULLSCREEN_STEP) * FULLSCREEN_STEP
+/// The widest fullscreen decode. Every frame crosses ffmpeg's pipe as RGBA and is uploaded
+/// again, so 4K60 is already about 2 GB/s; a preview gains nothing past it.
+const MAX_FULLSCREEN_WIDTH: u32 = 3840;
+
+/// A window's size in pixels, from its logical size and scale factor. `None` when unreadable.
+pub fn window_pixels(logical: (f32, f32), scale: f32) -> Option<(u32, u32)> {
+    let (w, h) = (logical.0 * scale, logical.1 * scale);
+    (w.is_finite() && h.is_finite() && w >= 1.0 && h >= 1.0)
+        .then(|| (w.round() as u32, h.round() as u32))
+}
+
+/// The fullscreen decode width for a `window`-pixel window showing a `clip`-sized clip: as wide
+/// as the picture is drawn there (narrower than the window when the clip's shape leaves bars at
+/// the sides), rounded up to [`FULLSCREEN_STEP`], at most [`MAX_FULLSCREEN_WIDTH`]. A 3440-wide
+/// clip on a 3440-wide window is no longer upscaled from a fraction of its pixels. Never wider
+/// than the clip itself: [`thumbs::scaled_dims`] caps that at decode time.
+pub fn fullscreen_width(window: (u32, u32), clip: Option<(u32, u32)>) -> u32 {
+    let (window_w, window_h) = window;
+    let drawn = match clip {
+        Some((w, h)) if w > 0 && h > 0 => {
+            let at_full_height = u64::from(window_h) * u64::from(w) / u64::from(h);
+            u64::from(window_w).min(at_full_height) as u32
+        }
+        _ => window_w,
+    };
+    (drawn.max(1).div_ceil(FULLSCREEN_STEP) * FULLSCREEN_STEP).min(MAX_FULLSCREEN_WIDTH)
 }
 
 /// The preview's fixed frame rate. The recorder's capture is damage-driven (variable rate, with
@@ -416,22 +428,39 @@ pub fn waveform(path: &Path, buckets: usize) -> Option<Vec<f32>> {
 mod tests {
     use super::*;
 
+    const ULTRAWIDE: (u32, u32) = (3440, 1440);
+
     #[test]
-    fn fullscreen_decodes_at_the_windows_pixel_width() {
-        assert_eq!(fullscreen_width(1920.0, 1.0), 1920);
-        assert_eq!(fullscreen_width(1280.0, 1.5), 1920);
+    fn fullscreen_decodes_as_wide_as_the_picture_is_drawn() {
         assert_eq!(
-            fullscreen_width(3440.0, 1.0),
+            fullscreen_width(ULTRAWIDE, Some(ULTRAWIDE)),
             3456,
             "3440 rounded up a step"
         );
-        assert_eq!(fullscreen_width(1512.0, 2.0), 3072);
+        assert_eq!(fullscreen_width((1920, 1080), Some((3840, 2160))), 1920);
+        assert_eq!(
+            fullscreen_width(ULTRAWIDE, Some((1920, 1080))),
+            2560,
+            "a 16:9 clip is pillarboxed on an ultrawide, so only 2560 px of it show"
+        );
+        assert_eq!(fullscreen_width((1920, 1080), None), 1920);
     }
 
     #[test]
-    fn an_unreadable_window_falls_back_to_the_default_width() {
-        assert_eq!(fullscreen_width(0.0, 1.0), FULLSCREEN_WIDTH);
-        assert_eq!(fullscreen_width(f32::NAN, 2.0), FULLSCREEN_WIDTH);
-        assert_eq!(fullscreen_width(1920.0, f32::INFINITY), FULLSCREEN_WIDTH);
+    fn fullscreen_decodes_no_wider_than_4k() {
+        assert_eq!(fullscreen_width((5120, 2880), Some((7680, 4320))), 3840);
+    }
+
+    #[test]
+    fn window_pixels_scale_the_logical_size() {
+        assert_eq!(window_pixels((1280.0, 720.0), 1.5), Some((1920, 1080)));
+        assert_eq!(window_pixels((1512.0, 982.0), 2.0), Some((3024, 1964)));
+    }
+
+    #[test]
+    fn an_unreadable_window_has_no_pixel_size() {
+        assert_eq!(window_pixels((0.0, 720.0), 1.0), None);
+        assert_eq!(window_pixels((f32::NAN, 720.0), 2.0), None);
+        assert_eq!(window_pixels((1920.0, 1080.0), f32::INFINITY), None);
     }
 }

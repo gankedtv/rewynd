@@ -619,6 +619,16 @@ impl Config {
         }
     }
 
+    /// The bitrate a recording on `display` would use — [`video_for_display`]'s, without its
+    /// warning about out-of-range values, so a settings view can show it on every redraw.
+    ///
+    /// [`video_for_display`]: Self::video_for_display
+    #[must_use]
+    pub fn bitrate_for_display(&self, display: Option<(u32, u32)>) -> u32 {
+        let (width, height) = self.resolution_mode().resolve(display);
+        self.bitrate_for(width, height, self.video.framerate.clamp(1, 240))
+    }
+
     /// The video settings exactly as stored (no sanitizing) — for the settings editor, so an
     /// edit-and-save round-trip never rewrites values the daemon merely clamps at use.
     #[must_use]
@@ -1449,6 +1459,11 @@ mod tests {
             c.video_for_display(Some((3440, 1440))).bitrate_bps,
             crate::bitrate::auto_bitrate_bps(2580, 1080, 60),
             "auto uses the recorded size, not the display's"
+        );
+        assert_eq!(
+            c.bitrate_for_display(Some((3440, 1440))),
+            c.video_for_display(Some((3440, 1440))).bitrate_bps,
+            "the quiet readout agrees with what the recorder resolves"
         );
     }
 
