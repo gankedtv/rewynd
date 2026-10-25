@@ -322,8 +322,8 @@ pub enum Message {
     FullscreenToggle,
     /// Leave the fullscreen preview (Escape).
     FullscreenExit,
-    /// The window changed size.
-    WindowResized,
+    /// The window changed size or moved to a display with a different scale factor.
+    WindowChanged,
     /// The window's size in pixels (`None` when it couldn't be read).
     WindowMeasured(Option<(u32, u32)>),
     /// Move the playhead to this time (a press/drag between the trim edges).
@@ -1194,7 +1194,7 @@ impl Library {
             }
             Message::FullscreenToggle => return self.set_fullscreen(!self.fullscreen),
             Message::FullscreenExit => return self.set_fullscreen(false),
-            Message::WindowResized => return measure_window(),
+            Message::WindowChanged => return measure_window(),
             Message::WindowMeasured(px) => {
                 let before = self.preview_width();
                 self.window_px = px.or(self.window_px);
@@ -1485,7 +1485,17 @@ impl Library {
         if self.animating() {
             subs.push(iced::window::frames().map(Message::Tick));
         }
-        subs.push(iced::window::resize_events().map(|_| Message::WindowResized));
+        // A move to a display with another scale factor can keep the logical size, so it shows up
+        // only as `Rescaled`, yet it changes the pixel count the fullscreen preview decodes at.
+        subs.push(iced::event::listen_with(|event, _status, _id| {
+            matches!(
+                event,
+                iced::Event::Window(
+                    iced::window::Event::Resized(_) | iced::window::Event::Rescaled(_)
+                )
+            )
+            .then_some(Message::WindowChanged)
+        }));
         if self.rename.is_some() {
             // The field itself swallows Escape (it drops focus), so this listener takes the key
             // whether or not the event was captured, and only exists while a rename is open.
