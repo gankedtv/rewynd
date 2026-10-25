@@ -375,6 +375,12 @@ const OUTPUT_DEFAULT: &str = "System default";
 const SIDEBAR_WIDTH: f32 = 232.0;
 const BITS_PER_MBIT: u32 = 1_000_000;
 
+/// `bps` as a quality-slider position: rounded to whole Mbps and held inside its range.
+fn slider_mbps(bps: u32) -> u32 {
+    (bps.saturating_add(BITS_PER_MBIT / 2) / BITS_PER_MBIT)
+        .clamp(BITRATE_MIN_MBPS, BITRATE_MAX_MBPS)
+}
+
 fn main() -> iced::Result {
     // Must be first: Velopack's install/update hooks run here and may exit/restart the process.
     // `on_restarted` fires after an update relaunch — the update flow stopped the recorder before
@@ -827,6 +833,7 @@ enum Message {
     CustomHeightEdited(String),
     FpsPicked(u32),
     BitrateMbps(u32),
+    AutoBitrate(bool),
     EncoderPicked(String),
     /// The recorder's `--probe-encoders` output (for the recording-method picker).
     EncodersProbed(Result<config::EncoderProbe, String>),
@@ -1197,6 +1204,19 @@ impl App {
                 let mut v = self.config.video_stored();
                 v.bitrate_bps = mbps.saturating_mul(BITS_PER_MBIT);
                 self.config.set_video(v);
+                // Explicit, so landing on the old 12 Mbps default doesn't read back as auto.
+                self.config.set_auto_bitrate(false);
+                self.touch();
+            }
+            Message::AutoBitrate(on) => {
+                if !on && self.config.auto_bitrate() {
+                    // Start the slider where auto was, not at whatever was stored long ago.
+                    let auto = self.config.bitrate_for_display(self.display_geometry());
+                    let mut v = self.config.video_stored();
+                    v.bitrate_bps = slider_mbps(auto) * BITS_PER_MBIT;
+                    self.config.set_video(v);
+                }
+                self.config.set_auto_bitrate(on);
                 self.touch();
             }
             Message::EncoderPicked(value) => {
@@ -1826,10 +1846,12 @@ impl App {
         let v = self.config.video_stored();
         let a = self.config.audio_stored();
         let mbps = v.bitrate_bps / BITS_PER_MBIT;
+        let auto_bitrate = self.config.auto_bitrate();
+        let video_bps = self.config.bitrate_for_display(self.display_geometry());
         let secs = self.config.buffer_seconds().min(u64::from(BUFFER_MAX_S)) as u32;
         // Rough clip size from the target bitrate (video + audio) over the replay window,
         // rounded to the nearest MB.
-        let est_bytes = u64::from(v.bitrate_bps)
+        let est_bytes = u64::from(video_bps)
             .saturating_add(u64::from(a.bitrate_bps))
             .saturating_mul(u64::from(secs))
             / 8;
@@ -2000,6 +2022,32 @@ impl App {
             )
         };
 
+        // Auto shows the bitrate it picked for the size above; the slider is only for a pinned one.
+        let auto_check = checkbox(auto_bitrate)
+            .label("Match bitrate to the resolution")
+            .on_toggle(Message::AutoBitrate)
+            .style(arena_check);
+        let quality: Element<Message> = if auto_bitrate {
+            let auto_mbps = f64::from(video_bps) / f64::from(BITS_PER_MBIT);
+            setting("Quality", format!("Auto · {auto_mbps:.0} Mbps"), auto_check)
+        } else {
+            column![
+                setting(
+                    "Quality",
+                    format!("{mbps} Mbps"),
+                    slider(
+                        BITRATE_MIN_MBPS..=BITRATE_MAX_MBPS,
+                        mbps,
+                        Message::BitrateMbps
+                    )
+                    .style(arena_slider),
+                ),
+                auto_check,
+            ]
+            .spacing(7)
+            .into()
+        };
+
         let recording = card(
             "RECORDING",
             column![
@@ -2017,16 +2065,7 @@ impl App {
                         .style(arena_pick)
                         .width(Length::Fill),
                 ),
-                setting(
-                    "Quality",
-                    format!("{mbps} Mbps"),
-                    slider(
-                        BITRATE_MIN_MBPS..=BITRATE_MAX_MBPS,
-                        mbps,
-                        Message::BitrateMbps
-                    )
-                    .style(arena_slider),
-                ),
+                quality,
                 encoder_method,
                 value_row("Estimated clip size", format!("about {est_mb} MB")),
             ]
@@ -2508,6 +2547,9 @@ fn normalize(c: &mut Config) {
         c.buffer_seconds()
             .clamp(u64::from(BUFFER_MIN_S), u64::from(BUFFER_MAX_S)),
     );
+    // Settle an older config's implied auto setting first: snapping its bitrate below could
+    // otherwise land on the old default and flip a hand-picked bitrate to auto.
+    c.set_auto_bitrate(c.auto_bitrate());
     let mut v = c.video_stored();
     let mbps = (v.bitrate_bps / BITS_PER_MBIT).clamp(BITRATE_MIN_MBPS, BITRATE_MAX_MBPS);
     v.bitrate_bps = mbps * BITS_PER_MBIT;
@@ -3002,6 +3044,23 @@ mod tests {
         // The view shows bps/1_000_000; a message multiplies back.
         assert_eq!(12_000_000 / BITS_PER_MBIT, 12);
         assert_eq!(25u32.saturating_mul(BITS_PER_MBIT), 25_000_000);
+    }
+
+    #[test]
+    fn an_auto_bitrate_lands_on_the_nearest_slider_position() {
+        assert_eq!(slider_mbps(28_700_000), 29);
+        assert_eq!(slider_mbps(12_000_000), 12);
+        assert_eq!(slider_mbps(100_000_000), BITRATE_MAX_MBPS);
+        assert_eq!(slider_mbps(300_000), BITRATE_MIN_MBPS);
+    }
+
+    #[test]
+    fn switching_auto_off_keeps_the_bitrate_auto_was_using() {
+        let mut app = app_on_display(Some((3440, 1440)));
+        app.config = Config::default();
+        let _ = app.update(Message::AutoBitrate(false));
+        assert!(!app.config.auto_bitrate());
+        assert_eq!(app.config.video_stored().bitrate_bps, 29_000_000);
     }
 
     fn probe(adapters: &[(&str, bool)]) -> config::EncoderProbe {

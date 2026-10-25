@@ -694,9 +694,11 @@ impl Wizard {
 
 /// The estimated clip size in MB for `seconds` of the config's video + audio bitrate.
 fn estimated_clip_mb(config: &Config, seconds: u32) -> u64 {
-    let v = config.video_stored();
+    // Setup runs before the recorder has measured a display, so an automatic bitrate counts at
+    // the 1080p reference.
+    let video_bps = config.bitrate_for_display(None);
     let a = config.audio_stored();
-    let bytes = u64::from(v.bitrate_bps)
+    let bytes = u64::from(video_bps)
         .saturating_add(u64::from(a.bitrate_bps))
         .saturating_mul(u64::from(seconds))
         / BITS_PER_BYTE;

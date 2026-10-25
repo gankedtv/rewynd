@@ -18,7 +18,10 @@ const DEFAULT_HEIGHT: u32 = 0;
 /// Derive the width from the captured display's aspect ratio instead of pinning the stored pair.
 const DEFAULT_MATCH_DISPLAY: bool = true;
 const DEFAULT_FRAMERATE: u32 = 60;
+/// The bitrate used when auto is off. Also the flat default every config carried before auto
+/// existed, which is how such a config is told apart from a hand-picked bitrate.
 const DEFAULT_VIDEO_BITRATE_BPS: u32 = 12_000_000;
+const DEFAULT_AUTO_BITRATE: bool = true;
 const DEFAULT_IDR_PERIOD: u32 = 60;
 /// Default encoder selection: prefer a GPU that can encode H.264, else the CPU. See
 /// [`EncoderPreference`].
@@ -136,7 +139,12 @@ struct VideoConfig {
     /// its stored 16:9 pair. See [`ResolutionMode`].
     match_display: bool,
     framerate: u32,
+    /// The bitrate when `auto_bitrate` is off.
     bitrate_bps: u32,
+    /// Derive the bitrate from the recorded size and rate instead of using `bitrate_bps`. Absent
+    /// from configs written before it existed; see [`Config::auto_bitrate`] for how those read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_bitrate: Option<bool>,
     idr_period: u32,
     /// Which encoder records: `"auto"`, `"cpu"`, or `"gpu:<adapter name>"`. Parsed by
     /// [`EncoderPreference::parse`]; not part of [`VideoSettings`] (it selects a backend, it
@@ -152,6 +160,7 @@ impl Default for VideoConfig {
             match_display: DEFAULT_MATCH_DISPLAY,
             framerate: DEFAULT_FRAMERATE,
             bitrate_bps: DEFAULT_VIDEO_BITRATE_BPS,
+            auto_bitrate: Some(DEFAULT_AUTO_BITRATE),
             idr_period: DEFAULT_IDR_PERIOD,
             encoder: DEFAULT_ENCODER.to_owned(),
         }
@@ -469,8 +478,10 @@ impl Config {
         if let Some(v) = u32_of("REWYND_FPS") {
             self.video.framerate = v;
         }
+        // Naming a bitrate means recording at it, as it always has.
         if let Some(v) = u32_of("REWYND_BITRATE_BPS") {
             self.video.bitrate_bps = v;
+            self.video.auto_bitrate = Some(false);
         }
         if let Some(v) = u32_of("REWYND_IDR_PERIOD") {
             self.video.idr_period = v;
@@ -529,20 +540,20 @@ impl Config {
             idr_period: self.video.idr_period,
         };
         let (width, height) = self.resolution_mode().resolve(display);
+        let framerate = raw.framerate.clamp(1, 240);
         let sanitized = VideoSettings {
             width,
             height,
-            framerate: raw.framerate.clamp(1, 240),
-            bitrate_bps: raw.bitrate_bps.clamp(100_000, 100_000_000),
+            framerate,
+            bitrate_bps: self.bitrate_for(width, height, framerate),
             idr_period: raw.idr_period.clamp(1, 1000),
         };
-        // The resolution is *resolved*, not merely clamped — the recorder logs it with the
-        // detected geometry — so only the untouched-by-design fields warrant a warning here.
-        if (
-            sanitized.framerate,
-            sanitized.bitrate_bps,
-            sanitized.idr_period,
-        ) != (raw.framerate, raw.bitrate_bps, raw.idr_period)
+        // The resolution (and an automatic bitrate) is *resolved*, not merely clamped — the
+        // recorder logs it with the detected geometry — so only the untouched-by-design fields
+        // warrant a warning here.
+        let bitrate_clamped = !self.auto_bitrate() && sanitized.bitrate_bps != raw.bitrate_bps;
+        if (sanitized.framerate, sanitized.idr_period) != (raw.framerate, raw.idr_period)
+            || bitrate_clamped
         {
             tracing::warn!(
                 ?raw,
@@ -579,6 +590,43 @@ impl Config {
             );
         }
         sanitized
+    }
+
+    /// Whether the bitrate follows the recorded size and rate. A config written before the
+    /// setting existed reads as auto only while it still holds the old flat default, so a
+    /// bitrate someone picked by hand survives the upgrade.
+    #[must_use]
+    pub fn auto_bitrate(&self) -> bool {
+        self.video
+            .auto_bitrate
+            .unwrap_or(self.video.bitrate_bps == DEFAULT_VIDEO_BITRATE_BPS)
+    }
+
+    /// Switch the automatic bitrate on or off; the stored `bitrate_bps` is kept for when it is off.
+    pub fn set_auto_bitrate(&mut self, on: bool) {
+        self.video.auto_bitrate = Some(on);
+    }
+
+    /// The bitrate to record a `width`×`height` stream at `framerate` with: the automatic one,
+    /// or the stored bitrate clamped to `[100 kbps, 100 Mbps]`. The recorder calls this again
+    /// whenever the size it settles on differs from [`video_for_display`](Self::video_for_display)'s.
+    #[must_use]
+    pub fn bitrate_for(&self, width: u32, height: u32, framerate: u32) -> u32 {
+        if self.auto_bitrate() {
+            crate::bitrate::auto_bitrate_bps(width, height, framerate)
+        } else {
+            self.video.bitrate_bps.clamp(100_000, 100_000_000)
+        }
+    }
+
+    /// The bitrate a recording on `display` would use — [`video_for_display`]'s, without its
+    /// warning about out-of-range values, so a settings view can show it on every redraw.
+    ///
+    /// [`video_for_display`]: Self::video_for_display
+    #[must_use]
+    pub fn bitrate_for_display(&self, display: Option<(u32, u32)>) -> u32 {
+        let (width, height) = self.resolution_mode().resolve(display);
+        self.bitrate_for(width, height, self.video.framerate.clamp(1, 240))
     }
 
     /// The video settings exactly as stored (no sanitizing) — for the settings editor, so an
@@ -1187,6 +1235,9 @@ width = 0
 height = 0
 match_display = true
 framerate = 60
+# auto_bitrate scales the bitrate with the recorded size and frame rate (12 Mbps at 1080p60,
+# about 29 Mbps at 3440x1440). Set it to false to record at bitrate_bps instead.
+auto_bitrate = true
 bitrate_bps = 12000000
 idr_period = 60
 # Which encoder records: \"auto\" (the GPU when it can encode H.264, else the CPU), \"cpu\",
@@ -1370,8 +1421,74 @@ mod tests {
         let v = c.video();
         assert_eq!((v.width, v.height), (1280, 720)); // set
         assert_eq!(v.framerate, 30); // set
-        assert_eq!(v.bitrate_bps, 12_000_000); // default
+        assert!(c.auto_bitrate()); // default
+        assert_eq!(v.bitrate_bps, 3_500_000, "auto, for 720p30");
         assert_eq!(v.idr_period, 60); // default
+    }
+
+    #[test]
+    fn a_config_from_before_auto_bitrate_goes_auto_only_on_the_old_default() {
+        let untouched = Config::from_toml_str("[video]\nbitrate_bps = 12000000\n").expect("parses");
+        assert!(untouched.auto_bitrate());
+        assert_eq!(
+            untouched.video_for_display(Some((3440, 1440))).bitrate_bps,
+            28_700_000
+        );
+
+        let picked = Config::from_toml_str("[video]\nbitrate_bps = 50000000\n").expect("parses");
+        assert!(!picked.auto_bitrate(), "a hand-picked bitrate is kept");
+        assert_eq!(
+            picked.video_for_display(Some((3440, 1440))).bitrate_bps,
+            50_000_000
+        );
+    }
+
+    #[test]
+    fn a_manual_bitrate_is_clamped_and_auto_follows_the_resolved_size() {
+        let mut c = Config::default();
+        c.set_auto_bitrate(false);
+        assert_eq!(
+            c.video_for_display(Some((3440, 1440))).bitrate_bps,
+            12_000_000
+        );
+        assert_eq!(c.bitrate_for(3840, 2160, 60), 12_000_000);
+
+        c.set_auto_bitrate(true);
+        c.set_resolution_mode(ResolutionMode::Height(1080));
+        assert_eq!(
+            c.video_for_display(Some((3440, 1440))).bitrate_bps,
+            crate::bitrate::auto_bitrate_bps(2580, 1080, 60),
+            "auto uses the recorded size, not the display's"
+        );
+        assert_eq!(
+            c.bitrate_for_display(Some((3440, 1440))),
+            c.video_for_display(Some((3440, 1440))).bitrate_bps,
+            "the quiet readout agrees with what the recorder resolves"
+        );
+    }
+
+    #[test]
+    fn turning_auto_bitrate_off_round_trips_through_toml() {
+        let mut c = Config::default();
+        c.set_auto_bitrate(false);
+        let toml = c.to_toml_string().expect("serialize");
+        assert!(toml.contains("auto_bitrate = false"));
+        let back = Config::from_toml_str(&toml).expect("parses");
+        assert!(
+            !back.auto_bitrate(),
+            "off stays off even at the old default bitrate"
+        );
+    }
+
+    #[test]
+    fn a_bitrate_in_the_environment_turns_auto_off() {
+        let mut c = Config::default();
+        c.apply_env_overrides(|k| (k == "REWYND_BITRATE_BPS").then(|| "20000000".to_owned()));
+        assert!(!c.auto_bitrate());
+        assert_eq!(
+            c.video_for_display(Some((3840, 2160))).bitrate_bps,
+            20_000_000
+        );
     }
 
     #[test]

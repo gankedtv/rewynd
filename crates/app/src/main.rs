@@ -608,11 +608,15 @@ mod params {
                     "resolution scaled down to the encoder's maximum frame size"
                 );
                 (params.width, params.height) = capped;
+                params.bitrate_bps =
+                    config.bitrate_for(params.width, params.height, params.framerate);
             }
         }
         tracing::info!(
             width = params.width,
             height = params.height,
+            bitrate_bps = params.bitrate_bps,
+            auto_bitrate = config.auto_bitrate(),
             ?measured,
             mode = ?config.resolution_mode(),
             "resolved the recording resolution"
@@ -699,6 +703,10 @@ mod params {
             let c = Config::default();
             let p = session_params(&c, Some((3440, 1440)), &EncoderChoice::Cpu, &[]);
             assert_eq!((p.width, p.height), (3440, 1440));
+            assert_eq!(
+                p.bitrate_bps, 28_700_000,
+                "the auto bitrate follows the size"
+            );
         }
 
         #[test]
@@ -720,6 +728,11 @@ mod params {
                 (p.width, p.height),
                 (1918, 802),
                 "scaled just under the width cap (both dimensions even), aspect intact"
+            );
+            assert_eq!(
+                p.bitrate_bps,
+                c.bitrate_for(1918, 802, p.framerate),
+                "the auto bitrate is for the capped size, not the display's"
             );
         }
 
@@ -2588,21 +2601,27 @@ mod windows {
         // GPU pipeline lives (and tears down) there.
         let capture_buffer = buffer.clone();
         let capture_stop = stop.clone();
-        let capture_choice = encoder_choice.clone();
         let capture_status = status.clone();
+        let sizing = Sizing {
+            config: config.clone(),
+            choice: encoder_choice.clone(),
+            adapters: adapters.clone(),
+            saver: saver.clone(),
+            status: status.clone(),
+            display,
+            params,
+        };
         let capture = std::thread::Builder::new()
             .name("rewynd-capture".to_owned())
             .spawn(move || {
                 if let Err(e) = run_capture(
-                    params,
+                    sizing,
                     epoch,
                     &capture_buffer,
                     &capture_stop,
                     capture_desktop,
                     windowed_games,
                     on_game,
-                    capture_choice,
-                    &capture_status,
                 ) {
                     tracing::error!(error = %e, "capture loop stopped");
                     capture_status.set_failed(format!("{e:#}"));
@@ -2742,16 +2761,24 @@ mod windows {
         Ok(())
     }
 
+    /// Which encoder [`build_encoder`] ended up with, so a resize builds the same kind again on
+    /// the same device.
+    #[derive(Clone, Copy)]
+    enum Backend {
+        Gpu,
+        Cpu,
+    }
+
     /// Build the GPU-backed encoder for `choice`, falling back to the CPU encoder if the GPU
     /// device or encoder can't be created.
     fn build_encoder(
         choice: &config::EncoderChoice,
         params: EncodeParams,
         status: &crate::status::StatusPublisher,
-    ) -> Result<(Arc<GpuContext>, Box<dyn Encoder + Send>)> {
+    ) -> Result<(Arc<GpuContext>, Box<dyn Encoder + Send>, Backend)> {
         match choice {
             config::EncoderChoice::Gpu(name) => match gpu_encoder(name, params) {
-                Ok(pair) => Ok(pair),
+                Ok((gpu, enc)) => Ok((gpu, enc, Backend::Gpu)),
                 Err(e) => {
                     tracing::warn!(error = %e, "GPU encoder init failed; falling back to the CPU encoder");
                     toast(
@@ -2761,10 +2788,14 @@ mod windows {
                         ),
                     );
                     status.set_encoder(config::EncoderChoice::Cpu.label());
-                    cpu_encoder(params)
+                    let (gpu, enc) = cpu_encoder(params)?;
+                    Ok((gpu, enc, Backend::Cpu))
                 }
             },
-            config::EncoderChoice::Cpu => cpu_encoder(params),
+            config::EncoderChoice::Cpu => {
+                let (gpu, enc) = cpu_encoder(params)?;
+                Ok((gpu, enc, Backend::Cpu))
+            }
         }
     }
 
@@ -2774,15 +2805,86 @@ mod windows {
         params: EncodeParams,
     ) -> Result<(Arc<GpuContext>, Box<dyn Encoder + Send>)> {
         let gpu = Arc::new(pollster::block_on(GpuContext::new_for_adapter(name))?);
-        let enc: Box<dyn Encoder + Send> = Box::new(GpuVideoEncoder::new(&gpu, params)?);
+        let enc = encoder_on(&gpu, Backend::Gpu, params)?;
         Ok((gpu, enc))
     }
 
     /// The software (CPU) encoder on a render-only device.
     fn cpu_encoder(params: EncodeParams) -> Result<(Arc<GpuContext>, Box<dyn Encoder + Send>)> {
         let gpu = Arc::new(pollster::block_on(GpuContext::new_render_only())?);
-        let enc: Box<dyn Encoder + Send> = Box::new(SoftwareTextureEncoder::new(&gpu, params)?);
+        let enc = encoder_on(&gpu, Backend::Cpu, params)?;
         Ok((gpu, enc))
+    }
+
+    /// A `backend` encoder for `params` on an existing device.
+    fn encoder_on(
+        gpu: &GpuContext,
+        backend: Backend,
+        params: EncodeParams,
+    ) -> Result<Box<dyn Encoder + Send>> {
+        let enc: Box<dyn Encoder + Send> = match backend {
+            Backend::Gpu => Box::new(GpuVideoEncoder::new(gpu, params)?),
+            Backend::Cpu => Box::new(SoftwareTextureEncoder::new(gpu, params)?),
+        };
+        Ok(enc)
+    }
+
+    /// Keeps the encode sized for the display actually being captured. The size measured at
+    /// startup is only a first guess: it is the primary monitor as the recorder launched, which
+    /// can be the wrong screen (a game on another monitor) or a stale reading (taken at login,
+    /// before every monitor was up). Each capture session's own display re-decides it, and only
+    /// while the ring is empty, so a clip never mixes two sizes.
+    struct Sizing {
+        config: config::Config,
+        choice: config::EncoderChoice,
+        adapters: Vec<config::ProbeAdapter>,
+        saver: Arc<ClipSaver>,
+        status: crate::status::StatusPublisher,
+        /// The display the live encoder was sized for.
+        display: Option<(u32, u32)>,
+        params: EncodeParams,
+    }
+
+    impl Sizing {
+        /// Re-size for the `measured` display when the encoder wasn't built for it. If the new
+        /// size can't be built, the old one is rebuilt and its frames come out letterboxed; the
+        /// display stays unadopted, so the next session tries again. `Err` only when even that
+        /// fails, which leaves `enc` empty.
+        fn follow(
+            &mut self,
+            measured: Option<(u32, u32)>,
+            gpu: &GpuContext,
+            backend: Backend,
+            enc: &mut Option<Box<dyn Encoder + Send>>,
+        ) -> Result<()> {
+            if measured.is_none() || measured == self.display {
+                return Ok(());
+            }
+            let next = session_params(&self.config, measured, &self.choice, &self.adapters);
+            let shape = |p: &EncodeParams| (p.width, p.height, p.bitrate_bps);
+            if shape(&next) != shape(&self.params) {
+                // Old one first: a GPU can cap how many hardware encode sessions run at once,
+                // and the ring is empty, so it holds nothing worth keeping.
+                *enc = None;
+                match encoder_on(gpu, backend, next) {
+                    Ok(fresh) => *enc = Some(fresh),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            ?measured,
+                            "could not rebuild the encoder for this display; keeping the current size"
+                        );
+                        *enc = Some(encoder_on(gpu, backend, self.params)?);
+                        return Ok(());
+                    }
+                }
+                self.params = next;
+                self.saver.set_dimensions(next.width, next.height);
+            }
+            self.display = measured;
+            self.status.set_display(measured);
+            Ok(())
+        }
     }
 
     /// Build the GPU pipeline and pump captured frames into `buffer` until the stream
@@ -2792,32 +2894,34 @@ mod windows {
     /// dependency order afterwards (tearing the device down before the encoder it
     /// backs crashes the driver); by the time the stream returns, the WGC thread is
     /// joined, so these Arcs are the last owners.
-    #[allow(clippy::too_many_arguments)]
     fn run_capture(
-        params: EncodeParams,
+        mut sizing: Sizing,
         epoch: Instant,
         buffer: &SharedBuffer,
         stop: &Arc<AtomicBool>,
         desktop: bool,
         windowed_games: WindowedGames,
         on_game: Option<rewynd_capture::windows::GameCallback>,
-        choice: config::EncoderChoice,
-        status: &crate::status::StatusPublisher,
     ) -> Result<()> {
-        let (gpu, enc) = build_encoder(&choice, params, status)?;
+        let (gpu, enc, backend) = build_encoder(&sizing.choice, sizing.params, &sizing.status)?;
+        if let Backend::Cpu = backend {
+            // After a GPU fallback, re-sizing must not keep honouring that GPU's size limits.
+            sizing.choice = config::EncoderChoice::Cpu;
+        }
         // Mutexes, not RefCell/Rc as on Linux: the per-frame callback runs on the WGC
-        // capture thread, so everything it captures must be Send (+Sync via Arc).
+        // capture thread, so everything it captures must be Send (+Sync via Arc). The encoder
+        // slot is only ever empty while a re-size swaps it.
         let conv = Arc::new(Mutex::new(Nv12Converter::new(&gpu)?));
-        let enc = Arc::new(Mutex::new(enc));
-        status.set_capture_live();
+        let enc = Arc::new(Mutex::new(Some(enc)));
+        sizing.status.set_capture_live();
         tracing::info!(desktop, "capture pipeline ready; filling the ring buffer");
 
         // WGC captures the source at its native size; whatever arrives is scaled to the
         // encoder's dimensions in the NV12 pass. The framerate pref caps delivery.
         let prefs = StreamPrefs {
-            width: params.width,
-            height: params.height,
-            framerate: params.framerate,
+            width: sizing.params.width,
+            height: sizing.params.height,
+            framerate: sizing.params.framerate,
         };
         // A callback Break reads as a clean stop to the stream; record the real reason so
         // it still surfaces as this function's Err. (Mutex, not Cell: the callback runs on
@@ -2841,11 +2945,16 @@ mod windows {
                 // WGC callback (an FFI boundary) — catch it and stop cleanly.
                 let fresh_ring = lock_unpoisoned(&buffer).is_empty();
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut enc = lock_unpoisoned(&enc);
+                    if fresh_ring {
+                        sizing.follow(captured.display, &gpu, backend, &mut enc)?;
+                    }
+                    let enc = enc.as_deref_mut().context("no encoder after a re-size")?;
                     encode_captured(
                         &gpu,
                         &lock_unpoisoned(&conv),
-                        &mut **lock_unpoisoned(&enc),
-                        params,
+                        enc,
+                        sizing.params,
                         &captured,
                         frame_index == 0 || fresh_ring,
                     )
