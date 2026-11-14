@@ -325,6 +325,11 @@ where
 
         let width = frame.width();
         let height = frame.height();
+        // A game collapsed to a pixel while unfocused: scaled up, that pixel would fill the
+        // clip. Delivering nothing matches a minimized game.
+        if width <= 1 || height <= 1 {
+            return Ok(());
+        }
         let format = frame.desc().Format;
         let frame_texture = frame.as_raw_texture().clone();
 

@@ -22,6 +22,11 @@ updates:
     groups:
       site:
         patterns: ["*"]
+    ignore:
+      # @astrojs/check peers on typescript ^5 || ^6, so a TypeScript 7 bump breaks `npm ci`.
+      # Drop once it accepts 7.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: docker
     directory: /site
