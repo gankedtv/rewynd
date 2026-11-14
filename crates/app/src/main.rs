@@ -2239,8 +2239,9 @@ mod windows {
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey,
-        UnregisterHotKey, VK_F1,
+        GetAsyncKeyState, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
+        MOD_WIN, RegisterHotKey, UnregisterHotKey, VIRTUAL_KEY, VK_CONTROL, VK_F1, VK_LWIN,
+        VK_MENU, VK_RWIN, VK_SHIFT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage, WM_HOTKEY,
@@ -2254,8 +2255,9 @@ mod windows {
 
     /// Our one thread-queue hotkey registration.
     const HOTKEY_ID: i32 = 1;
-    /// How often the hotkey message pump wakes to drain its queue and check the stop
-    /// flag — the worst-case added latency on a press, well under perception.
+    /// How often the hotkey message pump wakes to drain its queue, sample the chord's key
+    /// state and check the stop flag — the worst-case added latency on a press, well under
+    /// perception, and shorter than a deliberate chord is held.
     const HOTKEY_POLL: Duration = Duration::from_millis(30);
 
     pub fn run() -> Result<()> {
@@ -2927,7 +2929,8 @@ mod windows {
 
     /// The tray + hotkey thread: build the tray icon and menu, register the configured
     /// trigger, and pump this thread's message queue until the stop flag rises. One
-    /// pump drives both — WM_HOTKEY saves a clip, menu events run the tray commands.
+    /// pump drives both — a press of the trigger ([`ChordPress`]) saves a clip, menu
+    /// events run the tray commands.
     /// A hotkey that cannot be parsed or registered degrades to tray-only saving; a
     /// failed tray degrades to hotkey-only (matching the Linux "continuing without it").
     fn run_tray_loop(
@@ -2970,13 +2973,13 @@ mod windows {
             }
         };
 
-        let hotkey_registered = match parse_trigger(trigger) {
+        let chord = match parse_trigger(trigger) {
             // SAFETY: FFI; a NULL hwnd registers on this thread's queue, unregistered below.
             Some((mods, vk)) => {
                 match unsafe { RegisterHotKey(None, HOTKEY_ID, mods | MOD_NOREPEAT, vk) } {
                     Ok(()) => {
                         tracing::info!(trigger, "global hotkey ready; press it to save a clip");
-                        true
+                        Some((mods, vk))
                     }
                     Err(e) => {
                         tracing::error!(error = %e, trigger, "could not register the global hotkey (in use elsewhere?)");
@@ -2984,7 +2987,7 @@ mod windows {
                             "Hotkey unavailable",
                             &format!("Could not register {trigger}: use the tray's Save clip now."),
                         );
-                        false
+                        None
                     }
                 }
             }
@@ -2994,16 +2997,18 @@ mod windows {
                     "Hotkey unavailable",
                     &format!("The configured hotkey \"{trigger}\" could not be understood."),
                 );
-                false
+                None
             }
         };
+        let mut press = ChordPress::default();
 
         loop {
             let mut msg = MSG::default();
             // SAFETY: FFI; drains this thread's own queue.
             while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
-                if msg.message == WM_HOTKEY && msg.wParam.0 == HOTKEY_ID as usize {
-                    tracing::info!("hotkey activated");
+                if msg.message == WM_HOTKEY && msg.wParam.0 == HOTKEY_ID as usize && press.hotkey()
+                {
+                    tracing::info!(source = "WM_HOTKEY", "hotkey activated");
                     save_and_toast(saver, capture_desktop);
                 }
                 // tray-icon's internal window procs need the messages dispatched.
@@ -3012,6 +3017,12 @@ mod windows {
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
+            }
+            if let Some((mods, vk)) = chord
+                && press.poll(chord_down(mods, vk, key_held))
+            {
+                tracing::info!(source = "key state", "hotkey activated");
+                save_and_toast(saver, capture_desktop);
             }
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 let id = event.id();
@@ -3031,11 +3042,61 @@ mod windows {
             }
             std::thread::sleep(HOTKEY_POLL);
         }
-        if hotkey_registered {
+        if chord.is_some() {
             // SAFETY: FFI; pairs the registration above.
             let _ = unsafe { UnregisterHotKey(None, HOTKEY_ID) };
         }
         // `_tray` drops here, removing the icon.
+    }
+
+    /// One press of the save chord, reported by two channels so that each press saves once.
+    /// Some games (League of Legends) swallow registered hotkeys while focused, yet leave the
+    /// async key state readable; an elevated foreground window hides the key state from us,
+    /// yet still lets `WM_HOTKEY` through. Either channel can see a press first.
+    #[derive(Debug, Default)]
+    struct ChordPress {
+        claimed: bool,
+    }
+
+    impl ChordPress {
+        /// The polled chord state: `true` on the first tick of a press nobody claimed yet.
+        fn poll(&mut self, down: bool) -> bool {
+            if !down {
+                self.claimed = false;
+                return false;
+            }
+            !std::mem::replace(&mut self.claimed, true)
+        }
+
+        /// A `WM_HOTKEY`: `true` unless the poll already saved this press.
+        fn hotkey(&mut self) -> bool {
+            !std::mem::replace(&mut self.claimed, true)
+        }
+    }
+
+    /// Whether the chord is held with exactly its modifiers, as `RegisterHotKey` matches it.
+    fn chord_down(mods: HOT_KEY_MODIFIERS, vk: u32, held: impl Fn(VIRTUAL_KEY) -> bool) -> bool {
+        let mut current = HOT_KEY_MODIFIERS(0);
+        for (key, modifier) in [
+            (VK_CONTROL, MOD_CONTROL),
+            (VK_MENU, MOD_ALT),
+            (VK_SHIFT, MOD_SHIFT),
+        ] {
+            if held(key) {
+                current |= modifier;
+            }
+        }
+        if held(VK_LWIN) || held(VK_RWIN) {
+            current |= MOD_WIN;
+        }
+        current == mods && u16::try_from(vk).is_ok_and(|vk| held(VIRTUAL_KEY(vk)))
+    }
+
+    fn key_held(key: VIRTUAL_KEY) -> bool {
+        // SAFETY: FFI, no pointers involved.
+        let state = unsafe { GetAsyncKeyState(i32::from(key.0)) };
+        // The high bit (a negative result) means the key is down right now.
+        state < 0
     }
 
     /// Parse a `CTRL+ALT+R`-style trigger (the config's format, shared with the Linux
@@ -3152,6 +3213,60 @@ mod windows {
             assert!(parse_trigger("CTRL+R+S").is_none(), "two keys");
             assert!(parse_trigger("CTRL+F25").is_none(), "F-key out of range");
             assert!(parse_trigger("CTRL+ESC?").is_none(), "unsupported key name");
+        }
+
+        fn holding(keys: &[VIRTUAL_KEY]) -> impl Fn(VIRTUAL_KEY) -> bool + '_ {
+            move |key| keys.contains(&key)
+        }
+
+        #[test]
+        fn the_chord_needs_its_key_and_exactly_its_modifiers() {
+            let r = u32::from(b'R');
+            let mods = MOD_CONTROL | MOD_ALT;
+            let key_r = VIRTUAL_KEY(b'R'.into());
+            assert!(chord_down(mods, r, holding(&[VK_CONTROL, VK_MENU, key_r])));
+            assert!(!chord_down(mods, r, holding(&[VK_CONTROL, VK_MENU])));
+            assert!(!chord_down(mods, r, holding(&[VK_CONTROL, key_r])));
+            assert!(!chord_down(
+                mods,
+                r,
+                holding(&[VK_CONTROL, VK_MENU, VK_SHIFT, key_r])
+            ));
+            assert!(chord_down(
+                MOD_SHIFT | MOD_WIN,
+                r,
+                holding(&[VK_SHIFT, VK_RWIN, key_r])
+            ));
+        }
+
+        #[test]
+        fn a_polled_press_saves_once_until_released() {
+            let mut press = ChordPress::default();
+            assert!(!press.poll(false));
+            assert!(press.poll(true));
+            assert!(!press.poll(true));
+            assert!(!press.poll(false));
+            assert!(press.poll(true));
+        }
+
+        #[test]
+        fn a_press_seen_on_both_channels_saves_once() {
+            let mut press = ChordPress::default();
+            assert!(press.hotkey());
+            assert!(!press.poll(true));
+            assert!(!press.poll(false));
+
+            assert!(press.poll(true));
+            assert!(!press.hotkey());
+            assert!(!press.poll(false));
+        }
+
+        #[test]
+        fn hotkeys_still_save_when_the_key_state_is_hidden() {
+            let mut press = ChordPress::default();
+            assert!(press.hotkey());
+            assert!(!press.poll(false));
+            assert!(press.hotkey());
         }
     }
 }
