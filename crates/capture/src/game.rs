@@ -41,9 +41,19 @@ impl GameInfo {
         if !cleaned.is_empty() {
             return cleaned;
         }
-        self.title.trim().to_owned()
+        let title = self.title.trim();
+        TITLE_NAMES
+            .iter()
+            .find(|(raw, _)| *raw == title)
+            .map_or(title, |(_, name)| name)
+            .to_owned()
     }
 }
+
+/// Window titles that name their game badly, and the name to use instead. Anti-cheat games
+/// are named by their title: their process name is unreadable to us, and an executable
+/// name like `r5apex` would say less anyway.
+const TITLE_NAMES: &[(&str, &str)] = &[("League of Legends (TM) Client", "League of Legends")];
 
 /// Shell/desktop app ids that legitimately go fullscreen (lock screens, launchers,
 /// splashes) or are rewynd itself, and must never be latched onto as "the game".
@@ -165,6 +175,24 @@ mod tests {
         assert_eq!(
             info("", "Some Window Title").display_name_via(no_steam),
             "Some Window Title"
+        );
+    }
+
+    #[test]
+    fn display_name_renames_known_bad_titles() {
+        let no_steam = |_: u32| None;
+        assert_eq!(
+            info("", "League of Legends (TM) Client").display_name_via(no_steam),
+            "League of Legends"
+        );
+        assert_eq!(
+            info("", " VALORANT  ").display_name_via(no_steam),
+            "VALORANT"
+        );
+        // An app id still wins over a renamed title.
+        assert_eq!(
+            info("lol.exe", "League of Legends (TM) Client").display_name_via(no_steam),
+            "lol"
         );
     }
 

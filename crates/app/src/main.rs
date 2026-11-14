@@ -2235,12 +2235,14 @@ mod windows {
         AudioMixer, EncodeParams, Encoder, GpuVideoEncoder, Nv12Converter, SoftwareTextureEncoder,
     };
     use rewynd_gpu::{D3d11HandleImport, GpuContext};
+    use windows::Win32::System::SystemInformation::GetTickCount;
     use windows::Win32::UI::HiDpi::{
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey,
-        UnregisterHotKey, VK_F1,
+        GetAsyncKeyState, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
+        MOD_WIN, RegisterHotKey, UnregisterHotKey, VIRTUAL_KEY, VK_CONTROL, VK_F1, VK_LWIN,
+        VK_MENU, VK_RWIN, VK_SHIFT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage, WM_HOTKEY,
@@ -2254,8 +2256,11 @@ mod windows {
 
     /// Our one thread-queue hotkey registration.
     const HOTKEY_ID: i32 = 1;
-    /// How often the hotkey message pump wakes to drain its queue and check the stop
-    /// flag — the worst-case added latency on a press, well under perception.
+    /// How often the hotkey message pump wakes to drain its queue, sample the chord's key
+    /// state and check the stop flag — the worst-case added latency on a press, well under
+    /// perception. Where a game swallows `WM_HOTKEY`, it also bounds the shortest press the
+    /// sample catches: a chord held by hand, not always one software sends and releases
+    /// within a few ms.
     const HOTKEY_POLL: Duration = Duration::from_millis(30);
 
     pub fn run() -> Result<()> {
@@ -2927,7 +2932,8 @@ mod windows {
 
     /// The tray + hotkey thread: build the tray icon and menu, register the configured
     /// trigger, and pump this thread's message queue until the stop flag rises. One
-    /// pump drives both — WM_HOTKEY saves a clip, menu events run the tray commands.
+    /// pump drives both — a press of the trigger ([`ChordPress`]) saves a clip, menu
+    /// events run the tray commands.
     /// A hotkey that cannot be parsed or registered degrades to tray-only saving; a
     /// failed tray degrades to hotkey-only (matching the Linux "continuing without it").
     fn run_tray_loop(
@@ -2970,13 +2976,16 @@ mod windows {
             }
         };
 
-        let hotkey_registered = match parse_trigger(trigger) {
+        // Only a registered chord is also polled: one another app owns must not save too.
+        let chord = match parse_trigger(trigger) {
             // SAFETY: FFI; a NULL hwnd registers on this thread's queue, unregistered below.
             Some((mods, vk)) => {
-                match unsafe { RegisterHotKey(None, HOTKEY_ID, mods | MOD_NOREPEAT, vk) } {
+                match unsafe {
+                    RegisterHotKey(None, HOTKEY_ID, mods | MOD_NOREPEAT, u32::from(vk.0))
+                } {
                     Ok(()) => {
                         tracing::info!(trigger, "global hotkey ready; press it to save a clip");
-                        true
+                        Some((mods, vk))
                     }
                     Err(e) => {
                         tracing::error!(error = %e, trigger, "could not register the global hotkey (in use elsewhere?)");
@@ -2984,7 +2993,7 @@ mod windows {
                             "Hotkey unavailable",
                             &format!("Could not register {trigger}: use the tray's Save clip now."),
                         );
-                        false
+                        None
                     }
                 }
             }
@@ -2994,16 +3003,20 @@ mod windows {
                     "Hotkey unavailable",
                     &format!("The configured hotkey \"{trigger}\" could not be understood."),
                 );
-                false
+                None
             }
         };
+        let mut press = ChordPress::default();
 
         loop {
             let mut msg = MSG::default();
             // SAFETY: FFI; drains this thread's own queue.
             while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
-                if msg.message == WM_HOTKEY && msg.wParam.0 == HOTKEY_ID as usize {
-                    tracing::info!("hotkey activated");
+                if msg.message == WM_HOTKEY
+                    && msg.wParam.0 == HOTKEY_ID as usize
+                    && press.hotkey(msg.time)
+                {
+                    tracing::info!(source = "WM_HOTKEY", "hotkey activated");
                     save_and_toast(saver, capture_desktop);
                 }
                 // tray-icon's internal window procs need the messages dispatched.
@@ -3011,6 +3024,15 @@ mod windows {
                 unsafe {
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
+                }
+            }
+            if let Some((mods, vk)) = chord {
+                let key = key_held(vk);
+                // The modifiers are only read while the trigger key is down: it rarely is.
+                let exact = key && modifiers_held(key_held) == mods;
+                if press.poll(key, exact, tick_count()) {
+                    tracing::info!(source = "key state", "hotkey activated");
+                    save_and_toast(saver, capture_desktop);
                 }
             }
             while let Ok(event) = MenuEvent::receiver().try_recv() {
@@ -3031,17 +3053,99 @@ mod windows {
             }
             std::thread::sleep(HOTKEY_POLL);
         }
-        if hotkey_registered {
+        if chord.is_some() {
             // SAFETY: FFI; pairs the registration above.
             let _ = unsafe { UnregisterHotKey(None, HOTKEY_ID) };
         }
         // `_tray` drops here, removing the icon.
     }
 
+    /// The poll only sees a press before its `WM_HOTKEY` is drained when the keydown lands
+    /// between the drain and the sample, so the two are stamped within a tick or two of the
+    /// ~16 ms clock, either way round. No hand presses the chord twice inside this.
+    const SAME_PRESS_MS: u32 = 100;
+
+    /// Whether two tick counts are [`SAME_PRESS_MS`] apart at most, across the ~49.7-day wrap.
+    fn same_press(a: u32, b: u32) -> bool {
+        a.wrapping_sub(b).min(b.wrapping_sub(a)) <= SAME_PRESS_MS
+    }
+
+    /// The save chord, reported by two channels so that each press saves once. Some games
+    /// (League of Legends) swallow registered hotkeys while focused, yet leave the async key
+    /// state readable; an elevated foreground window hides the key state from us, yet still
+    /// lets `WM_HOTKEY` through. Either channel can see a press first.
+    #[derive(Debug, Default)]
+    struct ChordPress {
+        /// The trigger key's last known state.
+        key_down: bool,
+        /// When the poll last saved, until that press's `WM_HOTKEY` turns up (if it ever does).
+        polled_at: Option<u32>,
+    }
+
+    impl ChordPress {
+        /// One key-state sample at tick `now`: `true` when the trigger key went down with
+        /// exactly the chord's modifiers held, the keydown `RegisterHotKey` itself fires on.
+        fn poll(&mut self, key: bool, exact_modifiers: bool, now: u32) -> bool {
+            // A press's WM_HOTKEY is drained before the next sample, so one that has not
+            // turned up by now never will (the game swallowed it).
+            if self.polled_at.is_some_and(|at| !same_press(at, now)) {
+                self.polled_at = None;
+            }
+            let was_down = std::mem::replace(&mut self.key_down, key);
+            let pressed = key && !was_down && exact_modifiers;
+            if pressed {
+                self.polled_at = Some(now);
+            }
+            pressed
+        }
+
+        /// A `WM_HOTKEY` stamped `time`: `true` unless it reports the press the poll saved.
+        fn hotkey(&mut self, time: u32) -> bool {
+            // The key is down now, even where its state is hidden: no polled press until the
+            // poll has seen it released.
+            self.key_down = true;
+            let polled = self.polled_at.is_some_and(|at| same_press(at, time));
+            if polled {
+                self.polled_at = None;
+            }
+            !polled
+        }
+    }
+
+    /// The modifiers held right now, in `RegisterHotKey`'s terms.
+    fn modifiers_held(held: impl Fn(VIRTUAL_KEY) -> bool) -> HOT_KEY_MODIFIERS {
+        let mut mods = HOT_KEY_MODIFIERS(0);
+        for (key, modifier) in [
+            (VK_CONTROL, MOD_CONTROL),
+            (VK_MENU, MOD_ALT),
+            (VK_SHIFT, MOD_SHIFT),
+        ] {
+            if held(key) {
+                mods |= modifier;
+            }
+        }
+        if held(VK_LWIN) || held(VK_RWIN) {
+            mods |= MOD_WIN;
+        }
+        mods
+    }
+
+    fn key_held(key: VIRTUAL_KEY) -> bool {
+        // SAFETY: FFI, no pointers involved.
+        let state = unsafe { GetAsyncKeyState(i32::from(key.0)) };
+        // The high bit (a negative result) means the key is down right now.
+        state < 0
+    }
+
+    fn tick_count() -> u32 {
+        // SAFETY: FFI, no arguments.
+        unsafe { GetTickCount() }
+    }
+
     /// Parse a `CTRL+ALT+R`-style trigger (the config's format, shared with the Linux
     /// portal hint) into `RegisterHotKey` modifiers + a virtual-key code. Exactly one
     /// non-modifier key is required: a letter, a digit, or `F1`–`F24`.
-    fn parse_trigger(trigger: &str) -> Option<(HOT_KEY_MODIFIERS, u32)> {
+    fn parse_trigger(trigger: &str) -> Option<(HOT_KEY_MODIFIERS, VIRTUAL_KEY)> {
         let mut mods = HOT_KEY_MODIFIERS(0);
         let mut key = None;
         for part in trigger.split('+') {
@@ -3062,13 +3166,14 @@ mod windows {
 
     /// The virtual-key code for a single non-modifier key name (already uppercased).
     /// Letters and digits map to their ASCII codes per the Win32 VK table.
-    fn parse_key(key: &str) -> Option<u32> {
+    fn parse_key(key: &str) -> Option<VIRTUAL_KEY> {
         let mut bytes = key.bytes();
         if let (Some(c), None) = (bytes.next(), bytes.next()) {
-            return (c.is_ascii_uppercase() || c.is_ascii_digit()).then_some(u32::from(c));
+            return (c.is_ascii_uppercase() || c.is_ascii_digit())
+                .then_some(VIRTUAL_KEY(u16::from(c)));
         }
-        let n: u32 = key.strip_prefix('F')?.parse().ok()?;
-        (1..=24).contains(&n).then(|| u32::from(VK_F1.0) + n - 1)
+        let n: u16 = key.strip_prefix('F')?.parse().ok()?;
+        (1..=24).contains(&n).then(|| VIRTUAL_KEY(VK_F1.0 + n - 1))
     }
 
     /// Cut + mux a clip and confirm on every channel: toast (desktop), on-screen badge + chime
@@ -3134,15 +3239,15 @@ mod windows {
         fn triggers_parse_to_modifiers_and_keys() {
             let (mods, vk) = parse_trigger("CTRL+ALT+R").expect("parses");
             assert_eq!(mods, MOD_CONTROL | MOD_ALT);
-            assert_eq!(vk, u32::from(b'R'));
+            assert_eq!(vk, VIRTUAL_KEY(b'R'.into()));
 
             let (mods, vk) = parse_trigger(" shift + win + f12 ").expect("parses");
             assert_eq!(mods, MOD_SHIFT | MOD_WIN);
-            assert_eq!(vk, u32::from(VK_F1.0) + 11);
+            assert_eq!(vk, VIRTUAL_KEY(VK_F1.0 + 11));
 
             let (mods, vk) = parse_trigger("CTRL+9").expect("parses");
             assert_eq!(mods, MOD_CONTROL);
-            assert_eq!(vk, u32::from(b'9'));
+            assert_eq!(vk, VIRTUAL_KEY(b'9'.into()));
         }
 
         #[test]
@@ -3152,6 +3257,122 @@ mod windows {
             assert!(parse_trigger("CTRL+R+S").is_none(), "two keys");
             assert!(parse_trigger("CTRL+F25").is_none(), "F-key out of range");
             assert!(parse_trigger("CTRL+ESC?").is_none(), "unsupported key name");
+        }
+
+        fn holding(keys: &[VIRTUAL_KEY]) -> impl Fn(VIRTUAL_KEY) -> bool + '_ {
+            move |key| keys.contains(&key)
+        }
+
+        #[test]
+        fn held_modifiers_map_to_hotkey_modifiers() {
+            assert_eq!(modifiers_held(holding(&[])), HOT_KEY_MODIFIERS(0));
+            assert_eq!(
+                modifiers_held(holding(&[VK_CONTROL, VK_MENU])),
+                MOD_CONTROL | MOD_ALT
+            );
+            assert_eq!(
+                modifiers_held(holding(&[VK_SHIFT, VK_RWIN])),
+                MOD_SHIFT | MOD_WIN
+            );
+            assert_eq!(modifiers_held(holding(&[VK_LWIN])), MOD_WIN);
+        }
+
+        #[test]
+        fn the_poll_saves_on_the_keydown_with_exact_modifiers() {
+            let mut press = ChordPress::default();
+            assert!(!press.poll(false, false, 0));
+            assert!(press.poll(true, true, 30));
+            assert!(!press.poll(true, true, 60), "held, not pressed again");
+            assert!(!press.poll(false, false, 90));
+            assert!(press.poll(true, true, 120));
+        }
+
+        #[test]
+        fn modifier_changes_while_the_key_is_held_never_save() {
+            let mut press = ChordPress::default();
+            // Ctrl+Alt+R held, Shift tapped and let go.
+            assert!(press.poll(true, true, 0));
+            assert!(!press.poll(true, false, 30));
+            assert!(!press.poll(true, true, 60));
+            // R held first (a League ability), Ctrl+Alt added after.
+            assert!(!press.poll(false, false, 90));
+            assert!(!press.poll(true, false, 120));
+            assert!(!press.poll(true, true, 150));
+        }
+
+        #[test]
+        fn a_hotkey_then_its_polled_keydown_save_once() {
+            let mut press = ChordPress::default();
+            assert!(press.hotkey(1000));
+            assert!(!press.poll(true, true, 1030));
+            assert!(!press.poll(false, false, 1060));
+        }
+
+        #[test]
+        fn a_polled_save_swallows_that_press_hotkey_only() {
+            let mut press = ChordPress::default();
+            assert!(press.poll(true, true, 1030));
+            // Stamped at the keydown, before the poll saw it.
+            assert!(!press.hotkey(1010));
+            assert!(!press.poll(false, false, 1060));
+            // The next press, reported by the hotkey alone.
+            assert!(press.hotkey(2000));
+        }
+
+        #[test]
+        fn a_hotkey_stamped_just_after_the_polled_save_is_that_press() {
+            let mut press = ChordPress::default();
+            assert!(press.poll(true, true, 1000));
+            assert!(!press.hotkey(1016));
+            // Past the window it is another press.
+            let mut press = ChordPress::default();
+            assert!(press.poll(true, true, 1000));
+            assert!(press.hotkey(1000 + SAME_PRESS_MS + 1));
+        }
+
+        #[test]
+        fn the_dedupe_window_spans_the_tick_count_wrap() {
+            let mut press = ChordPress::default();
+            assert!(press.poll(true, true, 5));
+            assert!(!press.hotkey(u32::MAX - 5));
+            let mut press = ChordPress::default();
+            assert!(press.poll(true, true, u32::MAX - 5));
+            assert!(!press.hotkey(5));
+        }
+
+        #[test]
+        fn a_polled_save_whose_hotkey_never_came_is_forgotten() {
+            let mut press = ChordPress::default();
+            assert!(press.poll(true, true, 1000));
+            assert!(!press.poll(false, false, 1000 + SAME_PRESS_MS + 1));
+            // A hotkey stamped as that press is no longer swallowed, as after the clock wraps.
+            assert!(press.hotkey(1000));
+        }
+
+        #[test]
+        fn hotkeys_queued_during_a_save_each_save() {
+            let mut press = ChordPress::default();
+            assert!(press.hotkey(1000));
+            assert!(press.hotkey(1400));
+        }
+
+        #[test]
+        fn hotkeys_still_save_when_the_key_state_is_hidden() {
+            let mut press = ChordPress::default();
+            assert!(press.hotkey(1000));
+            assert!(!press.poll(false, false, 1030));
+            assert!(press.hotkey(3000));
+        }
+
+        #[test]
+        fn a_hotkey_after_a_game_swallowed_one_still_saves() {
+            let mut press = ChordPress::default();
+            // In League: polled, and no WM_HOTKEY ever follows.
+            assert!(press.poll(true, true, 1000));
+            assert!(!press.poll(false, false, 1100));
+            // Later, in a window that does let the hotkey through.
+            assert!(press.hotkey(60_000));
+            assert!(!press.poll(true, true, 60_030));
         }
     }
 }
