@@ -95,6 +95,8 @@ pub struct CapturedD3d11Frame {
     /// reflect the real (damage-driven, variable) delivery cadence, so downstream
     /// PTS stays wall-clock-accurate.
     pub pts: Duration,
+    /// The source monitor's pixel size at session start, if readable.
+    pub display: Option<(u32, u32)>,
 }
 
 impl CapturedD3d11Frame {
@@ -188,6 +190,7 @@ impl SharedSlot {
 struct HandlerFlags<F> {
     on_frame: F,
     epoch: Instant,
+    display: Option<(u32, u32)>,
     stop: Option<Arc<AtomicBool>>,
     /// Set when the callback breaks: a deliberate, successful end.
     success: Arc<AtomicBool>,
@@ -355,6 +358,7 @@ where
             height,
             dxgi_format: format,
             pts: self.flags.epoch.elapsed(),
+            display: self.flags.display,
         };
         if let ControlFlow::Break(()) = (self.flags.on_frame)(captured) {
             self.flags.success.store(true, Ordering::Relaxed);
@@ -418,12 +422,24 @@ where
     F: FnMut(CapturedD3d11Frame) -> ControlFlow<()> + Send + 'static,
 {
     let monitor = select_monitor(monitor_index)?;
+    // Not `display`: tracing's macros import a `display` fn that a local of that name loses to.
+    let measured = monitor_size(&monitor);
     tracing::info!(
         monitor = monitor.name().unwrap_or_default(),
+        ?measured,
         "starting WGC monitor capture"
     );
     let refresh = monitor.refresh_rate().unwrap_or(0);
-    run_session(monitor, refresh, epoch, prefs, stop, || true, on_frame)
+    run_session(
+        monitor,
+        refresh,
+        measured,
+        epoch,
+        prefs,
+        stop,
+        || true,
+        on_frame,
+    )
 }
 
 /// The monitor `monitor_index` names (one-based, per the Win32 display enumeration); `None`
@@ -446,12 +462,18 @@ pub fn display_geometry(monitor_index: Option<usize>) -> Option<(u32, u32)> {
     let monitor = select_monitor(monitor_index)
         .inspect_err(|e| tracing::warn!(error = %e, "could not select a monitor to measure"))
         .ok()?;
+    let size = monitor_size(&monitor);
+    if size.is_none() {
+        tracing::warn!("could not read the monitor's size; using the configured resolution");
+    }
+    size
+}
+
+/// A monitor's current mode in pixels, or `None` when it can't be read.
+fn monitor_size(monitor: &Monitor) -> Option<(u32, u32)> {
     match (monitor.width(), monitor.height()) {
         (Ok(w), Ok(h)) if w > 0 && h > 0 => Some((w, h)),
-        _ => {
-            tracing::warn!("could not read the monitor's size; using the configured resolution");
-            None
-        }
+        _ => None,
     }
 }
 
@@ -522,10 +544,11 @@ where
             };
             on_game(Some(&info));
         }
-        let refresh = window
-            .monitor()
-            .and_then(|m| m.refresh_rate().ok())
-            .unwrap_or(0);
+        // The game's own monitor, not the primary.
+        let monitor = window.monitor();
+        let refresh = monitor.and_then(|m| m.refresh_rate().ok()).unwrap_or(0);
+        let measured = monitor.as_ref().and_then(monitor_size);
+        tracing::info!(?measured, "measured the game's monitor");
 
         let session_cb = {
             let on_frame = on_frame.clone();
@@ -558,6 +581,7 @@ where
         let session = run_session(
             window,
             refresh,
+            measured,
             epoch,
             prefs,
             stop.clone(),
@@ -591,13 +615,16 @@ where
 /// One WGC session over `item` (a monitor or a window): the shared body of
 /// [`capture_stream`] and [`capture_game_stream`]. `refresh` is the source
 /// monitor's refresh rate (0 = unknown), used to decide whether `prefs.framerate`
-/// caps delivery via WGC's minimum update interval.
+/// caps delivery via WGC's minimum update interval; `measured` is its size, stamped
+/// on every frame.
 ///
 /// `keep_alive` is polled next to the stop flag every [`STOP_POLL`]; `false` ends the
 /// session as a clean stop. The monitor path has nothing to re-check: `|| true`.
+#[allow(clippy::too_many_arguments)]
 fn run_session<T, F>(
     item: T,
     refresh: u32,
+    measured: Option<(u32, u32)>,
     epoch: Instant,
     prefs: StreamPrefs,
     stop: Option<Arc<AtomicBool>>,
@@ -636,6 +663,7 @@ where
         HandlerFlags {
             on_frame,
             epoch,
+            display: measured,
             stop: stop.clone(),
             success: success.clone(),
             stopped: stopped.clone(),

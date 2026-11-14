@@ -89,7 +89,8 @@ impl ClipSaver {
     }
 
     /// Tell the saver what the encoder is actually producing, so the MP4 track's dimensions match
-    /// the stream. Called once the recorder has measured the captured display.
+    /// the stream. Called once the recorder has measured the captured display, and on each
+    /// re-size while the ring is empty.
     pub fn set_dimensions(&self, width: u32, height: u32) {
         *lock_unpoisoned(&self.dimensions) = (width, height);
     }
@@ -122,10 +123,16 @@ impl ClipSaver {
             }
         }
 
-        // Hold each lock only for the cut (which clones ref-counts, not payloads).
-        let chunks = lock_unpoisoned(&self.buffer)
-            .flush_last(self.window)
-            .map_err(|e| SaveError::Empty(e.to_string()))?;
+        // Hold each lock only for the cut (which clones ref-counts, not payloads). The size is
+        // read under the ring's lock so it can't straddle a re-size.
+        let (chunks, (width, height)) = {
+            let ring = lock_unpoisoned(&self.buffer);
+            (
+                ring.flush_last(self.window),
+                *lock_unpoisoned(&self.dimensions),
+            )
+        };
+        let chunks = chunks.map_err(|e| SaveError::Empty(e.to_string()))?;
 
         // The clip starts at its first (keyframe) chunk; take the audio from that instant on —
         // all PTS share the capture epoch, so this keeps the tracks aligned.
@@ -163,7 +170,6 @@ impl ClipSaver {
             },
         ];
 
-        let (width, height) = *lock_unpoisoned(&self.dimensions);
         let muxer = Mp4Muxer::new(width, height, self.params.framerate);
         let result = if audio_chunks.is_empty() && mic_chunks.is_empty() {
             muxer.write_mp4(&chunks, &path)
