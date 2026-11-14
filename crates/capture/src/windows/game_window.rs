@@ -200,6 +200,12 @@ impl WindowedGames {
     }
 }
 
+/// Some games (League of Legends) shrink their window to a pixel instead of minimizing
+/// when they lose focus; that is minimized in all but name.
+fn is_collapsed(rect: RECT) -> bool {
+    rect.right - rect.left <= 1 || rect.bottom - rect.top <= 1
+}
+
 /// A borderless window may hang a pixel over, so "covers" is `<=`/`>=`, not equality.
 fn rect_covers(rect: RECT, bounds: RECT) -> bool {
     rect.left <= bounds.left
@@ -229,8 +235,8 @@ pub(crate) enum WindowState {
 /// Long enough to ride out a display-mode switch's flicker.
 pub(crate) const RELEASE_GRACE: Duration = Duration::from_secs(1);
 
-/// Longer: alt-tab minimizes an exclusive-fullscreen game. Bounded, so one left
-/// minimized cannot hold the recorder while another runs.
+/// Longer: alt-tab minimizes an exclusive-fullscreen game, or collapses it ([`is_collapsed`]).
+/// Bounded, so one left minimized cannot hold the recorder while another runs.
 pub(crate) const MINIMIZED_GRACE: Duration = Duration::from_secs(30);
 
 /// Releases the captured window once it has not qualified for its earned grace.
@@ -324,7 +330,8 @@ pub(crate) fn game_window(windowed_games: &WindowedGames) -> Option<DetectedGame
 }
 
 /// The window's process; for a UWP frame, the app hosted in it. Empty when unreadable:
-/// anti-cheat games refuse OpenProcess, so that must NOT disqualify.
+/// anti-cheat drivers deny the memory-read access this query needs, so that must NOT
+/// disqualify.
 fn process_name(window: &Window) -> String {
     let Ok(name) = window.process_name() else {
         return String::new();
@@ -391,7 +398,7 @@ pub(crate) fn window_state(window: &Window, windowed: bool) -> WindowState {
     // SAFETY: FFI; both tolerate a destroyed HWND (they report false).
     let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
     // SAFETY: FFI.
-    let minimized = unsafe { IsIconic(hwnd) }.as_bool();
+    let minimized = unsafe { IsIconic(hwnd) }.as_bool() || window.rect().is_ok_and(is_collapsed);
     window_state_from(
         visible,
         minimized,
@@ -553,6 +560,15 @@ mod tests {
         assert!(rect_covers(MONITOR, MONITOR));
         assert!(rect_covers(rect(-1, -1, 2561, 1441), MONITOR));
         assert!(rect_covers(rect(-8, -8, 2568, 1448), MONITOR));
+    }
+
+    #[test]
+    fn a_window_shrunk_to_a_pixel_counts_as_collapsed() {
+        assert!(is_collapsed(rect(0, 0, 1, 1)));
+        assert!(is_collapsed(rect(0, 0, 1920, 1)));
+        assert!(is_collapsed(rect(0, 0, 0, 0)));
+        assert!(!is_collapsed(rect(0, 0, 2, 2)));
+        assert!(!is_collapsed(MONITOR));
     }
 
     #[test]
