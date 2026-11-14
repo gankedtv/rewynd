@@ -2258,7 +2258,9 @@ mod windows {
     const HOTKEY_ID: i32 = 1;
     /// How often the hotkey message pump wakes to drain its queue, sample the chord's key
     /// state and check the stop flag — the worst-case added latency on a press, well under
-    /// perception, and shorter than a deliberate chord is held.
+    /// perception. Where a game swallows `WM_HOTKEY`, it also bounds the shortest press the
+    /// sample catches: a chord held by hand, not always one software sends and releases
+    /// within a few ms.
     const HOTKEY_POLL: Duration = Duration::from_millis(30);
 
     pub fn run() -> Result<()> {
@@ -3026,7 +3028,7 @@ mod windows {
             }
             if let Some((mods, vk)) = chord {
                 let key = key_held(vk);
-                // The modifiers are only read on a press: the trigger key is rarely down.
+                // The modifiers are only read while the trigger key is down: it rarely is.
                 let exact = key && modifiers_held(key_held) == mods;
                 if press.poll(key, exact, tick_count()) {
                     tracing::info!(source = "key state", "hotkey activated");
@@ -3058,10 +3060,15 @@ mod windows {
         // `_tray` drops here, removing the icon.
     }
 
-    /// How much earlier than the poll's save a press's `WM_HOTKEY` can be stamped: it is
-    /// stamped at the keydown, and the poll sees that keydown a tick later at most, or after
-    /// whatever blocked the pump meanwhile (a save from the tray, say).
-    const SAME_PRESS_MS: u32 = 1000;
+    /// The poll only sees a press before its `WM_HOTKEY` is drained when the keydown lands
+    /// between the drain and the sample, so the two are stamped within a tick or two of the
+    /// ~16 ms clock, either way round. No hand presses the chord twice inside this.
+    const SAME_PRESS_MS: u32 = 100;
+
+    /// Whether two tick counts are [`SAME_PRESS_MS`] apart at most, across the ~49.7-day wrap.
+    fn same_press(a: u32, b: u32) -> bool {
+        a.wrapping_sub(b).min(b.wrapping_sub(a)) <= SAME_PRESS_MS
+    }
 
     /// The save chord, reported by two channels so that each press saves once. Some games
     /// (League of Legends) swallow registered hotkeys while focused, yet leave the async key
@@ -3079,6 +3086,11 @@ mod windows {
         /// One key-state sample at tick `now`: `true` when the trigger key went down with
         /// exactly the chord's modifiers held, the keydown `RegisterHotKey` itself fires on.
         fn poll(&mut self, key: bool, exact_modifiers: bool, now: u32) -> bool {
+            // A press's WM_HOTKEY is drained before the next sample, so one that has not
+            // turned up by now never will (the game swallowed it).
+            if self.polled_at.is_some_and(|at| !same_press(at, now)) {
+                self.polled_at = None;
+            }
             let was_down = std::mem::replace(&mut self.key_down, key);
             let pressed = key && !was_down && exact_modifiers;
             if pressed {
@@ -3092,9 +3104,7 @@ mod windows {
             // The key is down now, even where its state is hidden: no polled press until the
             // poll has seen it released.
             self.key_down = true;
-            let polled = self
-                .polled_at
-                .is_some_and(|at| at.wrapping_sub(time) <= SAME_PRESS_MS);
+            let polled = self.polled_at.is_some_and(|at| same_press(at, time));
             if polled {
                 self.polled_at = None;
             }
@@ -3307,6 +3317,36 @@ mod windows {
             assert!(!press.poll(false, false, 1060));
             // The next press, reported by the hotkey alone.
             assert!(press.hotkey(2000));
+        }
+
+        #[test]
+        fn a_hotkey_stamped_just_after_the_polled_save_is_that_press() {
+            let mut press = ChordPress::default();
+            assert!(press.poll(true, true, 1000));
+            assert!(!press.hotkey(1016));
+            // Past the window it is another press.
+            let mut press = ChordPress::default();
+            assert!(press.poll(true, true, 1000));
+            assert!(press.hotkey(1000 + SAME_PRESS_MS + 1));
+        }
+
+        #[test]
+        fn the_dedupe_window_spans_the_tick_count_wrap() {
+            let mut press = ChordPress::default();
+            assert!(press.poll(true, true, 5));
+            assert!(!press.hotkey(u32::MAX - 5));
+            let mut press = ChordPress::default();
+            assert!(press.poll(true, true, u32::MAX - 5));
+            assert!(!press.hotkey(5));
+        }
+
+        #[test]
+        fn a_polled_save_whose_hotkey_never_came_is_forgotten() {
+            let mut press = ChordPress::default();
+            assert!(press.poll(true, true, 1000));
+            assert!(!press.poll(false, false, 1000 + SAME_PRESS_MS + 1));
+            // A hotkey stamped as that press is no longer swallowed, as after the clock wraps.
+            assert!(press.hotkey(1000));
         }
 
         #[test]
