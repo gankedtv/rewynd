@@ -89,8 +89,8 @@ impl ClipSaver {
     }
 
     /// Tell the saver what the encoder is actually producing, so the MP4 track's dimensions match
-    /// the stream. Called once the recorder has measured the captured display, and again on a
-    /// re-size — which must happen with the ring empty, before the first frame at the new size.
+    /// the stream. Called once the recorder has measured the captured display, and on each
+    /// re-size while the ring is empty.
     pub fn set_dimensions(&self, width: u32, height: u32) {
         *lock_unpoisoned(&self.dimensions) = (width, height);
     }
@@ -124,8 +124,7 @@ impl ClipSaver {
         }
 
         // Hold each lock only for the cut (which clones ref-counts, not payloads). The size is
-        // read under the ring's lock: a re-size empties the ring first, so the frames cut here
-        // and the size they were encoded at can't come from either side of one.
+        // read under the ring's lock so it can't straddle a re-size.
         let (chunks, (width, height)) = {
             let ring = lock_unpoisoned(&self.buffer);
             (

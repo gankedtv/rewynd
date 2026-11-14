@@ -375,7 +375,7 @@ const OUTPUT_DEFAULT: &str = "System default";
 const SIDEBAR_WIDTH: f32 = 232.0;
 const BITS_PER_MBIT: u32 = 1_000_000;
 
-/// `bps` as a quality-slider position: rounded to whole Mbps and held inside its range.
+/// `bps` as the nearest quality-slider position.
 fn slider_mbps(bps: u32) -> u32 {
     (bps.saturating_add(BITS_PER_MBIT / 2) / BITS_PER_MBIT)
         .clamp(BITRATE_MIN_MBPS, BITRATE_MAX_MBPS)
@@ -1210,7 +1210,7 @@ impl App {
             }
             Message::AutoBitrate(on) => {
                 if !on && self.config.auto_bitrate() {
-                    // Start the slider where auto was, not at whatever was stored long ago.
+                    // Start the slider at the bitrate auto was using.
                     let auto = self.config.bitrate_for_display(self.display_geometry());
                     let mut v = self.config.video_stored();
                     v.bitrate_bps = slider_mbps(auto) * BITS_PER_MBIT;
@@ -2022,7 +2022,6 @@ impl App {
             )
         };
 
-        // Auto shows the bitrate it picked for the size above; the slider is only for a pinned one.
         let auto_check = checkbox(auto_bitrate)
             .label("Match bitrate to the resolution")
             .on_toggle(Message::AutoBitrate)
@@ -2547,8 +2546,8 @@ fn normalize(c: &mut Config) {
         c.buffer_seconds()
             .clamp(u64::from(BUFFER_MIN_S), u64::from(BUFFER_MAX_S)),
     );
-    // Settle an older config's implied auto setting first: snapping its bitrate below could
-    // otherwise land on the old default and flip a hand-picked bitrate to auto.
+    // Pin the implied auto setting first: snapping a hand-picked bitrate onto 12 Mbps below
+    // would otherwise flip it to auto.
     c.set_auto_bitrate(c.auto_bitrate());
     let mut v = c.video_stored();
     let mbps = (v.bitrate_bps / BITS_PER_MBIT).clamp(BITRATE_MIN_MBPS, BITRATE_MAX_MBPS);

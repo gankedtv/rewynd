@@ -2761,8 +2761,7 @@ mod windows {
         Ok(())
     }
 
-    /// Which encoder [`build_encoder`] ended up with, so a resize builds the same kind again on
-    /// the same device.
+    /// Which encoder [`build_encoder`] ended up with, so a re-size rebuilds the same kind.
     #[derive(Clone, Copy)]
     enum Backend {
         Gpu,
@@ -2829,11 +2828,9 @@ mod windows {
         Ok(enc)
     }
 
-    /// Keeps the encode sized for the display actually being captured. The size measured at
-    /// startup is only a first guess: it is the primary monitor as the recorder launched, which
-    /// can be the wrong screen (a game on another monitor) or a stale reading (taken at login,
-    /// before every monitor was up). Each capture session's own display re-decides it, and only
-    /// while the ring is empty, so a clip never mixes two sizes.
+    /// Keeps the encode sized for the captured display. The startup size (the primary monitor,
+    /// possibly stale) is only a guess; each session's own display re-decides it, only while
+    /// the ring is empty so a clip never mixes two sizes.
     struct Sizing {
         config: config::Config,
         choice: config::EncoderChoice,
@@ -2846,10 +2843,8 @@ mod windows {
     }
 
     impl Sizing {
-        /// Re-size for the `measured` display when the encoder wasn't built for it. If the new
-        /// size can't be built, the old one is rebuilt and its frames come out letterboxed; the
-        /// display stays unadopted, so the next session tries again. `Err` only when even that
-        /// fails, which leaves `enc` empty.
+        /// Re-size for `measured`. If that fails, the old size is rebuilt and `measured` stays
+        /// unadopted so the next session retries; `Err` (with `enc` empty) if that fails too.
         fn follow(
             &mut self,
             measured: Option<(u32, u32)>,
@@ -2863,8 +2858,7 @@ mod windows {
             let next = session_params(&self.config, measured, &self.choice, &self.adapters);
             let shape = |p: &EncodeParams| (p.width, p.height, p.bitrate_bps);
             if shape(&next) != shape(&self.params) {
-                // Old one first: a GPU can cap how many hardware encode sessions run at once,
-                // and the ring is empty, so it holds nothing worth keeping.
+                // Drop the old one first: a GPU can cap concurrent hardware encode sessions.
                 *enc = None;
                 match encoder_on(gpu, backend, next) {
                     Ok(fresh) => *enc = Some(fresh),

@@ -95,8 +95,7 @@ pub struct CapturedD3d11Frame {
     /// reflect the real (damage-driven, variable) delivery cadence, so downstream
     /// PTS stays wall-clock-accurate.
     pub pts: Duration,
-    /// The pixel size of the monitor the source is on, measured as its session started:
-    /// what the encode should be sized for. `None` when the monitor couldn't be read.
+    /// The source monitor's pixel size at session start, if readable.
     pub display: Option<(u32, u32)>,
 }
 
@@ -540,7 +539,7 @@ where
             };
             on_game(Some(&info));
         }
-        // The game's own monitor, not the primary: that is the screen it fills.
+        // The game's own monitor, not the primary.
         let monitor = window.monitor();
         let refresh = monitor.and_then(|m| m.refresh_rate().ok()).unwrap_or(0);
         let measured = monitor.as_ref().and_then(monitor_size);

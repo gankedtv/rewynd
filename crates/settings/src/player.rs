@@ -36,13 +36,10 @@ pub enum Event {
 /// hidpi). The scrub preview reuses it so paused and playing frames match.
 pub const PREVIEW_WIDTH: u32 = 960;
 
-/// Fullscreen decode widths round up to this, so dragging the window's edge restarts playback
-/// a handful of times rather than at every pixel. It divides the common widths (1280, 1920,
-/// 2560, 3840), so those decode exactly.
+/// Fullscreen widths round up to this, so resizing the window rarely restarts playback.
 const FULLSCREEN_STEP: u32 = 128;
 
-/// The widest fullscreen decode. Every frame crosses ffmpeg's pipe as RGBA and is uploaded
-/// again, so 4K60 is already about 2 GB/s; a preview gains nothing past it.
+/// Every frame crosses ffmpeg's pipe as RGBA, so 4K60 is already ~2 GB/s.
 const MAX_FULLSCREEN_WIDTH: u32 = 3840;
 
 /// A window's size in pixels, from its logical size and scale factor. `None` when unreadable.
@@ -52,12 +49,8 @@ pub fn window_pixels(logical: (f32, f32), scale: f32) -> Option<(u32, u32)> {
         .then(|| (w.round() as u32, h.round() as u32))
 }
 
-/// The fullscreen decode width for a `window`-pixel window showing a `clip`-sized clip: as wide
-/// as the picture is drawn there (narrower than the window when the clip's shape leaves bars at
-/// the sides), rounded up to [`FULLSCREEN_STEP`], at most [`MAX_FULLSCREEN_WIDTH`]. A 3440-wide
-/// clip on a 3440-wide window is no longer upscaled from a fraction of its pixels. Never wider
-/// than the clip itself: the decode couldn't use more, and since playback is keyed on this
-/// width, resizing the window over a smaller clip would restart it for nothing.
+/// The fullscreen decode width: the clip's drawn width in `window`, rounded up a step and
+/// capped at the clip's own width and [`MAX_FULLSCREEN_WIDTH`].
 pub fn fullscreen_width(window: (u32, u32), clip: Option<(u32, u32)>) -> u32 {
     let (window_w, window_h) = window;
     let (drawn, widest) = match clip {

@@ -322,7 +322,7 @@ pub enum Message {
     FullscreenToggle,
     /// Leave the fullscreen preview (Escape).
     FullscreenExit,
-    /// The window changed size or moved to a display with a different scale factor.
+    /// The window was resized or rescaled.
     WindowChanged,
     /// The window's size in pixels (`None` when it couldn't be read).
     WindowMeasured(Option<(u32, u32)>),
@@ -433,7 +433,7 @@ pub struct Library {
     seek_resume: bool,
     /// Whether the preview fills the whole window.
     fullscreen: bool,
-    /// The window's last measured size in pixels, which the fullscreen decode width follows.
+    /// The window's last measured size in pixels.
     window_px: Option<(u32, u32)>,
     /// The open clip's normalized audio peaks for the timeline lane.
     waveform: Option<Vec<f32>>,
@@ -1414,9 +1414,7 @@ impl Library {
         Task::batch([summary, self.build_strip(path), wave])
     }
 
-    /// Grow or shrink the preview; a running playback restarts from its current position so the
-    /// decode width follows the pane size. Resizes keep the window's size current, so only the
-    /// first fullscreen has to wait for a reading (playing on at the inline width meanwhile).
+    /// Grow or shrink the preview, measuring the window on the first fullscreen.
     fn set_fullscreen(&mut self, on: bool) -> Task<Message> {
         if self.fullscreen == on {
             return Task::none();
@@ -1431,9 +1429,8 @@ impl Library {
         }
     }
 
-    /// Restart a running playback from where it is when the decode width moved off `before`:
-    /// the playback subscription is keyed by its range and width, so a new width alone would
-    /// rewind it, and re-anchoring when nothing moved would restart it for nothing.
+    /// Re-anchor a running playback at its position if the decode width moved off `before`:
+    /// playback is keyed by range and width, so a new width alone would rewind it.
     fn width_changed(&mut self, before: u32) {
         if self.preview_width() == before {
             return;
@@ -1485,8 +1482,7 @@ impl Library {
         if self.animating() {
             subs.push(iced::window::frames().map(Message::Tick));
         }
-        // A move to a display with another scale factor can keep the logical size, so it shows up
-        // only as `Rescaled`, yet it changes the pixel count the fullscreen preview decodes at.
+        // A move to a display with another scale factor may fire only `Rescaled`.
         subs.push(iced::event::listen_with(|event, _status, _id| {
             matches!(
                 event,
@@ -3568,7 +3564,7 @@ impl DestStatus {
     }
 }
 
-/// Read the window's size in pixels, for the fullscreen decode width.
+/// Read the window's size in pixels.
 fn measure_window() -> Task<Message> {
     iced::window::latest().and_then(|id| {
         iced::window::size(id).then(move |size| {

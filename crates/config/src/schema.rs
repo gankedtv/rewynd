@@ -18,8 +18,7 @@ const DEFAULT_HEIGHT: u32 = 0;
 /// Derive the width from the captured display's aspect ratio instead of pinning the stored pair.
 const DEFAULT_MATCH_DISPLAY: bool = true;
 const DEFAULT_FRAMERATE: u32 = 60;
-/// The bitrate used when auto is off. Also the flat default every config carried before auto
-/// existed, which is how such a config is told apart from a hand-picked bitrate.
+/// Also the pre-auto flat default: an older config still holding it reads as auto.
 const DEFAULT_VIDEO_BITRATE_BPS: u32 = 12_000_000;
 const DEFAULT_AUTO_BITRATE: bool = true;
 const DEFAULT_IDR_PERIOD: u32 = 60;
@@ -141,8 +140,8 @@ struct VideoConfig {
     framerate: u32,
     /// The bitrate when `auto_bitrate` is off.
     bitrate_bps: u32,
-    /// Derive the bitrate from the recorded size and rate instead of using `bitrate_bps`. Absent
-    /// from configs written before it existed; see [`Config::auto_bitrate`] for how those read.
+    /// Scale the bitrate with the recorded size and rate. Absent from older configs; see
+    /// [`Config::auto_bitrate`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     auto_bitrate: Option<bool>,
     idr_period: u32,
@@ -478,7 +477,7 @@ impl Config {
         if let Some(v) = u32_of("REWYND_FPS") {
             self.video.framerate = v;
         }
-        // Naming a bitrate means recording at it, as it always has.
+        // An explicit bitrate turns auto off.
         if let Some(v) = u32_of("REWYND_BITRATE_BPS") {
             self.video.bitrate_bps = v;
             self.video.auto_bitrate = Some(false);
@@ -548,9 +547,8 @@ impl Config {
             bitrate_bps: self.bitrate_for(width, height, framerate),
             idr_period: raw.idr_period.clamp(1, 1000),
         };
-        // The resolution (and an automatic bitrate) is *resolved*, not merely clamped — the
-        // recorder logs it with the detected geometry — so only the untouched-by-design fields
-        // warrant a warning here.
+        // The resolution and an automatic bitrate are *resolved*, not clamped (the recorder logs
+        // them), so only the other fields warrant a warning here.
         let bitrate_clamped = !self.auto_bitrate() && sanitized.bitrate_bps != raw.bitrate_bps;
         if (sanitized.framerate, sanitized.idr_period) != (raw.framerate, raw.idr_period)
             || bitrate_clamped
@@ -592,9 +590,8 @@ impl Config {
         sanitized
     }
 
-    /// Whether the bitrate follows the recorded size and rate. A config written before the
-    /// setting existed reads as auto only while it still holds the old flat default, so a
-    /// bitrate someone picked by hand survives the upgrade.
+    /// Whether the bitrate follows the recorded size and rate. An older config without the key
+    /// is auto only while it holds the old default, so a hand-picked bitrate survives.
     #[must_use]
     pub fn auto_bitrate(&self) -> bool {
         self.video
@@ -607,9 +604,8 @@ impl Config {
         self.video.auto_bitrate = Some(on);
     }
 
-    /// The bitrate to record a `width`×`height` stream at `framerate` with: the automatic one,
-    /// or the stored bitrate clamped to `[100 kbps, 100 Mbps]`. The recorder calls this again
-    /// whenever the size it settles on differs from [`video_for_display`](Self::video_for_display)'s.
+    /// The bitrate for a `width`×`height` stream at `framerate`: the automatic one, or the
+    /// stored one clamped to `[100 kbps, 100 Mbps]`.
     #[must_use]
     pub fn bitrate_for(&self, width: u32, height: u32, framerate: u32) -> u32 {
         if self.auto_bitrate() {
@@ -619,10 +615,8 @@ impl Config {
         }
     }
 
-    /// The bitrate a recording on `display` would use — [`video_for_display`]'s, without its
-    /// warning about out-of-range values, so a settings view can show it on every redraw.
-    ///
-    /// [`video_for_display`]: Self::video_for_display
+    /// [`video_for_display`](Self::video_for_display)'s bitrate without its clamp warning, so a
+    /// settings view can show it on every redraw.
     #[must_use]
     pub fn bitrate_for_display(&self, display: Option<(u32, u32)>) -> u32 {
         let (width, height) = self.resolution_mode().resolve(display);
